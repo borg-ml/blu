@@ -77,6 +77,7 @@ fn canonical_package_round_trips_with_stable_identity() {
     assert_eq!(decoded.payload(), RETURN_THREE_V12);
     assert_eq!(decoded.digest(), package.digest());
     assert_eq!(decoded.chunk().version, 12);
+    assert_eq!(decoded.validated_chunk().as_chunk(), decoded.chunk());
     assert_eq!(decoded.encode(), bytes);
     assert_eq!(
         package.digest().to_string(),

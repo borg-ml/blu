@@ -50,10 +50,11 @@ Ordinary bytecode calls currently run on an owned, bounded VM frame stack.
 Suspended callers and their registers are traced as GC roots. Generational
 thread values support `coroutine.create`, `resume`, `yield`, `status`, `wrap`,
 `running`, `isyieldable`, and `close`, including nested yields and successful
-yields through `pcall`. Luau `running` returns one value and reports the main
-thread as yieldable; Blu follows modern Lua by returning `(thread, is_main)` and
-making the main thread non-yieldable. Protected error unwinding after a resume
-remains an explicit compatibility gap.
+yields through `pcall`. Errors raised after resumption unwind through saved
+explicit frames to the nearest suspended `pcall` or `xpcall`; `xpcall` handlers
+may themselves yield without losing outer callers. Luau `running` returns one
+value and reports the main thread as yieldable; Blu follows modern Lua by
+returning `(thread, is_main)` and making the main thread non-yieldable.
 
 ## Semantic profiles
 
@@ -103,7 +104,11 @@ Blu plugin is active.
 ## Resource limits
 
 Serialized bytecode and mutable embedding inputs are checked again at the
-execution boundary. A `NEWTABLE` instruction may request at most 1,048,576
+execution boundary. Loaders, compiler artifacts, and portable packages also
+expose an opaque `ValidatedChunk` whose safe API permits immutable inspection
+or consuming conversion back to a mutable tooling `Chunk`; converting back
+requires validation again before execution. A `NEWTABLE` instruction may
+request at most 1,048,576
 initial array slots and 1,048,576 initial hash slots. Larger requests fail
 validation or return a structured runtime error before allocation. This
 initial-capacity bound is only one defense; VM-wide byte accounting and

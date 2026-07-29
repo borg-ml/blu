@@ -28,6 +28,7 @@ impl fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 pub fn validate(chunk: &Chunk) -> Result<(), ValidationError> {
+    validate_chunk_structure(chunk)?;
     for (prototype_index, prototype) in chunk.prototypes.iter().enumerate() {
         Validator {
             chunk,
@@ -39,6 +40,141 @@ pub fn validate(chunk: &Chunk) -> Result<(), ValidationError> {
     Ok(())
 }
 
+fn validate_chunk_structure(chunk: &Chunk) -> Result<(), ValidationError> {
+    let error = |prototype: usize, message: String| ValidationError {
+        prototype,
+        pc: None,
+        message,
+    };
+    if chunk.main >= chunk.prototypes.len() {
+        return Err(error(
+            0,
+            format!(
+                "main prototype {} exceeds prototype count {}",
+                chunk.main,
+                chunk.prototypes.len()
+            ),
+        ));
+    }
+    for (_, string) in &chunk.userdata_types {
+        if *string >= chunk.strings.len() {
+            return Err(error(
+                chunk.main,
+                format!(
+                    "userdata type string {string} exceeds string count {}",
+                    chunk.strings.len()
+                ),
+            ));
+        }
+    }
+    for (prototype_index, prototype) in chunk.prototypes.iter().enumerate() {
+        let check_string = |index: usize, what: &str| {
+            if index < chunk.strings.len() {
+                Ok(())
+            } else {
+                Err(error(
+                    prototype_index,
+                    format!(
+                        "{what} string {index} exceeds string count {}",
+                        chunk.strings.len()
+                    ),
+                ))
+            }
+        };
+        let check_prototype = |index: usize, what: &str| {
+            if index < chunk.prototypes.len() {
+                Ok(())
+            } else {
+                Err(error(
+                    prototype_index,
+                    format!(
+                        "{what} prototype {index} exceeds prototype count {}",
+                        chunk.prototypes.len()
+                    ),
+                ))
+            }
+        };
+        if let Some(name) = prototype.debug_name {
+            check_string(name, "debug name")?;
+        }
+        for child in &prototype.children {
+            check_prototype(*child, "child")?;
+        }
+        if let Some(debug) = &prototype.debug_info {
+            for local in &debug.locals {
+                if let Some(name) = local.name {
+                    check_string(name, "debug local")?;
+                }
+            }
+            for name in debug.upvalue_names.iter().flatten() {
+                check_string(*name, "upvalue")?;
+            }
+        }
+        for constant in &prototype.constants {
+            match constant {
+                Constant::String(string) => check_string(*string, "constant")?,
+                Constant::Closure(child) => check_prototype(*child, "closure constant")?,
+                Constant::Table(keys) => {
+                    for key in keys {
+                        check_constant(prototype_index, *key, prototype.constants.len(), "table")?;
+                    }
+                }
+                Constant::TableWithConstants(entries) => {
+                    for (key, value) in entries {
+                        check_constant(prototype_index, *key, prototype.constants.len(), "table")?;
+                        if let Ok(value) = usize::try_from(*value) {
+                            check_constant(
+                                prototype_index,
+                                value,
+                                prototype.constants.len(),
+                                "table value",
+                            )?;
+                        }
+                    }
+                }
+                Constant::ClassShape {
+                    class_name,
+                    properties,
+                    methods,
+                } => {
+                    check_string(*class_name, "class")?;
+                    for property in properties {
+                        check_string(*property, "class property")?;
+                    }
+                    for method in methods {
+                        check_string(*method, "class method")?;
+                    }
+                }
+                Constant::Nil
+                | Constant::Boolean(_)
+                | Constant::Number(_)
+                | Constant::Integer(_)
+                | Constant::Vector(_)
+                | Constant::VectorDouble(_)
+                | Constant::Import(_) => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn check_constant(
+    prototype: usize,
+    index: usize,
+    count: usize,
+    what: &str,
+) -> Result<(), ValidationError> {
+    if index < count {
+        Ok(())
+    } else {
+        Err(ValidationError {
+            prototype,
+            pc: None,
+            message: format!("{what} constant {index} exceeds constant count {count}"),
+        })
+    }
+}
+
 struct Validator<'a> {
     chunk: &'a Chunk,
     prototype: &'a Prototype,
@@ -47,6 +183,15 @@ struct Validator<'a> {
 
 impl Validator<'_> {
     fn validate(&self) -> Result<(), ValidationError> {
+        let decoded = crate::decode(&self.prototype.code).map_err(|error| {
+            self.make_error(None, format!("instruction decoding failed: {error}"))
+        })?;
+        if decoded != self.prototype.instructions {
+            return self.error(
+                None,
+                "cached instructions do not match prototype code".into(),
+            );
+        }
         if self.prototype.parameter_count > self.prototype.max_stack_size {
             return self.error(
                 None,
@@ -887,5 +1032,35 @@ mod tests {
             1,
         )))
         .unwrap();
+    }
+
+    #[test]
+    fn rejects_stale_or_forged_instruction_caches_without_panicking() {
+        let mut stale = prototype(vec![Opcode::Return as u32], 1);
+        stale.instructions = crate::decode(&[
+            u32::from(Opcode::LoadNil as u8) | (255 << 8),
+            Opcode::Return as u32,
+        ])
+        .unwrap();
+        let error = validate(&chunk(stale)).unwrap_err();
+        assert!(error.message.contains("do not match"));
+    }
+
+    #[test]
+    fn rejects_mutated_cross_references_before_instruction_validation() {
+        let mut invalid_child = prototype(vec![Opcode::Return as u32], 1);
+        invalid_child.children.push(usize::MAX);
+        let error = validate(&chunk(invalid_child)).unwrap_err();
+        assert!(error.message.contains("child prototype"));
+
+        let mut invalid_string = prototype(vec![Opcode::Return as u32], 1);
+        invalid_string.constants.push(Constant::String(0));
+        let error = validate(&chunk(invalid_string)).unwrap_err();
+        assert!(error.message.contains("constant string"));
+
+        let mut invalid_main = chunk(prototype(vec![Opcode::Return as u32], 1));
+        invalid_main.main = 1;
+        let error = validate(&invalid_main).unwrap_err();
+        assert!(error.message.contains("main prototype"));
     }
 }

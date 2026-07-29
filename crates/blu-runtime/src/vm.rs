@@ -1,8 +1,8 @@
 use crate::heap::UpvalueId;
 use crate::{ClosureId, Dialect, Heap, HeapError, NativeFunctionId, TableId, ThreadId, Value};
 use blu_bytecode::{
-    Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype, ValidationError,
-    validate,
+    Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype, ValidatedChunk,
+    ValidationError,
 };
 use core::fmt;
 use std::{
@@ -164,11 +164,25 @@ impl Vm {
     }
 
     pub fn execute_owned(&mut self, chunk: Chunk) -> Result<Vec<Value>, RuntimeError> {
-        validate(&chunk).map_err(RuntimeError::Validation)?;
+        let chunk = ValidatedChunk::new(chunk).map_err(RuntimeError::Validation)?;
+        self.execute_validated_owned(chunk)
+    }
+
+    pub fn execute_validated(
+        &mut self,
+        chunk: &ValidatedChunk,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        self.execute_validated_owned(chunk.clone())
+    }
+
+    pub fn execute_validated_owned(
+        &mut self,
+        chunk: ValidatedChunk,
+    ) -> Result<Vec<Value>, RuntimeError> {
         if !matches!(self.dialect, Dialect::Blu | Dialect::Luau) {
             return Err(RuntimeError::DialectNotImplemented(self.dialect));
         }
-        let chunk = Arc::new(chunk);
+        let chunk = Arc::new(chunk.into_chunk());
         let mut remaining = self.instruction_limit;
         self.execute_frame(&chunk, chunk.main, None, &[], &mut remaining, 0)
     }
@@ -958,14 +972,6 @@ impl Vm {
                 }
                 Opcode::Call | Opcode::CallFb => {
                     let function = frame.get(instruction.a())?.clone();
-                    let suspended_return_mode = match function {
-                        Value::NativeFunction(function)
-                            if self.protected_call == Some(function) =>
-                        {
-                            ReturnMode::Protected
-                        }
-                        _ => ReturnMode::Direct,
-                    };
                     let start = usize::from(instruction.a()) + 1;
                     let count = if instruction.b() == 0 {
                         frame.top.saturating_sub(start)
@@ -973,6 +979,24 @@ impl Vm {
                         usize::from(instruction.b() - 1)
                     };
                     let arguments = frame.register_slice(start, count)?.to_vec();
+                    let suspended_return_mode = match &function {
+                        Value::NativeFunction(function)
+                            if self.protected_call == Some(*function) =>
+                        {
+                            ReturnMode::Protected
+                        }
+                        Value::NativeFunction(function)
+                            if self.error_handler_call == Some(*function) =>
+                        {
+                            ReturnMode::ErrorHandler(arguments.get(1).cloned().ok_or(
+                                RuntimeError::Argument {
+                                    function: "xpcall",
+                                    index: 2,
+                                },
+                            )?)
+                        }
+                        _ => ReturnMode::Direct,
+                    };
                     let results = if let Value::Closure(closure) = function {
                         let (child_chunk, child, _) = self.heap.closure_parts(closure)?;
                         if depth + 1 > self.call_limit {
@@ -1048,15 +1072,7 @@ impl Vm {
                         self.active_roots.pop();
                         frame = caller.frame;
                         frame.refresh_open_upvalues(&self.heap)?;
-                        let results = match caller.return_mode {
-                            ReturnMode::Direct => results,
-                            ReturnMode::Protected => {
-                                let mut protected = Vec::with_capacity(results.len() + 1);
-                                protected.push(Value::Boolean(true));
-                                protected.extend(results);
-                                protected
-                            }
-                        };
+                        let results = caller.return_mode.success_results(results);
                         frame.write_results(caller.register, caller.encoded_count, results)?;
                         continue;
                     }
@@ -1171,6 +1187,7 @@ impl Vm {
                             protected.extend(values);
                             protected
                         }
+                        Err(error @ RuntimeError::CoroutineYield(_)) => return Err(error),
                         Err(error) => {
                             let handled = self.call_value(
                                 handler,
@@ -2270,7 +2287,7 @@ impl Vm {
                     for caller in &continuation.callers {
                         self.active_roots.push(caller.frame.gc_roots(&self.heap)?);
                     }
-                    self.run_frames(
+                    self.run_resumed_frames(
                         continuation.frame,
                         continuation.callers,
                         remaining,
@@ -2309,6 +2326,76 @@ impl Vm {
         })
     }
 
+    fn run_resumed_frames(
+        &mut self,
+        mut frame: Frame,
+        mut callers: Vec<Caller>,
+        remaining: &mut u64,
+        depth: usize,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        loop {
+            let saved_callers = callers.clone();
+            match self.run_frames(frame, callers, remaining, depth) {
+                Ok(values) => return Ok(values),
+                Err(error @ RuntimeError::CoroutineYield(_)) => return Err(error),
+                Err(error) => {
+                    let Some(protected_index) = saved_callers
+                        .iter()
+                        .rposition(|caller| caller.return_mode.catches_errors())
+                    else {
+                        return Err(error);
+                    };
+                    let mut protected = saved_callers[protected_index].clone();
+                    callers = saved_callers[..protected_index].to_vec();
+                    let error_value = runtime_error_value(error);
+                    let results = match protected.return_mode.clone() {
+                        ReturnMode::Protected => {
+                            vec![Value::Boolean(false), error_value]
+                        }
+                        ReturnMode::ErrorHandler(handler) => {
+                            let roots = protected.frame.gc_roots(&self.heap)?;
+                            match self.call_value(handler, &[error_value], remaining, depth, roots)
+                            {
+                                Ok(values) => vec![
+                                    Value::Boolean(false),
+                                    values.into_iter().next().unwrap_or(Value::Nil),
+                                ],
+                                Err(RuntimeError::CoroutineYield(values)) => {
+                                    let thread = self
+                                        .running_thread
+                                        .ok_or(RuntimeError::CoroutineYieldOutside)?;
+                                    self.suspend_thread(
+                                        thread,
+                                        protected.frame,
+                                        callers,
+                                        protected.register,
+                                        protected.encoded_count,
+                                        ReturnMode::ErrorHandlerResult,
+                                        depth,
+                                    )?;
+                                    return Err(RuntimeError::CoroutineYield(values));
+                                }
+                                Err(handler_error) => {
+                                    vec![Value::Boolean(false), runtime_error_value(handler_error)]
+                                }
+                            }
+                        }
+                        ReturnMode::Direct | ReturnMode::ErrorHandlerResult => {
+                            unreachable!("only protected callers catch errors")
+                        }
+                    };
+                    protected.frame.refresh_open_upvalues(&self.heap)?;
+                    protected.frame.write_results(
+                        protected.register,
+                        protected.encoded_count,
+                        results,
+                    )?;
+                    frame = protected.frame;
+                }
+            }
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn suspend_thread(
         &mut self,
@@ -2322,15 +2409,15 @@ impl Vm {
     ) -> Result<(), RuntimeError> {
         let continuation = match self.threads.remove(&thread) {
             Some(ThreadState::Suspended(mut continuation)) => {
-                continuation.callers.insert(
-                    0,
-                    Caller {
-                        frame,
-                        register,
-                        encoded_count,
-                        return_mode,
-                    },
-                );
+                let mut prefix = callers;
+                prefix.push(Caller {
+                    frame,
+                    register,
+                    encoded_count,
+                    return_mode,
+                });
+                prefix.append(&mut continuation.callers);
+                continuation.callers = prefix;
                 continuation
             }
             Some(ThreadState::Running) => Continuation {
@@ -2822,10 +2909,34 @@ struct Caller {
     return_mode: ReturnMode,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum ReturnMode {
     Direct,
     Protected,
+    ErrorHandler(Value),
+    ErrorHandlerResult,
+}
+
+impl ReturnMode {
+    fn catches_errors(&self) -> bool {
+        matches!(self, Self::Protected | Self::ErrorHandler(_))
+    }
+
+    fn success_results(&self, results: Vec<Value>) -> Vec<Value> {
+        match self {
+            Self::Direct => results,
+            Self::Protected | Self::ErrorHandler(_) => {
+                let mut protected = Vec::with_capacity(results.len() + 1);
+                protected.push(Value::Boolean(true));
+                protected.extend(results);
+                protected
+            }
+            Self::ErrorHandlerResult => vec![
+                Value::Boolean(false),
+                results.into_iter().next().unwrap_or(Value::Nil),
+            ],
+        }
+    }
 }
 
 #[derive(Clone, Debug)]

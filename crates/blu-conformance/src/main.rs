@@ -527,6 +527,25 @@ end)
 local first_ok, paused = coroutine.resume(thread)
 local suspended = coroutine.status(thread)
 local second_ok, protected_ok, result = coroutine.resume(thread, 41)
+local failing = coroutine.create(function()
+    local ok, message = pcall(function()
+        coroutine.yield("error pause")
+        error("resume boom")
+    end)
+    return ok, type(message)
+end)
+local failing_first, failing_pause = coroutine.resume(failing)
+local failing_second, failing_ok, failing_type = coroutine.resume(failing)
+local handled = coroutine.create(function()
+    return xpcall(function()
+        coroutine.yield("handled pause")
+        error("handled boom")
+    end, function()
+        return "handled"
+    end)
+end)
+local handled_first, handled_pause = coroutine.resume(handled)
+local handled_second, handled_ok, handled_message = coroutine.resume(handled)
 return first_ok and paused == "pause" and suspended == "suspended"
     and second_ok and protected_ok and result == 42
     and coroutine.status(thread) == "dead"
@@ -534,6 +553,10 @@ return first_ok and paused == "pause" and suspended == "suspended"
     and closed and coroutine.status(disposable) == "dead"
     and select("#", coroutine.running()) == 1
     and coroutine.isyieldable()
+    and failing_first and failing_pause == "error pause"
+    and failing_second and not failing_ok and failing_type == "string"
+    and handled_first and handled_pause == "handled pause"
+    and handled_second and not handled_ok and handled_message == "handled"
 "##;
 const COROUTINE_REFERENCE_SOURCE: &str = r##"
 local wrapped = coroutine.wrap(function(first)
@@ -557,6 +580,25 @@ end)
 local first_ok, paused = coroutine.resume(thread)
 local suspended = coroutine.status(thread)
 local second_ok, protected_ok, result = coroutine.resume(thread, 41)
+local failing = coroutine.create(function()
+    local ok, message = pcall(function()
+        coroutine.yield("error pause")
+        error("resume boom")
+    end)
+    return ok, type(message)
+end)
+local failing_first, failing_pause = coroutine.resume(failing)
+local failing_second, failing_ok, failing_type = coroutine.resume(failing)
+local handled = coroutine.create(function()
+    return xpcall(function()
+        coroutine.yield("handled pause")
+        error("handled boom")
+    end, function()
+        return "handled"
+    end)
+end)
+local handled_first, handled_pause = coroutine.resume(handled)
+local handled_second, handled_ok, handled_message = coroutine.resume(handled)
 local value = first_ok and paused == "pause" and suspended == "suspended"
     and second_ok and protected_ok and result == 42
     and coroutine.status(thread) == "dead"
@@ -564,6 +606,10 @@ local value = first_ok and paused == "pause" and suspended == "suspended"
     and closed and coroutine.status(disposable) == "dead"
     and select("#", coroutine.running()) == 1
     and coroutine.isyieldable()
+    and failing_first and failing_pause == "error pause"
+    and failing_second and not failing_ok and failing_type == "string"
+    and handled_first and handled_pause == "handled pause"
+    and handled_second and not handled_ok and handled_message == "handled"
 print(type(value) .. ":" .. tostring(value))
 "##;
 

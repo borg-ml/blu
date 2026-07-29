@@ -55,9 +55,11 @@ impl Engine {
         }
         let chunk = self
             .compiler
-            .compile(source)
+            .compile_bytecode(source)
             .map_err(ExecuteError::Compile)?;
-        self.vm.execute_owned(chunk).map_err(ExecuteError::Runtime)
+        self.vm
+            .execute_validated_owned(chunk.chunk)
+            .map_err(ExecuteError::Runtime)
     }
 
     pub fn execute_package(
@@ -103,7 +105,7 @@ impl Engine {
             ));
         }
         self.vm
-            .execute_owned(package.into_chunk())
+            .execute_validated_owned(package.into_validated_chunk())
             .map_err(ExecutePackageError::Runtime)
     }
 }
@@ -560,6 +562,196 @@ mod tests {
                 Value::Boolean(true),
                 Value::Boolean(true),
                 Value::Number(42.0),
+            ])
+        );
+    }
+
+    #[test]
+    fn resumed_coroutine_errors_unwind_to_suspended_protected_calls() {
+        assert_eq!(
+            Engine::default().execute(
+                br#"
+                    local pcall_thread = coroutine.create(function()
+                        local ok, message = pcall(function()
+                            coroutine.yield("pcall pause")
+                            error("pcall boom")
+                        end)
+                        return ok, message, coroutine.status(coroutine.running())
+                    end)
+                    local p1, ppaused = coroutine.resume(pcall_thread)
+                    local p2, protected_ok, pmessage, inside_status =
+                        coroutine.resume(pcall_thread)
+
+                    local xpcall_thread = coroutine.create(function()
+                        local ok, message = xpcall(function()
+                            coroutine.yield("xpcall pause")
+                            error("xpcall boom")
+                        end, function(error_value)
+                            return "handled: " .. error_value
+                        end)
+                        return ok, message
+                    end)
+                    local x1, xpaused = coroutine.resume(xpcall_thread)
+                    local x2, handled_ok, xmessage = coroutine.resume(xpcall_thread)
+
+                    return p1, ppaused, p2, protected_ok, pmessage, inside_status,
+                        coroutine.status(pcall_thread),
+                        x1, xpaused, x2, handled_ok, xmessage,
+                        coroutine.status(xpcall_thread)
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"pcall pause"[..])),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"pcall boom"[..])),
+                Value::String(Arc::from(&b"running"[..])),
+                Value::String(Arc::from(&b"dead"[..])),
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"xpcall pause"[..])),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"handled: xpcall boom"[..])),
+                Value::String(Arc::from(&b"dead"[..])),
+            ])
+        );
+    }
+
+    #[test]
+    fn resumed_xpcall_handlers_can_yield_and_nested_protection_stays_intact() {
+        assert_eq!(
+            Engine::default().execute(
+                br#"
+                    local yielding_handler = coroutine.create(function()
+                        return xpcall(function()
+                            coroutine.yield("target pause")
+                            error("target boom")
+                        end, function(error_value)
+                            local resumed = coroutine.yield("handling " .. error_value)
+                            return "handled " .. resumed
+                        end)
+                    end)
+                    local first_ok, first = coroutine.resume(yielding_handler)
+                    local second_ok, second = coroutine.resume(yielding_handler)
+                    local third_ok, protected_ok, handled =
+                        coroutine.resume(yielding_handler, "done")
+
+                    local nested = coroutine.create(function()
+                        return pcall(function()
+                            local ok, message = xpcall(function()
+                                coroutine.yield("nested pause")
+                                error("nested target")
+                            end, function()
+                                error("handler boom")
+                            end)
+                            return ok, message
+                        end)
+                    end)
+                    local nested_first_ok, nested_pause = coroutine.resume(nested)
+                    local nested_second_ok, outer_ok, inner_ok, nested_message =
+                        coroutine.resume(nested)
+
+                    return first_ok, first, second_ok, second,
+                        third_ok, protected_ok, handled,
+                        coroutine.status(yielding_handler),
+                        nested_first_ok, nested_pause, nested_second_ok,
+                        outer_ok, inner_ok, nested_message, coroutine.status(nested)
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"target pause"[..])),
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"handling target boom"[..])),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"handled done"[..])),
+                Value::String(Arc::from(&b"dead"[..])),
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"nested pause"[..])),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"handler boom"[..])),
+                Value::String(Arc::from(&b"dead"[..])),
+            ])
+        );
+    }
+
+    #[test]
+    fn yielding_error_handlers_preserve_outer_saved_callers() {
+        assert_eq!(
+            Engine::default().execute(
+                br#"
+                    local thread = coroutine.create(function()
+                        local function protected()
+                            return xpcall(function()
+                                coroutine.yield("target pause")
+                                error("target boom")
+                            end, function(message)
+                                local suffix = coroutine.yield("handler pause: " .. message)
+                                return "handled " .. suffix
+                            end)
+                        end
+                        local function outer()
+                            return "outer", protected()
+                        end
+                        return outer()
+                    end)
+                    local first_ok, first = coroutine.resume(thread)
+                    local second_ok, second = coroutine.resume(thread)
+                    local third_ok, outer, protected_ok, handled =
+                        coroutine.resume(thread, "done")
+                    return first_ok, first, second_ok, second,
+                        third_ok, outer, protected_ok, handled
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"target pause"[..])),
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"handler pause: target boom"[..])),
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"outer"[..])),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"handled done"[..])),
+            ])
+        );
+    }
+
+    #[test]
+    fn resumed_protected_errors_unwind_the_explicit_caller_stack() {
+        let mut engine = Engine::default();
+        *engine.vm_mut() = Vm::default().with_call_limit(10_000);
+        assert_eq!(
+            engine.execute(
+                br#"
+                    local thread = coroutine.create(function()
+                        return pcall(function()
+                            local function descend(remaining)
+                                if remaining == 0 then
+                                    coroutine.yield("deep pause")
+                                    error("deep boom")
+                                end
+                                return descend(remaining - 1)
+                            end
+                            return descend(3_000)
+                        end)
+                    end)
+                    local first_ok, paused = coroutine.resume(thread)
+                    local second_ok, protected_ok, message = coroutine.resume(thread)
+                    return first_ok, paused, second_ok, protected_ok, message,
+                        coroutine.status(thread)
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"deep pause"[..])),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"deep boom"[..])),
+                Value::String(Arc::from(&b"dead"[..])),
             ])
         );
     }

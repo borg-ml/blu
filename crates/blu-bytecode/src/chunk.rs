@@ -7,6 +7,7 @@ use crate::{
     TYPEINFO_VERSION_MIN, ValidationError, decode, validate,
 };
 use core::fmt;
+use core::ops::Deref;
 
 const PROTO_FLAG_INLINABLE: u8 = 1 << 3;
 const FEEDBACK_CALL_TARGET: u8 = 0;
@@ -44,6 +45,34 @@ pub struct Chunk {
     pub userdata_types: Vec<(u8, usize)>,
     pub prototypes: Vec<Prototype>,
     pub main: usize,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ValidatedChunk(Chunk);
+
+impl ValidatedChunk {
+    pub fn new(chunk: Chunk) -> Result<Self, ValidationError> {
+        validate(&chunk)?;
+        Ok(Self(chunk))
+    }
+
+    #[must_use]
+    pub const fn as_chunk(&self) -> &Chunk {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_chunk(self) -> Chunk {
+        self.0
+    }
+}
+
+impl Deref for ValidatedChunk {
+    type Target = Chunk;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_chunk()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -343,6 +372,10 @@ pub fn load(bytes: &[u8], limits: LoadLimits) -> Result<Chunk, ChunkError> {
     };
     validate(&chunk).map_err(ChunkError::Validation)?;
     Ok(chunk)
+}
+
+pub fn load_validated(bytes: &[u8], limits: LoadLimits) -> Result<ValidatedChunk, ChunkError> {
+    load(bytes, limits).map(ValidatedChunk)
 }
 
 fn load_prototype(
@@ -789,5 +822,20 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn validated_chunks_are_opaque_and_mutations_require_revalidation() {
+        let validated = load_validated(RETURN_THREE_V12, LoadLimits::default()).unwrap();
+        assert_eq!(validated.version, 12);
+
+        let mut mutable = validated.into_chunk();
+        mutable.prototypes[0].code = vec![
+            u32::from(Opcode::LoadNil as u8) | (1 << 8),
+            Opcode::Return as u32,
+        ];
+        mutable.prototypes[0].instructions = decode(&mutable.prototypes[0].code).unwrap();
+        let error = ValidatedChunk::new(mutable).unwrap_err();
+        assert!(error.message.contains("register 1"));
     }
 }

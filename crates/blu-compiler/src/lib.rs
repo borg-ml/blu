@@ -4,7 +4,7 @@
 //! buffer is copied into Rust-owned memory, released with the matching C
 //! allocator, and decoded under [`blu_bytecode::LoadLimits`] before use.
 
-use blu_bytecode::{Chunk, ChunkError, LoadLimits, load};
+use blu_bytecode::{Chunk, ChunkError, LoadLimits, ValidatedChunk, load_validated};
 use core::fmt;
 use std::ffi::{c_char, c_int, c_void};
 
@@ -39,7 +39,7 @@ pub struct Compiler {
 #[derive(Clone, Debug)]
 pub struct CompiledBytecode {
     pub bytes: Vec<u8>,
-    pub chunk: Chunk,
+    pub chunk: ValidatedChunk,
 }
 
 impl Compiler {
@@ -52,7 +52,8 @@ impl Compiler {
     }
 
     pub fn compile(&self, source: impl AsRef<[u8]>) -> Result<Chunk, CompileError> {
-        self.compile_bytecode(source).map(|compiled| compiled.chunk)
+        self.compile_bytecode(source)
+            .map(|compiled| compiled.chunk.into_chunk())
     }
 
     pub fn compile_bytecode(
@@ -100,7 +101,7 @@ impl Compiler {
         // SAFETY: `luau_compile` documents that its result must be released
         // with `free`, and this pointer has not previously been freed.
         unsafe { free(output.cast()) };
-        let chunk = load(&bytes, self.load_limits).map_err(CompileError::Chunk)?;
+        let chunk = load_validated(&bytes, self.load_limits).map_err(CompileError::Chunk)?;
         Ok(CompiledBytecode { bytes, chunk })
     }
 }
@@ -193,7 +194,7 @@ mod tests {
             .compile_bytecode(b"return 20 + 22")
             .expect("valid source");
         assert_eq!(
-            load(&compiled.bytes, LoadLimits::default()).unwrap(),
+            load_validated(&compiled.bytes, LoadLimits::default()).unwrap(),
             compiled.chunk
         );
         assert_eq!(

@@ -27,7 +27,8 @@ Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
 remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,
 including nested calls, resume arguments, successful protected-call
-suspension, and GC-traced continuations.
+suspension, resumed `pcall`/`xpcall` error unwinding, yielding error handlers,
+and GC-traced continuations.
 Portable V1 package envelopes provide bounded canonical decoding, SHA-256
 identity, explicit dialect and authority requirements, and an opaque validated
 bytecode payload. The public engine currently executes only dialect-matched

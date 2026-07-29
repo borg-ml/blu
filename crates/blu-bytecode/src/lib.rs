@@ -12,7 +12,7 @@ mod validate;
 
 pub use chunk::{
     Chunk, ChunkError, Constant, DebugInfo, DebugLocal, FeedbackSlot, LineInfo, LoadLimits,
-    Prototype, load,
+    Prototype, ValidatedChunk, load, load_validated,
 };
 pub use disassemble::disassemble;
 pub use instruction::{DecodeError, Instruction, InstructionIter, decode};

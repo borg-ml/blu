@@ -3,7 +3,7 @@ use crate::{
     CapabilityRequirement, Digest, Export, Import, ImportSource, Manifest, Name, PACKAGE_FORMAT_V1,
     PackageDialect, PackageIdentity, ServiceId, Version,
 };
-use blu_bytecode::{Chunk, ChunkError, LoadLimits, load};
+use blu_bytecode::{Chunk, ChunkError, LoadLimits, ValidatedChunk, load_validated};
 use core::fmt;
 use sha2::{Digest as _, Sha256};
 
@@ -46,7 +46,7 @@ pub struct Package {
     manifest: Manifest,
     payload: Vec<u8>,
     digest: Digest,
-    chunk: Chunk,
+    chunk: ValidatedChunk,
 }
 
 impl Package {
@@ -57,7 +57,7 @@ impl Package {
     ) -> Result<Self, PackageError> {
         validate_manifest(&manifest, &limits)?;
         limit("payload bytes", payload.len(), limits.max_payload_bytes)?;
-        let chunk = load(&payload, limits.bytecode).map_err(PackageError::Bytecode)?;
+        let chunk = load_validated(&payload, limits.bytecode).map_err(PackageError::Bytecode)?;
         validate_descriptor(&manifest, &chunk)?;
         let manifest_bytes = encode_manifest(&manifest)?;
         limit(
@@ -125,7 +125,7 @@ impl Package {
         let manifest = decode_manifest(&bytes[manifest_start..payload_start], &limits)?;
         validate_manifest(&manifest, &limits)?;
         let payload = bytes[payload_start..digest_start].to_vec();
-        let chunk = load(&payload, limits.bytecode).map_err(PackageError::Bytecode)?;
+        let chunk = load_validated(&payload, limits.bytecode).map_err(PackageError::Bytecode)?;
         validate_descriptor(&manifest, &chunk)?;
         Ok(Self {
             manifest,
@@ -160,11 +160,21 @@ impl Package {
 
     #[must_use]
     pub const fn chunk(&self) -> &Chunk {
+        self.chunk.as_chunk()
+    }
+
+    #[must_use]
+    pub const fn validated_chunk(&self) -> &ValidatedChunk {
         &self.chunk
     }
 
     #[must_use]
     pub fn into_chunk(self) -> Chunk {
+        self.chunk.into_chunk()
+    }
+
+    #[must_use]
+    pub fn into_validated_chunk(self) -> ValidatedChunk {
         self.chunk
     }
 }
