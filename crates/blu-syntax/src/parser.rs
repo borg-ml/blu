@@ -1,9 +1,9 @@
 use crate::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
-    BreakStatement, DialectDirective, Expression, ExpressionId, ExpressionKind, Identifier,
-    IfClause, IfStatement, LexError, Lexed, LexerLimits, LocalListStatement, LocalStatement,
-    ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement,
-    lex,
+    BreakStatement, ContinueStatement, DialectDirective, Expression, ExpressionId, ExpressionKind,
+    Identifier, IfClause, IfStatement, LexError, Lexed, LexerLimits, LocalListStatement,
+    LocalStatement, ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator,
+    WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -344,10 +344,10 @@ impl<'a> Parser<'a> {
                 TokenKind::Identifier => self.parse_assignment()?,
                 TokenKind::If => self.parse_if()?,
                 TokenKind::While => self.parse_while()?,
-                TokenKind::Break => {
+                TokenKind::Break | TokenKind::Continue => {
                     let Some(keyword) = self.bump() else {
                         return Err(ParseError::InternalInvariant {
-                            message: "break check succeeded without a current token",
+                            message: "loop-control check succeeded without a current token",
                         });
                     };
                     if self.loop_depth == 0 {
@@ -355,14 +355,18 @@ impl<'a> Parser<'a> {
                             "BLU-PARSE-0022",
                             self.lexed.profile(),
                             keyword.span(),
-                            "`break` is only valid inside a loop",
+                            "loop control is only valid inside a loop",
                             &["loop body"],
                             Some(self.source.slice(keyword.span())?),
                             self.limits.lexer.diagnostic_limits,
                         )?;
                         self.push_diagnostic(diagnostic)?;
-                    } else {
+                    } else if keyword.kind() == TokenKind::Break {
                         self.push_statement(Statement::Break(BreakStatement::new(keyword.span())))?;
+                    } else {
+                        self.push_statement(Statement::Continue(ContinueStatement::new(
+                            keyword.span(),
+                        )))?;
                     }
                     while self.at(TokenKind::Semicolon) {
                         self.bump();
@@ -373,7 +377,7 @@ impl<'a> Parser<'a> {
                     {
                         self.report_current(
                             "BLU-PARSE-0023",
-                            "unexpected token after break statement",
+                            "unexpected token after loop-control statement",
                             &["end of block"],
                         )?;
                         while self
@@ -410,7 +414,15 @@ impl<'a> Parser<'a> {
                     self.report_current(
                         "BLU-PARSE-0001",
                         "expected a supported statement",
-                        &["local", "assignment", "if", "while", "break", "return"],
+                        &[
+                            "local",
+                            "assignment",
+                            "if",
+                            "while",
+                            "break",
+                            "continue",
+                            "return",
+                        ],
                     )?;
                     self.bump();
                 }

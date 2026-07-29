@@ -13,9 +13,9 @@ mod parser;
 
 pub use ast::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
-    BreakStatement, Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement,
-    LocalListStatement, LocalStatement, ReturnStatement, Statement, UnaryExpression, UnaryOperator,
-    WhileStatement,
+    BreakStatement, ContinueStatement, Expression, ExpressionId, ExpressionKind, Identifier,
+    IfClause, IfStatement, LocalListStatement, LocalStatement, ReturnStatement, Statement,
+    UnaryExpression, UnaryOperator, WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
@@ -141,6 +141,7 @@ pub enum TokenKind {
     While,
     Do,
     Break,
+    Continue,
     Nil,
     True,
     False,
@@ -836,6 +837,25 @@ pub fn lex(
                     b"while" => TokenKind::While,
                     b"do" => TokenKind::Do,
                     b"break" => TokenKind::Break,
+                    b"continue" => {
+                        if !supports_continue(explicit_profile) {
+                            let span = source.span(start, offset)?;
+                            let diagnostic = diagnostic(
+                                "BLU-LEX-0018",
+                                explicit_profile,
+                                span,
+                                "`continue` is unavailable in this profile",
+                                limits.diagnostic_limits,
+                            )?
+                            .try_with_found(&bytes[start..offset])?
+                            .try_with_note_parts(&[
+                                "selected profile: ",
+                                explicit_profile.as_str(),
+                            ])?;
+                            push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                        }
+                        TokenKind::Continue
+                    }
                     b"nil" => TokenKind::Nil,
                     b"true" => TokenKind::True,
                     b"false" => TokenKind::False,
@@ -1086,6 +1106,10 @@ fn supports_floor_division(profile: SemanticProfile) -> bool {
         SemanticProfile::Lua51 | SemanticProfile::Lua52 => false,
         _ => false,
     }
+}
+
+const fn supports_continue(profile: SemanticProfile) -> bool {
+    matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
 }
 
 const fn supports_numeric_separators(profile: SemanticProfile) -> bool {

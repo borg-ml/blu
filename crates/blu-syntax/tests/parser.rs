@@ -410,6 +410,28 @@ fn break_is_scoped_to_loop_bodies_and_terminates_its_block() {
 }
 
 #[test]
+fn continue_is_scoped_to_blu_and_luau_loop_bodies() {
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let source_file = source(b"while ready do continue end".to_vec());
+        let parsed = accepted(&source_file, profile, ParseLimits::default());
+        let Statement::While(statement) = &parsed.ast().statements()[0] else {
+            panic!("expected while statement");
+        };
+        assert!(matches!(
+            statement.body().statements()[0],
+            Statement::Continue(_)
+        ));
+    }
+
+    let outside = source(b"continue".to_vec());
+    let outcome = parse(&outside, SemanticProfile::Blu, ParseLimits::default()).unwrap();
+    assert_eq!(
+        outcome.rejected().unwrap().diagnostics()[0].code().as_str(),
+        "BLU-PARSE-0022"
+    );
+}
+
+#[test]
 fn multiplication_binds_above_addition_and_is_left_associative() {
     let source = source(b"return a + b * c * d + e".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());

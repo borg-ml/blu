@@ -791,6 +791,23 @@ fn break_is_a_shared_loop_keyword() {
 }
 
 #[test]
+fn continue_is_blu_and_luau_only() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"while true do continue end".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        let supported = matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau);
+        assert_eq!(!lexed.has_errors(), supported, "{profile}");
+        assert!(
+            significant_kinds(&lexed).contains(&TokenKind::Continue),
+            "{profile}"
+        );
+        if !supported {
+            assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0018");
+        }
+    }
+}
+
+#[test]
 fn malformed_decimal_exponents_are_structured() {
     let source = source(b"return 1e+".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua54, LexerLimits::default()).unwrap();

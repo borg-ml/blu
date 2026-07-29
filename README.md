@@ -99,6 +99,8 @@ validation records the target's definite-initialization state, and runtime
 execution remains subject to the VM instruction limit.
 Shared `break` statements are structurally restricted to loop bodies and patch
 only the innermost loop's exit, including through nested conditional blocks.
+`continue` is an explicit Blu/Luau extension that restarts the innermost loop;
+Lua 5.1–5.5 profiles reject it during lexing.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

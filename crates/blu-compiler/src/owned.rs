@@ -371,6 +371,7 @@ struct Lowerer<'a> {
     bindings: Vec<Binding>,
     closed_bindings: Vec<Binding>,
     loop_breaks: Vec<Vec<usize>>,
+    loop_starts: Vec<usize>,
     register_count: usize,
     constants: Vec<Constant>,
     constant_bytes: usize,
@@ -396,6 +397,7 @@ impl<'a> Lowerer<'a> {
                 "closed local bindings",
             )?,
             loop_breaks: allocate_vec(8, "loop control stack")?,
+            loop_starts: allocate_vec(8, "loop start stack")?,
             register_count: 0,
             constants: allocate_vec(capacity.min(limits.max_constants), "constants")?,
             constant_bytes: 0,
@@ -548,6 +550,10 @@ impl<'a> Lowerer<'a> {
                     self.lower_break(statement.span())?;
                     true
                 }
+                Statement::Continue(statement) => {
+                    self.lower_continue(statement.span())?;
+                    true
+                }
                 Statement::Return(return_statement) => {
                     self.lower_return(return_statement)?;
                     true
@@ -622,7 +628,19 @@ impl<'a> Lowerer<'a> {
             allocate_vec(2, "loop break branches")?,
             "loop control stack",
         )?;
+        push_fallible(&mut self.loop_starts, start, "loop start stack")?;
         let lowered = self.lower_statements(statement.body().statements());
+        let popped_start = self
+            .loop_starts
+            .pop()
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "loop start stack became empty during lowering",
+            })?;
+        if popped_start != start {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "loop start stack order changed during lowering",
+            });
+        }
         let breaks = self
             .loop_breaks
             .pop()
@@ -660,6 +678,18 @@ impl<'a> Lowerer<'a> {
             });
         };
         push_fallible(breaks, branch, "loop break branches")
+    }
+
+    fn lower_continue(&mut self, span: ByteSpan) -> Result<(), OwnedCompileError> {
+        let Some(&start) = self.loop_starts.last() else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "parser exposed continue outside a loop",
+            });
+        };
+        let target = u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
+            message: "loop target passed limits but cannot fit BluV1",
+        })?;
+        self.emit(Instruction::Jump { target }, span)
     }
 
     fn close_scope(&mut self, start: usize) -> Result<(), OwnedCompileError> {

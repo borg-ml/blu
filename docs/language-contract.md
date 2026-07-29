@@ -168,6 +168,10 @@ and unstructured source jumps remain unsupported.
 loop. Lowering maintains a nested loop-control stack, so breaks inside nested
 conditionals target the innermost active loop exit without escaping outer
 loops or lexical scopes.
+`continue` is assigned to Blu and Luau only. It is rejected lexically for Lua
+5.1–5.5 rather than being treated as an identifier or silently accepted.
+Within a loop it terminates the current block path and emits a validated
+back-edge to the innermost loop condition.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

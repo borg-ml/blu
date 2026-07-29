@@ -436,6 +436,22 @@ pub struct BreakStatement {
     span: ByteSpan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct ContinueStatement {
+    span: ByteSpan,
+}
+
+impl ContinueStatement {
+    pub(crate) const fn new(span: ByteSpan) -> Self {
+        Self { span }
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl BreakStatement {
     pub(crate) const fn new(span: ByteSpan) -> Self {
         Self { span }
@@ -456,6 +472,7 @@ pub enum Statement {
     If(IfStatement),
     While(WhileStatement),
     Break(BreakStatement),
+    Continue(ContinueStatement),
     Return(ReturnStatement),
 }
 
@@ -470,6 +487,7 @@ impl Statement {
             Self::If(statement) => statement.span(),
             Self::While(statement) => statement.span(),
             Self::Break(statement) => statement.span(),
+            Self::Continue(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
         }
     }

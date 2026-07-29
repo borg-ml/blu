@@ -946,6 +946,33 @@ fn break_exits_only_the_innermost_owned_loop() {
 }
 
 #[test]
+fn continue_restarts_only_blu_and_luau_owned_loops() {
+    let source = make_source(
+        b"local index = 0\nlocal total = 0\nwhile index < 5 do\nindex = index + 1\nif index % 2 == 0 then continue end\ntotal = total + index\nend\nreturn total"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert_eq!(
+                Vm::default().execute_blu_v1(
+                    compiled.unwrap().into_validated_artifact(),
+                    BluLimits::default()
+                ),
+                Ok(vec![Value::Number(9.0)]),
+                "{profile}"
+            );
+        } else {
+            let error = compiled.unwrap_err();
+            assert!(
+                matches!(error, OwnedCompileError::Syntax(_)),
+                "{profile}: {error:?}"
+            );
+        }
+    }
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {
