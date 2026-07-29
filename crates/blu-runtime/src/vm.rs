@@ -1595,7 +1595,285 @@ impl Vm {
                 Value::NativeFunction(string_sub),
             )
             .expect("valid built-in table key");
+        let string_len = self.register_function(|_, arguments| {
+            let string = arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.len",
+                index: 1,
+            })?;
+            Ok(vec![Value::Integer(
+                string_bytes(string, "string.len")?.len() as i64,
+            )])
+        });
+        self.heap
+            .table_set(
+                string,
+                Value::String(Arc::from(&b"len"[..])),
+                Value::NativeFunction(string_len),
+            )
+            .expect("valid built-in table key");
+        let string_byte = self.register_function(|_, arguments| {
+            let string = arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.byte",
+                index: 1,
+            })?;
+            let string = string_bytes(string, "string.byte")?;
+            let start = arguments
+                .get(1)
+                .map(|_| integer_argument(arguments, 1, "string.byte"))
+                .transpose()?
+                .unwrap_or(1);
+            let end = arguments
+                .get(2)
+                .map(|_| integer_argument(arguments, 2, "string.byte"))
+                .transpose()?
+                .unwrap_or(start);
+            let start = relative_index(start, string.len()).clamp(1, string.len() as i64 + 1);
+            let end = relative_index(end, string.len()).clamp(0, string.len() as i64);
+            if start > end {
+                return Ok(Vec::new());
+            }
+            Ok(string[(start - 1) as usize..end as usize]
+                .iter()
+                .map(|value| Value::Integer(i64::from(*value)))
+                .collect())
+        });
+        self.heap
+            .table_set(
+                string,
+                Value::String(Arc::from(&b"byte"[..])),
+                Value::NativeFunction(string_byte),
+            )
+            .expect("valid built-in table key");
+        let string_reverse = self.register_function(|_, arguments| {
+            let string = arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.reverse",
+                index: 1,
+            })?;
+            let mut result = string_bytes(string, "string.reverse")?.to_vec();
+            result.reverse();
+            Ok(vec![Value::String(Arc::from(result))])
+        });
+        self.heap
+            .table_set(
+                string,
+                Value::String(Arc::from(&b"reverse"[..])),
+                Value::NativeFunction(string_reverse),
+            )
+            .expect("valid built-in table key");
         self.set_global(&b"string"[..], Value::Table(string));
+
+        self.install_table_library();
+        self.install_math_library();
+    }
+
+    fn install_table_library(&mut self) {
+        let insert = self.register_function(|vm, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.insert",
+                index: 1,
+            })?;
+            let table = table_id(table)?;
+            let length = vm.heap.table_length(table)?;
+            let (position, value) = match arguments {
+                [_, value] => (length + 1, value.clone()),
+                [_, position, value, ..] => {
+                    let position = position.as_number().ok_or(RuntimeError::Type {
+                        operation: "table.insert",
+                        expected: "number",
+                        actual: position.type_name(),
+                    })? as i64;
+                    let position =
+                        usize::try_from(position).map_err(|_| RuntimeError::TablePosition {
+                            function: "table.insert",
+                            position,
+                            length,
+                        })?;
+                    (position, value.clone())
+                }
+                _ => {
+                    return Err(RuntimeError::Argument {
+                        function: "table.insert",
+                        index: 2,
+                    });
+                }
+            };
+            if !(1..=length + 1).contains(&position) {
+                return Err(RuntimeError::TablePosition {
+                    function: "table.insert",
+                    position: position as i64,
+                    length,
+                });
+            }
+            for index in (position..=length).rev() {
+                let value = vm.heap.table_get(table, &Value::Integer(index as i64))?;
+                vm.heap
+                    .table_set(table, Value::Integer((index + 1) as i64), value)?;
+            }
+            vm.heap
+                .table_set(table, Value::Integer(position as i64), value)?;
+            Ok(Vec::new())
+        });
+
+        let remove = self.register_function(|vm, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.remove",
+                index: 1,
+            })?;
+            let table = table_id(table)?;
+            let length = vm.heap.table_length(table)?;
+            let position = arguments
+                .get(1)
+                .and_then(Value::as_number)
+                .map_or(length as i64, |value| value as i64);
+            if position < 1 || position > length as i64 {
+                return Ok(vec![Value::Nil]);
+            }
+            let removed = vm.heap.table_get(table, &Value::Integer(position))?;
+            for index in position as usize..length {
+                let value = vm
+                    .heap
+                    .table_get(table, &Value::Integer((index + 1) as i64))?;
+                vm.heap
+                    .table_set(table, Value::Integer(index as i64), value)?;
+            }
+            vm.heap
+                .table_set(table, Value::Integer(length as i64), Value::Nil)?;
+            Ok(vec![removed])
+        });
+
+        let concat = self.register_function(|vm, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.concat",
+                index: 1,
+            })?;
+            let table = table_id(table)?;
+            let separator = match arguments.get(1) {
+                Some(value) => concat_bytes(value).ok_or(RuntimeError::Type {
+                    operation: "table.concat",
+                    expected: "string or number",
+                    actual: value.type_name(),
+                })?,
+                None => Vec::new(),
+            };
+            let start = arguments
+                .get(2)
+                .and_then(Value::as_number)
+                .map_or(1, |value| value as i64);
+            let end = arguments
+                .get(3)
+                .and_then(Value::as_number)
+                .map_or(vm.heap.table_length(table)? as i64, |value| value as i64);
+            let mut result = Vec::new();
+            if start <= end {
+                for index in start..=end {
+                    if index != start {
+                        result.extend_from_slice(&separator);
+                    }
+                    let value = vm.heap.table_get(table, &Value::Integer(index))?;
+                    let value = concat_bytes(&value).ok_or(RuntimeError::Type {
+                        operation: "table.concat",
+                        expected: "string or number",
+                        actual: value.type_name(),
+                    })?;
+                    result.extend_from_slice(&value);
+                }
+            }
+            Ok(vec![Value::String(Arc::from(result))])
+        });
+
+        let table = self.heap.allocate_table(0, 3);
+        for (name, function) in [
+            (&b"insert"[..], insert),
+            (&b"remove"[..], remove),
+            (&b"concat"[..], concat),
+        ] {
+            self.heap
+                .table_set(
+                    table,
+                    Value::String(Arc::from(name)),
+                    Value::NativeFunction(function),
+                )
+                .expect("valid built-in table key");
+        }
+        self.set_global(&b"table"[..], Value::Table(table));
+    }
+
+    fn install_math_library(&mut self) {
+        let abs = self.register_function(|_, arguments| {
+            let value = number_argument(arguments, 0, "math.abs")?;
+            Ok(vec![Value::Number(value.abs())])
+        });
+        let floor = self.register_function(|_, arguments| {
+            let value = number_argument(arguments, 0, "math.floor")?;
+            Ok(vec![Value::Number(value.floor())])
+        });
+        let ceil = self.register_function(|_, arguments| {
+            let value = number_argument(arguments, 0, "math.ceil")?;
+            Ok(vec![Value::Number(value.ceil())])
+        });
+        let sqrt = self.register_function(|_, arguments| {
+            let value = number_argument(arguments, 0, "math.sqrt")?;
+            Ok(vec![Value::Number(value.sqrt())])
+        });
+        let min = self.register_function(|_, arguments| {
+            let mut values = arguments.iter();
+            let first = values.next().ok_or(RuntimeError::Argument {
+                function: "math.min",
+                index: 1,
+            })?;
+            let mut result = first.as_number().ok_or(RuntimeError::Type {
+                operation: "math.min",
+                expected: "number",
+                actual: first.type_name(),
+            })?;
+            for value in values {
+                let value = value.as_number().ok_or(RuntimeError::Type {
+                    operation: "math.min",
+                    expected: "number",
+                    actual: value.type_name(),
+                })?;
+                result = result.min(value);
+            }
+            Ok(vec![Value::Number(result)])
+        });
+        let max = self.register_function(|_, arguments| {
+            let mut values = arguments.iter();
+            let first = values.next().ok_or(RuntimeError::Argument {
+                function: "math.max",
+                index: 1,
+            })?;
+            let mut result = first.as_number().ok_or(RuntimeError::Type {
+                operation: "math.max",
+                expected: "number",
+                actual: first.type_name(),
+            })?;
+            for value in values {
+                let value = value.as_number().ok_or(RuntimeError::Type {
+                    operation: "math.max",
+                    expected: "number",
+                    actual: value.type_name(),
+                })?;
+                result = result.max(value);
+            }
+            Ok(vec![Value::Number(result)])
+        });
+
+        let table = self.heap.allocate_table(0, 8);
+        for (name, value) in [
+            (&b"abs"[..], Value::NativeFunction(abs)),
+            (&b"floor"[..], Value::NativeFunction(floor)),
+            (&b"ceil"[..], Value::NativeFunction(ceil)),
+            (&b"sqrt"[..], Value::NativeFunction(sqrt)),
+            (&b"min"[..], Value::NativeFunction(min)),
+            (&b"max"[..], Value::NativeFunction(max)),
+            (&b"pi"[..], Value::Number(core::f64::consts::PI)),
+            (&b"huge"[..], Value::Number(f64::INFINITY)),
+        ] {
+            self.heap
+                .table_set(table, Value::String(Arc::from(name)), value)
+                .expect("valid built-in table key");
+        }
+        self.set_global(&b"math"[..], Value::Table(table));
     }
 }
 
@@ -1629,6 +1907,24 @@ fn integer_argument(
             expected: "number",
             actual: value.type_name(),
         })
+}
+
+fn number_argument(
+    arguments: &[Value],
+    zero_based_index: usize,
+    function: &'static str,
+) -> Result<f64, RuntimeError> {
+    let value = arguments
+        .get(zero_based_index)
+        .ok_or(RuntimeError::Argument {
+            function,
+            index: zero_based_index + 1,
+        })?;
+    value.as_number().ok_or(RuntimeError::Type {
+        operation: function,
+        expected: "number",
+        actual: value.type_name(),
+    })
 }
 
 fn relative_index(index: i64, length: usize) -> i64 {
@@ -2157,6 +2453,11 @@ pub enum RuntimeError {
     },
     Raised(Value),
     SelectIndex(i64),
+    TablePosition {
+        function: &'static str,
+        position: i64,
+        length: usize,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -2248,6 +2549,14 @@ impl fmt::Display for RuntimeError {
             }
             Self::Raised(value) => write!(f, "runtime error: {value:?}"),
             Self::SelectIndex(index) => write!(f, "select index {index} is out of range"),
+            Self::TablePosition {
+                function,
+                position,
+                length,
+            } => write!(
+                f,
+                "{function} position {position} is invalid for length {length}"
+            ),
         }
     }
 }
@@ -2546,8 +2855,8 @@ mod tests {
         assert_eq!(
             vm.collect(std::iter::empty::<&Value>()),
             crate::CollectionStats {
-                before: 2,
-                retained: 1,
+                before: 4,
+                retained: 3,
                 collected: 1,
             }
         );

@@ -416,6 +416,36 @@ end)
 local result = ok and not failed and first == 4 and second == 5 and type(message) == "string"
 print(type(result) .. ":" .. tostring(result))
 "#;
+const TABLE_STRING_LIBRARY_SOURCE: &str = r#"
+local values = { "a", "c" }
+table.insert(values, 2, "b")
+local removed = table.remove(values, 3)
+local joined = table.concat(values, "-")
+local first, second = string.byte("AZ", 1, 2)
+return string.len(joined) + first + second
+    + (string.reverse(joined) == "b-a" and removed == "c" and 1 or 0)
+"#;
+const TABLE_STRING_LIBRARY_REFERENCE_SOURCE: &str = r#"
+local values = { "a", "c" }
+table.insert(values, 2, "b")
+local removed = table.remove(values, 3)
+local joined = table.concat(values, "-")
+local first, second = string.byte("AZ", 1, 2)
+local result = string.len(joined) + first + second
+    + (string.reverse(joined) == "b-a" and removed == "c" and 1 or 0)
+print(type(result) .. ":" .. tostring(result))
+"#;
+const MATH_LIBRARY_SOURCE: &str = r#"
+return math.abs(-3) + math.floor(2.9) + math.ceil(2.1) + math.sqrt(16)
+    + math.min(8, 1, 5) + math.max(2, 9, 4)
+    + (math.pi > 3 and 1 or 0) + (math.huge > 1e300 and 1 or 0)
+"#;
+const MATH_LIBRARY_REFERENCE_SOURCE: &str = r#"
+local result = math.abs(-3) + math.floor(2.9) + math.ceil(2.1) + math.sqrt(16)
+    + math.min(8, 1, 5) + math.max(2, 9, 4)
+    + (math.pi > 3 and 1 or 0) + (math.huge > 1e300 and 1 or 0)
+print(type(result) .. ":" .. tostring(result))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -622,6 +652,22 @@ fn run() -> Result<(), String> {
         "protected calls",
         PROTECTED_CALL_SOURCE,
         PROTECTED_CALL_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "table and string libraries",
+        TABLE_STRING_LIBRARY_SOURCE,
+        TABLE_STRING_LIBRARY_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "math library",
+        MATH_LIBRARY_SOURCE,
+        MATH_LIBRARY_REFERENCE_SOURCE,
         &compiler,
         &args.upstream,
         temporary.path(),
