@@ -48,10 +48,12 @@ and semantic profiles exist.
 
 Ordinary bytecode calls currently run on an owned, bounded VM frame stack.
 Suspended callers and their registers are traced as GC roots. Generational
-thread values support initial `coroutine.create`, `resume`, `yield`, and
-`status` behavior, including nested yields and successful yields through
-`pcall`. `wrap`, main-thread identity, closing threads, and protected error
-unwinding after a resume remain explicit compatibility gaps.
+thread values support `coroutine.create`, `resume`, `yield`, `status`, `wrap`,
+`running`, `isyieldable`, and `close`, including nested yields and successful
+yields through `pcall`. Luau `running` returns one value and reports the main
+thread as yieldable; Blu follows modern Lua by returning `(thread, is_main)` and
+making the main thread non-yieldable. Protected error unwinding after a resume
+remains an explicit compatibility gap.
 
 ## Semantic profiles
 

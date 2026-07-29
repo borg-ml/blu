@@ -19,7 +19,7 @@ enum ThreadState {
     New(Value),
     Suspended(Continuation),
     Running,
-    Dead,
+    Dead(Option<Value>),
 }
 
 enum Resumable {
@@ -43,6 +43,7 @@ pub struct Vm {
     module_cache: HashMap<Arc<[u8]>, Value>,
     loading_modules: HashSet<Arc<[u8]>>,
     threads: HashMap<ThreadId, ThreadState>,
+    main_thread: ThreadId,
     running_thread: Option<ThreadId>,
     output: Vec<u8>,
     active_roots: Vec<Vec<Value>>,
@@ -57,11 +58,15 @@ impl Default for Vm {
 impl Vm {
     #[must_use]
     pub fn new(dialect: Dialect) -> Self {
+        let mut heap = Heap::default();
+        let main_thread = heap.allocate_thread(Vec::new());
+        let mut threads = HashMap::new();
+        threads.insert(main_thread, ThreadState::Running);
         let mut vm = Self {
             dialect,
             instruction_limit: 10_000_000,
             call_limit: 1_000,
-            heap: Heap::default(),
+            heap,
             globals: HashMap::new(),
             native_functions: Vec::new(),
             protected_call: None,
@@ -71,7 +76,8 @@ impl Vm {
             module_loader: None,
             module_cache: HashMap::new(),
             loading_modules: HashSet::new(),
-            threads: HashMap::new(),
+            threads,
+            main_thread,
             running_thread: None,
             output: Vec::new(),
             active_roots: Vec::new(),
@@ -140,6 +146,7 @@ impl Vm {
         roots: impl IntoIterator<Item = &'a Value>,
     ) -> crate::CollectionStats {
         let mut all_roots: Vec<Value> = self.globals.values().cloned().collect();
+        all_roots.push(Value::Thread(self.main_thread));
         all_roots.extend(self.module_cache.values().cloned());
         all_roots.extend(self.active_roots.iter().flatten().cloned());
         all_roots.extend(roots.into_iter().cloned());
@@ -1072,6 +1079,23 @@ impl Vm {
                 self.active_roots.pop();
                 result
             }
+            Value::CoroutineFunction(thread) => {
+                let mut resume_arguments = Vec::with_capacity(arguments.len() + 1);
+                resume_arguments.push(Value::Thread(thread));
+                resume_arguments.extend_from_slice(arguments);
+                let mut results = self.resume_thread(&resume_arguments, remaining, depth, roots)?;
+                if results.first().is_some_and(Value::is_truthy) {
+                    results.remove(0);
+                    Ok(results)
+                } else {
+                    Err(RuntimeError::Raised(
+                        results
+                            .get(1)
+                            .cloned()
+                            .unwrap_or_else(|| Value::String(Arc::from(&b"coroutine failed"[..]))),
+                    ))
+                }
+            }
             Value::NativeFunction(function) => {
                 if self.coroutine_resume == Some(function) {
                     return self.resume_thread(arguments, remaining, depth, roots);
@@ -1220,7 +1244,9 @@ impl Vm {
             match index {
                 Value::Nil => return Ok(Value::Nil),
                 Value::Table(next) => table = next,
-                function @ (Value::Closure(_) | Value::NativeFunction(_)) => {
+                function @ (Value::Closure(_)
+                | Value::CoroutineFunction(_)
+                | Value::NativeFunction(_)) => {
                     return Ok(self
                         .call_value(
                             function,
@@ -1271,7 +1297,9 @@ impl Vm {
                     return Ok(());
                 }
                 Value::Table(next) => table = next,
-                function @ (Value::Closure(_) | Value::NativeFunction(_)) => {
+                function @ (Value::Closure(_)
+                | Value::CoroutineFunction(_)
+                | Value::NativeFunction(_)) => {
                     self.call_value(
                         function,
                         &[Value::Table(table), key, assigned],
@@ -1378,7 +1406,10 @@ impl Vm {
             .table_get(metatable, &Value::String(Arc::from(name.as_bytes())))?;
         if matches!(value, Value::Nil) {
             Ok(None)
-        } else if matches!(value, Value::Closure(_) | Value::NativeFunction(_)) {
+        } else if matches!(
+            value,
+            Value::Closure(_) | Value::CoroutineFunction(_) | Value::NativeFunction(_)
+        ) {
             Ok(Some(value))
         } else {
             Err(RuntimeError::UnsupportedMetamethod {
@@ -2061,7 +2092,10 @@ impl Vm {
                 function: "coroutine.create",
                 index: 1,
             })?;
-            if !matches!(function, Value::Closure(_) | Value::NativeFunction(_)) {
+            if !matches!(
+                function,
+                Value::Closure(_) | Value::CoroutineFunction(_) | Value::NativeFunction(_)
+            ) {
                 return Err(RuntimeError::Type {
                     operation: "coroutine.create",
                     expected: "function",
@@ -2077,7 +2111,7 @@ impl Vm {
             let status = match vm.threads.get(&thread) {
                 Some(ThreadState::New(_) | ThreadState::Suspended(_)) => b"suspended".as_slice(),
                 Some(ThreadState::Running) => b"running".as_slice(),
-                Some(ThreadState::Dead) => b"dead".as_slice(),
+                Some(ThreadState::Dead(_)) => b"dead".as_slice(),
                 None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
             };
             Ok(vec![Value::String(Arc::from(status))])
@@ -2087,13 +2121,79 @@ impl Vm {
         let yield_function =
             self.register_function(|_, _| Err(RuntimeError::NativeFunction(u32::MAX)));
         self.coroutine_yield = Some(yield_function);
+        let wrap = self.register_function(|vm, arguments| {
+            let function = arguments.first().cloned().ok_or(RuntimeError::Argument {
+                function: "coroutine.wrap",
+                index: 1,
+            })?;
+            if !matches!(
+                function,
+                Value::Closure(_) | Value::CoroutineFunction(_) | Value::NativeFunction(_)
+            ) {
+                return Err(RuntimeError::Type {
+                    operation: "coroutine.wrap",
+                    expected: "function",
+                    actual: function.type_name(),
+                });
+            }
+            let thread = vm.heap.allocate_thread(vec![function.clone()]);
+            vm.threads.insert(thread, ThreadState::New(function));
+            Ok(vec![Value::CoroutineFunction(thread)])
+        });
+        let running = self.register_function(|vm, _| {
+            let thread = vm.running_thread.unwrap_or(vm.main_thread);
+            let mut result = vec![Value::Thread(thread)];
+            if vm.dialect == Dialect::Blu {
+                result.push(Value::Boolean(vm.running_thread.is_none()));
+            }
+            Ok(result)
+        });
+        let isyieldable = self.register_function(|vm, _| {
+            Ok(vec![Value::Boolean(
+                vm.running_thread.is_some() || vm.dialect == Dialect::Luau,
+            )])
+        });
+        let close = self.register_function(|vm, arguments| {
+            let thread = thread_argument(arguments, 0, "coroutine.close")?;
+            let state = vm
+                .threads
+                .remove(&thread)
+                .ok_or(RuntimeError::Heap(HeapError::StaleThread(thread)))?;
+            let result = match state {
+                ThreadState::Running => {
+                    vm.threads.insert(thread, ThreadState::Running);
+                    vec![
+                        Value::Boolean(false),
+                        Value::String(Arc::from(&b"cannot close a running coroutine"[..])),
+                    ]
+                }
+                ThreadState::Dead(error) => {
+                    let result = match &error {
+                        Some(error) => vec![Value::Boolean(false), error.clone()],
+                        None => vec![Value::Boolean(true)],
+                    };
+                    vm.threads.insert(thread, ThreadState::Dead(error));
+                    result
+                }
+                ThreadState::New(_) | ThreadState::Suspended(_) => {
+                    vm.threads.insert(thread, ThreadState::Dead(None));
+                    vm.heap.thread_set_roots(thread, Vec::new())?;
+                    vec![Value::Boolean(true)]
+                }
+            };
+            Ok(result)
+        });
 
-        let table = self.heap.allocate_table(0, 4);
+        let table = self.heap.allocate_table(0, 8);
         for (name, function) in [
             (&b"create"[..], create),
             (&b"status"[..], status),
             (&b"resume"[..], resume),
             (&b"yield"[..], yield_function),
+            (&b"wrap"[..], wrap),
+            (&b"running"[..], running),
+            (&b"isyieldable"[..], isyieldable),
+            (&b"close"[..], close),
         ] {
             self.heap
                 .table_set(
@@ -2121,7 +2221,7 @@ impl Vm {
         let resumable = match state {
             ThreadState::New(function) => Resumable::New(function),
             ThreadState::Suspended(continuation) => Resumable::Continuation(continuation),
-            state @ (ThreadState::Running | ThreadState::Dead) => {
+            state @ (ThreadState::Running | ThreadState::Dead(_)) => {
                 self.threads.insert(thread, state);
                 return Ok(vec![
                     Value::Boolean(false),
@@ -2168,7 +2268,7 @@ impl Vm {
         self.running_thread = previous_thread;
         Ok(match result {
             Ok(values) => {
-                self.threads.insert(thread, ThreadState::Dead);
+                self.threads.insert(thread, ThreadState::Dead(None));
                 self.heap.thread_set_roots(thread, Vec::new())?;
                 let mut resumed = Vec::with_capacity(values.len() + 1);
                 resumed.push(Value::Boolean(true));
@@ -2184,9 +2284,11 @@ impl Vm {
                 yielded
             }
             Err(error) => {
-                self.threads.insert(thread, ThreadState::Dead);
+                let error_value = runtime_error_value(error);
+                self.threads
+                    .insert(thread, ThreadState::Dead(Some(error_value.clone())));
                 self.heap.thread_set_roots(thread, Vec::new())?;
-                vec![Value::Boolean(false), runtime_error_value(error)]
+                vec![Value::Boolean(false), error_value]
             }
         })
     }
@@ -2646,6 +2748,9 @@ fn append_value(output: &mut Vec<u8>, value: &Value) {
         Value::Table(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
         Value::Closure(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
         Value::Thread(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
+        Value::CoroutineFunction(value) => {
+            output.extend_from_slice(format!("CoroutineFunction({value:?})").as_bytes());
+        }
         Value::NativeFunction(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
     }
 }

@@ -16,6 +16,7 @@ pub enum Value {
     Table(TableId),
     Closure(ClosureId),
     Thread(ThreadId),
+    CoroutineFunction(ThreadId),
     NativeFunction(NativeFunctionId),
 }
 
@@ -35,6 +36,7 @@ impl Value {
             Self::Table(_) => "table",
             Self::Closure(_) => "function",
             Self::Thread(_) => "thread",
+            Self::CoroutineFunction(_) => "function",
             Self::NativeFunction(_) => "function",
         }
     }
@@ -62,6 +64,9 @@ impl fmt::Debug for Value {
             Self::Table(value) => value.fmt(f),
             Self::Closure(value) => value.fmt(f),
             Self::Thread(value) => value.fmt(f),
+            Self::CoroutineFunction(value) => {
+                f.debug_tuple("CoroutineFunction").field(value).finish()
+            }
             Self::NativeFunction(value) => value.fmt(f),
         }
     }
@@ -80,6 +85,7 @@ impl PartialEq for Value {
             (Self::Table(left), Self::Table(right)) => left == right,
             (Self::Closure(left), Self::Closure(right)) => left == right,
             (Self::Thread(left), Self::Thread(right)) => left == right,
+            (Self::CoroutineFunction(left), Self::CoroutineFunction(right)) => left == right,
             (Self::NativeFunction(left), Self::NativeFunction(right)) => left == right,
             _ => false,
         }

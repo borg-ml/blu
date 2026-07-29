@@ -389,6 +389,7 @@ fn enqueue_value(value: &Value, queue: &mut VecDeque<ObjectId>) {
         Value::Table(value) => queue.push_back((*value).into()),
         Value::Closure(value) => queue.push_back((*value).into()),
         Value::Thread(value) => queue.push_back((*value).into()),
+        Value::CoroutineFunction(value) => queue.push_back((*value).into()),
         Value::NativeFunction(_) => {}
         _ => {}
     }
@@ -495,6 +496,7 @@ enum Key {
     Table(TableId),
     Closure(ClosureId),
     Thread(ThreadId),
+    CoroutineFunction(ThreadId),
     NativeFunction(crate::NativeFunctionId),
 }
 
@@ -521,6 +523,7 @@ impl Key {
             Value::Table(value) => Ok(Self::Table(*value)),
             Value::Closure(value) => Ok(Self::Closure(*value)),
             Value::Thread(value) => Ok(Self::Thread(*value)),
+            Value::CoroutineFunction(value) => Ok(Self::CoroutineFunction(*value)),
             Value::NativeFunction(value) => Ok(Self::NativeFunction(*value)),
         }
     }
@@ -537,6 +540,7 @@ impl Key {
             Self::Table(value) => queue.push_back((*value).into()),
             Self::Closure(value) => queue.push_back((*value).into()),
             Self::Thread(value) => queue.push_back((*value).into()),
+            Self::CoroutineFunction(value) => queue.push_back((*value).into()),
             _ => {}
         }
     }
@@ -550,6 +554,7 @@ impl Key {
             Self::Table(value) => Value::Table(*value),
             Self::Closure(value) => Value::Closure(*value),
             Self::Thread(value) => Value::Thread(*value),
+            Self::CoroutineFunction(value) => Value::CoroutineFunction(*value),
             Self::NativeFunction(value) => Value::NativeFunction(*value),
         }
     }

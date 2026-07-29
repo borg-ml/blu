@@ -25,8 +25,9 @@ protected calls, `pairs`/`ipairs`/`next`, string method dispatch, core
 metamethods, an initial standard library, and host-configured cached `require`.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
 remain GC roots. Initial generational coroutine threads implement
-`create`/`resume`/`yield`/`status`, including nested calls, resume arguments,
-successful protected-call suspension, and GC-traced continuations.
+`create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,
+including nested calls, resume arguments, successful protected-call
+suspension, and GC-traced continuations.
 The default engine selects `blu`; `--!dialect` directives are checked against
 the configured engine. Lua 5.1–5.5 profiles are declared but still fail
 explicitly as unimplemented. This is meaningful execution coverage, not yet a

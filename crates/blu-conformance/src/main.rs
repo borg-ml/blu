@@ -505,7 +505,16 @@ local result = tonumber("12.5") + tonumber("ff", 16) + tonumber(3)
     + (typeof(tonumber("invalid")) == "nil" and 1 or 0)
 print(type(result) .. ":" .. tostring(result))
 "#;
-const COROUTINE_SOURCE: &str = r#"
+const COROUTINE_SOURCE: &str = r##"
+local wrapped = coroutine.wrap(function(first)
+    local resumed = coroutine.yield(first + 1)
+    return resumed + 1
+end)
+local wrapped_first = wrapped(3)
+local wrapped_second = wrapped(7)
+local disposable = coroutine.create(function() end)
+local closed = coroutine.close(disposable)
+
 local thread = coroutine.create(function()
     local ok, value = pcall(function()
         local function nested()
@@ -521,8 +530,21 @@ local second_ok, protected_ok, result = coroutine.resume(thread, 41)
 return first_ok and paused == "pause" and suspended == "suspended"
     and second_ok and protected_ok and result == 42
     and coroutine.status(thread) == "dead"
-"#;
-const COROUTINE_REFERENCE_SOURCE: &str = r#"
+    and wrapped_first == 4 and wrapped_second == 8
+    and closed and coroutine.status(disposable) == "dead"
+    and select("#", coroutine.running()) == 1
+    and coroutine.isyieldable()
+"##;
+const COROUTINE_REFERENCE_SOURCE: &str = r##"
+local wrapped = coroutine.wrap(function(first)
+    local resumed = coroutine.yield(first + 1)
+    return resumed + 1
+end)
+local wrapped_first = wrapped(3)
+local wrapped_second = wrapped(7)
+local disposable = coroutine.create(function() end)
+local closed = coroutine.close(disposable)
+
 local thread = coroutine.create(function()
     local ok, value = pcall(function()
         local function nested()
@@ -538,8 +560,12 @@ local second_ok, protected_ok, result = coroutine.resume(thread, 41)
 local value = first_ok and paused == "pause" and suspended == "suspended"
     and second_ok and protected_ok and result == 42
     and coroutine.status(thread) == "dead"
+    and wrapped_first == 4 and wrapped_second == 8
+    and closed and coroutine.status(disposable) == "dead"
+    and select("#", coroutine.running()) == 1
+    and coroutine.isyieldable()
 print(type(value) .. ":" .. tostring(value))
-"#;
+"##;
 
 fn main() -> ExitCode {
     match run() {

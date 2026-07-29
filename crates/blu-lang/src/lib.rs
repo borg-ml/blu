@@ -405,4 +405,99 @@ mod tests {
             ])
         );
     }
+
+    #[test]
+    fn coroutine_wrap_is_callable_gc_traced_and_propagates_errors() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            engine.execute(
+                br#"
+                    wrapped = coroutine.wrap(function(first)
+                        local resumed = coroutine.yield(first + 1)
+                        return resumed + 1
+                    end)
+                    return wrapped(4)
+                "#
+            ),
+            Ok(vec![Value::Number(5.0)])
+        );
+        engine.vm_mut().collect(std::iter::empty());
+        assert_eq!(
+            engine.execute(b"return wrapped(9)"),
+            Ok(vec![Value::Number(10.0)])
+        );
+        assert_eq!(
+            engine.execute(
+                br#"
+                    local failing = coroutine.wrap(function()
+                        error("boom")
+                    end)
+                    local ok, message = pcall(failing)
+                    return ok, type(message)
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"string"[..])),
+            ])
+        );
+    }
+
+    #[test]
+    fn coroutine_main_thread_and_close_follow_explicit_profiles() {
+        assert_eq!(
+            Engine::default().execute(
+                b"local thread, is_main = coroutine.running()\n\
+                  return type(thread), is_main, coroutine.isyieldable()"
+            ),
+            Ok(vec![
+                Value::String(Arc::from(&b"thread"[..])),
+                Value::Boolean(true),
+                Value::Boolean(false),
+            ])
+        );
+        assert_eq!(
+            Engine::for_dialect(Dialect::Luau).execute(
+                b"return select('#', coroutine.running()), \
+                  type(coroutine.running()), coroutine.isyieldable()"
+            ),
+            Ok(vec![
+                Value::Number(1.0),
+                Value::String(Arc::from(&b"thread"[..])),
+                Value::Boolean(true),
+            ])
+        );
+        assert_eq!(
+            Engine::default().execute(
+                br#"
+                    local fresh = coroutine.create(function() end)
+                    local fresh_closed = coroutine.close(fresh)
+
+                    local paused = coroutine.create(function()
+                        coroutine.yield()
+                    end)
+                    coroutine.resume(paused)
+                    local paused_closed = coroutine.close(paused)
+
+                    local failed = coroutine.create(function()
+                        error("boom")
+                    end)
+                    coroutine.resume(failed)
+                    local failed_closed, failure = coroutine.close(failed)
+
+                    return fresh_closed, coroutine.status(fresh),
+                        paused_closed, coroutine.status(paused),
+                        failed_closed, type(failure)
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"dead"[..])),
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"dead"[..])),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"string"[..])),
+            ])
+        );
+    }
 }
