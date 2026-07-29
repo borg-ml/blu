@@ -1,7 +1,7 @@
 // Ported from Luau Bytecode/src/BytecodeBuilder.cpp at the pinned revision.
 // Luau is copyright Roblox Corporation and Lua.org, PUC-Rio, MIT licensed.
 
-use crate::{Chunk, Constant, Instruction, Opcode, Prototype};
+use crate::{Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype};
 use core::fmt;
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -367,7 +367,35 @@ impl Validator<'_> {
                 self.register(pc, instruction.a())?;
                 self.register(pc, instruction.b())?;
             }
-            NewTable => self.register(pc, instruction.a())?,
+            NewTable => {
+                self.register(pc, instruction.a())?;
+                let array_capacity = self.aux(pc, instruction)? as usize;
+                if array_capacity > MAX_TABLE_INITIAL_CAPACITY {
+                    return self.error(
+                        Some(pc),
+                        format!(
+                            "NEWTABLE array capacity {array_capacity} exceeds limit \
+                             {MAX_TABLE_INITIAL_CAPACITY}"
+                        ),
+                    );
+                }
+                let hash_capacity = if instruction.b() == 0 {
+                    0
+                } else {
+                    1usize
+                        .checked_shl(u32::from(instruction.b() - 1))
+                        .unwrap_or(usize::MAX)
+                };
+                if hash_capacity > MAX_TABLE_INITIAL_CAPACITY {
+                    return self.error(
+                        Some(pc),
+                        format!(
+                            "NEWTABLE hash capacity {hash_capacity} exceeds limit \
+                             {MAX_TABLE_INITIAL_CAPACITY}"
+                        ),
+                    );
+                }
+            }
             DupTable => {
                 self.register(pc, instruction.a())?;
                 self.constant_i16(pc, instruction.d(), Some("table"))?;
@@ -830,5 +858,34 @@ mod tests {
         let mut valid = prototype(vec![get_all_varargs, return_all], 1);
         valid.is_vararg = true;
         validate(&chunk(valid)).unwrap();
+    }
+
+    #[test]
+    fn rejects_table_capacities_that_exceed_the_runtime_limit() {
+        let new_table = Opcode::NewTable as u32;
+        let return_none = u32::from(Opcode::Return as u8) | (1 << 16);
+        let oversized_array = u32::try_from(MAX_TABLE_INITIAL_CAPACITY + 1).unwrap();
+        let error = validate(&chunk(prototype(
+            vec![new_table, oversized_array, return_none],
+            1,
+        )))
+        .unwrap_err();
+        assert!(error.message.contains("array capacity"));
+
+        let oversized_hash = new_table | (22 << 16);
+        let error =
+            validate(&chunk(prototype(vec![oversized_hash, 0, return_none], 1))).unwrap_err();
+        assert!(error.message.contains("hash capacity"));
+
+        let maximum_hash = new_table | (21 << 16);
+        validate(&chunk(prototype(
+            vec![
+                maximum_hash,
+                u32::try_from(MAX_TABLE_INITIAL_CAPACITY).unwrap(),
+                return_none,
+            ],
+            1,
+        )))
+        .unwrap();
     }
 }

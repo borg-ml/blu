@@ -28,6 +28,11 @@ remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,
 including nested calls, resume arguments, successful protected-call
 suspension, and GC-traced continuations.
+Portable V1 package envelopes provide bounded canonical decoding, SHA-256
+identity, explicit dialect and authority requirements, and an opaque validated
+bytecode payload. The public engine currently executes only dialect-matched
+pure packages without imports; capability matching and linking fail
+explicitly until their host policies exist.
 The default engine selects `blu`; `--!dialect` directives are checked against
 the configured engine. Lua 5.1–5.5 profiles are declared but still fail
 explicitly as unimplemented. This is meaningful execution coverage, not yet a
@@ -38,6 +43,7 @@ claim of complete Luau, Lua, or Blu compatibility.
 - `blu-lang`: public facade crate for embedding Blu.
 - `blu-compiler`: isolated in-process Luau source compiler adapter.
 - `blu-bytecode`: versioned Luau instruction decoding and serialized chunk loading.
+- `blu-package`: bounded canonical package envelopes and artifact validation.
 - `blu-runtime`: values, heap, interpreter, interruption, and Rust host API.
 - `blu-conformance`: differential execution against pinned Luau and Lua runtimes.
 - `.upstream/luau`: ignored checkout created by `just upstream`.

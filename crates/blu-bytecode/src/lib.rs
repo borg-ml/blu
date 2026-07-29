@@ -25,3 +25,4 @@ pub const BYTECODE_VERSION_TARGET: u8 = 9;
 pub const TYPEINFO_VERSION_MIN: u8 = 1;
 pub const TYPEINFO_VERSION_MAX: u8 = 3;
 pub const TYPEINFO_VERSION_TARGET: u8 = 3;
+pub const MAX_TABLE_INITIAL_CAPACITY: usize = 1 << 20;

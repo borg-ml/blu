@@ -100,6 +100,16 @@ Borg project plugins choose `confined` or `trusted` through project trust.
 Built-in Borg behavior remains Rust and pays no Blu initialization cost when no
 Blu plugin is active.
 
+## Resource limits
+
+Serialized bytecode and mutable embedding inputs are checked again at the
+execution boundary. A `NEWTABLE` instruction may request at most 1,048,576
+initial array slots and 1,048,576 initial hash slots. Larger requests fail
+validation or return a structured runtime error before allocation. This
+initial-capacity bound is only one defense; VM-wide byte accounting and
+automatic GC thresholds remain required before confined execution can claim a
+hard memory limit.
+
 ## Package compatibility
 
 Blu targets:
@@ -116,9 +126,14 @@ Roblox datatypes/services. Blu may provide adapters, but language compatibility
 does not fabricate those environments.
 
 The initial embedding surface exposes a host-configured `require` loader with a
-per-VM cache, circular-load detection, and GC-rooted module results. Filesystem
-resolution, manifests, authority checks, LuaRocks resolution, and native module
-loading are not yet implemented.
+per-VM cache, circular-load detection, and GC-rooted module results. Portable
+V1 envelopes canonically declare identity, dialect, bytecode versions,
+imports, exports, schema digests, and authority requirements; decoding is
+bounded, integrity-checked, and validates the contained bytecode without
+executing it. The public engine executes only dialect-matched pure packages
+with no imports. Capability matching, linking, filesystem resolution,
+dependency locks, signatures, LuaRocks resolution, and native module loading
+are not yet implemented and fail explicitly where exposed.
 
 ## Native modules
 

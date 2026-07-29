@@ -1,6 +1,6 @@
 use crate::heap::UpvalueId;
 use crate::{ClosureId, Dialect, Heap, HeapError, NativeFunctionId, TableId, ThreadId, Value};
-use blu_bytecode::{Chunk, Constant, Instruction, Opcode, Prototype};
+use blu_bytecode::{Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype};
 use core::fmt;
 use std::{
     collections::{HashMap, HashSet},
@@ -577,6 +577,13 @@ impl Vm {
                         pc: instruction.pc(),
                         opcode: instruction.opcode(),
                     })? as usize;
+                    if array_capacity > MAX_TABLE_INITIAL_CAPACITY {
+                        return Err(RuntimeError::TableCapacity {
+                            kind: "array",
+                            requested: array_capacity as u64,
+                            limit: MAX_TABLE_INITIAL_CAPACITY,
+                        });
+                    }
                     let hash_capacity = if instruction.b() == 0 {
                         0
                     } else {
@@ -584,9 +591,14 @@ impl Vm {
                             .checked_shl(u32::from(instruction.b() - 1))
                             .unwrap_or(usize::MAX)
                     };
-                    let table = self
-                        .heap
-                        .allocate_table(array_capacity, hash_capacity.min(1 << 20));
+                    if hash_capacity > MAX_TABLE_INITIAL_CAPACITY {
+                        return Err(RuntimeError::TableCapacity {
+                            kind: "hash",
+                            requested: u64::try_from(hash_capacity).unwrap_or(u64::MAX),
+                            limit: MAX_TABLE_INITIAL_CAPACITY,
+                        });
+                    }
+                    let table = self.heap.allocate_table(array_capacity, hash_capacity);
                     frame.set(instruction.a(), Value::Table(table))?;
                 }
                 Opcode::DupTable => {
@@ -3317,6 +3329,11 @@ pub enum RuntimeError {
         required: usize,
         limit: usize,
     },
+    TableCapacity {
+        kind: &'static str,
+        requested: u64,
+        limit: usize,
+    },
     CoroutineYield(Vec<Value>),
     CoroutineYieldOutside,
     ModuleLoaderMissing,
@@ -3436,6 +3453,14 @@ impl fmt::Display for RuntimeError {
                     "string result requires {required} bytes, limit is {limit}"
                 )
             }
+            Self::TableCapacity {
+                kind,
+                requested,
+                limit,
+            } => write!(
+                f,
+                "table {kind} capacity {requested} exceeds initial capacity limit {limit}"
+            ),
             Self::CoroutineYield(values) => {
                 write!(f, "coroutine yielded {} values", values.len())
             }
@@ -3533,6 +3558,40 @@ mod tests {
             .execute(&chunk)
             .unwrap_err();
         assert_eq!(error, RuntimeError::InstructionLimit { limit: 8 });
+    }
+
+    #[test]
+    fn oversized_table_capacities_fail_without_allocating() {
+        let return_none = abc(Opcode::Return, 0, 1, 0);
+        let chunk = test_chunk(
+            &[],
+            vec![],
+            vec![
+                abc(Opcode::NewTable, 0, 0, 0),
+                u32::try_from(MAX_TABLE_INITIAL_CAPACITY + 1).unwrap(),
+                return_none,
+            ],
+            1,
+        );
+        assert_eq!(
+            Vm::default().execute(&chunk),
+            Err(RuntimeError::TableCapacity {
+                kind: "array",
+                requested: (MAX_TABLE_INITIAL_CAPACITY + 1) as u64,
+                limit: MAX_TABLE_INITIAL_CAPACITY,
+            })
+        );
+
+        let chunk = test_chunk(
+            &[],
+            vec![],
+            vec![abc(Opcode::NewTable, 0, 255, 0), 0, return_none],
+            1,
+        );
+        assert!(matches!(
+            Vm::default().execute(&chunk),
+            Err(RuntimeError::TableCapacity { kind: "hash", .. })
+        ));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 [package]
-name = "blu-lang"
-description = "High-performance Lua-family language and Rust runtime"
+name = "blu-package"
+description = "Portable validated package envelopes for Blu bytecode"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,6 +10,4 @@ authors.workspace = true
 
 [dependencies]
 blu-bytecode.workspace = true
-blu-compiler.workspace = true
-blu-package.workspace = true
-blu-runtime.workspace = true
+sha2.workspace = true

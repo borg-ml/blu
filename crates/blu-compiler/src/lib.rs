@@ -36,6 +36,12 @@ pub struct Compiler {
     load_limits: LoadLimits,
 }
 
+#[derive(Clone, Debug)]
+pub struct CompiledBytecode {
+    pub bytes: Vec<u8>,
+    pub chunk: Chunk,
+}
+
 impl Compiler {
     #[must_use]
     pub const fn new(options: CompileOptions, load_limits: LoadLimits) -> Self {
@@ -46,6 +52,13 @@ impl Compiler {
     }
 
     pub fn compile(&self, source: impl AsRef<[u8]>) -> Result<Chunk, CompileError> {
+        self.compile_bytecode(source).map(|compiled| compiled.chunk)
+    }
+
+    pub fn compile_bytecode(
+        &self,
+        source: impl AsRef<[u8]>,
+    ) -> Result<CompiledBytecode, CompileError> {
         validate_level("optimization", self.options.optimization_level, 2)?;
         validate_level("debug", self.options.debug_level, 2)?;
         validate_level("type information", self.options.type_info_level, 1)?;
@@ -87,7 +100,8 @@ impl Compiler {
         // SAFETY: `luau_compile` documents that its result must be released
         // with `free`, and this pointer has not previously been freed.
         unsafe { free(output.cast()) };
-        load(&bytes, self.load_limits).map_err(CompileError::Chunk)
+        let chunk = load(&bytes, self.load_limits).map_err(CompileError::Chunk)?;
+        Ok(CompiledBytecode { bytes, chunk })
     }
 }
 
@@ -175,10 +189,17 @@ mod tests {
 
     #[test]
     fn compiles_source_for_the_blu_runtime() {
-        let chunk = Compiler::default()
-            .compile(b"return 20 + 22")
+        let compiled = Compiler::default()
+            .compile_bytecode(b"return 20 + 22")
             .expect("valid source");
-        assert_eq!(Vm::default().execute(&chunk), Ok(vec![Value::Number(42.0)]));
+        assert_eq!(
+            load(&compiled.bytes, LoadLimits::default()).unwrap(),
+            compiled.chunk
+        );
+        assert_eq!(
+            Vm::default().execute(&compiled.chunk),
+            Ok(vec![Value::Number(42.0)])
+        );
     }
 
     #[test]

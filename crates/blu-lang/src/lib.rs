@@ -4,9 +4,13 @@
 //! runtime crates remain public for tooling and specialized embedders.
 
 pub use blu_bytecode as bytecode;
-pub use blu_compiler::{CompileError, CompileOptions, Compiler, LUAU_COMPILER_RELEASE};
+pub use blu_compiler::{
+    CompileError, CompileOptions, CompiledBytecode, Compiler, LUAU_COMPILER_RELEASE,
+};
+pub use blu_package as package;
 pub use blu_runtime::{Dialect, RuntimeError, Value, Vm};
 
+use blu_package::{AuthorityProfile, Package, PackageDialect};
 use core::fmt;
 
 #[derive(Clone, Debug, Default)]
@@ -54,6 +58,124 @@ impl Engine {
             .compile(source)
             .map_err(ExecuteError::Compile)?;
         self.vm.execute_owned(chunk).map_err(ExecuteError::Runtime)
+    }
+
+    pub fn execute_package(
+        &mut self,
+        package: Package,
+        policy: &HostPolicy,
+    ) -> Result<Vec<Value>, ExecutePackageError> {
+        let package_dialect = match package.manifest().dialect {
+            PackageDialect::Blu => Dialect::Blu,
+            PackageDialect::Luau => Dialect::Luau,
+            PackageDialect::Lua51
+            | PackageDialect::Lua52
+            | PackageDialect::Lua53
+            | PackageDialect::Lua54
+            | PackageDialect::Lua55 => {
+                return Err(ExecutePackageError::UnsupportedDialect(
+                    package.manifest().dialect,
+                ));
+            }
+        };
+        let configured = self.vm.dialect();
+        if package_dialect != configured {
+            return Err(ExecutePackageError::DialectMismatch {
+                configured,
+                package: package_dialect,
+            });
+        }
+        let required = package.manifest().authority.profile;
+        if required > policy.authority {
+            return Err(ExecutePackageError::Authority {
+                required,
+                granted: policy.authority,
+            });
+        }
+        if !package.manifest().authority.capabilities.is_empty() {
+            return Err(ExecutePackageError::CapabilitiesUnsupported(
+                package.manifest().authority.capabilities.len(),
+            ));
+        }
+        if !package.manifest().imports.is_empty() {
+            return Err(ExecutePackageError::ImportsUnsupported(
+                package.manifest().imports.len(),
+            ));
+        }
+        self.vm
+            .execute_owned(package.into_chunk())
+            .map_err(ExecutePackageError::Runtime)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HostPolicy {
+    pub authority: AuthorityProfile,
+}
+
+impl Default for HostPolicy {
+    fn default() -> Self {
+        Self {
+            authority: AuthorityProfile::Pure,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub enum ExecutePackageError {
+    UnsupportedDialect(PackageDialect),
+    DialectMismatch {
+        configured: Dialect,
+        package: Dialect,
+    },
+    Authority {
+        required: AuthorityProfile,
+        granted: AuthorityProfile,
+    },
+    CapabilitiesUnsupported(usize),
+    ImportsUnsupported(usize),
+    Runtime(RuntimeError),
+}
+
+impl fmt::Display for ExecutePackageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedDialect(dialect) => {
+                write!(
+                    f,
+                    "package dialect {dialect:?} has no executable V1 payload"
+                )
+            }
+            Self::DialectMismatch {
+                configured,
+                package,
+            } => write!(
+                f,
+                "package dialect {package:?} conflicts with configured dialect {configured:?}"
+            ),
+            Self::Authority { required, granted } => write!(
+                f,
+                "package requires {required:?} authority but host grants {granted:?}"
+            ),
+            Self::CapabilitiesUnsupported(count) => write!(
+                f,
+                "package declares {count} capability requirements but capability matching is not implemented"
+            ),
+            Self::ImportsUnsupported(count) => write!(
+                f,
+                "package declares {count} imports but package linking is not implemented"
+            ),
+            Self::Runtime(error) => write!(f, "package execution failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for ExecutePackageError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Runtime(error) => Some(error),
+            _ => None,
+        }
     }
 }
 
@@ -121,6 +243,10 @@ fn source_dialect(source: &[u8]) -> Result<Option<Dialect>, ExecuteError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use blu_package::{
+        AuthorityRequirement, BytecodeDescriptor, BytecodeFormat, Manifest, Name, PackageIdentity,
+        PackageLimits, Version,
+    };
     use std::sync::{
         Arc,
         atomic::{AtomicUsize, Ordering},
@@ -132,6 +258,38 @@ mod tests {
         assert_eq!(
             Engine::default().execute(b"return string.reverse('blu')"),
             Ok(vec![Value::String(std::sync::Arc::from(&b"ulb"[..]))])
+        );
+    }
+
+    #[test]
+    fn compiled_portable_packages_round_trip_and_execute_under_host_policy() {
+        let compiled = Compiler::default()
+            .compile_bytecode(b"return 40 + 2")
+            .unwrap();
+        let manifest = Manifest {
+            package: PackageIdentity {
+                name: Name::new("example.answer").unwrap(),
+                version: Version::new(1, 0, 0),
+            },
+            dialect: PackageDialect::Blu,
+            bytecode: BytecodeDescriptor {
+                format: BytecodeFormat::Luau,
+                version: compiled.chunk.version,
+                typeinfo_version: compiled.chunk.typeinfo_version,
+            },
+            authority: AuthorityRequirement {
+                profile: AuthorityProfile::Pure,
+                capabilities: Vec::new(),
+            },
+            imports: Vec::new(),
+            exports: Vec::new(),
+        };
+        let package = Package::new(manifest, compiled.bytes, PackageLimits::default()).unwrap();
+        let encoded = package.encode();
+        let decoded = Package::decode(&encoded, PackageLimits::default()).unwrap();
+        assert_eq!(
+            Engine::default().execute_package(decoded, &HostPolicy::default()),
+            Ok(vec![Value::Number(42.0)])
         );
     }
 
