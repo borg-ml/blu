@@ -41,15 +41,16 @@ claim of complete Luau, Lua, or Blu compatibility.
 
 The first Blu-owned frontend substrate is also present: `blu-syntax` performs
 bounded byte-oriented lexing and parses the initial local/return arithmetic
-slice, including grouping parentheses, into a spanned arena AST with explicit
-profile reconciliation.
+slice, including nil and boolean literals plus grouping parentheses, into a
+spanned arena AST with explicit profile reconciliation.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into
 canonical BluV1 artifacts without native linkage or fallback; the same
 explicit-profile API is available from the public facade as
 `blu_lang::frontend`. `Engine::execute_owned_compilation` directly executes
-the single-prototype baseline slice for every declared profile without the
+the single-prototype scalar baseline slice for every declared profile without the
 Luau compiler or bytecode translator. It revalidates the consumed artifact
-under caller-supplied execution limits. BluV1 floor division executes with
+under caller-supplied execution limits. Canonical register moves preserve
+arbitrary scalar return lists without numeric coercion. BluV1 floor division executes with
 Luau number semantics and Lua 5.3–5.5 integer/number semantics; Blu lowering
 still rejects it until Blu numeric and metamethod semantics are assigned.
 The older `Engine::execute` source path continues to use the pinned Luau

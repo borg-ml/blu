@@ -98,6 +98,27 @@ fn grouping_parentheses_are_profile_neutral_tokens() {
 }
 
 #[test]
+fn nil_and_boolean_literals_are_profile_neutral_keywords() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return nil, true, false".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::Return,
+                TokenKind::Nil,
+                TokenKind::Comma,
+                TokenKind::True,
+                TokenKind::Comma,
+                TokenKind::False,
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn conflicting_directive_is_reported_on_its_value() {
     let source = source(b"--!dialect lua54\r\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

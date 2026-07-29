@@ -227,6 +227,15 @@ fn translate_instruction(
             register(prototype, left)?,
             register(prototype, right)?,
         )),
+        BluInstruction::Move {
+            destination,
+            source,
+        } => Ok(abc(
+            Opcode::Move,
+            register(prototype, destination)?,
+            register(prototype, source)?,
+            0,
+        )),
         BluInstruction::FloorDivide { .. } => Err(TranslationError::UnsupportedInstruction {
             prototype,
             instruction: "floor division",

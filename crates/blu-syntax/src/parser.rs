@@ -232,7 +232,7 @@ impl ParseOutcome {
 /// Parses the currently supported grammar under an explicit profile.
 ///
 /// The grammar is limited to `local name = expression`, a final
-/// `return expression (, expression)*`, decimal-integer and identifier
+/// `return expression (, expression)*`, nil, booleans, decimal-integer and identifier
 /// expressions, grouping parentheses, and left-associative `+` and `//`
 /// (`//` binds more tightly).
 /// Trivia remains available through [`Parsed::tokens`] or
@@ -450,11 +450,14 @@ impl<'a> Parser<'a> {
             self.report_current_or_eof(
                 "BLU-PARSE-0004",
                 "expected an expression",
-                &["decimal integer", "identifier", "("],
+                &["nil", "boolean", "decimal integer", "identifier", "("],
             )?;
             return Ok(None);
         };
         let kind = match token.kind() {
+            TokenKind::Nil => ExpressionKind::Nil,
+            TokenKind::True => ExpressionKind::Boolean(true),
+            TokenKind::False => ExpressionKind::Boolean(false),
             TokenKind::DecimalInteger => ExpressionKind::DecimalInteger,
             TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
             TokenKind::LeftParenthesis => {
@@ -486,7 +489,7 @@ impl<'a> Parser<'a> {
                 self.report_current(
                     "BLU-PARSE-0004",
                     "expected an expression",
-                    &["decimal integer", "identifier", "("],
+                    &["nil", "boolean", "decimal integer", "identifier", "("],
                 )?;
                 return Ok(None);
             }

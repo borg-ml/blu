@@ -4,8 +4,9 @@
 //! [`crate::Compiler`]. It emits the shared BluV1 baseline for all seven
 //! established profiles, parses through `blu-syntax`, resolves local names,
 //! and round-trips the result through the canonical encoder and validated
-//! decoder. It never calls the native Luau compiler. Bootstrap translation and
-//! execution remain separately restricted to `blu` and `luau`.
+//! decoder. It never calls the native Luau compiler. Bootstrap translation
+//! remains separately restricted to `blu` and `luau`; direct baseline
+//! execution supports every explicit profile.
 //! Locals resolve in declaration order: use before declaration is an error,
 //! while a repeated name explicitly shadows the earlier binding.
 //! Lua 5.3--5.5 decimal literals use an exact `Integer` constant when they fit
@@ -536,34 +537,19 @@ impl<'a> Lowerer<'a> {
         self.emit(Instruction::Return { first, count }, statement.span())
     }
 
-    /// BluV1 has no baseline move instruction. This slice proves every
-    /// expression numeric, so adding the profile-appropriate zero is an identity
-    /// operation and can normalize a non-contiguous return list.
     fn copy_return_values(
         &mut self,
         values: &[ExpressionId],
         registers: &[u16],
     ) -> Result<u16, OwnedCompileError> {
-        let zero = self.push_constant(self.zero_constant())?;
-        let zero_register = self.allocate_register()?;
-        let zero_span = self.expression(values[0])?.span();
-        self.emit(
-            Instruction::LoadConstant {
-                destination: zero_register,
-                constant: zero,
-            },
-            zero_span,
-        )?;
-
         let mut first = None;
         for (expression_id, source) in values.iter().copied().zip(registers.iter().copied()) {
             let destination = self.allocate_register()?;
             first.get_or_insert(destination);
             self.emit(
-                Instruction::Add {
+                Instruction::Move {
                     destination,
-                    left: source,
-                    right: zero_register,
+                    source,
                 },
                 self.expression(expression_id)?.span(),
             )?;
@@ -576,6 +562,10 @@ impl<'a> Lowerer<'a> {
     fn lower_expression(&mut self, id: ExpressionId) -> Result<u16, OwnedCompileError> {
         let expression = *self.expression(id)?;
         match expression.kind() {
+            ExpressionKind::Nil => self.lower_constant(Constant::Nil, expression.span()),
+            ExpressionKind::Boolean(value) => {
+                self.lower_constant(Constant::Boolean(value), expression.span())
+            }
             ExpressionKind::DecimalInteger => {
                 let constant = self.decimal_constant(expression.span())?;
                 let constant_index = self.push_constant(constant)?;
@@ -640,6 +630,23 @@ impl<'a> Lowerer<'a> {
             })
     }
 
+    fn lower_constant(
+        &mut self,
+        constant: Constant,
+        span: ByteSpan,
+    ) -> Result<u16, OwnedCompileError> {
+        let constant = self.push_constant(constant)?;
+        let destination = self.allocate_register()?;
+        self.emit(
+            Instruction::LoadConstant {
+                destination,
+                constant,
+            },
+            span,
+        )?;
+        Ok(destination)
+    }
+
     fn decimal_constant(&self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
         let bytes = self.source.slice(span)?;
         check_limit(
@@ -687,17 +694,6 @@ impl<'a> Lowerer<'a> {
                 message: "validated decimal-integer text failed numeric parsing",
             })?;
         Ok(Constant::Number(number))
-    }
-
-    fn zero_constant(&self) -> Constant {
-        if matches!(
-            self.profile,
-            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
-        ) {
-            Constant::Integer(0)
-        } else {
-            Constant::Number(0.0)
-        }
     }
 
     fn source_diagnostic(

@@ -156,6 +156,28 @@ fn missing_group_closer_is_a_structured_rejection() {
 }
 
 #[test]
+fn nil_and_boolean_literals_have_distinct_ast_kinds() {
+    let source = source(b"return nil, true, false".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    let kinds: Vec<_> = statement
+        .values()
+        .iter()
+        .map(|id| parsed.ast().expression(*id).unwrap().kind())
+        .collect();
+    assert_eq!(
+        kinds,
+        [
+            ExpressionKind::Nil,
+            ExpressionKind::Boolean(true),
+            ExpressionKind::Boolean(false),
+        ]
+    );
+}
+
+#[test]
 fn return_expression_lists_are_spanned_and_comma_separated() {
     let source = source(b"return 1, value + 2, 9 // 4".to_vec());
     let parsed = accepted(&source, SemanticProfile::Lua53, ParseLimits::default());

@@ -48,8 +48,8 @@ and runtime semantics exist. The separate `blu-syntax` crate now implements a
 bounded byte lexer and small parser/AST slice for the first owned-frontend
 program. It includes byte-zero dialect directives, stable raw-byte spans,
 retained trivia, the documented `//` profile gate, `local name = expression`,
-expression-list `return`, and decimal-integer/identifier expressions with `+`
-and `//` precedence plus grouping parentheses. Parsing retains the explicit profile and rejects
+expression-list `return`, nil/boolean/decimal-integer/identifier expressions,
+and `+`/`//` precedence plus grouping parentheses. Parsing retains the explicit profile and rejects
 diagnostics without exposing a partial AST. Resolution, lowering, emission,
 and execution are separate explicit stages; the public engine never silently
 selects this frontend as a fallback. Parser-owned arenas, lists, and diagnostic counts are bounded
@@ -100,7 +100,9 @@ instructions, not the owned resolver, lowerer, or full Blu backend.
 `Vm::execute_blu_v1`, exposed for owned compilations as
 `Engine::execute_owned_compilation`, is the direct profile-aware path. It
 consumes and revalidates the artifact under caller-supplied limits and executes
-the single-prototype baseline slice for all seven profiles without translation.
+the single-prototype scalar baseline slice for all seven profiles without
+translation. Baseline register moves preserve non-contiguous values without
+coercing their types.
 It also executes floor division where the dialect matrix assigns it: Luau
 numbers and Lua 5.3--5.5 integers or numbers. Integer constants remain a
 lossless storage feature, so the executor rejects them explicitly for profiles

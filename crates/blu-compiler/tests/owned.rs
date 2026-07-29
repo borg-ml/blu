@@ -546,7 +546,7 @@ fn artifact_register_limit_is_separate_from_bootstrap_translation_limit() {
 }
 
 #[test]
-fn noncontiguous_return_values_are_normalized_with_numeric_baseline_ops() {
+fn noncontiguous_return_values_are_normalized_with_moves() {
     let source = make_source(b"local a = 1\nlocal b = 2\nreturn b, a".to_vec());
     let compiled = OwnedCompiler::default()
         .compile(&source, SemanticProfile::Blu, compiler_identity())
@@ -564,13 +564,19 @@ fn noncontiguous_return_values_are_normalized_with_numeric_baseline_ops() {
             span_of(&source, b"1"),
             span_of(&source, b"2"),
             returned_b,
-            returned_b,
             returned_a,
             source
                 .span(return_start, return_start + b"return b, a".len())
                 .unwrap(),
         ]
     );
+    assert!(matches!(
+        &compiled.artifact().main().code[2..4],
+        [
+            Instruction::Move { source: 1, .. },
+            Instruction::Move { source: 0, .. }
+        ]
+    ));
     assert!(matches!(
         compiled.artifact().main().code.last(),
         Some(Instruction::Return { count: 2, .. })

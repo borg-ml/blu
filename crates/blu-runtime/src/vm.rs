@@ -848,6 +848,13 @@ impl Vm {
                     )?;
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::Move {
+                    destination,
+                    source,
+                } => {
+                    let value = blu_register(&registers, source)?.clone();
+                    set_blu_register(&mut registers, destination, value)?;
+                }
                 BluInstruction::FloorDivide {
                     destination,
                     left,

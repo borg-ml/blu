@@ -297,7 +297,7 @@ mod tests {
         let source = SourceFile::new(
             SourceId::new(1),
             "answer.blu",
-            b"local answer = (40)\nreturn (answer + 2)".to_vec(),
+            b"local empty = nil\nlocal yes = true\nreturn empty, yes, false, (40 + 2)".to_vec(),
             SourceLimits::default(),
         )
         .unwrap();
@@ -319,7 +319,12 @@ mod tests {
             assert_eq!(
                 Engine::default()
                     .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
-                Ok(vec![Value::Number(42.0)]),
+                Ok(vec![
+                    Value::Nil,
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Number(42.0),
+                ]),
                 "{profile}"
             );
         }

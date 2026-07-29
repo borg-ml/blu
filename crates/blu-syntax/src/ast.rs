@@ -84,6 +84,8 @@ impl BinaryExpression {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ExpressionKind {
+    Nil,
+    Boolean(bool),
     DecimalInteger,
     Identifier(Identifier),
     Group(ExpressionId),

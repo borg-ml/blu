@@ -128,6 +128,9 @@ pub enum TokenKind {
     DialectDirective,
     Local,
     Return,
+    Nil,
+    True,
+    False,
     Identifier,
     DecimalInteger,
     Equal,
@@ -353,6 +356,9 @@ pub fn lex(
                 match &bytes[start..offset] {
                     b"local" => TokenKind::Local,
                     b"return" => TokenKind::Return,
+                    b"nil" => TokenKind::Nil,
+                    b"true" => TokenKind::True,
+                    b"false" => TokenKind::False,
                     _ => TokenKind::Identifier,
                 }
             }
