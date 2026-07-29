@@ -449,6 +449,19 @@ pub fn lex(
                     .try_with_expected("decimal exponent digit")?;
                     push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                 }
+                if scan.adjacent_dots {
+                    let span = source.span(start, offset)?;
+                    let diagnostic = diagnostic(
+                        "BLU-LEX-0010",
+                        explicit_profile,
+                        span,
+                        "a trailing decimal point must be separated from a following dot",
+                        limits.diagnostic_limits,
+                    )?
+                    .try_with_found(&bytes[start..offset])?
+                    .try_with_help("insert whitespace before a future concatenation operator")?;
+                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                }
                 if scan.is_integer {
                     TokenKind::DecimalInteger
                 } else {
@@ -521,21 +534,29 @@ struct DecimalScan {
     end: usize,
     is_integer: bool,
     malformed_exponent: Option<usize>,
+    adjacent_dots: bool,
 }
 
 fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
     let mut offset = start;
     let mut is_integer = true;
-    if bytes[offset] == b'.' {
+    let mut adjacent_dots = false;
+    let leading_dot = bytes[offset] == b'.';
+    if leading_dot {
         is_integer = false;
         offset += 1;
     }
     while offset < bytes.len() && bytes[offset].is_ascii_digit() {
         offset += 1;
     }
-    if bytes.get(offset) == Some(&b'.') && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit) {
+    if !leading_dot && bytes.get(offset) == Some(&b'.') {
         is_integer = false;
-        offset += 1;
+        if bytes.get(offset + 1) == Some(&b'.') {
+            adjacent_dots = true;
+            offset += 2;
+        } else {
+            offset += 1;
+        }
         while offset < bytes.len() && bytes[offset].is_ascii_digit() {
             offset += 1;
         }
@@ -560,6 +581,7 @@ fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
         end: offset,
         is_integer,
         malformed_exponent,
+        adjacent_dots,
     }
 }
 

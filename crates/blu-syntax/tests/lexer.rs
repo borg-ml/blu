@@ -484,7 +484,7 @@ fn diagnostic_value_limits_map_through_lex_error() {
 #[test]
 fn shared_fractional_and_exponent_decimal_forms_are_profile_neutral() {
     for profile in SemanticProfile::ALL {
-        let source = source(b"return 1.5, .25, 2e3, 4.5E-2".to_vec());
+        let source = source(b"return 1.5, .25, 1., 1.e2, 2e3, 4.5E-2".to_vec());
         let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
         assert!(!lexed.has_errors(), "{profile}");
         assert_eq!(
@@ -498,9 +498,23 @@ fn shared_fractional_and_exponent_decimal_forms_are_profile_neutral() {
                 TokenKind::DecimalNumber,
                 TokenKind::Comma,
                 TokenKind::DecimalNumber,
+                TokenKind::Comma,
+                TokenKind::DecimalNumber,
+                TokenKind::Comma,
+                TokenKind::DecimalNumber,
             ],
             "{profile}"
         );
+    }
+}
+
+#[test]
+fn adjacent_decimal_and_concatenation_dots_are_malformed_in_every_profile() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return 1..2".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0010");
+        assert_eq!(lexed.diagnostics()[0].found(), Some(b"1..2".as_slice()));
     }
 }
 

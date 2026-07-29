@@ -57,6 +57,8 @@ slice. Exponentiation follows the shared right-associative precedence above
 unary operators and always produces a number.
 Hexadecimal numerals, hexadecimal floats, numeric separators, and other
 profile-specific numeral extensions remain explicitly unsupported.
+Trailing-dot forms such as `1.` and `1.e2` are accepted; as in the pinned
+runtimes, `1..2` is malformed and must be spaced before future concatenation.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into
 canonical BluV1 artifacts without native linkage or fallback; the same
 explicit-profile API is available from the public facade as

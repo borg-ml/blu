@@ -801,7 +801,7 @@ fn decimal_constants_follow_each_profile_numeric_policy() {
 
 #[test]
 fn fractional_and_exponent_numbers_lower_for_every_profile() {
-    let source = make_source(b"return 1.5, .25, 2e3, 4.5E-2".to_vec());
+    let source = make_source(b"return 1.5, .25, 1., 1.e2, 2e3, 4.5E-2".to_vec());
     for profile in SemanticProfile::ALL {
         let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
@@ -811,6 +811,8 @@ fn fractional_and_exponent_numbers_lower_for_every_profile() {
             [
                 Constant::Number(1.5),
                 Constant::Number(0.25),
+                Constant::Number(1.0),
+                Constant::Number(100.0),
                 Constant::Number(2_000.0),
                 Constant::Number(0.045),
             ],
