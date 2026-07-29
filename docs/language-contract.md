@@ -108,6 +108,11 @@ coercing their types. Escape-free quoted strings are copied as exact source
 bytes between their delimiters, with per-constant and aggregate payload limits
 checked before allocation. A bare return uses a zero-width validated register
 range and produces no values.
+Direct BluV1 execution transiently charges its runtime constant vector,
+register file, copied string payloads, and largest possible fixed return buffer
+against the VM memory configuration, then releases that charge on both success
+and structured failure. This does not yet imply that every legacy Luau frame,
+native-owned allocation, or GC work buffer is VM-accounted.
 It also executes floor division where the dialect matrix assigns it: Luau
 numbers and Lua 5.3--5.5 integers or numbers. Integer constants remain a
 lossless storage feature, so the executor rejects them explicitly for profiles

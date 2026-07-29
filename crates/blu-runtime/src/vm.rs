@@ -1,7 +1,7 @@
 use crate::heap::UpvalueId;
 use crate::{
-    ClosureId, Dialect, Heap, HeapError, MemoryConfig, MemoryUsage, NativeFunctionId, TableId,
-    ThreadId, Value,
+    ClosureId, Dialect, Heap, HeapError, MemoryConfig, MemoryError, MemoryUsage, NativeFunctionId,
+    TableId, ThreadId, Value, checked_vector_bytes,
 };
 use blu_bytecode::{
     Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype, ValidatedChunk,
@@ -159,9 +159,11 @@ impl Vm {
 
     /// Creates a VM with deterministic accounting for heap-owned storage.
     ///
-    /// Strings, chunks, VM frames, native-owned values, and GC work queues are
-    /// not included in this stage's reported usage. Logical charged capacities
-    /// are conservative but are not an exact process RSS measurement.
+    /// Direct BluV1 constants, registers, string payload copies, and return
+    /// buffers are transiently charged. Legacy Luau chunks, their frames,
+    /// native-owned values, and GC work queues are not all included in this
+    /// stage's reported usage. Logical charged capacities are conservative but
+    /// are not an exact process RSS measurement.
     pub fn try_new_with_memory(
         dialect: Dialect,
         memory: MemoryConfig,
@@ -783,6 +785,19 @@ impl Vm {
     }
 
     fn run_blu_v1_prototype(
+        &mut self,
+        prototype: &blu_bytecode::blu::Prototype,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let charge = blu_v1_execution_bytes(prototype)?;
+        let roots = GcRoots::default();
+        self.collect_if_needed(charge, &roots, core::iter::empty(), core::iter::empty())?;
+        self.heap.charge_external(charge)?;
+        let result = self.run_charged_blu_v1_prototype(prototype);
+        self.heap.release_external(charge)?;
+        result
+    }
+
+    fn run_charged_blu_v1_prototype(
         &mut self,
         prototype: &blu_bytecode::blu::Prototype,
     ) -> Result<Vec<Value>, RuntimeError> {
@@ -4550,6 +4565,41 @@ fn table_string_constant(instruction: Instruction) -> Result<u32, RuntimeError> 
     )
 }
 
+fn blu_v1_execution_bytes(prototype: &blu_bytecode::blu::Prototype) -> Result<usize, RuntimeError> {
+    let runtime_memory_error = |error| RuntimeError::from(HeapError::Memory(error));
+    let constant_bytes =
+        checked_vector_bytes::<Value>(prototype.constants.len()).map_err(runtime_memory_error)?;
+    let register_bytes = checked_vector_bytes::<Value>(usize::from(prototype.register_count))
+        .map_err(runtime_memory_error)?;
+    let return_capacity = prototype
+        .code
+        .iter()
+        .filter_map(|instruction| match instruction {
+            BluInstruction::Return { count, .. } => Some(usize::from(*count)),
+            _ => None,
+        })
+        .max()
+        .unwrap_or(0);
+    let return_bytes =
+        checked_vector_bytes::<Value>(return_capacity).map_err(runtime_memory_error)?;
+    let string_bytes = prototype
+        .constants
+        .iter()
+        .try_fold(0usize, |total, constant| {
+            let bytes = match constant {
+                BluConstant::String(bytes) => bytes.len(),
+                _ => 0,
+            };
+            total.checked_add(bytes).ok_or(MemoryError::SizeOverflow)
+        })
+        .map_err(runtime_memory_error)?;
+    constant_bytes
+        .checked_add(register_bytes)
+        .and_then(|total| total.checked_add(return_bytes))
+        .and_then(|total| total.checked_add(string_bytes))
+        .ok_or_else(|| RuntimeError::from(HeapError::Memory(MemoryError::SizeOverflow)))
+}
+
 fn blu_register(registers: &[Value], register: u16) -> Result<&Value, RuntimeError> {
     registers
         .get(usize::from(register))
@@ -5182,6 +5232,84 @@ mod tests {
                 "{profile}"
             );
         }
+    }
+
+    #[test]
+    fn direct_blu_v1_transient_storage_is_memory_accounted_and_released() {
+        let program = || {
+            validated_blu_program(
+                SemanticProfile::Blu,
+                vec![BluConstant::String(b"blu".to_vec())],
+                vec![
+                    BluInstruction::LoadConstant {
+                        destination: 0,
+                        constant: 0,
+                    },
+                    BluInstruction::Return { first: 0, count: 1 },
+                ],
+                FeatureBits::BASELINE,
+                1,
+            )
+        };
+        let charge = blu_v1_execution_bytes(program().main()).unwrap();
+        assert!(charge > b"blu".len());
+
+        let baseline = Vm::try_new(Dialect::Blu)
+            .unwrap()
+            .memory_usage()
+            .current_bytes;
+        let rejected_limit = baseline + charge - 1;
+        let mut rejected = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                hard_limit_bytes: Some(rejected_limit),
+                ..MemoryConfig::default()
+            },
+        )
+        .unwrap();
+        assert!(matches!(
+            rejected.execute_blu_v1(program(), BluLimits::default()),
+            Err(RuntimeError::Heap(HeapError::Memory(
+                MemoryError::LimitExceeded {
+                    requested,
+                    used,
+                    limit,
+                }
+            ))) if requested == charge && used == baseline && limit == rejected_limit
+        ));
+        assert_eq!(rejected.memory_usage().current_bytes, baseline);
+
+        let accepted_limit = baseline + charge;
+        let mut accepted = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                hard_limit_bytes: Some(accepted_limit),
+                ..MemoryConfig::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            accepted.execute_blu_v1(program(), BluLimits::default()),
+            Ok(vec![Value::String(Arc::from(&b"blu"[..]))])
+        );
+        assert_eq!(accepted.memory_usage().current_bytes, baseline);
+        assert_eq!(accepted.memory_usage().peak_bytes, accepted_limit);
+
+        let mut failing = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                hard_limit_bytes: Some(accepted_limit),
+                ..MemoryConfig::default()
+            },
+        )
+        .unwrap()
+        .with_instruction_limit(0);
+        assert_eq!(
+            failing.execute_blu_v1(program(), BluLimits::default()),
+            Err(RuntimeError::InstructionLimit { limit: 0 })
+        );
+        assert_eq!(failing.memory_usage().current_bytes, baseline);
+        assert_eq!(failing.memory_usage().peak_bytes, accepted_limit);
     }
 
     #[test]

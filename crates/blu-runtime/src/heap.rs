@@ -146,6 +146,16 @@ impl Heap {
         self.memory.should_collect(requested)
     }
 
+    pub(crate) fn charge_external(&mut self, bytes: usize) -> Result<(), HeapError> {
+        self.memory.reserve(bytes)?.commit();
+        Ok(())
+    }
+
+    pub(crate) fn release_external(&mut self, bytes: usize) -> Result<(), HeapError> {
+        self.memory.release(bytes)?;
+        Ok(())
+    }
+
     pub(crate) fn table_allocation_bytes(
         &self,
         array_capacity: usize,
