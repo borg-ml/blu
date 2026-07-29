@@ -913,6 +913,23 @@ impl Vm {
                     let value = Value::Boolean(!blu_register(&registers, source)?.is_truthy());
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::Negate {
+                    destination,
+                    source,
+                } => {
+                    let value = match blu_register(&registers, source)? {
+                        Value::Integer(value) => Value::Integer(value.wrapping_neg()),
+                        Value::Number(value) => Value::Number(-value),
+                        other => {
+                            return Err(RuntimeError::Type {
+                                operation: "unary minus",
+                                expected: "number",
+                                actual: other.type_name(),
+                            });
+                        }
+                    };
+                    set_blu_register(&mut registers, destination, value)?;
+                }
                 BluInstruction::FloorDivide {
                     destination,
                     left,

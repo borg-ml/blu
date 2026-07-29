@@ -233,6 +233,10 @@ pub enum Instruction {
         destination: u16,
         source: u16,
     },
+    Negate {
+        destination: u16,
+        source: u16,
+    },
     Add {
         destination: u16,
         left: u16,
@@ -283,6 +287,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             Instruction::LoadConstant { .. }
             | Instruction::Move { .. }
             | Instruction::Not { .. }
+            | Instruction::Negate { .. }
             | Instruction::Add { .. }
             | Instruction::Subtract { .. }
             | Instruction::Multiply { .. }
@@ -295,6 +300,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             Instruction::LoadConstant { .. }
                 | Instruction::Move { .. }
                 | Instruction::Not { .. }
+                | Instruction::Negate { .. }
                 | Instruction::Add { .. }
                 | Instruction::Subtract { .. }
                 | Instruction::Multiply { .. }
@@ -1124,6 +1130,14 @@ fn validate_prototype(
                 check_read(index, pc, source, &initialized)?;
                 initialized[destination as usize] = true;
             }
+            Instruction::Negate {
+                destination,
+                source,
+            } => {
+                check_register(index, pc, destination, registers)?;
+                check_read(index, pc, source, &initialized)?;
+                initialized[destination as usize] = true;
+            }
             Instruction::Add {
                 destination,
                 left,
@@ -1423,6 +1437,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::FloorDivide { .. } => 7,
                     Instruction::Move { .. }
                     | Instruction::Not { .. }
+                    | Instruction::Negate { .. }
                     | Instruction::Return { .. } => 5,
                 },
             )?;
@@ -1574,6 +1589,14 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 source,
             } => {
                 out.push(5);
+                put_u16(out, *destination);
+                put_u16(out, *source);
+            }
+            Instruction::Negate {
+                destination,
+                source,
+            } => {
+                out.push(9);
                 put_u16(out, *destination);
                 put_u16(out, *source);
             }
@@ -2189,6 +2212,10 @@ fn read_prototype(
                 destination: reader.u16()?,
                 left: reader.u16()?,
                 right: reader.u16()?,
+            },
+            9 => Instruction::Negate {
+                destination: reader.u16()?,
+                source: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

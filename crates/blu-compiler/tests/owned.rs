@@ -631,6 +631,27 @@ fn ordinary_division_lowers_for_every_profile() {
 }
 
 #[test]
+fn unary_negation_lowers_for_every_profile() {
+    let source = make_source(b"return -7, -(2 + 3), - -1".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            compiled
+                .artifact()
+                .main()
+                .code
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::Negate { .. }))
+                .count(),
+            4,
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn decimal_constants_follow_each_profile_numeric_policy() {
     let number_source = make_source(b"return 9007199254740993, 18446744073709551616".to_vec());
     for profile in [

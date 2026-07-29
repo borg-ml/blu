@@ -592,11 +592,13 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_prefix(&mut self) -> Result<Option<BuiltExpression>, ParseError> {
-        let Some(operator) = self
-            .current()
-            .filter(|token| token.kind() == TokenKind::Not)
-        else {
+        let Some(operator) = self.current() else {
             return self.parse_primary();
+        };
+        let unary_operator = match operator.kind() {
+            TokenKind::Not => UnaryOperator::Not,
+            TokenKind::Minus => UnaryOperator::Negate,
+            _ => return self.parse_primary(),
         };
         self.bump();
         let Some(operand) = self.parse_expression(3)? else {
@@ -606,7 +608,7 @@ impl<'a> Parser<'a> {
         self.push_expression(
             Expression::new(
                 ExpressionKind::Unary(UnaryExpression::new(
-                    UnaryOperator::Not,
+                    unary_operator,
                     operator.span(),
                     operand.id,
                 )),
@@ -629,6 +631,7 @@ impl<'a> Parser<'a> {
                     "decimal integer",
                     "identifier",
                     "not",
+                    "-",
                     "(",
                 ],
             )?;

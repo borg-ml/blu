@@ -715,6 +715,18 @@ impl<'a> Lowerer<'a> {
                     )?;
                     Ok(destination)
                 }
+                UnaryOperator::Negate => {
+                    let source = self.lower_expression(unary.operand())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::Negate {
+                            destination,
+                            source,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
+                }
             },
             ExpressionKind::Binary(binary) => match binary.operator() {
                 BinaryOperator::Add => {
