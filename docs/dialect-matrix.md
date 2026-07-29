@@ -121,7 +121,7 @@ frontend.
 
 | ID | `blu` state | `luau` state | `lua51`-`lua55` state | Current evidence and limitation |
 |---|---|---|---|---|
-| `LEX` | `experimental` | `experimental` | `unsupported` | Source is compiled by `luau0-src` release 728. The engine checks an initial dialect directive, but there is no Blu-owned profile parser. |
+| `LEX` | `experimental` | `experimental` | `unsupported` | Public execution still compiles source with pinned `luau0-src` release 728. The separate bounded `blu-syntax` lexer retains raw-byte spans and trivia, reconciles byte-zero dialect directives, and gates the initial token slice by profile; it does not yet parse or compile source. |
 | `NUM` | `experimental` | `experimental` | `unsupported` | Basic number/integer VM values and arithmetic execute; full pinned numeric boundaries and profile coercions are not gated. |
 | `OP` | `experimental` | `experimental` | `unsupported` | Arithmetic, logical, comparison, length, concat, and Luau `//` bytecode paths exist. Lua 5.3 bitwise syntax/semantics do not. |
 | `ENV` | `unsupported` | `unsupported` | `unsupported` | Globals exist, but complete `getfenv`/`setfenv`, `_ENV`, loaded-chunk environment, and 5.5 declaration semantics do not. |
