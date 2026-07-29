@@ -1116,6 +1116,24 @@ fn decimal_and_hexadecimal_byte_escapes_decode_by_profile() {
 }
 
 #[test]
+fn whitespace_escape_consumes_all_following_ascii_space() {
+    let source = make_source(b"return \"left\\z \n\t\r\n right\"".to_vec());
+    for profile in SemanticProfile::ALL {
+        let result = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+        if profile == SemanticProfile::Lua51 {
+            assert!(result.is_err());
+        } else {
+            let compiled = result.unwrap();
+            assert_eq!(
+                compiled.artifact().main().constants,
+                [Constant::String(b"leftright".to_vec())],
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn artifact_register_limit_is_separate_from_bootstrap_translation_limit() {
     use core::fmt::Write;
 

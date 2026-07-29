@@ -56,11 +56,10 @@ numeric separators plus binary integers in the Blu and Luau profiles,
 hexadecimal exponent forms for Blu and Lua 5.1–5.5, and fractional hexadecimal
 forms for Blu and Lua 5.2–5.5,
 single- and double-quoted byte strings with common escaped delimiters, backslash,
-control escapes, shared decimal byte escapes, and `\\xXX` in Blu, Luau, and Lua 5.2–5.5, and
+control escapes, shared decimal byte escapes, `\xXX`, and whitespace-eating `\z` in Blu, Luau, and Lua 5.2–5.5, and
 `+`/`-`/`*`/`/`/`%`/`^`/`//`
 precedence plus grouping parentheses and unary `not`/`-`/`#` for byte strings.
-Unicode, `\z`,
-and line-continuation escapes are rejected until their profile-specific rules are
+Unicode and line-continuation escapes are rejected until their profile-specific rules are
 implemented. Parsing retains the explicit profile and rejects
 diagnostics without exposing a partial AST. Resolution, lowering, emission,
 and execution are separate explicit stages; the public engine never silently

@@ -393,6 +393,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let whitespace_escape = SourceFile::new(
+            SourceId::new(15),
+            "whitespace-escape.blu",
+            b"return \"left\\z \n\t\r\n right\"".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -412,6 +419,15 @@ mod tests {
                 "{profile}"
             );
             if profile != SemanticProfile::Lua51 {
+                let compiled = OwnedCompiler::default()
+                    .compile(&whitespace_escape, profile, compiler.clone())
+                    .unwrap();
+                assert_eq!(
+                    Engine::default()
+                        .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                    Ok(vec![Value::String(Arc::from(&b"leftright"[..]))]),
+                    "{profile}"
+                );
                 let compiled = OwnedCompiler::default()
                     .compile(&hex_byte_escapes, profile, compiler.clone())
                     .unwrap();

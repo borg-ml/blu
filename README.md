@@ -65,6 +65,8 @@ Other profile-specific numeral extensions remain explicitly unsupported.
 Quoted strings support decimal byte escapes in every profile. Two-digit
 hexadecimal byte escapes are available in Blu, Luau, and Lua 5.2–5.5; malformed
 or out-of-range byte escapes are rejected structurally.
+Those same profiles support `\z`, which removes every following ASCII
+whitespace byte, including line breaks. Lua 5.1 rejects it explicitly.
 Trailing-dot forms such as `1.` and `1.e2` are accepted; as in the pinned
 runtimes, `1..2` is malformed and must be spaced before future concatenation.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into

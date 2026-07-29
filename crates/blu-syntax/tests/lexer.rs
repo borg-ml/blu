@@ -327,6 +327,29 @@ fn decimal_and_hexadecimal_byte_escapes_follow_the_profile_matrix() {
 }
 
 #[test]
+fn whitespace_escape_is_profile_gated_and_spans_lines() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return \"left\\z \n\t\r\n right\"".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        if profile == SemanticProfile::Lua51 {
+            assert!(
+                lexed
+                    .diagnostics()
+                    .iter()
+                    .any(|diagnostic| diagnostic.code().as_str() == "BLU-LEX-0007")
+            );
+        } else {
+            assert!(!lexed.has_errors(), "{profile}");
+            assert_eq!(
+                significant_kinds(&lexed),
+                [TokenKind::Return, TokenKind::StringLiteral],
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn conflicting_directive_is_reported_on_its_value() {
     let source = source(b"--!dialect lua54\r\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

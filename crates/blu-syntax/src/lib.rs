@@ -428,6 +428,13 @@ pub fn lex(
                             }
                             continue;
                         }
+                        if escaped == b'z' && supports_whitespace_escape(explicit_profile) {
+                            offset += 2;
+                            while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+                                offset += 1;
+                            }
+                            continue;
+                        }
                         unsupported_escape.get_or_insert(offset);
                     }
                     offset += 1;
@@ -994,6 +1001,10 @@ const fn supports_hex_byte_escape(profile: SemanticProfile) -> bool {
         SemanticProfile::Lua51 => false,
         _ => false,
     }
+}
+
+const fn supports_whitespace_escape(profile: SemanticProfile) -> bool {
+    supports_hex_byte_escape(profile)
 }
 
 fn long_comment_opener(bytes: &[u8], start: usize) -> Option<(usize, usize)> {

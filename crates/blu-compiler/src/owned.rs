@@ -1191,7 +1191,9 @@ impl<'a> Lowerer<'a> {
             let byte = value[offset];
             if byte == b'\\' {
                 let (decoded_byte, consumed) = decode_string_escape(value, offset)?;
-                push_fallible(&mut decoded, decoded_byte, "string literal bytes")?;
+                if let Some(decoded_byte) = decoded_byte {
+                    push_fallible(&mut decoded, decoded_byte, "string literal bytes")?;
+                }
                 offset += consumed;
             } else {
                 push_fallible(&mut decoded, byte, "string literal bytes")?;
@@ -1336,14 +1338,17 @@ fn decode_common_string_escape(escaped: u8) -> Option<u8> {
     })
 }
 
-fn decode_string_escape(value: &[u8], offset: usize) -> Result<(u8, usize), OwnedCompileError> {
+fn decode_string_escape(
+    value: &[u8],
+    offset: usize,
+) -> Result<(Option<u8>, usize), OwnedCompileError> {
     let escaped = *value
         .get(offset + 1)
         .ok_or(OwnedCompileError::InternalInvariant {
             message: "validated string literal ends in a backslash",
         })?;
     if let Some(decoded) = decode_common_string_escape(escaped) {
-        return Ok((decoded, 2));
+        return Ok((Some(decoded), 2));
     }
     if escaped.is_ascii_digit() {
         let mut cursor = offset + 1;
@@ -1357,7 +1362,7 @@ fn decode_string_escape(value: &[u8], offset: usize) -> Result<(u8, usize), Owne
         let decoded = u8::try_from(decoded).map_err(|_| OwnedCompileError::InternalInvariant {
             message: "validated decimal byte escape is out of range",
         })?;
-        return Ok((decoded, cursor - offset));
+        return Ok((Some(decoded), cursor - offset));
     }
     if escaped == b'x' {
         let high = *value
@@ -1372,7 +1377,14 @@ fn decode_string_escape(value: &[u8], offset: usize) -> Result<(u8, usize), Owne
             .ok_or(OwnedCompileError::InternalInvariant {
                 message: "validated hexadecimal byte escape has no low digit",
             })?;
-        return Ok((hex_digit(high) * 16 + hex_digit(low), 4));
+        return Ok((Some(hex_digit(high) * 16 + hex_digit(low)), 4));
+    }
+    if escaped == b'z' {
+        let mut cursor = offset + 2;
+        while value.get(cursor).is_some_and(u8::is_ascii_whitespace) {
+            cursor += 1;
+        }
+        return Ok((None, cursor - offset));
     }
     Err(OwnedCompileError::InternalInvariant {
         message: "validated string literal contains an unsupported escape",
@@ -1423,8 +1435,11 @@ fn decoded_string_len(value: &[u8]) -> Result<usize, OwnedCompileError> {
     let mut offset = 0;
     while offset < value.len() {
         if value[offset] == b'\\' {
-            let (_, consumed) = decode_string_escape(value, offset)?;
+            let (decoded, consumed) = decode_string_escape(value, offset)?;
             offset += consumed;
+            if decoded.is_none() {
+                continue;
+            }
         } else {
             offset += 1;
         }
