@@ -12,6 +12,22 @@ pub use blu_compiler::{
 pub use blu_package as package;
 pub use blu_runtime::{Dialect, RuntimeError, Value, Vm};
 
+/// Explicit, Blu-owned source frontend APIs.
+///
+/// This module exposes the safe-Rust BluV1 compiler slice through the public
+/// facade. Compilation requires caller-selected source and compiler identities
+/// plus a semantic profile. It never selects the legacy Luau compiler as a
+/// fallback.
+pub mod frontend {
+    pub use blu_compiler::owned::{
+        OwnedCompilation, OwnedCompileError, OwnedCompileLimit, OwnedCompileLimits, OwnedCompiler,
+    };
+    pub use blu_core::{
+        CompilerId, CompilerIdentity, IdentityLimits, SemanticProfile, SourceError, SourceFile,
+        SourceId, SourceLimits,
+    };
+}
+
 use blu_package::{AuthorityProfile, Package, PackageDialect};
 use core::fmt;
 
@@ -256,6 +272,40 @@ mod tests {
         Arc,
         atomic::{AtomicUsize, Ordering},
     };
+
+    #[test]
+    fn owned_frontend_is_available_through_the_public_facade() {
+        use frontend::{
+            CompilerId, CompilerIdentity, IdentityLimits, OwnedCompiler, SemanticProfile,
+            SourceFile, SourceId, SourceLimits,
+        };
+
+        let source = SourceFile::new(
+            SourceId::new(1),
+            "answer.blu",
+            b"local answer = 40\nreturn answer + 2".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
+        let compiler = CompilerIdentity::new(
+            CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
+            "blu-owned",
+            env!("CARGO_PKG_VERSION"),
+            None,
+            IdentityLimits::default(),
+        )
+        .unwrap();
+        let compiled = OwnedCompiler::default()
+            .compile(&source, SemanticProfile::Blu, compiler)
+            .unwrap();
+
+        let artifact = compiled.artifact().artifact();
+        assert_eq!(
+            artifact.prototypes[artifact.main as usize].profile,
+            SemanticProfile::Blu
+        );
+        assert!(!compiled.bytes().is_empty());
+    }
 
     #[test]
     fn executes_source_through_the_public_facade() {
@@ -761,6 +811,55 @@ mod tests {
             engine.vm().heap().table_length(child_table),
             Err(blu_runtime::HeapError::StaleTable(stale)) if stale == child_table
         ));
+    }
+
+    #[test]
+    fn raised_heap_values_remain_rooted_until_explicit_release() {
+        let vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            blu_runtime::MemoryConfig {
+                hard_limit_bytes: None,
+                gc_start_bytes: 0,
+                gc_growth_percent: 0,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let mut engine = Engine::new(Compiler::default(), vm);
+        let raised = match engine.execute(b"error({ answer = 42 })") {
+            Err(ExecuteError::Runtime(RuntimeError::Raised(value))) => value,
+            result => panic!("expected raised table, got {result:?}"),
+        };
+        let Value::Table(table) = raised else {
+            panic!("expected raised table, got {raised:?}");
+        };
+        assert_eq!(engine.vm().retained_value_count(), 1);
+
+        assert_eq!(
+            engine.execute(
+                br#"
+                    for index = 1, 100 do
+                        local garbage = { index, index + 1, index + 2 }
+                    end
+                    return "collected"
+                "#
+            ),
+            Ok(vec![Value::String(Arc::from(&b"collected"[..]))])
+        );
+        assert_eq!(
+            engine
+                .vm()
+                .heap()
+                .table_get(table, &Value::String(Arc::from(&b"answer"[..]))),
+            Ok(Value::Number(42.0))
+        );
+
+        assert!(engine.vm_mut().release_value(&Value::Table(table)));
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
+        assert_eq!(
+            engine.vm().heap().table_get(table, &Value::Integer(1)),
+            Err(blu_runtime::HeapError::StaleTable(table))
+        );
     }
 
     #[test]

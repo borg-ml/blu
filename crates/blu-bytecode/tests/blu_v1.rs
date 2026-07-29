@@ -170,6 +170,17 @@ fn baseline_fixture(profile: SemanticProfile) -> Artifact {
     artifact
 }
 
+fn floor_division_fixture(profile: SemanticProfile) -> Artifact {
+    let mut artifact = baseline_fixture(profile);
+    artifact.prototypes[0].required_features = FeatureBits::BASELINE | FeatureBits::FLOOR_DIVISION;
+    artifact.prototypes[0].code[2] = Instruction::FloorDivide {
+        destination: 2,
+        left: 0,
+        right: 1,
+    };
+    artifact
+}
+
 #[test]
 fn canonical_round_trip_preserves_profiles_and_metadata() {
     let limits = BluLimits::default();
@@ -263,6 +274,93 @@ fn baseline_instruction_legality_is_explicit_for_every_profile() {
         artifact.prototypes[0].profile = profile;
         assert!(ValidatedArtifact::new(artifact, BluLimits::default()).is_ok());
     }
+}
+
+#[test]
+fn floor_division_wire_feature_and_profile_legality_are_explicit() {
+    let limits = BluLimits::default();
+    let instruction = Instruction::FloorDivide {
+        destination: 2,
+        left: 0,
+        right: 1,
+    };
+
+    for profile in SemanticProfile::ALL {
+        let legal = matches!(
+            profile,
+            SemanticProfile::Luau
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        assert_eq!(
+            instruction_is_legal(profile, instruction),
+            legal,
+            "{profile}"
+        );
+
+        if legal {
+            let mut missing = floor_division_fixture(profile);
+            missing.prototypes[0].required_features = FeatureBits::BASELINE;
+            assert_eq!(
+                ValidatedArtifact::new(missing, limits),
+                Err(ValidationError::MissingFeature {
+                    prototype: 0,
+                    feature: "floor division",
+                })
+            );
+
+            let validated =
+                ValidatedArtifact::new(floor_division_fixture(profile), limits).unwrap();
+            let bytes = encode(&validated, limits).unwrap();
+            let (_, first_instruction) = first_constant_and_instruction_offsets(&bytes);
+            assert_eq!(bytes[first_instruction + 14], 3, "{profile}");
+            let decoded = decode_validated(&bytes, limits).unwrap();
+            assert!(
+                decoded
+                    .main()
+                    .required_features
+                    .contains(FeatureBits::FLOOR_DIVISION)
+            );
+            assert_eq!(decoded.main().code[2], instruction);
+        } else {
+            assert_eq!(
+                ValidatedArtifact::new(floor_division_fixture(profile), limits),
+                Err(ValidationError::FeatureNotLegal {
+                    prototype: 0,
+                    feature: "floor division",
+                    profile,
+                })
+            );
+        }
+    }
+}
+
+#[test]
+fn luau_bootstrap_translation_rejects_floor_division_explicitly() {
+    let limits = BluLimits::default();
+    let artifact =
+        ValidatedArtifact::new(floor_division_fixture(SemanticProfile::Luau), limits).unwrap();
+    assert_eq!(
+        translate_baseline_to_luau(artifact, SemanticProfile::Luau, limits),
+        Err(TranslationError::UnsupportedInstruction {
+            prototype: 0,
+            instruction: "floor division",
+        })
+    );
+
+    let mut artifact = floor_division_fixture(SemanticProfile::Luau);
+    artifact.prototypes[0].constants[0] = Constant::Integer(i64::MAX);
+    artifact.prototypes[0].required_features =
+        FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS | FeatureBits::FLOOR_DIVISION;
+    let artifact = ValidatedArtifact::new(artifact, limits).unwrap();
+    assert_eq!(
+        translate_baseline_to_luau(artifact, SemanticProfile::Luau, limits),
+        Err(TranslationError::UnsupportedInstruction {
+            prototype: 0,
+            instruction: "floor division",
+        })
+    );
 }
 
 #[test]

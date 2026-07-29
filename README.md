@@ -43,12 +43,15 @@ The first Blu-owned frontend substrate is also present: `blu-syntax` performs
 bounded byte-oriented lexing and parses the initial local/return arithmetic
 slice into a spanned arena AST with explicit profile reconciliation.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into
-canonical BluV1 artifacts without native linkage or fallback. Public
-`blu-lang` source execution still explicitly enables the pinned Luau
-compatibility compiler while the owned execution path is incomplete. BluV1
-baseline artifacts can be revalidated under execution limits, translated into
-a profile-tagged bootstrap chunk, and consumed by the VM without discarding
-the authorized Blu/Luau profile.
+canonical BluV1 artifacts without native linkage or fallback; the same
+explicit-profile API is available from the public facade as
+`blu_lang::frontend`. Public `blu-lang` source execution still explicitly
+enables the pinned Luau compatibility compiler while the owned execution path
+is incomplete. BluV1 represents floor division for Luau and Lua 5.3–5.5
+directly; Blu lowering rejects it until Blu numeric/metamethod semantics are
+assigned, and the bootstrap translator rejects it until the profile-aware
+BluV1 executor exists. Translatable baseline artifacts are revalidated
+under execution limits and retain their authorized Blu/Luau frame profile.
 
 ## Repository layout
 

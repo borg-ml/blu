@@ -56,6 +56,7 @@ version = "0.1.0"
 dependencies = [
  "blu-bytecode",
  "blu-compiler",
+ "blu-core",
  "blu-package",
  "blu-runtime",
 ]

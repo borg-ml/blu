@@ -60,18 +60,20 @@ APIs and surface `DiagnosticError` through `LexError` or `ParseError`. These
 are frontend object limits with structured allocation failures, not a claim
 that every process or host allocation is VM-accounted.
 
-The separate `blu_compiler::owned::OwnedCompiler` compiles exactly this AST
-slice: declaration-ordered locals (with explicit shadowing), decimal integer
-literals, numeric `+`, and a final expression-list `return`. Lua 5.3--5.5
-artifacts store literals through `i64::MAX` as exact BluV1 Integer constants
-and use normal IEEE-754 parsing above that; Lua 5.1, Lua 5.2, and Luau always
-use the latter Number policy. Blu currently uses the Number policy for its
-bootstrap path, which is not a final Blu numeric-semantics commitment. The
-compiler emits canonical, source-digested artifacts tagged for all seven
-profiles, but rejects `//` because BluV1 has no floor-division opcode. It does
+The separate `blu_compiler::owned::OwnedCompiler`, also re-exported through
+`blu_lang::frontend`, compiles exactly this AST slice: declaration-ordered
+locals (with explicit shadowing), decimal integer
+literals, numeric `+`, profile-gated `//`, and a final expression-list
+`return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
+BluV1 Integer constants and use normal IEEE-754 parsing above that; Lua 5.1,
+Lua 5.2, and Luau always use the latter Number policy. Blu currently uses the
+Number policy for its bootstrap path, which is not a final Blu
+numeric-semantics commitment. BluV1 assigns floor division its own feature bit
+and opcode, legal only for `luau` and Lua 5.3--5.5; the owned compiler lowers
+it for those profiles. Lua 5.1/5.2 reject it during lexing, while Blu rejects
+it during lowering until its numeric and metamethod semantics are assigned. It does
 not replace the legacy `Compiler`, call the native Luau compiler, or fall back
-to it after rejection. Only matching `blu` and `luau` artifacts can currently
-use the profile-safe bootstrap translator and VM execution entry point.
+to it after rejection.
 Resolution and lowering rejections use bounded, fallibly constructed
 `blu-core::Diagnostic` values with stable codes, phases, profiles, and byte
 spans; diagnostic-construction failures remain separate structured errors.
@@ -83,11 +85,18 @@ their source paths migrate.
 The BluV1 baseline artifact can be translated only for an explicitly matching
 `blu` or `luau` profile. Translation revalidates the artifact under caller
 supplied execution limits, rejects nested/upvalue structure and Luau field
-widths it cannot preserve, and returns a profile-tagged chunk.
-`Vm::execute_translated` consumes that chunk and checks the configured dialect;
-the retained tag is also checked if low-level code extracts the
-`ValidatedChunk`. This is a bootstrap path for the three baseline instructions,
-not the owned resolver, lowerer, or full Blu backend.
+widths it cannot preserve, and returns a profile-tagged chunk. It explicitly
+rejects BluV1 floor division rather than substituting a Luau opcode because
+the direct profile-aware BluV1 runtime semantics are not implemented.
+`Vm::execute_translated` consumes that chunk and derives the root frame's
+semantic profile from the retained artifact tag; the configured VM dialect is
+only the fallback for ordinary unprofiled chunks. Frames retain that profile
+through suspension, and closures retain the creating profile for later calls.
+Only `blu` and `luau` translated artifacts are executable in this bootstrap
+path. Mixed-profile BluV1 calls remain explicitly unsupported because the
+translator rejects nested prototypes and upvalues rather than collapsing a
+child profile into its parent. This is a bootstrap path for the baseline
+instructions, not the owned resolver, lowerer, or full Blu backend.
 
 Ordinary bytecode calls currently run on an owned, bounded VM frame stack.
 Suspended callers and their registers are traced as GC roots. Generational

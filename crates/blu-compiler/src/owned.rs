@@ -449,21 +449,28 @@ impl<'a> Lowerer<'a> {
                 message: "register count passed limits but cannot fit BluV1",
             }
         })?;
+        let mut required_features = FeatureBits::BASELINE;
+        if self
+            .constants
+            .iter()
+            .any(|constant| matches!(constant, Constant::Integer(_)))
+        {
+            required_features = required_features | FeatureBits::INTEGER_CONSTANTS;
+        }
+        if self
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::FloorDivide { .. }))
+        {
+            required_features = required_features | FeatureBits::FLOOR_DIVISION;
+        }
         Ok(Prototype {
             profile: ast.profile(),
             source: self.source.identity().id(),
             register_count,
             parameter_count: 0,
             is_vararg: false,
-            required_features: if self
-                .constants
-                .iter()
-                .any(|constant| matches!(constant, Constant::Integer(_)))
-            {
-                FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS
-            } else {
-                FeatureBits::BASELINE
-            },
+            required_features,
             constants: self.constants,
             upvalues: Vec::new(),
             children: Vec::new(),
@@ -599,12 +606,26 @@ impl<'a> Lowerer<'a> {
                     Ok(destination)
                 }
                 BinaryOperator::FloorDivide => {
-                    Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                        "BLU-LOWER-0001",
-                        Phase::Lower,
-                        binary.operator_span(),
-                        "operator has no BluV1 baseline opcode",
-                    )?))
+                    if self.profile == SemanticProfile::Blu {
+                        return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                            "BLU-LOWER-0001",
+                            Phase::Lower,
+                            binary.operator_span(),
+                            "Blu floor-division semantics are not assigned",
+                        )?));
+                    }
+                    let left = self.lower_expression(binary.left())?;
+                    let right = self.lower_expression(binary.right())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::FloorDivide {
+                            destination,
+                            left,
+                            right,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
                 }
             },
         }

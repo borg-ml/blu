@@ -3,6 +3,7 @@ use crate::{
     checked_vector_bytes,
 };
 use blu_bytecode::Chunk;
+use blu_core::SemanticProfile;
 use core::fmt;
 use std::{
     collections::{HashMap, VecDeque},
@@ -209,6 +210,7 @@ impl Heap {
         &mut self,
         chunk: Arc<Chunk>,
         prototype: usize,
+        profile: SemanticProfile,
         upvalue_capacity: usize,
     ) -> Result<ClosureId, HeapError> {
         let dynamic_bytes = checked_vector_bytes::<UpvalueId>(upvalue_capacity)?;
@@ -218,6 +220,7 @@ impl Heap {
             Ok(Object::Closure(Closure {
                 chunk,
                 prototype,
+                profile,
                 upvalues,
                 upvalue_capacity,
             }))
@@ -399,11 +402,12 @@ impl Heap {
     pub(crate) fn closure_parts(
         &self,
         closure: ClosureId,
-    ) -> Result<(Arc<Chunk>, usize, Vec<UpvalueId>), HeapError> {
+    ) -> Result<(Arc<Chunk>, usize, SemanticProfile, Vec<UpvalueId>), HeapError> {
         let closure = self.closure(closure)?;
         Ok((
             closure.chunk.clone(),
             closure.prototype,
+            closure.profile,
             try_clone_slice(&closure.upvalues)?,
         ))
     }
@@ -757,6 +761,7 @@ impl Object {
 struct Closure {
     chunk: Arc<Chunk>,
     prototype: usize,
+    profile: SemanticProfile,
     upvalues: Vec<UpvalueId>,
     upvalue_capacity: usize,
 }
@@ -1125,7 +1130,9 @@ mod tests {
         heap.table_set(child, Value::Integer(1), Value::Table(retained))
             .unwrap();
         let upvalue = heap.allocate_upvalue(Value::Table(retained)).unwrap();
-        let closure = heap.allocate_closure(empty_chunk(), 0, 1).unwrap();
+        let closure = heap
+            .allocate_closure(empty_chunk(), 0, SemanticProfile::Blu, 1)
+            .unwrap();
         heap.closure_push_upvalue(closure, upvalue).unwrap();
 
         let root = Value::Closure(closure);
@@ -1222,7 +1229,7 @@ mod tests {
             Err(HeapError::Memory(MemoryError::SizeOverflow))
         );
         assert_eq!(
-            heap.allocate_closure(empty_chunk(), 0, usize::MAX),
+            heap.allocate_closure(empty_chunk(), 0, SemanticProfile::Blu, usize::MAX),
             Err(HeapError::Memory(MemoryError::SizeOverflow))
         );
         assert_eq!(heap.live_objects(), 0);
@@ -1411,7 +1418,8 @@ mod tests {
         let limit = checked_add(slot_bytes, upvalue_bytes).unwrap();
         let mut heap = Heap::try_new(limited_memory(limit)).unwrap();
 
-        heap.allocate_closure(empty_chunk(), 0, 2).unwrap();
+        heap.allocate_closure(empty_chunk(), 0, SemanticProfile::Blu, 2)
+            .unwrap();
         assert_eq!(heap.memory_usage().current_bytes, limit);
         heap.collect(std::iter::empty()).unwrap();
         assert_eq!(heap.memory_usage().current_bytes, slot_bytes);

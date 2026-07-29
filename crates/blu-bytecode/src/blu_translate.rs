@@ -21,6 +21,9 @@ use core::fmt;
 /// BluV1 integer constants are mapped to the bootstrap's Luau numeric
 /// constant only when the `i64` is exactly representable as an IEEE-754
 /// `f64`; values which would round are rejected explicitly.
+/// BluV1 floor division is also rejected explicitly: translating it to a Luau
+/// opcode would bypass the direct runtime's still-missing per-profile numeric
+/// and metamethod semantics.
 pub fn translate_baseline_to_luau(
     artifact: ValidatedArtifact,
     execution_profile: SemanticProfile,
@@ -84,6 +87,16 @@ pub fn translate_baseline_to_luau(
             return Err(TranslationError::UnsupportedStructure {
                 prototype: prototype_index,
                 what: "upvalues",
+            });
+        }
+        if prototype
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, BluInstruction::FloorDivide { .. }))
+        {
+            return Err(TranslationError::UnsupportedInstruction {
+                prototype: prototype_index,
+                instruction: "floor division",
             });
         }
 
@@ -214,6 +227,10 @@ fn translate_instruction(
             register(prototype, left)?,
             register(prototype, right)?,
         )),
+        BluInstruction::FloorDivide { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "floor division",
+        }),
         BluInstruction::Return { first, count } => {
             let result_field = count
                 .checked_add(1)
@@ -304,6 +321,10 @@ pub enum TranslationError {
         constant: usize,
         value: i64,
     },
+    UnsupportedInstruction {
+        prototype: usize,
+        instruction: &'static str,
+    },
     TooLarge {
         prototype: Option<usize>,
         what: &'static str,
@@ -351,6 +372,14 @@ impl fmt::Display for TranslationError {
                 formatter,
                 "prototype {prototype} integer constant {constant} value {value} \
                  is not exactly representable by the Luau bootstrap number type"
+            ),
+            Self::UnsupportedInstruction {
+                prototype,
+                instruction,
+            } => write!(
+                formatter,
+                "prototype {prototype} uses {instruction}, which the Luau bootstrap translator \
+                 cannot execute without profile-specific runtime semantics"
             ),
             Self::TooLarge {
                 prototype,

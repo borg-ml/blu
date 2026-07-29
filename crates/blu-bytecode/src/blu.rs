@@ -50,7 +50,10 @@ impl FeatureBits {
     /// A decoder predating integer tag 5 may instead safely reject that tag as
     /// an unknown constant.
     pub const INTEGER_CONSTANTS: Self = Self(1 << 1);
-    pub const SUPPORTED: Self = Self(Self::BASELINE.0 | Self::INTEGER_CONSTANTS.0);
+    /// Profile-gated numeric floor division.
+    pub const FLOOR_DIVISION: Self = Self(1 << 2);
+    pub const SUPPORTED: Self =
+        Self(Self::BASELINE.0 | Self::INTEGER_CONSTANTS.0 | Self::FLOOR_DIVISION.0);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -226,6 +229,11 @@ pub enum Instruction {
         left: u16,
         right: u16,
     },
+    FloorDivide {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
     Return {
         first: u16,
         count: u16,
@@ -234,25 +242,41 @@ pub enum Instruction {
 
 /// BluV1's versioned profile-by-instruction legality table.
 ///
-/// The current baseline operations have identical legality in all seven
-/// established profiles. Future `SemanticProfile` variants default to illegal
-/// until BluV1 (or a later format version) assigns them an explicit policy.
+/// Baseline operations are legal in all seven established profiles. Floor
+/// division follows the assigned semantic contract: it is legal for Luau and
+/// Lua 5.3--5.5, and illegal for Blu, Lua 5.1, and Lua 5.2. Blu accepts the
+/// token in the provisional parser but has no assigned numeric/metamethod
+/// semantics yet. Future `SemanticProfile` variants
+/// default to illegal until BluV1 (or a later format version) assigns them an
+/// explicit policy.
 #[must_use]
 pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruction) -> bool {
     match profile {
-        SemanticProfile::Blu
-        | SemanticProfile::Luau
-        | SemanticProfile::Lua51
-        | SemanticProfile::Lua52
+        SemanticProfile::Luau
         | SemanticProfile::Lua53
         | SemanticProfile::Lua54
         | SemanticProfile::Lua55 => match instruction {
             Instruction::LoadConstant { .. }
             | Instruction::Add { .. }
+            | Instruction::FloorDivide { .. }
             | Instruction::Return { .. } => true,
         },
+        SemanticProfile::Blu | SemanticProfile::Lua51 | SemanticProfile::Lua52 => matches!(
+            instruction,
+            Instruction::LoadConstant { .. } | Instruction::Add { .. } | Instruction::Return { .. }
+        ),
         _ => false,
     }
+}
+
+const fn floor_division_is_legal(profile: SemanticProfile) -> bool {
+    matches!(
+        profile,
+        SemanticProfile::Luau
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    )
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -358,6 +382,11 @@ pub enum ValidationError {
         prototype: usize,
         feature: &'static str,
     },
+    FeatureNotLegal {
+        prototype: usize,
+        feature: &'static str,
+        profile: SemanticProfile,
+    },
     InvalidReference {
         prototype: Option<usize>,
         what: &'static str,
@@ -412,6 +441,14 @@ impl fmt::Display for ValidationError {
                     "prototype {prototype} is missing required feature {feature}"
                 )
             }
+            Self::FeatureNotLegal {
+                prototype,
+                feature,
+                profile,
+            } => write!(
+                f,
+                "prototype {prototype} requires feature {feature}, which is not legal for {profile}"
+            ),
             Self::InvalidReference {
                 prototype,
                 what,
@@ -933,6 +970,17 @@ fn validate_prototype(
         });
     }
     if prototype
+        .required_features
+        .contains(FeatureBits::FLOOR_DIVISION)
+        && !floor_division_is_legal(prototype.profile)
+    {
+        return Err(ValidationError::FeatureNotLegal {
+            prototype: index,
+            feature: "floor division",
+            profile: prototype.profile,
+        });
+    }
+    if prototype
         .constants
         .iter()
         .any(|constant| matches!(constant, Constant::Integer(_)))
@@ -943,6 +991,19 @@ fn validate_prototype(
         return Err(ValidationError::MissingFeature {
             prototype: index,
             feature: "integer constants",
+        });
+    }
+    if prototype
+        .code
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::FloorDivide { .. }))
+        && !prototype
+            .required_features
+            .contains(FeatureBits::FLOOR_DIVISION)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "floor division",
         });
     }
     let Some(&source_len) = sources.get(&prototype.source) else {
@@ -1012,6 +1073,11 @@ fn validate_prototype(
                 initialized[destination as usize] = true;
             }
             Instruction::Add {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::FloorDivide {
                 destination,
                 left,
                 right,
@@ -1282,7 +1348,9 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
             add_size(
                 &mut size,
                 match instruction {
-                    Instruction::LoadConstant { .. } | Instruction::Add { .. } => 7,
+                    Instruction::LoadConstant { .. }
+                    | Instruction::Add { .. }
+                    | Instruction::FloorDivide { .. } => 7,
                     Instruction::Return { .. } => 5,
                 },
             )?;
@@ -1387,6 +1455,16 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 right,
             } => {
                 out.push(1);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::FloorDivide {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(3);
                 put_u16(out, *destination);
                 put_u16(out, *left);
                 put_u16(out, *right);
@@ -1965,6 +2043,11 @@ fn read_prototype(
             2 => Instruction::Return {
                 first: reader.u16()?,
                 count: reader.u16()?,
+            },
+            3 => Instruction::FloorDivide {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

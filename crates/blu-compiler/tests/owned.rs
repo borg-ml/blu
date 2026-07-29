@@ -195,23 +195,83 @@ fn local_resolution_is_sequential_and_shadow_aware() {
 }
 
 #[test]
-fn floor_division_is_rejected_during_lowering_without_an_opcode_substitute() {
+fn floor_division_lowers_only_for_syntax_profiles_and_stays_non_executable() {
     for profile in [
-        SemanticProfile::Blu,
         SemanticProfile::Luau,
         SemanticProfile::Lua53,
         SemanticProfile::Lua54,
         SemanticProfile::Lua55,
     ] {
         let source = make_source(b"return 40 // 2".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .required_features
+                .contains(FeatureBits::FLOOR_DIVISION)
+        );
+        assert_eq!(
+            compiled.artifact().main().code,
+            [
+                Instruction::LoadConstant {
+                    destination: 0,
+                    constant: 0,
+                },
+                Instruction::LoadConstant {
+                    destination: 1,
+                    constant: 1,
+                },
+                Instruction::FloorDivide {
+                    destination: 2,
+                    left: 0,
+                    right: 1,
+                },
+                Instruction::Return { first: 2, count: 1 },
+            ]
+        );
+        assert_eq!(
+            compiled.artifact().main().source_map[2],
+            source.span(7, source.len()).unwrap()
+        );
+
+        if profile == SemanticProfile::Luau {
+            assert_eq!(
+                translate_baseline_to_luau(
+                    compiled.into_validated_artifact(),
+                    profile,
+                    BluLimits::default(),
+                ),
+                Err(TranslationError::UnsupportedInstruction {
+                    prototype: 0,
+                    instruction: "floor division",
+                })
+            );
+        }
+    }
+
+    let source = make_source(b"return 40 // 2".to_vec());
+    let error = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap_err();
+    let diagnostic = error.diagnostic().expect("lowering diagnostic");
+    assert_eq!(diagnostic.code().as_str(), "BLU-LOWER-0001");
+    assert_eq!(diagnostic.phase(), Phase::Lower);
+    assert_eq!(diagnostic.profile(), SemanticProfile::Blu);
+    assert_eq!(source.slice(diagnostic.primary().span()).unwrap(), b"//");
+
+    for profile in [SemanticProfile::Lua51, SemanticProfile::Lua52] {
+        let source = make_source(b"return 40 // 2".to_vec());
         let error = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
             .unwrap_err();
-        let diagnostic = error.diagnostic().expect("lowering diagnostic");
-        assert_eq!(diagnostic.code().as_str(), "BLU-LOWER-0001");
-        assert_eq!(diagnostic.phase(), Phase::Lower);
+        let rejected = error.syntax().expect("lexical profile rejection");
+        let diagnostic = &rejected.diagnostics()[0];
+        assert_eq!(diagnostic.code().as_str(), "BLU-LEX-0002");
+        assert_eq!(diagnostic.phase(), Phase::Lex);
         assert_eq!(diagnostic.profile(), profile);
-        assert_eq!(diagnostic.severity(), Severity::Error);
         assert_eq!(source.slice(diagnostic.primary().span()).unwrap(), b"//");
     }
 }

@@ -37,6 +37,12 @@ enum Resumable {
     Continuation(Continuation),
 }
 
+#[derive(Clone, Copy, Debug)]
+struct FrameTarget {
+    prototype_index: usize,
+    profile: SemanticProfile,
+}
+
 #[derive(Clone, Debug, Default)]
 struct GcRoots {
     values: Vec<Value>,
@@ -102,6 +108,7 @@ impl HostRoot {
 #[derive(Clone)]
 pub struct Vm {
     dialect: Dialect,
+    active_profile: Option<SemanticProfile>,
     instruction_limit: u64,
     call_limit: usize,
     heap_object_limit: usize,
@@ -155,6 +162,7 @@ impl Vm {
         threads.insert(main_thread, ThreadState::Running);
         let mut vm = Self {
             dialect,
+            active_profile: None,
             instruction_limit: 10_000_000,
             call_limit: 1_000,
             heap_object_limit: 1_000_000,
@@ -257,6 +265,19 @@ impl Vm {
     #[must_use]
     pub const fn dialect(&self) -> Dialect {
         self.dialect
+    }
+
+    fn configured_profile(&self) -> Result<SemanticProfile, RuntimeError> {
+        match self.dialect {
+            Dialect::Blu => Ok(SemanticProfile::Blu),
+            Dialect::Luau => Ok(SemanticProfile::Luau),
+            dialect => Err(RuntimeError::DialectNotImplemented(dialect)),
+        }
+    }
+
+    fn active_profile(&self) -> Result<SemanticProfile, RuntimeError> {
+        self.active_profile
+            .map_or_else(|| self.configured_profile(), Ok)
     }
 
     pub fn register_function(
@@ -498,6 +519,7 @@ impl Vm {
         &mut self,
         chunk: Arc<Chunk>,
         prototype: usize,
+        profile: SemanticProfile,
         upvalue_capacity: usize,
         roots: &GcRoots,
     ) -> Result<ClosureId, RuntimeError> {
@@ -505,7 +527,7 @@ impl Vm {
         self.collect_if_needed(requested, roots, std::iter::empty(), std::iter::empty())?;
         Ok(self
             .heap
-            .allocate_closure(chunk, prototype, upvalue_capacity)?)
+            .allocate_closure(chunk, prototype, profile, upvalue_capacity)?)
     }
 
     fn allocate_thread(
@@ -595,23 +617,12 @@ impl Vm {
     /// Executes a BluV1 baseline translation without discarding its profile.
     ///
     /// The translated chunk is consumed, so this path does not deep-clone the
-    /// artifact. The VM dialect must match the profile authorized during
-    /// translation.
+    /// artifact. Its authorized profile becomes the executing frame profile;
+    /// the VM dialect is only the fallback for ordinary unprofiled chunks.
     pub fn execute_translated(
         &mut self,
         translated: TranslatedChunk,
     ) -> Result<Vec<Value>, RuntimeError> {
-        let expected = match self.dialect {
-            Dialect::Blu => SemanticProfile::Blu,
-            Dialect::Luau => SemanticProfile::Luau,
-            dialect => return Err(RuntimeError::DialectNotImplemented(dialect)),
-        };
-        if translated.profile() != expected {
-            return Err(RuntimeError::SemanticProfileMismatch {
-                configured: self.dialect,
-                artifact: translated.profile(),
-            });
-        }
         self.execute_validated_owned(translated.into_validated_chunk())
     }
 
@@ -619,24 +630,37 @@ impl Vm {
         &mut self,
         chunk: ValidatedChunk,
     ) -> Result<Vec<Value>, RuntimeError> {
-        let expected = match self.dialect {
-            Dialect::Blu => SemanticProfile::Blu,
-            Dialect::Luau => SemanticProfile::Luau,
-            dialect => return Err(RuntimeError::DialectNotImplemented(dialect)),
+        let profile = match chunk.semantic_profile() {
+            Some(profile @ (SemanticProfile::Blu | SemanticProfile::Luau)) => profile,
+            Some(profile) => return Err(RuntimeError::SemanticProfileNotImplemented(profile)),
+            None => self.configured_profile()?,
         };
-        if let Some(artifact) = chunk.semantic_profile()
-            && artifact != expected
-        {
-            return Err(RuntimeError::SemanticProfileMismatch {
-                configured: self.dialect,
-                artifact,
-            });
-        }
         let chunk = Arc::new(chunk.into_chunk());
         let mut remaining = self.instruction_limit;
-        let values = self.execute_frame(&chunk, chunk.main, None, &[], &mut remaining, 0)?;
-        self.retain_host_occurrences(&values)?;
-        Ok(values)
+        let target = FrameTarget {
+            prototype_index: chunk.main,
+            profile,
+        };
+        match self.execute_frame(&chunk, target, None, &[], &mut remaining, 0) {
+            Ok(values) => {
+                self.retain_host_occurrences(&values)?;
+                Ok(values)
+            }
+            Err(error) => {
+                self.retain_error_occurrences(&error)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn retain_error_occurrences(&mut self, error: &RuntimeError) -> Result<(), RuntimeError> {
+        match error {
+            RuntimeError::Raised(value) => {
+                self.retain_host_occurrences(std::slice::from_ref(value))
+            }
+            RuntimeError::CoroutineYield(values) => self.retain_host_occurrences(values),
+            _ => Ok(()),
+        }
     }
 
     fn retain_host_occurrences(&mut self, values: &[Value]) -> Result<(), RuntimeError> {
@@ -673,15 +697,14 @@ impl Vm {
     fn execute_frame(
         &mut self,
         chunk: &Arc<Chunk>,
-        prototype_index: usize,
+        target: FrameTarget,
         closure: Option<ClosureId>,
         arguments: &[Value],
         remaining: &mut u64,
         depth: usize,
     ) -> Result<Vec<Value>, RuntimeError> {
         let active_root_count = self.active_roots.len();
-        let result =
-            self.execute_frame_inner(chunk, prototype_index, closure, arguments, remaining, depth);
+        let result = self.execute_frame_inner(chunk, target, closure, arguments, remaining, depth);
         self.active_roots.truncate(active_root_count);
         result
     }
@@ -695,7 +718,7 @@ impl Vm {
     fn execute_frame_inner(
         &mut self,
         chunk: &Arc<Chunk>,
-        prototype_index: usize,
+        target: FrameTarget,
         closure: Option<ClosureId>,
         arguments: &[Value],
         remaining: &mut u64,
@@ -708,12 +731,13 @@ impl Vm {
         }
         let prototype = chunk
             .prototypes
-            .get(prototype_index)
-            .ok_or(RuntimeError::InvalidPrototype(prototype_index))?;
+            .get(target.prototype_index)
+            .ok_or(RuntimeError::InvalidPrototype(target.prototype_index))?;
         let constants = materialize_constants(chunk, prototype)?;
         let frame = Frame::new(
             chunk.clone(),
-            prototype_index,
+            target.prototype_index,
+            target.profile,
             constants,
             closure,
             arguments,
@@ -723,12 +747,26 @@ impl Vm {
 
     fn run_frames(
         &mut self,
+        frame: Frame,
+        callers: Vec<Caller>,
+        remaining: &mut u64,
+        depth: usize,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let previous_profile = self.active_profile;
+        let result = self.run_frames_inner(frame, callers, remaining, depth);
+        self.active_profile = previous_profile;
+        result
+    }
+
+    fn run_frames_inner(
+        &mut self,
         mut frame: Frame,
         mut callers: Vec<Caller>,
         remaining: &mut u64,
         depth: usize,
     ) -> Result<Vec<Value>, RuntimeError> {
         loop {
+            self.active_profile = Some(frame.profile);
             let depth = depth + callers.len();
             if *remaining == 0 {
                 return Err(RuntimeError::InstructionLimit {
@@ -884,9 +922,15 @@ impl Vm {
                         .upvalue_count;
                     let frame_roots = frame.gc_roots(&self.heap)?;
                     self.ensure_heap_objects(usize::from(upvalue_count) + 1, &frame_roots)?;
+                    // A validated Luau chunk has no per-prototype profile
+                    // field, so nested legacy prototypes necessarily inherit
+                    // their creating frame's profile. BluV1 translation
+                    // rejects nested prototypes until that metadata can be
+                    // preserved instead of silently collapsing a mixed child.
                     let closure = self.allocate_closure(
                         chunk.clone(),
                         child,
+                        frame.profile,
                         usize::from(upvalue_count),
                         &frame_roots,
                     )?;
@@ -1370,7 +1414,8 @@ impl Vm {
                     )
                     .expect("u8 fits usize");
                     if let Value::Closure(closure) = function {
-                        let (child_chunk, child, _) = self.heap.closure_parts(closure)?;
+                        let (child_chunk, child, child_profile, _) =
+                            self.heap.closure_parts(closure)?;
                         if depth + 1 > self.call_limit {
                             return Err(RuntimeError::CallLimit {
                                 limit: self.call_limit,
@@ -1381,8 +1426,14 @@ impl Vm {
                             .get(child)
                             .ok_or(RuntimeError::InvalidPrototype(child))?;
                         let constants = materialize_constants(&child_chunk, child_prototype)?;
-                        let child_frame =
-                            Frame::new(child_chunk, child, constants, Some(closure), &arguments)?;
+                        let child_frame = Frame::new(
+                            child_chunk,
+                            child,
+                            child_profile,
+                            constants,
+                            Some(closure),
+                            &arguments,
+                        )?;
                         let caller = Caller {
                             frame,
                             register: base,
@@ -1528,7 +1579,8 @@ impl Vm {
                         _ => ReturnMode::Direct,
                     };
                     let results = if let Value::Closure(closure) = function {
-                        let (child_chunk, child, _) = self.heap.closure_parts(closure)?;
+                        let (child_chunk, child, child_profile, _) =
+                            self.heap.closure_parts(closure)?;
                         if depth + 1 > self.call_limit {
                             return Err(RuntimeError::CallLimit {
                                 limit: self.call_limit,
@@ -1539,8 +1591,14 @@ impl Vm {
                             .get(child)
                             .ok_or(RuntimeError::InvalidPrototype(child))?;
                         let constants = materialize_constants(&child_chunk, child_prototype)?;
-                        let child_frame =
-                            Frame::new(child_chunk, child, constants, Some(closure), &arguments)?;
+                        let child_frame = Frame::new(
+                            child_chunk,
+                            child,
+                            child_profile,
+                            constants,
+                            Some(closure),
+                            &arguments,
+                        )?;
                         let roots = frame.gc_roots(&self.heap)?;
                         try_reserve_exact(&mut callers, 1, "VM caller stack")?;
                         self.push_active_roots(roots)?;
@@ -1626,11 +1684,14 @@ impl Vm {
     ) -> Result<Vec<Value>, RuntimeError> {
         match function {
             Value::Closure(closure) => {
-                let (closure_chunk, child, _) = self.heap.closure_parts(closure)?;
+                let (closure_chunk, child, profile, _) = self.heap.closure_parts(closure)?;
                 self.push_active_roots(roots)?;
                 let result = self.execute_frame(
                     &closure_chunk,
-                    child,
+                    FrameTarget {
+                        prototype_index: child,
+                        profile,
+                    },
                     Some(closure),
                     arguments,
                     remaining,
@@ -2607,8 +2668,8 @@ impl Vm {
             })?;
             let value = string_bytes(value, "string.rep")?;
             let count = integer_argument(arguments, 1, "string.rep")?.max(0) as usize;
-            let separator = match (vm.dialect, arguments.get(2)) {
-                (Dialect::Luau, _) | (_, None) => &[],
+            let separator = match (vm.active_profile()?, arguments.get(2)) {
+                (SemanticProfile::Luau, _) | (_, None) => &[],
                 (_, Some(separator)) => string_bytes(separator, "string.rep")?,
             };
             let value_bytes = value
@@ -3744,6 +3805,7 @@ impl PendingOperation {
 struct Frame {
     chunk: Arc<Chunk>,
     prototype_index: usize,
+    profile: SemanticProfile,
     constants: Vec<Value>,
     registers: Vec<Value>,
     varargs: Vec<Value>,
@@ -3758,6 +3820,7 @@ impl Frame {
     fn new(
         chunk: Arc<Chunk>,
         prototype_index: usize,
+        profile: SemanticProfile,
         constants: Vec<Value>,
         closure: Option<ClosureId>,
         arguments: &[Value],
@@ -3779,6 +3842,7 @@ impl Frame {
         Ok(Self {
             chunk,
             prototype_index,
+            profile,
             constants,
             registers,
             varargs,
@@ -3905,7 +3969,7 @@ impl Frame {
 
     fn upvalue(&self, heap: &Heap, index: u8) -> Result<UpvalueId, RuntimeError> {
         let closure = self.closure.ok_or(RuntimeError::MissingClosure)?;
-        let (_, _, upvalues) = heap.closure_parts(closure)?;
+        let (_, _, _, upvalues) = heap.closure_parts(closure)?;
         upvalues
             .get(index as usize)
             .copied()
@@ -4173,6 +4237,7 @@ pub enum RuntimeError {
         what: &'static str,
     },
     DialectNotImplemented(Dialect),
+    SemanticProfileNotImplemented(SemanticProfile),
     SemanticProfileMismatch {
         configured: Dialect,
         artifact: SemanticProfile,
@@ -4310,6 +4375,9 @@ impl fmt::Display for RuntimeError {
             Self::Allocation { what } => write!(f, "{what} allocation failed"),
             Self::DialectNotImplemented(dialect) => {
                 write!(f, "{dialect:?} execution is not implemented")
+            }
+            Self::SemanticProfileNotImplemented(profile) => {
+                write!(f, "{profile} execution is not implemented")
             }
             Self::SemanticProfileMismatch {
                 configured,
@@ -4610,7 +4678,7 @@ mod tests {
     }
 
     #[test]
-    fn translated_blu_v1_executes_only_under_its_authorized_profile() {
+    fn translated_blu_v1_execution_uses_its_authorized_profile() {
         assert_eq!(
             Vm::new(Dialect::Blu).execute_translated(translated_baseline(SemanticProfile::Blu)),
             Ok(vec![Value::Number(42.0)])
@@ -4621,19 +4689,122 @@ mod tests {
         );
         assert_eq!(
             Vm::new(Dialect::Luau).execute_translated(translated_baseline(SemanticProfile::Blu)),
-            Err(RuntimeError::SemanticProfileMismatch {
-                configured: Dialect::Luau,
-                artifact: SemanticProfile::Blu,
-            })
+            Ok(vec![Value::Number(42.0)])
         );
         let extracted = translated_baseline(SemanticProfile::Blu).into_validated_chunk();
         assert_eq!(
             Vm::new(Dialect::Luau).execute_validated_owned(extracted),
-            Err(RuntimeError::SemanticProfileMismatch {
-                configured: Dialect::Luau,
-                artifact: SemanticProfile::Blu,
-            })
+            Ok(vec![Value::Number(42.0)])
         );
+    }
+
+    #[test]
+    fn frame_runner_restores_active_profile_after_success_and_error() {
+        let success = Arc::new(test_chunk(
+            &[],
+            vec![],
+            vec![ad(Opcode::LoadN, 0, 7), abc(Opcode::Return, 0, 2, 0)],
+            1,
+        ));
+        let success_frame =
+            Frame::new(success, 0, SemanticProfile::Blu, Vec::new(), None, &[]).unwrap();
+        let mut vm = Vm::new(Dialect::Luau);
+        vm.active_profile = Some(SemanticProfile::Luau);
+        let mut remaining = 8;
+        assert_eq!(
+            vm.run_frames(success_frame, Vec::new(), &mut remaining, 0),
+            Ok(vec![Value::Number(7.0)])
+        );
+        assert_eq!(vm.active_profile, Some(SemanticProfile::Luau));
+
+        let failure = Arc::new(test_chunk(
+            &[b"missing"],
+            vec![Constant::String(0)],
+            vec![
+                abc(Opcode::GetGlobal, 0, 0, 0),
+                0,
+                abc(Opcode::Call, 0, 1, 1),
+                abc(Opcode::Return, 0, 1, 0),
+            ],
+            1,
+        ));
+        let failure_frame = Frame::new(
+            failure,
+            0,
+            SemanticProfile::Blu,
+            vec![Value::String(Arc::from(&b"missing"[..]))],
+            None,
+            &[],
+        )
+        .unwrap();
+        vm.active_profile = None;
+        let mut remaining = 8;
+        assert!(matches!(
+            vm.run_frames(failure_frame, Vec::new(), &mut remaining, 0),
+            Err(RuntimeError::Type {
+                operation: "call",
+                ..
+            })
+        ));
+        assert_eq!(vm.active_profile, None);
+    }
+
+    #[test]
+    fn artifact_profile_controls_observable_root_frame_semantics() {
+        // BluV1's current bootstrap instruction set cannot express a global
+        // lookup or call, and its translator rejects nested prototypes. Use a
+        // real translated artifact as the authorized source of the profile,
+        // then exercise that profile on the root-frame substrate which the
+        // translated code enters. This avoids exposing a way to forge a
+        // profiled ValidatedChunk merely for a test or pretending mixed-profile
+        // callees are representable.
+        let translated = translated_baseline(SemanticProfile::Blu);
+        let artifact_profile = translated.profile();
+        let chunk = Arc::new(test_chunk(
+            &[b"string", b"rep", b"ab", b"-"],
+            vec![
+                Constant::String(0),
+                Constant::String(1),
+                Constant::String(2),
+                Constant::String(3),
+            ],
+            vec![
+                abc(Opcode::GetGlobal, 0, 0, 0),
+                0,
+                abc(Opcode::GetTableKs, 0, 0, 0),
+                1,
+                ad(Opcode::LoadK, 1, 2),
+                ad(Opcode::LoadN, 2, 3),
+                ad(Opcode::LoadK, 3, 3),
+                abc(Opcode::Call, 0, 4, 2),
+                abc(Opcode::Return, 0, 2, 0),
+            ],
+            4,
+        ));
+        let mut vm = Vm::new(Dialect::Luau);
+        assert_eq!(vm.configured_profile(), Ok(SemanticProfile::Luau));
+        assert_ne!(artifact_profile, vm.configured_profile().unwrap());
+        let frame = Frame::new(
+            chunk,
+            0,
+            artifact_profile,
+            vec![
+                Value::String(Arc::from(&b"string"[..])),
+                Value::String(Arc::from(&b"rep"[..])),
+                Value::String(Arc::from(&b"ab"[..])),
+                Value::String(Arc::from(&b"-"[..])),
+            ],
+            None,
+            &[],
+        )
+        .unwrap();
+        let mut remaining = 32;
+
+        assert_eq!(
+            vm.run_frames(frame, Vec::new(), &mut remaining, 0),
+            Ok(vec![Value::String(Arc::from(&b"ab-ab-ab"[..]))])
+        );
+        assert_eq!(vm.active_profile, None);
     }
 
     #[test]
@@ -4805,7 +4976,7 @@ mod tests {
     #[test]
     fn dynamic_stack_limit_is_atomic_and_legal_growth_succeeds() {
         let chunk = Arc::new(test_chunk(&[], Vec::new(), vec![Opcode::Return as u32], 1));
-        let mut frame = Frame::new(chunk, 0, Vec::new(), None, &[]).unwrap();
+        let mut frame = Frame::new(chunk, 0, SemanticProfile::Blu, Vec::new(), None, &[]).unwrap();
         let before = frame.registers.clone();
 
         assert_eq!(
@@ -4827,7 +4998,7 @@ mod tests {
         assert_eq!(frame.top, usize::from(u8::MAX) + 2);
 
         let chunk = Arc::new(test_chunk(&[], Vec::new(), vec![Opcode::Return as u32], 1));
-        let mut frame = Frame::new(chunk, 0, Vec::new(), None, &[]).unwrap();
+        let mut frame = Frame::new(chunk, 0, SemanticProfile::Blu, Vec::new(), None, &[]).unwrap();
         let before = frame.registers.clone();
         assert_eq!(
             frame.ensure_dynamic(MAX_DYNAMIC_REGISTERS + 1),
@@ -4882,6 +5053,7 @@ mod tests {
         let frame = Frame::new(
             Arc::new(chunk),
             0,
+            SemanticProfile::Blu,
             constants.clone(),
             None,
             &[Value::Integer(1), Value::Integer(2), Value::Integer(3)],
@@ -4901,9 +5073,25 @@ mod tests {
         let caller_value = heap.allocate_table(0, 0).unwrap();
         let garbage = heap.allocate_table(0, 0).unwrap();
         let chunk = Arc::new(test_chunk(&[], Vec::new(), vec![Opcode::Return as u32], 1));
-        let frame = Frame::new(chunk.clone(), 0, vec![Value::Table(current)], None, &[]).unwrap();
+        let frame = Frame::new(
+            chunk.clone(),
+            0,
+            SemanticProfile::Blu,
+            vec![Value::Table(current)],
+            None,
+            &[],
+        )
+        .unwrap();
         let caller = Caller {
-            frame: Frame::new(chunk, 0, vec![Value::Table(caller_value)], None, &[]).unwrap(),
+            frame: Frame::new(
+                chunk,
+                0,
+                SemanticProfile::Blu,
+                vec![Value::Table(caller_value)],
+                None,
+                &[],
+            )
+            .unwrap(),
             register: 0,
             encoded_count: 1,
             return_mode: ReturnMode::Direct,
