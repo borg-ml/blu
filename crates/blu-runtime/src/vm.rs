@@ -3648,26 +3648,72 @@ impl Vm {
             };
             let start = arguments
                 .get(2)
-                .and_then(Value::as_number)
-                .map_or(1, |value| value as i64);
+                .map(|_| integer_argument(arguments, 2, "table.concat"))
+                .transpose()?
+                .unwrap_or(1);
             let end = arguments
                 .get(3)
-                .and_then(Value::as_number)
-                .map_or(vm.heap.table_length(table)? as i64, |value| value as i64);
-            let mut result = Vec::new();
-            if start <= end {
-                for index in start..=end {
-                    if index != start {
-                        result.extend_from_slice(&separator);
+                .map(|_| integer_argument(arguments, 3, "table.concat"))
+                .transpose()?
+                .unwrap_or(vm.heap.table_length(table)? as i64);
+            let count = if start <= end {
+                usize::try_from(i128::from(end) - i128::from(start) + 1).map_err(|_| {
+                    RuntimeError::StackLimit {
+                        required: usize::MAX,
+                        limit: MAX_DYNAMIC_REGISTERS,
                     }
-                    let value = vm.heap.table_get(table, &Value::Integer(index))?;
-                    let value = concat_bytes(&value).ok_or(RuntimeError::Type {
+                })?
+            } else {
+                0
+            };
+            if count > MAX_DYNAMIC_REGISTERS {
+                return Err(RuntimeError::StackLimit {
+                    required: count,
+                    limit: MAX_DYNAMIC_REGISTERS,
+                });
+            }
+
+            let mut required = separator.len().checked_mul(count.saturating_sub(1)).ok_or(
+                RuntimeError::StringLimit {
+                    required: usize::MAX,
+                    limit: MAX_STRING_BYTES,
+                },
+            )?;
+            for offset in 0..count {
+                let index = start + offset as i64;
+                let value = vm.heap.table_get(table, &Value::Integer(index))?;
+                if !matches!(
+                    value,
+                    Value::String(_) | Value::Integer(_) | Value::Number(_)
+                ) {
+                    return Err(RuntimeError::Type {
                         operation: "table.concat",
                         expected: "string or number",
                         actual: value.type_name(),
-                    })?;
-                    result.extend_from_slice(&value);
+                    });
                 }
+                required = required.checked_add(rendered_value_len(&value)).ok_or(
+                    RuntimeError::StringLimit {
+                        required: usize::MAX,
+                        limit: MAX_STRING_BYTES,
+                    },
+                )?;
+                if required > MAX_STRING_BYTES {
+                    return Err(RuntimeError::StringLimit {
+                        required,
+                        limit: MAX_STRING_BYTES,
+                    });
+                }
+            }
+
+            let mut result = try_vec_with_capacity(required, "table.concat result")?;
+            for offset in 0..count {
+                if offset != 0 {
+                    result.extend_from_slice(&separator);
+                }
+                let index = start + offset as i64;
+                let value = vm.heap.table_get(table, &Value::Integer(index))?;
+                append_value(&mut result, &value);
             }
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -5887,6 +5933,72 @@ mod tests {
             Ok(vec![Value::String(Arc::from(
                 i64::MIN.to_string().into_bytes()
             ))])
+        );
+    }
+
+    #[test]
+    fn table_concat_preflights_work_and_allocates_one_bounded_result() {
+        let mut vm = Vm::default();
+        let table = vm.heap.allocate_table(3, 0).unwrap();
+        for (index, value) in [
+            Value::String(Arc::from(&b"a\0"[..])),
+            Value::Integer(i64::MIN),
+            Value::Number(2.5),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            vm.heap
+                .table_set(table, Value::Integer((index + 1) as i64), value)
+                .unwrap();
+        }
+        let concat = native(&vm, b"table", b"concat");
+        assert_eq!(
+            concat(
+                &mut vm,
+                &[Value::Table(table), Value::String(Arc::from(&b"\xff"[..])),],
+            ),
+            Ok(vec![Value::String(Arc::from(
+                [
+                    b"a\0".as_slice(),
+                    b"\xff",
+                    i64::MIN.to_string().as_bytes(),
+                    b"\xff",
+                    b"2.5",
+                ]
+                .concat(),
+            ))])
+        );
+
+        assert_eq!(
+            concat(
+                &mut vm,
+                &[
+                    Value::Table(table),
+                    Value::String(Arc::from(&b""[..])),
+                    Value::Integer(0),
+                    Value::Integer(MAX_DYNAMIC_REGISTERS as i64),
+                ],
+            ),
+            Err(RuntimeError::StackLimit {
+                required: MAX_DYNAMIC_REGISTERS + 1,
+                limit: MAX_DYNAMIC_REGISTERS,
+            })
+        );
+        assert_eq!(
+            concat(
+                &mut vm,
+                &[
+                    Value::Table(table),
+                    Value::String(Arc::from(&b""[..])),
+                    Value::String(Arc::from(&b"1"[..])),
+                ],
+            ),
+            Err(RuntimeError::Type {
+                operation: "table.concat",
+                expected: "number",
+                actual: "string",
+            })
         );
     }
 
