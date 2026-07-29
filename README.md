@@ -43,12 +43,12 @@ The first Blu-owned frontend substrate is also present: `blu-syntax` performs
 bounded byte-oriented lexing and parses the initial local/assignment-list/return arithmetic
 slice, including nil, boolean, shared decimal integers plus digit-bearing
 fraction/exponent forms (`1.5`, `.25`, `2e3`, `4.5e-2`),
-and quoted byte-string literals with the common
-Lua/Luau escaped delimiters, backslash, and single-letter control escapes
+and quoted or long-bracket byte-string literals. Quoted strings implement the
+shared escapes plus explicit profile rules for byte, Unicode, whitespace, and
+line-continuation escapes; long strings use profile-specific newline handling
 plus semicolon separators, grouping parentheses, and profile-neutral
 `+`/`-`/`*`/`/`/`%`/`^`, into a spanned arena AST with explicit profile
-reconciliation. Numeric, hex, Unicode, `\z`, and line-continuation escapes fail
-explicitly until their profile-specific rules are implemented. Unary `not`
+reconciliation. Unary `not`
 follows common Lua truthiness and produces a boolean under every profile;
 unary `-` preserves integers in Lua 5.3–5.5 and negates numbers in the other
 profiles. Unary `#` measures byte strings, returning an integer for Lua

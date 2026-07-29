@@ -375,6 +375,27 @@ pub fn lex(
                 offset += 1;
                 TokenKind::Hash
             }
+            b'[' if long_comment_opener(bytes, offset).is_some() => {
+                let (delimiter_len, equals) =
+                    long_comment_opener(bytes, offset).expect("guard checked long delimiter");
+                let opener_end = offset + delimiter_len;
+                if let Some(end) = long_comment_end(bytes, opener_end, equals) {
+                    offset = end;
+                } else {
+                    offset = bytes.len();
+                    let opener_span = source.span(start, opener_end)?;
+                    let diagnostic = diagnostic(
+                        "BLU-LEX-0019",
+                        explicit_profile,
+                        opener_span,
+                        "unterminated long string",
+                        limits.diagnostic_limits,
+                    )?
+                    .try_with_expected("long-string closing delimiter")?;
+                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                }
+                TokenKind::StringLiteral
+            }
             quote @ (b'\'' | b'"') => {
                 offset += 1;
                 let mut unsupported_escape = None;

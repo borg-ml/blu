@@ -1151,22 +1151,31 @@ impl<'a> Lowerer<'a> {
 
     fn string_constant(&mut self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
         let bytes = self.source.slice(span)?;
-        let Some((&quote, rest)) = bytes.split_first() else {
+        let Some(&first) = bytes.first() else {
             return Err(OwnedCompileError::InternalInvariant {
                 message: "string-literal AST is empty",
             });
         };
-        let Some((&closing, value)) = rest.split_last() else {
-            return Err(OwnedCompileError::InternalInvariant {
-                message: "string-literal AST has no closing quote",
-            });
+        let (value, is_long) = if matches!(first, b'\'' | b'"') {
+            let Some((&closing, value)) = bytes[1..].split_last() else {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "string-literal AST has no closing quote",
+                });
+            };
+            if closing != first {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "string-literal AST delimiters do not match",
+                });
+            }
+            (value, false)
+        } else {
+            (long_string_payload(bytes)?, true)
         };
-        if !matches!(quote, b'\'' | b'"') || closing != quote {
-            return Err(OwnedCompileError::InternalInvariant {
-                message: "string-literal AST delimiters do not match",
-            });
-        }
-        let decoded_len = decoded_string_len(value, self.profile)?;
+        let decoded_len = if is_long {
+            decoded_long_string_len(value, self.profile)
+        } else {
+            decoded_string_len(value, self.profile)?
+        };
         check_limit(
             OwnedCompileLimit::StringLiteralBytes,
             decoded_len,
@@ -1186,18 +1195,22 @@ impl<'a> Lowerer<'a> {
             self.limits.artifact.max_total_constant_bytes,
         )?;
         let mut decoded = allocate_vec(decoded_len, "string literal bytes")?;
-        let mut offset = 0;
-        while offset < value.len() {
-            let byte = value[offset];
-            if byte == b'\\' {
-                let escape = decode_string_escape(value, offset, self.profile)?;
-                for decoded_byte in &escape.bytes[..escape.len] {
-                    push_fallible(&mut decoded, *decoded_byte, "string literal bytes")?;
+        if is_long {
+            decode_long_string(value, self.profile, &mut decoded)?;
+        } else {
+            let mut offset = 0;
+            while offset < value.len() {
+                let byte = value[offset];
+                if byte == b'\\' {
+                    let escape = decode_string_escape(value, offset, self.profile)?;
+                    for decoded_byte in &escape.bytes[..escape.len] {
+                        push_fallible(&mut decoded, *decoded_byte, "string literal bytes")?;
+                    }
+                    offset += escape.consumed;
+                } else {
+                    push_fallible(&mut decoded, byte, "string literal bytes")?;
+                    offset += 1;
                 }
-                offset += escape.consumed;
-            } else {
-                push_fallible(&mut decoded, byte, "string literal bytes")?;
-                offset += 1;
             }
         }
         self.constant_bytes = total;
@@ -1544,6 +1557,77 @@ fn parse_signed_decimal_exponent(bytes: &[u8]) -> Result<i64, OwnedCompileError>
     } else {
         magnitude
     })
+}
+
+fn long_string_payload(bytes: &[u8]) -> Result<&[u8], OwnedCompileError> {
+    if bytes.first() != Some(&b'[') {
+        return Err(OwnedCompileError::InternalInvariant {
+            message: "string-literal AST has an unsupported delimiter",
+        });
+    }
+    let mut opener_end = 1;
+    while bytes.get(opener_end) == Some(&b'=') {
+        opener_end += 1;
+    }
+    if bytes.get(opener_end) != Some(&b'[') {
+        return Err(OwnedCompileError::InternalInvariant {
+            message: "long-string AST has a malformed opening delimiter",
+        });
+    }
+    let equals = opener_end - 1;
+    let closing_len = equals + 2;
+    if bytes.len() < opener_end + 1 + closing_len {
+        return Err(OwnedCompileError::InternalInvariant {
+            message: "long-string AST has no closing delimiter",
+        });
+    }
+    let closing = &bytes[bytes.len() - closing_len..];
+    if closing.first() != Some(&b']')
+        || closing.last() != Some(&b']')
+        || !closing[1..closing.len() - 1]
+            .iter()
+            .all(|byte| *byte == b'=')
+    {
+        return Err(OwnedCompileError::InternalInvariant {
+            message: "long-string AST delimiters do not match",
+        });
+    }
+    Ok(&bytes[opener_end + 1..bytes.len() - closing_len])
+}
+
+fn long_string_content_start(value: &[u8], profile: SemanticProfile) -> usize {
+    match value {
+        [b'\r', b'\n', ..] => 2,
+        [b'\n', ..] => 1,
+        [b'\r', ..] if profile != SemanticProfile::Luau => 1,
+        _ => 0,
+    }
+}
+
+fn decoded_long_string_len(value: &[u8], profile: SemanticProfile) -> usize {
+    let value = &value[long_string_content_start(value, profile)..];
+    value.len() - value.windows(2).filter(|window| *window == b"\r\n").count()
+}
+
+fn decode_long_string(
+    value: &[u8],
+    profile: SemanticProfile,
+    decoded: &mut Vec<u8>,
+) -> Result<(), OwnedCompileError> {
+    let mut offset = long_string_content_start(value, profile);
+    while offset < value.len() {
+        if value[offset] == b'\r' && value.get(offset + 1) == Some(&b'\n') {
+            push_fallible(decoded, b'\n', "string literal bytes")?;
+            offset += 2;
+        } else if value[offset] == b'\r' && profile != SemanticProfile::Luau {
+            push_fallible(decoded, b'\n', "string literal bytes")?;
+            offset += 1;
+        } else {
+            push_fallible(decoded, value[offset], "string literal bytes")?;
+            offset += 1;
+        }
+    }
+    Ok(())
 }
 
 fn decoded_string_len(value: &[u8], profile: SemanticProfile) -> Result<usize, OwnedCompileError> {

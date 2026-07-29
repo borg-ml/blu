@@ -499,6 +499,36 @@ fn line_and_multiline_comments_are_retained_without_inner_tokens() {
 }
 
 #[test]
+fn long_strings_are_single_shared_byte_tokens() {
+    let literal_source = source(b"return [==[\r\nraw ]=] bytes\0\xff]==]".to_vec());
+    for profile in SemanticProfile::ALL {
+        let lexed = lex(&literal_source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        let strings: Vec<_> = lexed
+            .tokens()
+            .iter()
+            .filter(|token| token.kind() == TokenKind::StringLiteral)
+            .map(|token| literal_source.slice(token.span()).unwrap())
+            .collect();
+        assert_eq!(
+            strings,
+            [b"[==[\r\nraw ]=] bytes\0\xff]==]".as_slice()],
+            "{profile}"
+        );
+    }
+
+    let source = source(b"return [=[never closed".to_vec());
+    let lexed = lex(&source, SemanticProfile::Blu, LexerLimits::default()).unwrap();
+    assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0019");
+    assert_eq!(
+        source
+            .slice(lexed.diagnostics()[0].primary().span())
+            .unwrap(),
+        b"[=["
+    );
+}
+
+#[test]
 fn truncated_directive_and_long_comment_are_diagnosed() {
     let directive_source = source(b"--!dialect".to_vec());
     let directive = lex(

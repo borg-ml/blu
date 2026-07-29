@@ -582,6 +582,21 @@ fn quoted_string_literal_retains_delimiters_in_its_ast_span() {
 }
 
 #[test]
+fn long_string_literal_retains_delimiters_in_its_ast_span() {
+    let source = source(b"return [=[\nblu ]==] bytes]=]".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    let expression = parsed.ast().expression(statement.values()[0]).unwrap();
+    assert_eq!(expression.kind(), ExpressionKind::StringLiteral);
+    assert_eq!(
+        source.slice(expression.span()).unwrap(),
+        b"[=[\nblu ]==] bytes]=]"
+    );
+}
+
+#[test]
 fn return_expression_lists_are_spanned_and_comma_separated() {
     let source = source(b"return 1, value + 2, 9 // 4".to_vec());
     let parsed = accepted(&source, SemanticProfile::Lua53, ParseLimits::default());

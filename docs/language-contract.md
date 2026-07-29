@@ -124,8 +124,12 @@ consumes and revalidates the artifact under caller-supplied limits and executes
 the single-prototype scalar baseline slice for all seven profiles without
 translation. Baseline register moves preserve non-contiguous values without
 coercing their types. Escape-free quoted strings are copied as exact source
-bytes between their delimiters, with per-constant and aggregate payload limits
-checked before allocation. A bare return uses a zero-width validated register
+bytes between their delimiters. Long-bracket strings with any equality depth
+are also byte literals and do not process escapes. All profiles discard an
+immediate opening LF or CRLF and normalize CRLF to LF. Luau preserves other
+lone CR bytes; Lua 5.1–5.5 normalize them to LF, and Blu explicitly chooses the
+Lua normalization rule. Per-constant and aggregate payload limits are checked
+before allocation. A bare return uses a zero-width validated register
 range and produces no values.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer

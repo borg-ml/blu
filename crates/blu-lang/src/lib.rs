@@ -421,6 +421,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let long_string = SourceFile::new(
+            SourceId::new(19),
+            "long-string.blu",
+            b"return [==[\ra\rb\r\nc\\n\0\xff]==]".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -430,6 +437,20 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&long_string, profile, compiler.clone())
+                .unwrap();
+            let expected = if profile == SemanticProfile::Luau {
+                b"\ra\rb\nc\\n\0\xff".as_slice()
+            } else {
+                b"a\nb\nc\\n\0\xff".as_slice()
+            };
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![Value::String(Arc::from(expected))]),
+                "{profile}"
+            );
             if !matches!(profile, SemanticProfile::Lua51 | SemanticProfile::Lua52) {
                 let compiled = OwnedCompiler::default()
                     .compile(&unicode_escapes, profile, compiler.clone())

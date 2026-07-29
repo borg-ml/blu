@@ -1061,6 +1061,38 @@ fn string_literal_payload_limits_fail_before_constant_insertion() {
         compiled.artifact().main().constants,
         [Constant::String(vec![b'\n'])]
     );
+
+    let source = make_source(b"return [=[\nabc]=]".to_vec());
+    let mut limits = OwnedCompileLimits::default();
+    limits.artifact.max_constant_bytes = 2;
+    assert!(matches!(
+        OwnedCompiler::new(limits).compile(&source, SemanticProfile::Blu, compiler_identity(),),
+        Err(OwnedCompileError::Limit {
+            kind: OwnedCompileLimit::StringLiteralBytes,
+            required: 3,
+            limit: 2,
+        })
+    ));
+}
+
+#[test]
+fn long_strings_follow_explicit_lua_and_luau_newline_semantics() {
+    let source = make_source(b"return [==[\ra\rb\r\nc\\n\0\xff]==]".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = if profile == SemanticProfile::Luau {
+            b"\ra\rb\nc\\n\0\xff".as_slice()
+        } else {
+            b"a\nb\nc\\n\0\xff".as_slice()
+        };
+        assert_eq!(
+            compiled.artifact().main().constants,
+            [Constant::String(expected.to_vec())],
+            "{profile}"
+        );
+    }
 }
 
 #[test]
