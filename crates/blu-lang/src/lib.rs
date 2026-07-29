@@ -358,6 +358,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let binary_integers = SourceFile::new(
+            SourceId::new(10),
+            "binary-integers.blu",
+            b"return 0b101010, 0B1111_0000".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -367,6 +374,17 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                let compiled = OwnedCompiler::default()
+                    .compile(&binary_integers, profile, compiler.clone())
+                    .unwrap();
+                assert_eq!(
+                    Engine::default()
+                        .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                    Ok(vec![Value::Number(42.0), Value::Number(240.0)]),
+                    "{profile}"
+                );
+            }
             let compiled = OwnedCompiler::default()
                 .compile(&source, profile, compiler.clone())
                 .unwrap();

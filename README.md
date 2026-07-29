@@ -58,8 +58,8 @@ unary operators and always produces a number.
 Hexadecimal integers are accepted in every profile. Lua 5.3–5.5 use their
 wrapping 64-bit integer representation; Blu, Luau, Lua 5.1, and Lua 5.2 use
 numbers. Internal numeric separators are accepted only by Blu and Luau.
-Hexadecimal floats and other profile-specific numeral extensions remain
-explicitly unsupported.
+Binary integers are also available only in Blu and Luau. Hexadecimal floats and
+other profile-specific numeral extensions remain explicitly unsupported.
 Trailing-dot forms such as `1.` and `1.e2` are accepted; as in the pinned
 runtimes, `1..2` is malformed and must be spaced before future concatenation.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into

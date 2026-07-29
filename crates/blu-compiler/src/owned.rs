@@ -727,6 +727,19 @@ impl<'a> Lowerer<'a> {
                 )?;
                 Ok(destination)
             }
+            ExpressionKind::BinaryInteger => {
+                let constant = self.binary_integer_constant(expression.span())?;
+                let constant_index = self.push_constant(constant)?;
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::LoadConstant {
+                        destination,
+                        constant: constant_index,
+                    },
+                    expression.span(),
+                )?;
+                Ok(destination)
+            }
             ExpressionKind::StringLiteral => {
                 let constant = self.string_constant(expression.span())?;
                 self.lower_constant(constant, expression.span())
@@ -1030,6 +1043,38 @@ impl<'a> Lowerer<'a> {
             .filter(|byte| **byte != b'_')
             .fold(0.0_f64, |value, byte| {
                 value.mul_add(16.0, f64::from(hex_digit(*byte)))
+            });
+        Ok(Constant::Number(number))
+    }
+
+    fn binary_integer_constant(&self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
+        let bytes = self.source.slice(span)?;
+        check_limit(
+            OwnedCompileLimit::IntegerLiteralBytes,
+            bytes.len(),
+            self.limits.max_integer_literal_bytes,
+        )?;
+        let Some(digits) = bytes
+            .strip_prefix(b"0b")
+            .or_else(|| bytes.strip_prefix(b"0B"))
+        else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "binary-integer AST has no binary prefix",
+            });
+        };
+        if digits.is_empty()
+            || !digits.iter().all(|byte| matches!(byte, b'0' | b'1' | b'_'))
+            || !digits.iter().any(|byte| matches!(byte, b'0' | b'1'))
+        {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "binary-integer AST contains an invalid digit",
+            });
+        }
+        let number = digits
+            .iter()
+            .filter(|byte| **byte != b'_')
+            .fold(0.0_f64, |value, byte| {
+                value.mul_add(2.0, f64::from(*byte - b'0'))
             });
         Ok(Constant::Number(number))
     }

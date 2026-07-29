@@ -585,6 +585,39 @@ fn numeric_separators_are_blu_and_luau_only() {
 }
 
 #[test]
+fn binary_integers_are_blu_and_luau_only() {
+    for profile in SemanticProfile::ALL {
+        let valid = source(b"return 0b1010, 0B1111_0000".to_vec());
+        let lexed = lex(&valid, profile, LexerLimits::default()).unwrap();
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert!(!lexed.has_errors(), "{profile}");
+            assert_eq!(
+                significant_kinds(&lexed),
+                [
+                    TokenKind::Return,
+                    TokenKind::BinaryInteger,
+                    TokenKind::Comma,
+                    TokenKind::BinaryInteger,
+                ],
+                "{profile}"
+            );
+        } else {
+            assert!(
+                lexed
+                    .diagnostics()
+                    .iter()
+                    .all(|diagnostic| diagnostic.code().as_str() == "BLU-LEX-0014"),
+                "{profile}"
+            );
+        }
+    }
+
+    let malformed = source(b"return 0b".to_vec());
+    let lexed = lex(&malformed, SemanticProfile::Luau, LexerLimits::default()).unwrap();
+    assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0013");
+}
+
+#[test]
 fn only_a_byte_zero_directive_participates_in_reconciliation() {
     let source = source(b"\n--!dialect lua54\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

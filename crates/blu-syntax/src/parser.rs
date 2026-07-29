@@ -633,6 +633,7 @@ impl<'a> Parser<'a> {
                     "quoted string",
                     "decimal number",
                     "hexadecimal integer",
+                    "binary integer",
                     "identifier",
                     "not",
                     "-",
@@ -649,6 +650,7 @@ impl<'a> Parser<'a> {
             TokenKind::DecimalInteger => ExpressionKind::DecimalInteger,
             TokenKind::DecimalNumber => ExpressionKind::DecimalNumber,
             TokenKind::HexInteger => ExpressionKind::HexInteger,
+            TokenKind::BinaryInteger => ExpressionKind::BinaryInteger,
             TokenKind::StringLiteral => ExpressionKind::StringLiteral,
             TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
             TokenKind::LeftParenthesis => {

@@ -905,6 +905,30 @@ fn numeric_separators_lower_only_for_blu_and_luau() {
 }
 
 #[test]
+fn binary_integers_lower_only_for_blu_and_luau() {
+    let source = make_source(b"return 0b101010, 0B1111_0000".to_vec());
+    for profile in SemanticProfile::ALL {
+        let result = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let compiled = result.unwrap();
+            assert_eq!(
+                compiled.artifact().prototypes()[0].constants.as_slice(),
+                [Constant::Number(42.0), Constant::Number(240.0)],
+                "{profile}"
+            );
+        } else {
+            let error = result.unwrap_err();
+            let rejected = error.syntax().expect("binary integer rejection");
+            assert_eq!(
+                rejected.diagnostics()[0].code().as_str(),
+                "BLU-LEX-0014",
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn source_and_debug_name_limits_are_checked_before_owned_copies() {
     let source = make_source(b"local answer = 1\nreturn answer".to_vec());
     let mut source_name_limits = OwnedCompileLimits::default();

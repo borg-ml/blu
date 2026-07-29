@@ -137,6 +137,7 @@ pub enum TokenKind {
     DecimalInteger,
     DecimalNumber,
     HexInteger,
+    BinaryInteger,
     StringLiteral,
     Equal,
     Comma,
@@ -436,6 +437,46 @@ pub fn lex(
             }
             b'0'..=b'9' => {
                 if bytes[start] == b'0'
+                    && bytes
+                        .get(start + 1)
+                        .is_some_and(|byte| matches!(byte, b'b' | b'B'))
+                {
+                    offset += 2;
+                    let mut has_digit = false;
+                    while offset < bytes.len()
+                        && (matches!(bytes[offset], b'0' | b'1') || bytes[offset] == b'_')
+                    {
+                        has_digit |= matches!(bytes[offset], b'0' | b'1');
+                        offset += 1;
+                    }
+                    if !has_digit {
+                        let span = source.span(start, offset)?;
+                        let diagnostic = diagnostic(
+                            "BLU-LEX-0013",
+                            explicit_profile,
+                            span,
+                            "binary integer requires at least one digit",
+                            limits.diagnostic_limits,
+                        )?
+                        .try_with_found(&bytes[start..offset])?
+                        .try_with_expected("binary digit")?;
+                        push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                    }
+                    if !supports_binary_integers(explicit_profile) {
+                        let span = source.span(start, offset)?;
+                        let diagnostic = diagnostic(
+                            "BLU-LEX-0014",
+                            explicit_profile,
+                            span,
+                            "binary integers are not supported by this profile",
+                            limits.diagnostic_limits,
+                        )?
+                        .try_with_found(&bytes[start..offset])?
+                        .try_with_note_parts(&["selected profile: ", explicit_profile.as_str()])?;
+                        push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                    }
+                    TokenKind::BinaryInteger
+                } else if bytes[start] == b'0'
                     && bytes
                         .get(start + 1)
                         .is_some_and(|byte| matches!(byte, b'x' | b'X'))
@@ -811,6 +852,10 @@ fn supports_floor_division(profile: SemanticProfile) -> bool {
 }
 
 const fn supports_numeric_separators(profile: SemanticProfile) -> bool {
+    matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
+}
+
+const fn supports_binary_integers(profile: SemanticProfile) -> bool {
     matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
 }
 
