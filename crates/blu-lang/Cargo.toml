@@ -1,6 +1,8 @@
 [package]
 name = "blu-lang"
-description = "High-performance Lua-family language and Rust runtime"
+description = "Embeddable Lua and Luau superset language runtime for Rust"
+keywords = ["lua", "luau", "interpreter", "runtime", "embedded-scripting"]
+readme = "README.md"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,6 +1,7 @@
 [package]
 name = "blu-bytecode"
-description = "Safe Luau-compatible bytecode decoding for Blu"
+description = "Validated Luau bytecode decoding and disassembly for the Blu runtime"
+keywords = ["lua", "luau", "bytecode", "decoder", "virtual-machine"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +10,3 @@ repository.workspace = true
 authors.workspace = true
 
 [dependencies]
-

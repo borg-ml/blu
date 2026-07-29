@@ -1,6 +1,7 @@
 [package]
 name = "blu-runtime"
-description = "High-performance Lua-family runtime and interpreter for Blu"
+description = "Embeddable Lua and Luau interpreter and virtual machine for Blu"
+keywords = ["lua", "luau", "interpreter", "runtime", "virtual-machine"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

@@ -1,8 +1,8 @@
-# Blu
+# Blu — a Lua/Luau superset runtime in Rust
 
-Blu is a high-performance Lua-family language and Rust runtime, built for
-deeply extensible native applications and the Borg agent runtime. Its default
-`blu` dialect is a pragmatic superset of Luau and modern Lua; explicit
+Blu is a fast, embeddable Lua/Luau superset language and runtime written in
+Rust. It is built for deeply extensible native applications. Its default `blu`
+dialect pragmatically unifies and extends Luau and modern Lua; explicit
 compatibility dialects preserve the exact semantics of each upstream language
 version where those semantics conflict.
 
@@ -49,6 +49,11 @@ claim of complete Luau, Lua, or Blu compatibility.
 - `blu-conformance`: differential execution against pinned Luau and Lua runtimes.
 - `.upstream/luau`: ignored checkout created by `just upstream`.
 
+The bytecode, package, runtime, facade, and conformance crates forbid unsafe
+Rust at the crate level. `blu-compiler` contains the isolated native boundary
+for the pinned upstream Luau C++ compiler; a `noexcept` shim translates native
+exceptions and owns allocation/deallocation across that boundary.
+
 ## Development
 
 ```sh
@@ -59,7 +64,11 @@ just conformance
 
 See [NOTICE.md](NOTICE.md) for upstream attribution and [UPSTREAM.toml](UPSTREAM.toml)
 for compatibility revisions. The intended compatibility and authority model is
-defined in [docs/language-contract.md](docs/language-contract.md).
+defined in [docs/language-contract.md](docs/language-contract.md). The explicit
+profile backlog is tracked in
+[docs/dialect-matrix.md](docs/dialect-matrix.md), and the Blu-owned frontend
+decision is recorded in
+[ADR 0002](docs/adr/0002-blu-owned-frontend.md).
 
 Rust applications should depend on the `blu-lang` crate. The bare `blu` name on
 crates.io belongs to an unrelated project.

@@ -1,6 +1,7 @@
 [package]
 name = "blu-package"
 description = "Portable validated package envelopes for Blu bytecode"
+keywords = ["lua", "luau", "bytecode", "package", "runtime"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
