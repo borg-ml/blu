@@ -18,6 +18,12 @@ pinned upstream Luau revision. Lua 5.1–5.5 source profiles, standard libraries
 and versioned C API bridges follow behind the same differential conformance
 gates.
 
+The interpreter currently covers scalar and table operations, numeric and
+generic loops, closures and mutable upvalues, variadic and multiple-return
+calls, globals and imports, Rust native functions, `pairs`/`ipairs`/`next`,
+string method dispatch, and initial table metatables. This is meaningful
+execution coverage, not yet a claim of complete Luau, Lua, or Blu compatibility.
+
 ## Repository layout
 
 - `blu-lang`: public facade crate for embedding Blu.

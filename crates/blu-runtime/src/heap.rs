@@ -54,6 +54,7 @@ pub enum HeapError {
     StaleUpvalue(UpvalueId),
     NilKey,
     NanKey,
+    InvalidIterationKey,
 }
 
 impl fmt::Display for HeapError {
@@ -64,6 +65,7 @@ impl fmt::Display for HeapError {
             Self::StaleUpvalue(value) => write!(f, "stale or invalid upvalue handle {value:?}"),
             Self::NilKey => f.write_str("table index is nil"),
             Self::NanKey => f.write_str("table index is NaN"),
+            Self::InvalidIterationKey => f.write_str("invalid key to table iteration"),
         }
     }
 }
@@ -83,6 +85,7 @@ impl Heap {
         let id = self.allocate(Object::Table(Table {
             array: Vec::with_capacity(array_capacity),
             hash: HashMap::with_capacity(hash_capacity),
+            metatable: None,
         }));
         TableId {
             index: id.index,
@@ -134,6 +137,52 @@ impl Heap {
         Ok(self.table(table)?.length())
     }
 
+    pub fn table_metatable(&self, table: TableId) -> Result<Option<TableId>, HeapError> {
+        Ok(self.table(table)?.metatable)
+    }
+
+    pub fn set_table_metatable(
+        &mut self,
+        table: TableId,
+        metatable: Option<TableId>,
+    ) -> Result<(), HeapError> {
+        if let Some(metatable) = metatable {
+            self.table(metatable)?;
+        }
+        self.table_mut(table)?.metatable = metatable;
+        Ok(())
+    }
+
+    pub fn table_next(
+        &self,
+        table: TableId,
+        key: &Value,
+    ) -> Result<Option<(Value, Value)>, HeapError> {
+        let table = self.table(table)?;
+        let mut entries = table
+            .array
+            .iter()
+            .enumerate()
+            .filter(|(_, value)| !matches!(value, Value::Nil))
+            .map(|(index, value)| (Value::Integer((index + 1) as i64), value.clone()))
+            .chain(
+                table
+                    .hash
+                    .iter()
+                    .map(|(key, value)| (key.to_value(), value.clone())),
+            );
+        if matches!(key, Value::Nil) {
+            return Ok(entries.next());
+        }
+        let key = Key::from_value(key)?;
+        while let Some((candidate, _)) = entries.next() {
+            if Key::from_value(&candidate)? == key {
+                return Ok(entries.next());
+            }
+        }
+        Err(HeapError::InvalidIterationKey)
+    }
+
     pub(crate) fn closure_parts(
         &self,
         closure: ClosureId,
@@ -183,6 +232,9 @@ impl Heap {
             slot.marked = true;
             match object {
                 Object::Table(table) => {
+                    if let Some(metatable) = table.metatable {
+                        queue.push_back(metatable.into());
+                    }
                     for key in table.hash.keys() {
                         key.enqueue(&mut queue);
                     }
@@ -310,6 +362,7 @@ struct Closure {
 struct Table {
     array: Vec<Value>,
     hash: HashMap<Key, Value>,
+    metatable: Option<TableId>,
 }
 
 impl Table {
@@ -421,6 +474,18 @@ impl Key {
             _ => {}
         }
     }
+
+    fn to_value(&self) -> Value {
+        match self {
+            Self::Boolean(value) => Value::Boolean(*value),
+            Self::Integer(value) => Value::Integer(*value),
+            Self::Number(value) => Value::Number(f64::from_bits(*value)),
+            Self::String(value) => Value::String(value.clone()),
+            Self::Table(value) => Value::Table(*value),
+            Self::Closure(value) => Value::Closure(*value),
+            Self::NativeFunction(value) => Value::NativeFunction(*value),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -481,6 +546,37 @@ mod tests {
                 retained: 0,
                 collected: 4,
             }
+        );
+    }
+
+    #[test]
+    fn metatables_are_traced_and_support_iteration() {
+        let mut heap = Heap::default();
+        let table = heap.allocate_table(0, 0);
+        let metatable = heap.allocate_table(0, 1);
+        heap.table_set(
+            metatable,
+            Value::String(Arc::from(&b"answer"[..])),
+            Value::Integer(42),
+        )
+        .unwrap();
+        heap.set_table_metatable(table, Some(metatable)).unwrap();
+
+        assert_eq!(
+            heap.collect([&Value::Table(table)]),
+            CollectionStats {
+                before: 2,
+                retained: 2,
+                collected: 0,
+            }
+        );
+        assert_eq!(heap.table_metatable(table), Ok(Some(metatable)));
+        assert_eq!(
+            heap.table_next(metatable, &Value::Nil),
+            Ok(Some((
+                Value::String(Arc::from(&b"answer"[..])),
+                Value::Integer(42),
+            )))
         );
     }
 }

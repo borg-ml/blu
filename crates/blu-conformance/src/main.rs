@@ -184,6 +184,71 @@ local values = { 3, 4, alpha = 2, beta = "x" }
 local result = values[1] + values[2] + values.alpha + #values.beta
 print(type(result) .. ":" .. tostring(result))
 "#;
+const GENERIC_FOR_SOURCE: &str = r#"
+local array = { 10, 20, 30 }
+local object = { alpha = 4, beta = 5 }
+local result = 0
+for index, value in ipairs(array) do
+    result += index + value
+end
+for key, value in pairs(object) do
+    result += value
+end
+return result
+"#;
+const GENERIC_FOR_REFERENCE_SOURCE: &str = r#"
+local array = { 10, 20, 30 }
+local object = { alpha = 4, beta = 5 }
+local result = 0
+for index, value in ipairs(array) do
+    result += index + value
+end
+for key, value in pairs(object) do
+    result += value
+end
+print(type(result) .. ":" .. tostring(result))
+"#;
+const METHOD_CALL_SOURCE: &str = r#"
+return ("abcdef"):sub(2, 4)
+"#;
+const METHOD_CALL_REFERENCE_SOURCE: &str = r#"
+local result = ("abcdef"):sub(2, 4)
+print(type(result) .. ":" .. tostring(result))
+"#;
+const DIRECT_ITERATION_SOURCE: &str = r#"
+local values = { alpha = 3, beta = 7 }
+local result = 0
+for key, value in values do
+    result += value
+end
+return result
+"#;
+const DIRECT_ITERATION_REFERENCE_SOURCE: &str = r#"
+local values = { alpha = 3, beta = 7 }
+local result = 0
+for key, value in values do
+    result += value
+end
+print(type(result) .. ":" .. tostring(result))
+"#;
+const BASE_LIBRARY_SOURCE: &str = r#"
+return type(3) .. ":" .. tostring(3)
+"#;
+const BASE_LIBRARY_REFERENCE_SOURCE: &str = r#"
+local result = type(3) .. ":" .. tostring(3)
+print(type(result) .. ":" .. tostring(result))
+"#;
+const METATABLE_SOURCE: &str = r#"
+local prototype = { answer = 42 }
+local object = setmetatable({}, { __index = prototype })
+return object.answer
+"#;
+const METATABLE_REFERENCE_SOURCE: &str = r#"
+local prototype = { answer = 42 }
+local object = setmetatable({}, { __index = prototype })
+local result = object.answer
+print(type(result) .. ":" .. tostring(result))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -282,6 +347,46 @@ fn run() -> Result<(), String> {
         &args.upstream,
         temporary.path(),
     )?;
+    verify_program_case(
+        "generic for iteration",
+        GENERIC_FOR_SOURCE,
+        GENERIC_FOR_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "string method call",
+        METHOD_CALL_SOURCE,
+        METHOD_CALL_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "direct table iteration",
+        DIRECT_ITERATION_SOURCE,
+        DIRECT_ITERATION_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "base type and tostring",
+        BASE_LIBRARY_SOURCE,
+        BASE_LIBRARY_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "table metatable index inheritance",
+        METATABLE_SOURCE,
+        METATABLE_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
 
     let portable_source = temporary.path().join("portable.lua");
     fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
@@ -321,7 +426,7 @@ fn run() -> Result<(), String> {
     println!("bytecode version: {bytecode_version}");
     println!("scalar differential corpus: pass ({scalar_count} cases)");
     println!(
-        "program differential corpus: pass (tables, loops, closures, captures, varargs, multret)"
+        "program differential corpus: pass (tables, loops, iteration, methods, closures, captures, varargs, multret)"
     );
     println!("portable reference matrix: pass (Luau, Lua 5.1-5.5)");
     Ok(())

@@ -478,9 +478,9 @@ impl Vm {
                     frame.set(instruction.a(), Value::Table(table))?;
                 }
                 Opcode::GetTable => {
-                    let table = table_id(frame.get(instruction.b())?)?;
+                    let table = frame.get(instruction.b())?.clone();
                     let key = frame.get(instruction.c())?.clone();
-                    let value = self.heap.table_get(table, &key)?;
+                    let value = self.index_value(&table, &key, "table access")?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::SetTable => {
@@ -490,10 +490,10 @@ impl Vm {
                     self.heap.table_set(table, key, value)?;
                 }
                 Opcode::GetTableKs | Opcode::GetUdataKs => {
-                    let table = table_id(frame.get(instruction.b())?)?;
+                    let table = frame.get(instruction.b())?.clone();
                     let index = table_string_constant(instruction)?;
                     let key = frame.constant_u32(index)?;
-                    let value = self.heap.table_get(table, &key)?;
+                    let value = self.index_value(&table, &key, "table access")?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::SetTableKs | Opcode::SetUdataKs => {
@@ -504,9 +504,9 @@ impl Vm {
                     self.heap.table_set(table, key, value)?;
                 }
                 Opcode::GetTableN => {
-                    let table = table_id(frame.get(instruction.b())?)?;
+                    let table = frame.get(instruction.b())?.clone();
                     let key = Value::Integer(i64::from(instruction.c()) + 1);
-                    let value = self.heap.table_get(table, &key)?;
+                    let value = self.index_value(&table, &key, "table access")?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::SetTableN => {
@@ -540,6 +540,21 @@ impl Vm {
                             value,
                         )?;
                     }
+                }
+                Opcode::NameCall => {
+                    let receiver = frame.get(instruction.b())?.clone();
+                    let key = frame.constant_u32(table_string_constant(instruction)?)?;
+                    let method = self.index_value(&receiver, &key, "method lookup")?;
+                    let receiver_register =
+                        instruction
+                            .a()
+                            .checked_add(1)
+                            .ok_or(RuntimeError::Register {
+                                register: usize::from(instruction.a()) + 1,
+                                count: frame.registers.len(),
+                            })?;
+                    frame.set(instruction.a(), method)?;
+                    frame.set(receiver_register, receiver)?;
                 }
                 Opcode::ForNPrep | Opcode::ForNLoop => {
                     let base = instruction.a();
@@ -577,6 +592,81 @@ impl Vm {
                         limit <= index
                     };
                     if continues == (instruction.opcode() == Opcode::ForNLoop) {
+                        frame.jump(instruction)?;
+                    }
+                }
+                Opcode::ForGPrep => {
+                    let base = instruction.a();
+                    if let Value::Table(table) = frame.get(base)?.clone() {
+                        let next =
+                            self.globals
+                                .get(&b"next"[..])
+                                .cloned()
+                                .ok_or(RuntimeError::Type {
+                                    operation: "iterate",
+                                    expected: "function",
+                                    actual: "nil",
+                                })?;
+                        let state_register = base.checked_add(1).ok_or(RuntimeError::Register {
+                            register: usize::from(base) + 1,
+                            count: frame.registers.len(),
+                        })?;
+                        let index_register = base.checked_add(2).ok_or(RuntimeError::Register {
+                            register: usize::from(base) + 2,
+                            count: frame.registers.len(),
+                        })?;
+                        frame.set(base, next)?;
+                        frame.set(state_register, Value::Table(table))?;
+                        frame.set(index_register, Value::Nil)?;
+                    }
+                    frame.jump(instruction)?;
+                }
+                Opcode::ForGPrepInext | Opcode::ForGPrepNext => {
+                    frame.jump(instruction)?;
+                }
+                Opcode::ForGLoop => {
+                    let base = instruction.a();
+                    let function = frame.get(base)?.clone();
+                    let state_register = base.checked_add(1).ok_or(RuntimeError::Register {
+                        register: usize::from(base) + 1,
+                        count: frame.registers.len(),
+                    })?;
+                    let index_register = base.checked_add(2).ok_or(RuntimeError::Register {
+                        register: usize::from(base) + 2,
+                        count: frame.registers.len(),
+                    })?;
+                    let arguments = vec![
+                        frame.get(state_register)?.clone(),
+                        frame.get(index_register)?.clone(),
+                    ];
+                    let variable_count = usize::try_from(
+                        instruction.aux().ok_or(RuntimeError::MissingAux {
+                            pc: instruction.pc(),
+                            opcode: instruction.opcode(),
+                        })? & 0xff,
+                    )
+                    .expect("u8 fits usize");
+                    let results = self.call_value(
+                        chunk,
+                        function,
+                        &arguments,
+                        remaining,
+                        depth,
+                        frame.gc_roots(&self.heap)?,
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
+                    for offset in 0..variable_count {
+                        let register = usize::from(base) + 3 + offset;
+                        let register =
+                            u8::try_from(register).map_err(|_| RuntimeError::Register {
+                                register,
+                                count: frame.registers.len(),
+                            })?;
+                        frame.set(register, results.get(offset).cloned().unwrap_or(Value::Nil))?;
+                    }
+                    let first = results.first().cloned().unwrap_or(Value::Nil);
+                    frame.set(index_register, first.clone())?;
+                    if !matches!(first, Value::Nil) {
                         frame.jump(instruction)?;
                     }
                 }
@@ -665,39 +755,14 @@ impl Vm {
                         usize::from(instruction.b() - 1)
                     };
                     let arguments = frame.register_slice(start, count)?.to_vec();
-                    let result = match function {
-                        Value::Closure(closure) => {
-                            let (child, _) = self.heap.closure_parts(closure)?;
-                            self.active_roots.push(frame.gc_roots(&self.heap)?);
-                            let result = self.execute_frame(
-                                chunk,
-                                child,
-                                Some(closure),
-                                &arguments,
-                                remaining,
-                                depth + 1,
-                            );
-                            self.active_roots.pop();
-                            result
-                        }
-                        Value::NativeFunction(function) => {
-                            let function = self
-                                .native_functions
-                                .get(function.0 as usize)
-                                .cloned()
-                                .ok_or(RuntimeError::NativeFunction(function.0))?;
-                            self.active_roots.push(frame.gc_roots(&self.heap)?);
-                            let result = function(self, &arguments);
-                            self.active_roots.pop();
-                            result
-                        }
-                        other => Err(RuntimeError::Type {
-                            operation: "call",
-                            expected: "function",
-                            actual: other.type_name(),
-                        }),
-                    };
-                    let results = result?;
+                    let results = self.call_value(
+                        chunk,
+                        function,
+                        &arguments,
+                        remaining,
+                        depth,
+                        frame.gc_roots(&self.heap)?,
+                    )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.write_results(instruction.a(), instruction.c(), results)?;
                 }
@@ -730,7 +795,226 @@ impl Vm {
         }
     }
 
+    fn call_value(
+        &mut self,
+        chunk: &Chunk,
+        function: Value,
+        arguments: &[Value],
+        remaining: &mut u64,
+        depth: usize,
+        roots: Vec<Value>,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        match function {
+            Value::Closure(closure) => {
+                let (child, _) = self.heap.closure_parts(closure)?;
+                self.active_roots.push(roots);
+                let result = self.execute_frame(
+                    chunk,
+                    child,
+                    Some(closure),
+                    arguments,
+                    remaining,
+                    depth + 1,
+                );
+                self.active_roots.pop();
+                result
+            }
+            Value::NativeFunction(function) => {
+                let function = self
+                    .native_functions
+                    .get(function.0 as usize)
+                    .cloned()
+                    .ok_or(RuntimeError::NativeFunction(function.0))?;
+                self.active_roots.push(roots);
+                let result = function(self, arguments);
+                self.active_roots.pop();
+                result
+            }
+            other => Err(RuntimeError::Type {
+                operation: "call",
+                expected: "function",
+                actual: other.type_name(),
+            }),
+        }
+    }
+
+    fn index_value(
+        &self,
+        value: &Value,
+        key: &Value,
+        operation: &'static str,
+    ) -> Result<Value, RuntimeError> {
+        let mut table = match value {
+            Value::Table(table) => *table,
+            Value::String(_) => {
+                table_id(self.globals.get(&b"string"[..]).ok_or(RuntimeError::Type {
+                    operation,
+                    expected: "table",
+                    actual: value.type_name(),
+                })?)?
+            }
+            other => {
+                return Err(RuntimeError::Type {
+                    operation,
+                    expected: "table",
+                    actual: other.type_name(),
+                });
+            }
+        };
+        for _ in 0..100 {
+            let result = self.heap.table_get(table, key)?;
+            if !matches!(result, Value::Nil) {
+                return Ok(result);
+            }
+            let Some(metatable) = self.heap.table_metatable(table)? else {
+                return Ok(Value::Nil);
+            };
+            let index = self
+                .heap
+                .table_get(metatable, &Value::String(Arc::from(&b"__index"[..])))?;
+            match index {
+                Value::Nil => return Ok(Value::Nil),
+                Value::Table(next) => table = next,
+                other => {
+                    return Err(RuntimeError::UnsupportedMetamethod {
+                        name: "__index",
+                        actual: other.type_name(),
+                    });
+                }
+            }
+        }
+        Err(RuntimeError::MetatableLoop)
+    }
+
     fn install_base_library(&mut self) {
+        let next = self.register_function(|vm, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "next",
+                index: 1,
+            })?;
+            let table = table_id(table)?;
+            let key = arguments.get(1).unwrap_or(&Value::Nil);
+            Ok(vm
+                .heap
+                .table_next(table, key)?
+                .map_or_else(Vec::new, |(key, value)| vec![key, value]))
+        });
+        self.set_global(&b"next"[..], Value::NativeFunction(next));
+
+        let pairs = self.register_function(move |_, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "pairs",
+                index: 1,
+            })?;
+            table_id(table)?;
+            Ok(vec![Value::NativeFunction(next), table.clone(), Value::Nil])
+        });
+        self.set_global(&b"pairs"[..], Value::NativeFunction(pairs));
+
+        let inext = self.register_function(|vm, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "ipairs",
+                index: 1,
+            })?;
+            let table = table_id(table)?;
+            let index = arguments.get(1).and_then(Value::as_number).unwrap_or(0.0) as i64 + 1;
+            let value = vm.heap.table_get(table, &Value::Integer(index))?;
+            if matches!(value, Value::Nil) {
+                Ok(Vec::new())
+            } else {
+                Ok(vec![Value::Integer(index), value])
+            }
+        });
+        let ipairs = self.register_function(move |_, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "ipairs",
+                index: 1,
+            })?;
+            table_id(table)?;
+            Ok(vec![
+                Value::NativeFunction(inext),
+                table.clone(),
+                Value::Integer(0),
+            ])
+        });
+        self.set_global(&b"ipairs"[..], Value::NativeFunction(ipairs));
+
+        let type_function = self.register_function(|_, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "type",
+                index: 1,
+            })?;
+            Ok(vec![Value::String(Arc::from(value.type_name().as_bytes()))])
+        });
+        self.set_global(&b"type"[..], Value::NativeFunction(type_function));
+
+        let tostring = self.register_function(|_, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "tostring",
+                index: 1,
+            })?;
+            let mut result = Vec::new();
+            append_value(&mut result, value);
+            Ok(vec![Value::String(Arc::from(result))])
+        });
+        self.set_global(&b"tostring"[..], Value::NativeFunction(tostring));
+
+        let getmetatable = self.register_function(|vm, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "getmetatable",
+                index: 1,
+            })?;
+            let table = table_id(value)?;
+            let Some(metatable) = vm.heap.table_metatable(table)? else {
+                return Ok(vec![Value::Nil]);
+            };
+            let protected = vm
+                .heap
+                .table_get(metatable, &Value::String(Arc::from(&b"__metatable"[..])))?;
+            Ok(vec![if matches!(protected, Value::Nil) {
+                Value::Table(metatable)
+            } else {
+                protected
+            }])
+        });
+        self.set_global(&b"getmetatable"[..], Value::NativeFunction(getmetatable));
+
+        let setmetatable = self.register_function(|vm, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "setmetatable",
+                index: 1,
+            })?;
+            let table = table_id(value)?;
+            if let Some(current) = vm.heap.table_metatable(table)? {
+                let protected = vm
+                    .heap
+                    .table_get(current, &Value::String(Arc::from(&b"__metatable"[..])))?;
+                if !matches!(protected, Value::Nil) {
+                    return Err(RuntimeError::MetatableProtected);
+                }
+            }
+            let metatable = match arguments.get(1) {
+                Some(Value::Table(metatable)) => Some(*metatable),
+                Some(Value::Nil) => None,
+                Some(other) => {
+                    return Err(RuntimeError::Type {
+                        operation: "setmetatable",
+                        expected: "table or nil",
+                        actual: other.type_name(),
+                    });
+                }
+                None => {
+                    return Err(RuntimeError::Argument {
+                        function: "setmetatable",
+                        index: 2,
+                    });
+                }
+            };
+            vm.heap.set_table_metatable(table, metatable)?;
+            Ok(vec![value.clone()])
+        });
+        self.set_global(&b"setmetatable"[..], Value::NativeFunction(setmetatable));
+
         let print = self.register_function(|vm, arguments| {
             for (index, value) in arguments.iter().enumerate() {
                 if index != 0 {
@@ -1329,6 +1613,12 @@ pub enum RuntimeError {
         required: usize,
         limit: usize,
     },
+    MetatableProtected,
+    MetatableLoop,
+    UnsupportedMetamethod {
+        name: &'static str,
+        actual: &'static str,
+    },
 }
 
 impl fmt::Display for RuntimeError {
@@ -1408,6 +1698,14 @@ impl fmt::Display for RuntimeError {
                 write!(
                     f,
                     "dynamic stack requires {required} values, limit is {limit}"
+                )
+            }
+            Self::MetatableProtected => f.write_str("cannot change a protected metatable"),
+            Self::MetatableLoop => f.write_str("metatable lookup chain is too long"),
+            Self::UnsupportedMetamethod { name, actual } => {
+                write!(
+                    f,
+                    "{name} metamethod with {actual} value is not implemented"
                 )
             }
         }
