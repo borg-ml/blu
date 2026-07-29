@@ -136,6 +136,15 @@ registers and executes string/number coercion directly for every profile.
 The Luau bootstrap translator rejects it explicitly because Luau's range-form
 opcode requires verified contiguous operands; it does not silently rewrite
 canonical register semantics.
+Canonical comparison instructions likewise name independent operands and
+produce Boolean values. `Equal`, `LessThan`, and `LessEqual` are the artifact
+primitives; the compiler derives `~=`, `>`, and `>=` with Boolean negation or
+operand reversal while preserving source evaluation order. Equality between
+unlike scalar types is false. Ordering accepts compatible numeric operands or
+two byte strings and otherwise fails structurally at runtime. These rules are
+shared by the current scalar owned slice across all profiles. The bootstrap
+translator rejects canonical comparisons explicitly rather than substituting
+Luau conditional-skip instructions whose control-flow shape is different.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

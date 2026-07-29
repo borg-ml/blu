@@ -192,6 +192,13 @@ fn concatenation_fixture(profile: SemanticProfile) -> Artifact {
     artifact
 }
 
+fn comparison_fixture(profile: SemanticProfile, instruction: Instruction) -> Artifact {
+    let mut artifact = baseline_fixture(profile);
+    artifact.prototypes[0].required_features = FeatureBits::BASELINE | FeatureBits::COMPARISONS;
+    artifact.prototypes[0].code[2] = instruction;
+    artifact
+}
+
 #[test]
 fn canonical_round_trip_preserves_profiles_and_metadata() {
     let limits = BluLimits::default();
@@ -313,6 +320,21 @@ fn baseline_instruction_legality_is_explicit_for_every_profile() {
             right: 0,
         },
         Instruction::Concatenate {
+            destination: 0,
+            left: 0,
+            right: 0,
+        },
+        Instruction::Equal {
+            destination: 0,
+            left: 0,
+            right: 0,
+        },
+        Instruction::LessThan {
+            destination: 0,
+            left: 0,
+            right: 0,
+        },
+        Instruction::LessEqual {
             destination: 0,
             left: 0,
             right: 0,
@@ -754,6 +776,55 @@ fn power_is_canonical_profile_neutral_and_bootstrap_translatable() {
         translated.prototypes[0].instructions[2].opcode(),
         Opcode::Pow
     );
+}
+
+#[test]
+fn comparison_wire_feature_is_explicit_and_profile_neutral() {
+    let limits = BluLimits::default();
+    let instructions = [
+        Instruction::Equal {
+            destination: 2,
+            left: 0,
+            right: 1,
+        },
+        Instruction::LessThan {
+            destination: 2,
+            left: 0,
+            right: 1,
+        },
+        Instruction::LessEqual {
+            destination: 2,
+            left: 0,
+            right: 1,
+        },
+    ];
+    for profile in SemanticProfile::ALL {
+        for instruction in instructions {
+            assert!(instruction_is_legal(profile, instruction), "{profile}");
+            let validated =
+                ValidatedArtifact::new(comparison_fixture(profile, instruction), limits).unwrap();
+            let bytes = encode(&validated, limits).unwrap();
+            let decoded = decode_validated(&bytes, limits).unwrap();
+            assert!(
+                decoded
+                    .main()
+                    .required_features
+                    .contains(FeatureBits::COMPARISONS)
+            );
+            assert_eq!(decoded.main().code[2], instruction);
+            assert_eq!(encode(&decoded, limits).unwrap(), bytes);
+        }
+
+        let mut missing = comparison_fixture(profile, instructions[0]);
+        missing.prototypes[0].required_features = FeatureBits::BASELINE;
+        assert_eq!(
+            ValidatedArtifact::new(missing, limits),
+            Err(ValidationError::MissingFeature {
+                prototype: 0,
+                feature: "comparisons",
+            })
+        );
+    }
 }
 
 #[test]

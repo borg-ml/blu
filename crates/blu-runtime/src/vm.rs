@@ -1011,6 +1011,37 @@ impl Vm {
                     )?;
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::Equal {
+                    destination,
+                    left,
+                    right,
+                }
+                | BluInstruction::LessThan {
+                    destination,
+                    left,
+                    right,
+                }
+                | BluInstruction::LessEqual {
+                    destination,
+                    left,
+                    right,
+                } => {
+                    let opcode = match instruction {
+                        BluInstruction::Equal { .. } => Opcode::JumpIfEq,
+                        BluInstruction::LessThan { .. } => Opcode::JumpIfLt,
+                        BluInstruction::LessEqual { .. } => Opcode::JumpIfLe,
+                        _ => unreachable!(),
+                    };
+                    let left = blu_register(&registers, left)?.clone();
+                    let right = blu_register(&registers, right)?.clone();
+                    let value = self.compare_value(
+                        opcode,
+                        left,
+                        right,
+                        CallContext::new(&mut remaining, 0, GcRoots::default()),
+                    )?;
+                    set_blu_register(&mut registers, destination, Value::Boolean(value))?;
+                }
                 BluInstruction::Return { first, count } => {
                     let start = usize::from(first);
                     let end =

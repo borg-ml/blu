@@ -92,7 +92,11 @@ pub fn translate_baseline_to_luau(
         if prototype.code.iter().any(|instruction| {
             matches!(
                 instruction,
-                BluInstruction::FloorDivide { .. } | BluInstruction::Concatenate { .. }
+                BluInstruction::FloorDivide { .. }
+                    | BluInstruction::Concatenate { .. }
+                    | BluInstruction::Equal { .. }
+                    | BluInstruction::LessThan { .. }
+                    | BluInstruction::LessEqual { .. }
             )
         }) {
             let instruction = if prototype
@@ -101,8 +105,14 @@ pub fn translate_baseline_to_luau(
                 .any(|instruction| matches!(instruction, BluInstruction::FloorDivide { .. }))
             {
                 "floor division"
-            } else {
+            } else if prototype
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction, BluInstruction::Concatenate { .. }))
+            {
                 "concatenation"
+            } else {
+                "comparisons"
             };
             return Err(TranslationError::UnsupportedInstruction {
                 prototype: prototype_index,
@@ -330,6 +340,12 @@ fn translate_instruction(
         BluInstruction::Concatenate { .. } => Err(TranslationError::UnsupportedInstruction {
             prototype,
             instruction: "concatenation",
+        }),
+        BluInstruction::Equal { .. }
+        | BluInstruction::LessThan { .. }
+        | BluInstruction::LessEqual { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "comparisons",
         }),
         BluInstruction::Return { first, count } => {
             let result_field = count

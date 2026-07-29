@@ -671,6 +671,41 @@ fn concatenation_is_shared_and_disambiguated_from_decimal_points() {
 }
 
 #[test]
+fn comparison_tokens_are_shared_across_profiles() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return a == b, a ~= b, a < b, a <= b, a > b, a >= b".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        let comparisons: Vec<_> = significant_kinds(&lexed)
+            .into_iter()
+            .filter(|kind| {
+                matches!(
+                    kind,
+                    TokenKind::EqualEqual
+                        | TokenKind::NotEqual
+                        | TokenKind::LessThan
+                        | TokenKind::LessEqual
+                        | TokenKind::GreaterThan
+                        | TokenKind::GreaterEqual
+                )
+            })
+            .collect();
+        assert_eq!(
+            comparisons,
+            [
+                TokenKind::EqualEqual,
+                TokenKind::NotEqual,
+                TokenKind::LessThan,
+                TokenKind::LessEqual,
+                TokenKind::GreaterThan,
+                TokenKind::GreaterEqual,
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn malformed_decimal_exponents_are_structured() {
     let source = source(b"return 1e+".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua54, LexerLimits::default()).unwrap();

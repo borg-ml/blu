@@ -141,6 +141,12 @@ pub enum TokenKind {
     BinaryInteger,
     StringLiteral,
     Equal,
+    EqualEqual,
+    NotEqual,
+    LessThan,
+    LessEqual,
+    GreaterThan,
+    GreaterEqual,
     Comma,
     Semicolon,
     Plus,
@@ -340,9 +346,33 @@ pub fn lex(
                 offset += 1;
                 TokenKind::Slash
             }
+            b'=' if bytes.get(offset + 1) == Some(&b'=') => {
+                offset += 2;
+                TokenKind::EqualEqual
+            }
             b'=' => {
                 offset += 1;
                 TokenKind::Equal
+            }
+            b'~' if bytes.get(offset + 1) == Some(&b'=') => {
+                offset += 2;
+                TokenKind::NotEqual
+            }
+            b'<' if bytes.get(offset + 1) == Some(&b'=') => {
+                offset += 2;
+                TokenKind::LessEqual
+            }
+            b'<' => {
+                offset += 1;
+                TokenKind::LessThan
+            }
+            b'>' if bytes.get(offset + 1) == Some(&b'=') => {
+                offset += 2;
+                TokenKind::GreaterEqual
+            }
+            b'>' => {
+                offset += 1;
+                TokenKind::GreaterThan
             }
             b',' => {
                 offset += 1;

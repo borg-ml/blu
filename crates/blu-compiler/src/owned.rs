@@ -483,6 +483,16 @@ impl<'a> Lowerer<'a> {
         {
             required_features = required_features | FeatureBits::CONCATENATION;
         }
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::Equal { .. }
+                    | Instruction::LessThan { .. }
+                    | Instruction::LessEqual { .. }
+            )
+        }) {
+            required_features = required_features | FeatureBits::COMPARISONS;
+        }
         Ok(Prototype {
             profile: ast.profile(),
             source: self.source.identity().id(),
@@ -917,6 +927,70 @@ impl<'a> Lowerer<'a> {
                     let destination = self.allocate_register()?;
                     self.emit(
                         Instruction::Concatenate {
+                            destination,
+                            left,
+                            right,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
+                }
+                BinaryOperator::Equal | BinaryOperator::NotEqual => {
+                    let left = self.lower_expression(binary.left())?;
+                    let right = self.lower_expression(binary.right())?;
+                    let compared = self.allocate_register()?;
+                    self.emit(
+                        Instruction::Equal {
+                            destination: compared,
+                            left,
+                            right,
+                        },
+                        expression.span(),
+                    )?;
+                    if binary.operator() == BinaryOperator::NotEqual {
+                        let destination = self.allocate_register()?;
+                        self.emit(
+                            Instruction::Not {
+                                destination,
+                                source: compared,
+                            },
+                            expression.span(),
+                        )?;
+                        Ok(destination)
+                    } else {
+                        Ok(compared)
+                    }
+                }
+                BinaryOperator::LessThan | BinaryOperator::GreaterThan => {
+                    let left = self.lower_expression(binary.left())?;
+                    let right = self.lower_expression(binary.right())?;
+                    let destination = self.allocate_register()?;
+                    let (left, right) = if binary.operator() == BinaryOperator::GreaterThan {
+                        (right, left)
+                    } else {
+                        (left, right)
+                    };
+                    self.emit(
+                        Instruction::LessThan {
+                            destination,
+                            left,
+                            right,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
+                }
+                BinaryOperator::LessEqual | BinaryOperator::GreaterEqual => {
+                    let left = self.lower_expression(binary.left())?;
+                    let right = self.lower_expression(binary.right())?;
+                    let destination = self.allocate_register()?;
+                    let (left, right) = if binary.operator() == BinaryOperator::GreaterEqual {
+                        (right, left)
+                    } else {
+                        (left, right)
+                    };
+                    self.emit(
+                        Instruction::LessEqual {
                             destination,
                             left,
                             right,

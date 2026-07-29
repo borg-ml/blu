@@ -314,6 +314,27 @@ fn concatenation_is_right_associative_below_addition() {
 }
 
 #[test]
+fn comparisons_are_left_associative_below_concatenation() {
+    let source = source(b"return a .. b == c + d < e".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    let root = binary(&parsed, statement.values()[0]);
+    assert_eq!(root.operator(), BinaryOperator::LessThan);
+    let equal = binary(&parsed, root.left());
+    assert_eq!(equal.operator(), BinaryOperator::Equal);
+    assert_eq!(
+        binary(&parsed, equal.left()).operator(),
+        BinaryOperator::Concatenate
+    );
+    assert_eq!(
+        binary(&parsed, equal.right()).operator(),
+        BinaryOperator::Add
+    );
+}
+
+#[test]
 fn multiplication_binds_above_addition_and_is_left_associative() {
     let source = source(b"return a + b * c * d + e".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());

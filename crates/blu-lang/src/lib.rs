@@ -435,6 +435,14 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let comparisons = SourceFile::new(
+            SourceId::new(21),
+            "comparisons.blu",
+            br#"return 2 == 2, 2 ~= 3, 1 < 2, 2 <= 2, 3 > 2, 3 >= 3, "a" < "b", 1 == "1", 1 + 2 < 4, "a" .. "b" == "ab""#
+                .to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -444,6 +452,26 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&comparisons, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                ]),
+                "{profile}"
+            );
             let compiled = OwnedCompiler::default()
                 .compile(&concatenation, profile, compiler.clone())
                 .unwrap();

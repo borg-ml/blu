@@ -55,11 +55,14 @@ impl FeatureBits {
     pub const FLOOR_DIVISION: Self = Self(1 << 2);
     /// Profile-neutral string/number concatenation with independent operands.
     pub const CONCATENATION: Self = Self(1 << 3);
+    /// Profile-neutral value-producing equality and ordering comparisons.
+    pub const COMPARISONS: Self = Self(1 << 4);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
             | Self::FLOOR_DIVISION.0
-            | Self::CONCATENATION.0,
+            | Self::CONCATENATION.0
+            | Self::COMPARISONS.0,
     );
 
     #[must_use]
@@ -287,6 +290,21 @@ pub enum Instruction {
         left: u16,
         right: u16,
     },
+    Equal {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
+    LessThan {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
+    LessEqual {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
     Return {
         first: u16,
         count: u16,
@@ -322,6 +340,9 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::Power { .. }
             | Instruction::FloorDivide { .. }
             | Instruction::Concatenate { .. }
+            | Instruction::Equal { .. }
+            | Instruction::LessThan { .. }
+            | Instruction::LessEqual { .. }
             | Instruction::Return { .. } => true,
         },
         SemanticProfile::Blu | SemanticProfile::Lua51 | SemanticProfile::Lua52 => matches!(
@@ -338,6 +359,9 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::Modulo { .. }
                 | Instruction::Power { .. }
                 | Instruction::Concatenate { .. }
+                | Instruction::Equal { .. }
+                | Instruction::LessThan { .. }
+                | Instruction::LessEqual { .. }
                 | Instruction::Return { .. }
         ),
         _ => false,
@@ -1094,6 +1118,22 @@ fn validate_prototype(
             feature: "concatenation",
         });
     }
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::Equal { .. }
+                | Instruction::LessThan { .. }
+                | Instruction::LessEqual { .. }
+        )
+    }) && !prototype
+        .required_features
+        .contains(FeatureBits::COMPARISONS)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "comparisons",
+        });
+    }
     let Some(&source_len) = sources.get(&prototype.source) else {
         return Err(ValidationError::InvalidSourceMap {
             prototype: index,
@@ -1228,6 +1268,21 @@ fn validate_prototype(
                 right,
             }
             | Instruction::Concatenate {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::Equal {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::LessThan {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::LessEqual {
                 destination,
                 left,
                 right,
@@ -1506,7 +1561,10 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::Modulo { .. }
                     | Instruction::Power { .. }
                     | Instruction::FloorDivide { .. }
-                    | Instruction::Concatenate { .. } => 7,
+                    | Instruction::Concatenate { .. }
+                    | Instruction::Equal { .. }
+                    | Instruction::LessThan { .. }
+                    | Instruction::LessEqual { .. } => 7,
                     Instruction::Move { .. }
                     | Instruction::Not { .. }
                     | Instruction::Negate { .. }
@@ -1717,6 +1775,36 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 right,
             } => {
                 out.push(13);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::Equal {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(14);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::LessThan {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(15);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::LessEqual {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(16);
                 put_u16(out, *destination);
                 put_u16(out, *left);
                 put_u16(out, *right);
@@ -2343,6 +2431,21 @@ fn read_prototype(
                 source: reader.u16()?,
             },
             13 => Instruction::Concatenate {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
+            },
+            14 => Instruction::Equal {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
+            },
+            15 => Instruction::LessThan {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
+            },
+            16 => Instruction::LessEqual {
                 destination: reader.u16()?,
                 left: reader.u16()?,
                 right: reader.u16()?,

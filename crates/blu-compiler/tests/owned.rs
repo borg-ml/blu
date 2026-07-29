@@ -686,6 +686,91 @@ fn concatenation_is_canonical_profile_neutral_and_directly_executable() {
 }
 
 #[test]
+fn comparisons_are_canonical_profile_neutral_and_directly_executable() {
+    let source = make_source(
+        br#"return 2 == 2, 2 ~= 3, 1 < 2, 2 <= 2, 3 > 2, 3 >= 3, "a" < "b", 1 == "1", 1 + 2 < 4, "ab" == "ab""#
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .required_features
+                .contains(FeatureBits::COMPARISONS),
+            "{profile}"
+        );
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .code
+                .iter()
+                .any(|instruction| matches!(
+                    instruction,
+                    Instruction::Equal { .. }
+                        | Instruction::LessThan { .. }
+                        | Instruction::LessEqual { .. }
+                )),
+            "{profile}"
+        );
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let translation_error = translate_baseline_to_luau(
+                decode_validated(compiled.bytes(), BluLimits::default()).unwrap(),
+                profile,
+                BluLimits::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    translation_error,
+                    TranslationError::UnsupportedInstruction {
+                        instruction: "comparisons",
+                        ..
+                    }
+                ),
+                "{profile}: {translation_error:?}"
+            );
+        }
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn ordered_comparisons_reject_incompatible_operand_types() {
+    let source = make_source(br#"return 1 < "2""#.to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(
+            Vm::default()
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+                .is_err(),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn modulo_lowers_for_every_profile() {
     let source = make_source(b"return -7 % 3, 7 % -3".to_vec());
     for profile in SemanticProfile::ALL {
