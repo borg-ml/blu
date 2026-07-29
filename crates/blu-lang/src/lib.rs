@@ -263,4 +263,45 @@ mod tests {
             Ok(vec![Value::String(Arc::from(&b"ababab"[..]))])
         );
     }
+
+    #[test]
+    fn ordinary_calls_use_the_bounded_explicit_frame_stack() {
+        let mut engine = Engine::default();
+        *engine.vm_mut() = Vm::default().with_call_limit(10_000);
+        let source = br#"
+                    local function descend(remaining)
+                        if remaining == 0 then
+                            return 0
+                        end
+                        return descend(remaining - 1) + 1
+                    end
+                    return descend(5_000)
+                "#;
+        assert_eq!(engine.execute(source), Ok(vec![Value::Number(5_000.0)]));
+    }
+
+    #[test]
+    fn suspended_explicit_frames_remain_gc_roots() {
+        let mut engine = Engine::default();
+        let collect = engine.vm_mut().register_function(|vm, _| {
+            vm.collect(std::iter::empty());
+            Ok(Vec::new())
+        });
+        engine
+            .vm_mut()
+            .set_global(&b"collect"[..], Value::NativeFunction(collect));
+        assert_eq!(
+            engine.execute(
+                br#"
+                    local retained = { answer = 42 }
+                    local function child()
+                        collect()
+                    end
+                    child()
+                    return retained.answer
+                "#
+            ),
+            Ok(vec![Value::Number(42.0)])
+        );
+    }
 }

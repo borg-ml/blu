@@ -46,6 +46,10 @@ directive that conflicts with the configured engine. The Lua 5.1–5.5 profiles
 remain explicit, structured `not implemented` errors until their own frontends
 and semantic profiles exist.
 
+Ordinary bytecode calls currently run on an owned, bounded VM frame stack.
+Suspended callers and their registers are traced as GC roots. Coroutine thread
+objects and resumable yield continuations remain unimplemented.
+
 ## Semantic profiles
 
 Parsing different syntaxes into one instruction set is insufficient. Function

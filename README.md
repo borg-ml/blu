@@ -23,6 +23,8 @@ and table operations, numeric and generic loops, closures and mutable upvalues,
 variadic and multiple-return calls, globals and imports, Rust native functions,
 protected calls, `pairs`/`ipairs`/`next`, string method dispatch, core
 metamethods, an initial standard library, and host-configured cached `require`.
+Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
+remain GC roots.
 The default engine selects `blu`; `--!dialect` directives are checked against
 the configured engine. Lua 5.1–5.5 profiles are declared but still fail
 explicitly as unimplemented. This is meaningful execution coverage, not yet a

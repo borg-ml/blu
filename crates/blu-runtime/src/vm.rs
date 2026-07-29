@@ -147,6 +147,22 @@ impl Vm {
         remaining: &mut u64,
         depth: usize,
     ) -> Result<Vec<Value>, RuntimeError> {
+        let active_root_count = self.active_roots.len();
+        let result =
+            self.execute_frame_inner(chunk, prototype_index, closure, arguments, remaining, depth);
+        self.active_roots.truncate(active_root_count);
+        result
+    }
+
+    fn execute_frame_inner(
+        &mut self,
+        chunk: &Arc<Chunk>,
+        prototype_index: usize,
+        closure: Option<ClosureId>,
+        arguments: &[Value],
+        remaining: &mut u64,
+        depth: usize,
+    ) -> Result<Vec<Value>, RuntimeError> {
         if depth > self.call_limit {
             return Err(RuntimeError::CallLimit {
                 limit: self.call_limit,
@@ -157,9 +173,17 @@ impl Vm {
             .get(prototype_index)
             .ok_or(RuntimeError::InvalidPrototype(prototype_index))?;
         let constants = materialize_constants(chunk, prototype)?;
-        let mut frame = Frame::new(prototype, constants, closure, arguments);
+        let mut frame = Frame::new(
+            chunk.clone(),
+            prototype_index,
+            constants,
+            closure,
+            arguments,
+        )?;
+        let mut callers = Vec::<Caller>::new();
 
         loop {
+            let depth = depth + callers.len();
             if *remaining == 0 {
                 return Err(RuntimeError::InstructionLimit {
                     limit: self.instruction_limit,
@@ -171,6 +195,11 @@ impl Vm {
             let instruction = frame.instruction()?;
             let next_pc = instruction.pc() + usize::from(instruction.opcode().words());
             frame.pc = next_pc;
+            let chunk = frame.chunk.clone();
+            let prototype = chunk
+                .prototypes
+                .get(frame.prototype_index)
+                .ok_or(RuntimeError::InvalidPrototype(frame.prototype_index))?;
 
             match instruction.opcode() {
                 Opcode::Nop
@@ -307,6 +336,7 @@ impl Vm {
                         .get(child)
                         .ok_or(RuntimeError::InvalidPrototype(child))?
                         .upvalue_count;
+                    let closure = self.heap.allocate_closure(chunk.clone(), child, Vec::new());
                     let mut upvalues = Vec::with_capacity(upvalue_count as usize);
                     for capture_index in 0..upvalue_count {
                         let capture = frame.instruction()?;
@@ -319,6 +349,9 @@ impl Vm {
                         }
                         frame.pc = capture.pc() + 1;
                         let upvalue = match capture.a() {
+                            0 if capture.b() == instruction.a() => {
+                                self.heap.allocate_upvalue(Value::Closure(closure))
+                            }
                             0 => self.heap.allocate_upvalue(frame.get(capture.b())?.clone()),
                             1 => frame.capture_ref(&mut self.heap, capture.b())?,
                             2 => frame.upvalue(&self.heap, capture.b())?,
@@ -331,7 +364,7 @@ impl Vm {
                         };
                         upvalues.push(upvalue);
                     }
-                    let closure = self.heap.allocate_closure(chunk.clone(), child, upvalues);
+                    self.heap.closure_set_upvalues(closure, upvalues)?;
                     frame.set(instruction.a(), Value::Closure(closure))?;
                 }
                 Opcode::Capture => {
@@ -542,7 +575,7 @@ impl Vm {
                                 let value = if *value < 0 {
                                     Value::Number(0.0)
                                 } else {
-                                    materialize_constant(chunk, prototype, *value as usize)?
+                                    materialize_constant(&chunk, prototype, *value as usize)?
                                 };
                                 Ok((*key, value))
                             })
@@ -556,7 +589,7 @@ impl Vm {
                     };
                     let table = self.heap.allocate_table(0, entries.len());
                     for (key, value) in entries {
-                        let key = materialize_constant(chunk, prototype, key)?;
+                        let key = materialize_constant(&chunk, prototype, key)?;
                         self.heap.table_set(table, key, value)?;
                     }
                     frame.set(instruction.a(), Value::Table(table))?;
@@ -877,13 +910,38 @@ impl Vm {
                         usize::from(instruction.b() - 1)
                     };
                     let arguments = frame.register_slice(start, count)?.to_vec();
-                    let results = self.call_value(
-                        function,
-                        &arguments,
-                        remaining,
-                        depth,
-                        frame.gc_roots(&self.heap)?,
-                    )?;
+                    let results = if let Value::Closure(closure) = function {
+                        let (child_chunk, child, _) = self.heap.closure_parts(closure)?;
+                        if depth + 1 > self.call_limit {
+                            return Err(RuntimeError::CallLimit {
+                                limit: self.call_limit,
+                            });
+                        }
+                        let child_prototype = child_chunk
+                            .prototypes
+                            .get(child)
+                            .ok_or(RuntimeError::InvalidPrototype(child))?;
+                        let constants = materialize_constants(&child_chunk, child_prototype)?;
+                        let child_frame =
+                            Frame::new(child_chunk, child, constants, Some(closure), &arguments)?;
+                        let roots = frame.gc_roots(&self.heap)?;
+                        self.active_roots.push(roots);
+                        callers.push(Caller {
+                            frame,
+                            register: instruction.a(),
+                            encoded_count: instruction.c(),
+                        });
+                        frame = child_frame;
+                        continue;
+                    } else {
+                        self.call_value(
+                            function,
+                            &arguments,
+                            remaining,
+                            depth,
+                            frame.gc_roots(&self.heap)?,
+                        )?
+                    };
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.write_results(instruction.a(), instruction.c(), results)?;
                 }
@@ -904,7 +962,15 @@ impl Vm {
                             count: frame.registers.len(),
                         });
                     }
-                    return Ok(frame.registers[start..end].to_vec());
+                    let results = frame.registers[start..end].to_vec();
+                    if let Some(caller) = callers.pop() {
+                        self.active_roots.pop();
+                        frame = caller.frame;
+                        frame.refresh_open_upvalues(&self.heap)?;
+                        frame.write_results(caller.register, caller.encoded_count, results)?;
+                        continue;
+                    }
+                    return Ok(results);
                 }
                 opcode => {
                     return Err(RuntimeError::UnsupportedOpcode {
@@ -2341,8 +2407,15 @@ impl<'a> CallContext<'a> {
     }
 }
 
-struct Frame<'a> {
-    prototype: &'a Prototype,
+struct Caller {
+    frame: Frame,
+    register: u8,
+    encoded_count: u8,
+}
+
+struct Frame {
+    chunk: Arc<Chunk>,
+    prototype_index: usize,
     constants: Vec<Value>,
     registers: Vec<Value>,
     varargs: Vec<Value>,
@@ -2353,19 +2426,25 @@ struct Frame<'a> {
     top: usize,
 }
 
-impl<'a> Frame<'a> {
+impl Frame {
     fn new(
-        prototype: &'a Prototype,
+        chunk: Arc<Chunk>,
+        prototype_index: usize,
         constants: Vec<Value>,
         closure: Option<ClosureId>,
         arguments: &[Value],
-    ) -> Self {
+    ) -> Result<Self, RuntimeError> {
+        let prototype = chunk
+            .prototypes
+            .get(prototype_index)
+            .ok_or(RuntimeError::InvalidPrototype(prototype_index))?;
         let mut registers = vec![Value::Nil; usize::from(prototype.max_stack_size)];
         let parameter_count = usize::from(prototype.parameter_count);
         let copied = arguments.len().min(parameter_count).min(registers.len());
         registers[..copied].clone_from_slice(&arguments[..copied]);
-        Self {
-            prototype,
+        Ok(Self {
+            chunk,
+            prototype_index,
             constants,
             registers,
             varargs: arguments
@@ -2377,18 +2456,26 @@ impl<'a> Frame<'a> {
             open_upvalues_dirty: false,
             pc: 0,
             top: copied,
-        }
+        })
+    }
+
+    fn prototype(&self) -> Result<&Prototype, RuntimeError> {
+        self.chunk
+            .prototypes
+            .get(self.prototype_index)
+            .ok_or(RuntimeError::InvalidPrototype(self.prototype_index))
     }
 
     fn instruction(&self) -> Result<Instruction, RuntimeError> {
-        self.prototype
+        let prototype = self.prototype()?;
+        prototype
             .instructions
             .binary_search_by_key(&self.pc, |instruction| instruction.pc())
             .ok()
-            .map(|index| self.prototype.instructions[index])
+            .map(|index| prototype.instructions[index])
             .ok_or(RuntimeError::InvalidProgramCounter {
                 pc: self.pc,
-                code_words: self.prototype.code.len(),
+                code_words: prototype.code.len(),
             })
     }
 
@@ -2563,8 +2650,9 @@ impl<'a> Frame<'a> {
 
     fn jump(&mut self, instruction: Instruction) -> Result<(), RuntimeError> {
         let target = instruction.jump_target();
+        let prototype = self.prototype()?;
         let valid = target.is_some_and(|target| {
-            self.prototype
+            prototype
                 .instructions
                 .binary_search_by_key(&target, |candidate| candidate.pc())
                 .is_ok()

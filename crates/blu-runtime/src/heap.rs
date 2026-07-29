@@ -198,6 +198,20 @@ impl Heap {
         ))
     }
 
+    pub(crate) fn closure_set_upvalues(
+        &mut self,
+        closure: ClosureId,
+        upvalues: Vec<UpvalueId>,
+    ) -> Result<(), HeapError> {
+        match self.object_mut(closure.into()) {
+            Some(Object::Closure(value)) => {
+                value.upvalues = upvalues;
+                Ok(())
+            }
+            _ => Err(HeapError::StaleClosure(closure)),
+        }
+    }
+
     pub(crate) fn upvalue_get(&self, upvalue: UpvalueId) -> Result<Value, HeapError> {
         match self.object(upvalue.into()) {
             Some(Object::Upvalue(value)) => Ok(value.clone()),
