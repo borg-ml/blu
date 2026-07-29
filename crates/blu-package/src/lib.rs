@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Portable, integrity-checked envelopes for validated Blu bytecode.
 //!
 //! Decoding is inspection-only: a package declares authority requirements but

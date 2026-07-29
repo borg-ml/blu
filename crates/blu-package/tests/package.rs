@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use blu_package::{
     AuthorityProfile, AuthorityRequirement, BytecodeDescriptor, BytecodeFormat,
     CapabilityRequirement, Digest, Export, Import, ImportSource, Manifest, Name, Package,

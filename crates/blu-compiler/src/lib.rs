@@ -1,3 +1,6 @@
+#![deny(unsafe_code)]
+#![deny(unsafe_op_in_unsafe_fn)]
+
 //! In-process Luau source compilation for Blu.
 //!
 //! The foreign compiler boundary is isolated in this crate. Every returned
@@ -6,7 +9,9 @@
 
 use blu_bytecode::{Chunk, ChunkError, LoadLimits, ValidatedChunk, load_validated};
 use core::fmt;
-use std::ffi::{c_char, c_int, c_void};
+
+#[allow(unsafe_code)]
+mod ffi;
 
 /// The bundled compiler's Luau release number.
 pub const LUAU_COMPILER_RELEASE: &str = env!("LUAU_VERSION");
@@ -65,42 +70,15 @@ impl Compiler {
         validate_level("type information", self.options.type_info_level, 1)?;
         validate_level("coverage", self.options.coverage_level, 2)?;
 
-        let source = source.as_ref();
-        let mut size = 0;
-        let mut options = NativeCompileOptions {
-            optimization_level: c_int::from(self.options.optimization_level),
-            debug_level: c_int::from(self.options.debug_level),
-            type_info_level: c_int::from(self.options.type_info_level),
-            coverage_level: c_int::from(self.options.coverage_level),
-            vector_lib: core::ptr::null(),
-            vector_ctor: core::ptr::null(),
-            vector_type: core::ptr::null(),
-            mutable_globals: core::ptr::null(),
-            userdata_types: core::ptr::null(),
-            libraries_with_known_members: core::ptr::null(),
-            library_member_type_callback: None,
-            library_member_constant_callback: None,
-            disabled_builtins: core::ptr::null(),
-        };
-        // SAFETY: `source` is valid for `source.len()` bytes, `options` and
-        // `size` remain live for the call, and the returned allocation is
-        // copied before being released with the compiler's C allocator.
-        let output = unsafe {
-            luau_compile(
-                source.as_ptr().cast(),
-                source.len(),
-                &raw mut options,
-                &raw mut size,
-            )
-        };
-        if output.is_null() {
-            return Err(CompileError::Allocation);
-        }
-        // SAFETY: Luau reports the exact initialized allocation size.
-        let bytes = unsafe { core::slice::from_raw_parts(output.cast::<u8>(), size) }.to_vec();
-        // SAFETY: `luau_compile` documents that its result must be released
-        // with `free`, and this pointer has not previously been freed.
-        unsafe { free(output.cast()) };
+        let bytes = ffi::compile(
+            source.as_ref(),
+            self.options.optimization_level,
+            self.options.debug_level,
+            self.options.type_info_level,
+            self.options.coverage_level,
+            self.load_limits.max_bytes,
+        )
+        .map_err(CompileError::from_ffi)?;
         let chunk = load_validated(&bytes, self.load_limits).map_err(CompileError::Chunk)?;
         Ok(CompiledBytecode { bytes, chunk })
     }
@@ -126,7 +104,36 @@ pub enum CompileError {
         maximum: u8,
     },
     Allocation,
+    NativeException,
+    NativeContract {
+        status: i32,
+        output_is_null: bool,
+        output_size: usize,
+    },
     Chunk(ChunkError),
+}
+
+impl CompileError {
+    fn from_ffi(error: ffi::Error) -> Self {
+        match error {
+            ffi::Error::Allocation => Self::Allocation,
+            ffi::Error::Exception => Self::NativeException,
+            ffi::Error::Contract {
+                status,
+                output_is_null,
+                output_size,
+            } => Self::NativeContract {
+                status,
+                output_is_null,
+                output_size,
+            },
+            ffi::Error::TooLarge { actual, limit } => Self::Chunk(ChunkError::TooLarge {
+                what: "bytecode bytes",
+                actual,
+                limit,
+            }),
+        }
+    }
 }
 
 impl fmt::Display for CompileError {
@@ -138,6 +145,18 @@ impl fmt::Display for CompileError {
                 maximum,
             } => write!(f, "{name} level {value} exceeds maximum {maximum}"),
             Self::Allocation => f.write_str("Luau compiler failed to allocate its output"),
+            Self::NativeException => {
+                f.write_str("Luau compiler raised an unexpected native exception")
+            }
+            Self::NativeContract {
+                status,
+                output_is_null,
+                output_size,
+            } => write!(
+                f,
+                "Luau compiler violated its native output contract \
+                 (status {status}, null output {output_is_null}, size {output_size})"
+            ),
             Self::Chunk(error) => error.fmt(f),
         }
     }
@@ -150,37 +169,6 @@ impl std::error::Error for CompileError {
             _ => None,
         }
     }
-}
-
-type LibraryMemberTypeCallback = unsafe extern "C" fn(*const c_char, *const c_char) -> c_int;
-type LibraryMemberConstantCallback =
-    unsafe extern "C" fn(*const c_char, *const c_char, *mut *mut c_void);
-
-#[repr(C)]
-struct NativeCompileOptions {
-    optimization_level: c_int,
-    debug_level: c_int,
-    type_info_level: c_int,
-    coverage_level: c_int,
-    vector_lib: *const c_char,
-    vector_ctor: *const c_char,
-    vector_type: *const c_char,
-    mutable_globals: *const *const c_char,
-    userdata_types: *const *const c_char,
-    libraries_with_known_members: *const *const c_char,
-    library_member_type_callback: Option<LibraryMemberTypeCallback>,
-    library_member_constant_callback: Option<LibraryMemberConstantCallback>,
-    disabled_builtins: *const *const c_char,
-}
-
-unsafe extern "C" {
-    fn luau_compile(
-        source: *const c_char,
-        size: usize,
-        options: *mut NativeCompileOptions,
-        output_size: *mut usize,
-    ) -> *mut c_char;
-    fn free(pointer: *mut c_void);
 }
 
 #[cfg(test)]
@@ -224,5 +212,40 @@ mod tests {
                 maximum: 2,
             })
         ));
+    }
+
+    #[test]
+    fn accepts_empty_and_binary_source_boundaries() {
+        Compiler::default().compile_bytecode([]).unwrap();
+
+        for source in [b"\0".as_slice(), b"return '\0'".as_slice(), &[0xff, 0xfe]] {
+            assert!(matches!(
+                Compiler::default().compile_bytecode(source),
+                Ok(_) | Err(CompileError::Chunk(ChunkError::CompileError(_)))
+            ));
+        }
+    }
+
+    #[test]
+    fn enforces_output_limit_before_copying() {
+        let limits = LoadLimits {
+            max_bytes: 1,
+            ..LoadLimits::default()
+        };
+        assert!(matches!(
+            Compiler::new(CompileOptions::default(), limits).compile_bytecode(b"return 1"),
+            Err(CompileError::Chunk(ChunkError::TooLarge {
+                what: "bytecode bytes",
+                actual,
+                limit: 1,
+            })) if actual > 1
+        ));
+    }
+
+    #[test]
+    fn translates_native_exceptions_to_statuses() {
+        assert_eq!(ffi::test_exception(1), Err(ffi::Error::Allocation));
+        assert_eq!(ffi::test_exception(2), Err(ffi::Error::Exception));
+        assert_eq!(ffi::test_exception(0), Ok(()));
     }
 }

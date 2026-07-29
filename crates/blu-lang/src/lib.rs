@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Public embedding interface for Blu.
 //!
 //! Most applications should depend only on `blu-lang`. Lower-level bytecode and

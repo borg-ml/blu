@@ -1,6 +1,7 @@
 [package]
 name = "blu-compiler"
 description = "In-process Luau source compiler adapter for Blu"
+keywords = ["lua", "luau", "compiler", "scripting", "ffi"]
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -12,6 +13,7 @@ authors.workspace = true
 blu-bytecode.workspace = true
 
 [build-dependencies]
+cc = "1.2"
 luau0-src = "=0.20.7"
 
 [dev-dependencies]

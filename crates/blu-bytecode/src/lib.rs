@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Luau-compatible instruction and serialized chunk decoding.
 //!
 //! Opcode numbers and layouts are compatibility-sensitive. They are ported

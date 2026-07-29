@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 use blu_compiler::Compiler as SourceCompiler;
 use blu_runtime::{
     Dialect, Value, Vm,

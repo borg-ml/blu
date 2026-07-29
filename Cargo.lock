@@ -27,6 +27,7 @@ version = "0.1.0"
 dependencies = [
  "blu-bytecode",
  "blu-runtime",
+ "cc",
  "luau0-src",
 ]
 

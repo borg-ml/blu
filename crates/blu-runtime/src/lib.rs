@@ -1,3 +1,5 @@
+#![forbid(unsafe_code)]
+
 //! Blu's Lua-family runtime.
 //!
 //! The current interpreter executes a deliberately enumerated subset of pinned
