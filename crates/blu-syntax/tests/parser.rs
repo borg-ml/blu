@@ -544,6 +544,32 @@ fn binary_integer_literals_have_a_distinct_ast_kind() {
 }
 
 #[test]
+fn hexadecimal_numbers_have_a_distinct_ast_kind() {
+    for profile in [
+        SemanticProfile::Blu,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let source = source(b"return 0x1.8p1".to_vec());
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+            panic!("expected return statement");
+        };
+        assert_eq!(
+            parsed
+                .ast()
+                .expression(statement.values()[0])
+                .unwrap()
+                .kind(),
+            ExpressionKind::HexNumber,
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn quoted_string_literal_retains_delimiters_in_its_ast_span() {
     let source = source(b"return 'blu'".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());

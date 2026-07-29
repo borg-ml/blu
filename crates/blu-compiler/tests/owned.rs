@@ -929,6 +929,53 @@ fn binary_integers_lower_only_for_blu_and_luau() {
 }
 
 #[test]
+fn hexadecimal_numbers_follow_the_profile_matrix() {
+    let shared = make_source(b"return 0x1p2, 0x1p-2".to_vec());
+    for profile in SemanticProfile::ALL {
+        let result = OwnedCompiler::default().compile(&shared, profile, compiler_identity());
+        if profile == SemanticProfile::Luau {
+            let rejected = result.unwrap_err();
+            assert_eq!(
+                rejected.syntax().unwrap().diagnostics()[0].code().as_str(),
+                "BLU-LEX-0016"
+            );
+        } else {
+            let compiled = result.unwrap();
+            assert_eq!(
+                compiled.artifact().prototypes()[0].constants.as_slice(),
+                [Constant::Number(4.0), Constant::Number(0.25)],
+                "{profile}"
+            );
+        }
+    }
+
+    let fractional = make_source(b"return 0x1.8p1, 0x.8p1, 0x1.8".to_vec());
+    for profile in SemanticProfile::ALL {
+        let result = OwnedCompiler::default().compile(&fractional, profile, compiler_identity());
+        if matches!(profile, SemanticProfile::Luau | SemanticProfile::Lua51) {
+            assert_eq!(
+                result.unwrap_err().syntax().unwrap().diagnostics()[0]
+                    .code()
+                    .as_str(),
+                "BLU-LEX-0016",
+                "{profile}"
+            );
+        } else {
+            let compiled = result.unwrap();
+            assert_eq!(
+                compiled.artifact().prototypes()[0].constants.as_slice(),
+                [
+                    Constant::Number(3.0),
+                    Constant::Number(1.0),
+                    Constant::Number(1.5),
+                ],
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn source_and_debug_name_limits_are_checked_before_owned_copies() {
     let source = make_source(b"local answer = 1\nreturn answer".to_vec());
     let mut source_name_limits = OwnedCompileLimits::default();

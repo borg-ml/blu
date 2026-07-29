@@ -727,6 +727,19 @@ impl<'a> Lowerer<'a> {
                 )?;
                 Ok(destination)
             }
+            ExpressionKind::HexNumber => {
+                let constant = self.hex_number_constant(expression.span())?;
+                let constant_index = self.push_constant(constant)?;
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::LoadConstant {
+                        destination,
+                        constant: constant_index,
+                    },
+                    expression.span(),
+                )?;
+                Ok(destination)
+            }
             ExpressionKind::BinaryInteger => {
                 let constant = self.binary_integer_constant(expression.span())?;
                 let constant_index = self.push_constant(constant)?;
@@ -1079,6 +1092,63 @@ impl<'a> Lowerer<'a> {
         Ok(Constant::Number(number))
     }
 
+    fn hex_number_constant(&self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
+        let bytes = self.source.slice(span)?;
+        check_limit(
+            OwnedCompileLimit::NumberLiteralBytes,
+            bytes.len(),
+            self.limits.max_number_literal_bytes,
+        )?;
+        let Some(body) = bytes
+            .strip_prefix(b"0x")
+            .or_else(|| bytes.strip_prefix(b"0X"))
+        else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "hex-number AST has no hexadecimal prefix",
+            });
+        };
+        let exponent_offset = body.iter().position(|byte| matches!(byte, b'p' | b'P'));
+        let (mantissa, exponent) = match exponent_offset {
+            Some(offset) => (&body[..offset], Some(&body[offset + 1..])),
+            None => (body, None),
+        };
+        let dot = mantissa.iter().position(|byte| *byte == b'.');
+        let mut value = 0.0_f64;
+        let mut fractional_digits = 0_i64;
+        let mut after_dot = false;
+        for byte in mantissa {
+            match byte {
+                b'.' if !after_dot => after_dot = true,
+                b'_' => {}
+                byte if byte.is_ascii_hexdigit() => {
+                    value = value.mul_add(16.0, f64::from(hex_digit(*byte)));
+                    if after_dot {
+                        fractional_digits = fractional_digits.saturating_add(1);
+                    }
+                }
+                _ => {
+                    return Err(OwnedCompileError::InternalInvariant {
+                        message: "hex-number AST contains an invalid mantissa byte",
+                    });
+                }
+            }
+        }
+        if dot.is_none() && exponent.is_none() {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "hex-number AST has neither a point nor an exponent",
+            });
+        }
+        let exponent = exponent.map_or(Ok(0_i64), parse_signed_decimal_exponent)?;
+        let binary_exponent = exponent.saturating_sub(fractional_digits.saturating_mul(4));
+        let binary_exponent =
+            i32::try_from(binary_exponent).unwrap_or(if binary_exponent.is_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            });
+        Ok(Constant::Number(value * 2.0_f64.powi(binary_exponent)))
+    }
+
     fn string_constant(&mut self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
         let bytes = self.source.slice(span)?;
         let Some((&quote, rest)) = bytes.split_first() else {
@@ -1284,6 +1354,36 @@ fn hex_digit(byte: u8) -> u8 {
         b'A'..=b'F' => byte - b'A' + 10,
         _ => 0,
     }
+}
+
+fn parse_signed_decimal_exponent(bytes: &[u8]) -> Result<i64, OwnedCompileError> {
+    let (negative, digits) = match bytes.first() {
+        Some(b'+') => (false, &bytes[1..]),
+        Some(b'-') => (true, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if !digits.iter().any(u8::is_ascii_digit)
+        || !digits
+            .iter()
+            .all(|byte| byte.is_ascii_digit() || *byte == b'_')
+    {
+        return Err(OwnedCompileError::InternalInvariant {
+            message: "hex-number AST contains an invalid exponent",
+        });
+    }
+    let magnitude = digits
+        .iter()
+        .filter(|byte| **byte != b'_')
+        .fold(0_i64, |value, byte| {
+            value
+                .saturating_mul(10)
+                .saturating_add(i64::from(*byte - b'0'))
+        });
+    Ok(if negative {
+        magnitude.saturating_neg()
+    } else {
+        magnitude
+    })
 }
 
 fn decoded_string_len(value: &[u8]) -> Result<usize, OwnedCompileError> {

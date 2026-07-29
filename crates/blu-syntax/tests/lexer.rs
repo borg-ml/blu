@@ -618,6 +618,51 @@ fn binary_integers_are_blu_and_luau_only() {
 }
 
 #[test]
+fn hexadecimal_number_forms_follow_the_profile_matrix() {
+    for profile in SemanticProfile::ALL {
+        let exponent_only = source(b"return 0x1p2".to_vec());
+        let lexed = lex(&exponent_only, profile, LexerLimits::default()).unwrap();
+        assert_eq!(
+            lexed.has_errors(),
+            profile == SemanticProfile::Luau,
+            "{profile}"
+        );
+        if !lexed.has_errors() {
+            assert_eq!(
+                significant_kinds(&lexed),
+                [TokenKind::Return, TokenKind::HexNumber],
+                "{profile}"
+            );
+        }
+
+        let fractional = source(b"return 0x1.8p1, 0x.8p1, 0x1.8".to_vec());
+        let lexed = lex(&fractional, profile, LexerLimits::default()).unwrap();
+        let supported = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        assert_eq!(lexed.has_errors(), !supported, "{profile}");
+        if !supported {
+            assert!(
+                lexed
+                    .diagnostics()
+                    .iter()
+                    .all(|diagnostic| diagnostic.code().as_str() == "BLU-LEX-0016"),
+                "{profile}"
+            );
+        }
+    }
+
+    let malformed = source(b"return 0x1p+".to_vec());
+    let lexed = lex(&malformed, SemanticProfile::Lua54, LexerLimits::default()).unwrap();
+    assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0015");
+}
+
+#[test]
 fn only_a_byte_zero_directive_participates_in_reconciliation() {
     let source = source(b"\n--!dialect lua54\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

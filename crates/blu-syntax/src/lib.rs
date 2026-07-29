@@ -137,6 +137,7 @@ pub enum TokenKind {
     DecimalInteger,
     DecimalNumber,
     HexInteger,
+    HexNumber,
     BinaryInteger,
     StringLiteral,
     Equal,
@@ -491,6 +492,40 @@ pub fn lex(
                         has_separator |= bytes[offset] == b'_';
                         offset += 1;
                     }
+                    let has_dot =
+                        bytes.get(offset) == Some(&b'.') && bytes.get(offset + 1) != Some(&b'.');
+                    if has_dot {
+                        offset += 1;
+                        while offset < bytes.len()
+                            && (bytes[offset].is_ascii_hexdigit() || bytes[offset] == b'_')
+                        {
+                            has_digit |= bytes[offset].is_ascii_hexdigit();
+                            has_separator |= bytes[offset] == b'_';
+                            offset += 1;
+                        }
+                    }
+                    let mut has_exponent = false;
+                    let mut malformed_exponent = None;
+                    if matches!(bytes.get(offset), Some(b'p' | b'P')) {
+                        has_exponent = true;
+                        let exponent = offset;
+                        offset += 1;
+                        if matches!(bytes.get(offset), Some(b'+' | b'-')) {
+                            offset += 1;
+                        }
+                        let mut has_exponent_digit = false;
+                        while offset < bytes.len()
+                            && (bytes[offset].is_ascii_digit() || bytes[offset] == b'_')
+                        {
+                            has_exponent_digit |= bytes[offset].is_ascii_digit();
+                            has_separator |= bytes[offset] == b'_';
+                            offset += 1;
+                        }
+                        if !has_exponent_digit {
+                            malformed_exponent = Some(exponent);
+                        }
+                    }
+                    let is_number = has_dot || has_exponent;
                     if !has_digit {
                         let span = source.span(start, offset)?;
                         let diagnostic = diagnostic(
@@ -504,6 +539,32 @@ pub fn lex(
                         .try_with_expected("hexadecimal digit")?;
                         push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                     }
+                    if let Some(exponent) = malformed_exponent {
+                        let span = source.span(exponent, offset)?;
+                        let diagnostic = diagnostic(
+                            "BLU-LEX-0015",
+                            explicit_profile,
+                            span,
+                            "hexadecimal exponent requires at least one decimal digit",
+                            limits.diagnostic_limits,
+                        )?
+                        .try_with_found(&bytes[exponent..offset])?
+                        .try_with_expected("decimal exponent digit")?;
+                        push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                    }
+                    if is_number && !supports_hex_number(explicit_profile, has_dot, has_exponent) {
+                        let span = source.span(start, offset)?;
+                        let diagnostic = diagnostic(
+                            "BLU-LEX-0016",
+                            explicit_profile,
+                            span,
+                            "this hexadecimal number form is not supported by the selected profile",
+                            limits.diagnostic_limits,
+                        )?
+                        .try_with_found(&bytes[start..offset])?
+                        .try_with_note_parts(&["selected profile: ", explicit_profile.as_str()])?;
+                        push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                    }
                     if has_separator && !supports_numeric_separators(explicit_profile) {
                         push_numeric_separator_diagnostic(
                             source,
@@ -514,7 +575,11 @@ pub fn lex(
                             limits,
                         )?;
                     }
-                    TokenKind::HexInteger
+                    if is_number {
+                        TokenKind::HexNumber
+                    } else {
+                        TokenKind::HexInteger
+                    }
                 } else {
                     let scan = scan_decimal(bytes, start);
                     offset = scan.end;
@@ -857,6 +922,19 @@ const fn supports_numeric_separators(profile: SemanticProfile) -> bool {
 
 const fn supports_binary_integers(profile: SemanticProfile) -> bool {
     matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
+}
+
+const fn supports_hex_number(profile: SemanticProfile, has_dot: bool, has_exponent: bool) -> bool {
+    match profile {
+        SemanticProfile::Blu
+        | SemanticProfile::Lua52
+        | SemanticProfile::Lua53
+        | SemanticProfile::Lua54
+        | SemanticProfile::Lua55 => true,
+        SemanticProfile::Lua51 => has_exponent && !has_dot,
+        SemanticProfile::Luau => false,
+        _ => false,
+    }
 }
 
 fn long_comment_opener(bytes: &[u8], start: usize) -> Option<(usize, usize)> {

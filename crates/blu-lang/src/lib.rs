@@ -365,6 +365,20 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let hex_exponents = SourceFile::new(
+            SourceId::new(11),
+            "hex-exponents.blu",
+            b"return 0x1p2, 0x1p-2".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
+        let fractional_hex = SourceFile::new(
+            SourceId::new(12),
+            "fractional-hex.blu",
+            b"return 0x1.8p1, 0x.8p1, 0x1.8".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -374,6 +388,39 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            if profile != SemanticProfile::Luau {
+                let compiled = OwnedCompiler::default()
+                    .compile(&hex_exponents, profile, compiler.clone())
+                    .unwrap();
+                assert_eq!(
+                    Engine::default()
+                        .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                    Ok(vec![Value::Number(4.0), Value::Number(0.25)]),
+                    "{profile}"
+                );
+            }
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua52
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                let compiled = OwnedCompiler::default()
+                    .compile(&fractional_hex, profile, compiler.clone())
+                    .unwrap();
+                assert_eq!(
+                    Engine::default()
+                        .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                    Ok(vec![
+                        Value::Number(3.0),
+                        Value::Number(1.0),
+                        Value::Number(1.5)
+                    ]),
+                    "{profile}"
+                );
+            }
             if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
                 let compiled = OwnedCompiler::default()
                     .compile(&binary_integers, profile, compiler.clone())

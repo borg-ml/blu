@@ -53,6 +53,8 @@ decimal integers plus the digit-bearing fraction/exponent subset (`1.5`, `.25`,
 `1.`, `1.e2`, `2e3`, and `4.5e-2`), hexadecimal integers with explicit
 Lua 5.3–5.5 wrapping-integer versus number-profile lowering, and internal
 numeric separators plus binary integers in the Blu and Luau profiles,
+hexadecimal exponent forms for Blu and Lua 5.1–5.5, and fractional hexadecimal
+forms for Blu and Lua 5.2–5.5,
 single- and double-quoted byte strings with the common Lua/Luau escaped delimiters,
 backslash, and `\a`/`\b`/`\f`/`\n`/`\r`/`\t`/`\v`, and
 `+`/`-`/`*`/`/`/`%`/`^`/`//`
