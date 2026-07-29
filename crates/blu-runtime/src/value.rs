@@ -1,6 +1,9 @@
-use crate::TableId;
+use crate::{ClosureId, TableId};
 use core::fmt;
 use std::sync::Arc;
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub struct NativeFunctionId(pub(crate) u32);
 
 #[derive(Clone)]
 #[non_exhaustive]
@@ -11,6 +14,8 @@ pub enum Value {
     Integer(i64),
     String(Arc<[u8]>),
     Table(TableId),
+    Closure(ClosureId),
+    NativeFunction(NativeFunctionId),
 }
 
 impl Value {
@@ -27,6 +32,8 @@ impl Value {
             Self::Number(_) | Self::Integer(_) => "number",
             Self::String(_) => "string",
             Self::Table(_) => "table",
+            Self::Closure(_) => "function",
+            Self::NativeFunction(_) => "function",
         }
     }
 
@@ -51,6 +58,8 @@ impl fmt::Debug for Value {
                 .field(&String::from_utf8_lossy(value))
                 .finish(),
             Self::Table(value) => value.fmt(f),
+            Self::Closure(value) => value.fmt(f),
+            Self::NativeFunction(value) => value.fmt(f),
         }
     }
 }
@@ -66,6 +75,8 @@ impl PartialEq for Value {
             | (Self::Integer(right), Self::Number(left)) => *left == *right as f64,
             (Self::String(left), Self::String(right)) => left == right,
             (Self::Table(left), Self::Table(right)) => left == right,
+            (Self::Closure(left), Self::Closure(right)) => left == right,
+            (Self::NativeFunction(left), Self::NativeFunction(right)) => left == right,
             _ => false,
         }
     }

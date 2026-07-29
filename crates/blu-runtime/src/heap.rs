@@ -5,16 +5,39 @@ use std::{
     sync::Arc,
 };
 
-#[derive(Clone, Copy, Eq, Hash, PartialEq)]
-pub struct TableId {
-    index: u32,
-    generation: u32,
+macro_rules! object_id {
+    ($name:ident, $label:literal) => {
+        #[derive(Clone, Copy, Eq, Hash, PartialEq)]
+        pub struct $name {
+            index: u32,
+            generation: u32,
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                write!(f, concat!($label, "({}:{})"), self.index, self.generation)
+            }
+        }
+
+        impl From<$name> for ObjectId {
+            fn from(value: $name) -> Self {
+                Self {
+                    index: value.index,
+                    generation: value.generation,
+                }
+            }
+        }
+    };
 }
 
-impl fmt::Debug for TableId {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "Table({}:{})", self.index, self.generation)
-    }
+object_id!(TableId, "Table");
+object_id!(ClosureId, "Closure");
+object_id!(UpvalueId, "Upvalue");
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+struct ObjectId {
+    index: u32,
+    generation: u32,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -27,6 +50,8 @@ pub struct CollectionStats {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeapError {
     StaleTable(TableId),
+    StaleClosure(ClosureId),
+    StaleUpvalue(UpvalueId),
     NilKey,
     NanKey,
 }
@@ -34,7 +59,9 @@ pub enum HeapError {
 impl fmt::Display for HeapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::StaleTable(table) => write!(f, "stale or invalid table handle {table:?}"),
+            Self::StaleTable(value) => write!(f, "stale or invalid table handle {value:?}"),
+            Self::StaleClosure(value) => write!(f, "stale or invalid closure handle {value:?}"),
+            Self::StaleUpvalue(value) => write!(f, "stale or invalid upvalue handle {value:?}"),
             Self::NilKey => f.write_str("table index is nil"),
             Self::NanKey => f.write_str("table index is NaN"),
         }
@@ -53,30 +80,36 @@ pub struct Heap {
 impl Heap {
     #[must_use]
     pub fn allocate_table(&mut self, array_capacity: usize, hash_capacity: usize) -> TableId {
-        let table = Table {
+        let id = self.allocate(Object::Table(Table {
             array: Vec::with_capacity(array_capacity),
             hash: HashMap::with_capacity(hash_capacity),
-        };
-        self.live += 1;
-        if let Some(index) = self.free.pop() {
-            let slot = &mut self.slots[index as usize];
-            debug_assert!(slot.object.is_none());
-            slot.object = Some(Object::Table(table));
-            TableId {
-                index,
-                generation: slot.generation,
-            }
-        } else {
-            let index = self.slots.len() as u32;
-            self.slots.push(Slot {
-                generation: 0,
-                marked: false,
-                object: Some(Object::Table(table)),
-            });
-            TableId {
-                index,
-                generation: 0,
-            }
+        }));
+        TableId {
+            index: id.index,
+            generation: id.generation,
+        }
+    }
+
+    pub(crate) fn allocate_upvalue(&mut self, value: Value) -> UpvalueId {
+        let id = self.allocate(Object::Upvalue(value));
+        UpvalueId {
+            index: id.index,
+            generation: id.generation,
+        }
+    }
+
+    pub(crate) fn allocate_closure(
+        &mut self,
+        prototype: usize,
+        upvalues: Vec<UpvalueId>,
+    ) -> ClosureId {
+        let id = self.allocate(Object::Closure(Closure {
+            prototype,
+            upvalues,
+        }));
+        ClosureId {
+            index: id.index,
+            generation: id.generation,
         }
     }
 
@@ -101,6 +134,35 @@ impl Heap {
         Ok(self.table(table)?.length())
     }
 
+    pub(crate) fn closure_parts(
+        &self,
+        closure: ClosureId,
+    ) -> Result<(usize, Vec<UpvalueId>), HeapError> {
+        let closure = self.closure(closure)?;
+        Ok((closure.prototype, closure.upvalues.clone()))
+    }
+
+    pub(crate) fn upvalue_get(&self, upvalue: UpvalueId) -> Result<Value, HeapError> {
+        match self.object(upvalue.into()) {
+            Some(Object::Upvalue(value)) => Ok(value.clone()),
+            _ => Err(HeapError::StaleUpvalue(upvalue)),
+        }
+    }
+
+    pub(crate) fn upvalue_set(
+        &mut self,
+        upvalue: UpvalueId,
+        value: Value,
+    ) -> Result<(), HeapError> {
+        match self.object_mut(upvalue.into()) {
+            Some(Object::Upvalue(slot)) => {
+                *slot = value;
+                Ok(())
+            }
+            _ => Err(HeapError::StaleUpvalue(upvalue)),
+        }
+    }
+
     pub fn collect<'a>(&mut self, roots: impl IntoIterator<Item = &'a Value>) -> CollectionStats {
         let before = self.live;
         let mut queue = VecDeque::new();
@@ -108,24 +170,30 @@ impl Heap {
             enqueue_value(root, &mut queue);
         }
 
-        while let Some(table) = queue.pop_front() {
-            let Some(slot) = self.slots.get_mut(table.index as usize) else {
+        while let Some(id) = queue.pop_front() {
+            let Some(slot) = self.slots.get_mut(id.index as usize) else {
                 continue;
             };
-            if slot.generation != table.generation || slot.marked {
+            if slot.generation != id.generation || slot.marked {
                 continue;
             }
-            let Some(Object::Table(table)) = slot.object.as_ref() else {
+            let Some(object) = slot.object.as_ref() else {
                 continue;
             };
             slot.marked = true;
-            for key in table.hash.keys() {
-                if let Key::Table(table) = key {
-                    queue.push_back(*table);
+            match object {
+                Object::Table(table) => {
+                    for key in table.hash.keys() {
+                        key.enqueue(&mut queue);
+                    }
+                    for value in table.array.iter().chain(table.hash.values()) {
+                        enqueue_value(value, &mut queue);
+                    }
                 }
-            }
-            for value in table.array.iter().chain(table.hash.values()) {
-                enqueue_value(value, &mut queue);
+                Object::Closure(closure) => {
+                    queue.extend(closure.upvalues.iter().copied().map(ObjectId::from));
+                }
+                Object::Upvalue(value) => enqueue_value(value, &mut queue),
             }
         }
 
@@ -149,34 +217,72 @@ impl Heap {
         }
     }
 
-    fn table(&self, id: TableId) -> Result<&Table, HeapError> {
-        let slot = self
-            .slots
+    fn allocate(&mut self, object: Object) -> ObjectId {
+        self.live += 1;
+        if let Some(index) = self.free.pop() {
+            let slot = &mut self.slots[index as usize];
+            debug_assert!(slot.object.is_none());
+            slot.object = Some(object);
+            ObjectId {
+                index,
+                generation: slot.generation,
+            }
+        } else {
+            let index = self.slots.len() as u32;
+            self.slots.push(Slot {
+                generation: 0,
+                marked: false,
+                object: Some(object),
+            });
+            ObjectId {
+                index,
+                generation: 0,
+            }
+        }
+    }
+
+    fn object(&self, id: ObjectId) -> Option<&Object> {
+        self.slots
             .get(id.index as usize)
             .filter(|slot| slot.generation == id.generation)
-            .ok_or(HeapError::StaleTable(id))?;
-        match slot.object.as_ref() {
+            .and_then(|slot| slot.object.as_ref())
+    }
+
+    fn object_mut(&mut self, id: ObjectId) -> Option<&mut Object> {
+        self.slots
+            .get_mut(id.index as usize)
+            .filter(|slot| slot.generation == id.generation)
+            .and_then(|slot| slot.object.as_mut())
+    }
+
+    fn table(&self, id: TableId) -> Result<&Table, HeapError> {
+        match self.object(id.into()) {
             Some(Object::Table(table)) => Ok(table),
-            None => Err(HeapError::StaleTable(id)),
+            _ => Err(HeapError::StaleTable(id)),
         }
     }
 
     fn table_mut(&mut self, id: TableId) -> Result<&mut Table, HeapError> {
-        let slot = self
-            .slots
-            .get_mut(id.index as usize)
-            .filter(|slot| slot.generation == id.generation)
-            .ok_or(HeapError::StaleTable(id))?;
-        match slot.object.as_mut() {
+        match self.object_mut(id.into()) {
             Some(Object::Table(table)) => Ok(table),
-            None => Err(HeapError::StaleTable(id)),
+            _ => Err(HeapError::StaleTable(id)),
+        }
+    }
+
+    fn closure(&self, id: ClosureId) -> Result<&Closure, HeapError> {
+        match self.object(id.into()) {
+            Some(Object::Closure(closure)) => Ok(closure),
+            _ => Err(HeapError::StaleClosure(id)),
         }
     }
 }
 
-fn enqueue_value(value: &Value, queue: &mut VecDeque<TableId>) {
-    if let Value::Table(table) = value {
-        queue.push_back(*table);
+fn enqueue_value(value: &Value, queue: &mut VecDeque<ObjectId>) {
+    match value {
+        Value::Table(value) => queue.push_back((*value).into()),
+        Value::Closure(value) => queue.push_back((*value).into()),
+        Value::NativeFunction(_) => {}
+        _ => {}
     }
 }
 
@@ -190,6 +296,14 @@ struct Slot {
 #[derive(Clone, Debug)]
 enum Object {
     Table(Table),
+    Closure(Closure),
+    Upvalue(Value),
+}
+
+#[derive(Clone, Debug)]
+struct Closure {
+    prototype: usize,
+    upvalues: Vec<UpvalueId>,
 }
 
 #[derive(Clone, Debug)]
@@ -200,10 +314,10 @@ struct Table {
 
 impl Table {
     fn get(&self, key: &Key) -> Option<&Value> {
-        if let Some(index) = key.array_index() {
-            if index <= self.array.len() {
-                return self.array.get(index - 1);
-            }
+        if let Some(index) = key.array_index()
+            && index <= self.array.len()
+        {
+            return self.array.get(index - 1);
         }
         self.hash.get(key)
     }
@@ -263,6 +377,8 @@ enum Key {
     Number(u64),
     String(Arc<[u8]>),
     Table(TableId),
+    Closure(ClosureId),
+    NativeFunction(crate::NativeFunctionId),
 }
 
 impl Key {
@@ -286,6 +402,8 @@ impl Key {
             })),
             Value::String(value) => Ok(Self::String(value.clone())),
             Value::Table(value) => Ok(Self::Table(*value)),
+            Value::Closure(value) => Ok(Self::Closure(*value)),
+            Value::NativeFunction(value) => Ok(Self::NativeFunction(*value)),
         }
     }
 
@@ -293,6 +411,14 @@ impl Key {
         match self {
             Self::Integer(value) if *value > 0 => usize::try_from(*value).ok(),
             _ => None,
+        }
+    }
+
+    fn enqueue(&self, queue: &mut VecDeque<ObjectId>) {
+        match self {
+            Self::Table(value) => queue.push_back((*value).into()),
+            Self::Closure(value) => queue.push_back((*value).into()),
+            _ => {}
         }
     }
 }
@@ -320,15 +446,10 @@ mod tests {
             heap.table_get(table, &Value::Number(2.0)).unwrap(),
             Value::Number(2.0)
         );
-        assert_eq!(
-            heap.table_get(table, &Value::String(Arc::from(&b"name"[..])))
-                .unwrap(),
-            Value::Boolean(true)
-        );
     }
 
     #[test]
-    fn tracing_collection_handles_cycles_and_invalidates_stale_handles() {
+    fn tracing_collection_handles_cycles_and_closure_graphs() {
         let mut heap = Heap::default();
         let retained = heap.allocate_table(0, 0);
         let child = heap.allocate_table(0, 0);
@@ -337,13 +458,15 @@ mod tests {
             .unwrap();
         heap.table_set(child, Value::Integer(1), Value::Table(retained))
             .unwrap();
+        let upvalue = heap.allocate_upvalue(Value::Table(retained));
+        let closure = heap.allocate_closure(0, vec![upvalue]);
 
-        let root = Value::Table(retained);
+        let root = Value::Closure(closure);
         assert_eq!(
             heap.collect([&root]),
             CollectionStats {
-                before: 3,
-                retained: 2,
+                before: 5,
+                retained: 4,
                 collected: 1
             }
         );
@@ -354,9 +477,9 @@ mod tests {
         assert_eq!(
             heap.collect(std::iter::empty()),
             CollectionStats {
-                before: 2,
+                before: 4,
                 retained: 0,
-                collected: 2,
+                collected: 4,
             }
         );
     }

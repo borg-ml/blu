@@ -1,6 +1,6 @@
 use blu_runtime::{
     Value, Vm,
-    bytecode::{LoadLimits, load},
+    bytecode::{LoadLimits, disassemble, load},
 };
 use std::{
     env, fs,
@@ -72,6 +72,118 @@ for index = 1, 5 do
 end
 print(type(total) .. ":" .. tostring(total))
 "#;
+const FUNCTION_SOURCE: &str = r#"
+local function add(left, right)
+    return left + right
+end
+return add(3, 4)
+"#;
+const FUNCTION_REFERENCE_SOURCE: &str = r#"
+local function add(left, right)
+    return left + right
+end
+local value = add(3, 4)
+print(type(value) .. ":" .. tostring(value))
+"#;
+const CAPTURE_SOURCE: &str = r#"
+local value = 2
+local function bump()
+    value += 3
+    return value
+end
+bump()
+return bump()
+"#;
+const CAPTURE_REFERENCE_SOURCE: &str = r#"
+local value = 2
+local function bump()
+    value += 3
+    return value
+end
+bump()
+local result = bump()
+print(type(result) .. ":" .. tostring(result))
+"#;
+const NESTED_CAPTURE_SOURCE: &str = r#"
+local value = 4
+local function outer()
+    local function inner()
+        return value
+    end
+    return inner()
+end
+return outer()
+"#;
+const NESTED_CAPTURE_REFERENCE_SOURCE: &str = r#"
+local value = 4
+local function outer()
+    local function inner()
+        return value
+    end
+    return inner()
+end
+local result = outer()
+print(type(result) .. ":" .. tostring(result))
+"#;
+const PARENT_CAPTURE_SOURCE: &str = r#"
+local value = 1
+local function update()
+    value = 9
+end
+update()
+return value
+"#;
+const PARENT_CAPTURE_REFERENCE_SOURCE: &str = r#"
+local value = 1
+local function update()
+    value = 9
+end
+update()
+print(type(value) .. ":" .. tostring(value))
+"#;
+const VARARGS_SOURCE: &str = r#"
+local function sum(first, ...)
+    local second, third = ...
+    return first + second + third
+end
+return sum(1, 2, 3)
+"#;
+const VARARGS_REFERENCE_SOURCE: &str = r#"
+local function sum(first, ...)
+    local second, third = ...
+    return first + second + third
+end
+local result = sum(1, 2, 3)
+print(type(result) .. ":" .. tostring(result))
+"#;
+const MULTRET_SOURCE: &str = r#"
+local function pair()
+    return 2, 3
+end
+local function sum(left, right)
+    return left + right
+end
+return sum(pair())
+"#;
+const MULTRET_REFERENCE_SOURCE: &str = r#"
+local function pair()
+    return 2, 3
+end
+local function sum(left, right)
+    return left + right
+end
+local result = sum(pair())
+print(type(result) .. ":" .. tostring(result))
+"#;
+const TABLE_LITERAL_SOURCE: &str = r#"
+local values = { 3, 4, alpha = 2, beta = "x" }
+return values[1] + values[2] + values.alpha + #values.beta
+"#;
+const TABLE_LITERAL_REFERENCE_SOURCE: &str = r#"
+local values = { 3, 4, alpha = 2, beta = "x" }
+local result = values[1] + values[2] + values.alpha + #values.beta
+print(type(result) .. ":" .. tostring(result))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -114,6 +226,62 @@ fn run() -> Result<(), String> {
         &args.upstream,
         temporary.path(),
     )?;
+    verify_program_case(
+        "captureless function call",
+        FUNCTION_SOURCE,
+        FUNCTION_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "mutable captured local",
+        CAPTURE_SOURCE,
+        CAPTURE_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "nested upvalue capture",
+        NESTED_CAPTURE_SOURCE,
+        NESTED_CAPTURE_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "child mutation visible in parent",
+        PARENT_CAPTURE_SOURCE,
+        PARENT_CAPTURE_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "variadic arguments",
+        VARARGS_SOURCE,
+        VARARGS_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "multiple return forwarding",
+        MULTRET_SOURCE,
+        MULTRET_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "constant table template",
+        TABLE_LITERAL_SOURCE,
+        TABLE_LITERAL_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
 
     let portable_source = temporary.path().join("portable.lua");
     fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
@@ -123,8 +291,27 @@ fn run() -> Result<(), String> {
         .output()
         .map_err(|error| format!("failed to execute {}: {error}", compiler.display()))?;
     ensure_success(&compiler, &portable_bytecode)?;
-    load(&portable_bytecode.stdout, LoadLimits::default())
+    let portable_chunk = load(&portable_bytecode.stdout, LoadLimits::default())
         .map_err(|error| format!("Blu rejected portable upstream bytecode: {error}"))?;
+    let mut blu = Vm::default();
+    let results = blu.execute(&portable_chunk).map_err(|error| {
+        format!(
+            "Blu failed portable upstream bytecode: {error}\n{}",
+            disassemble(&portable_chunk)
+        )
+    })?;
+    if !results.is_empty() {
+        return Err(format!(
+            "Blu portable program returned unexpected values {results:?}"
+        ));
+    }
+    let output = blu.take_output();
+    if output != b"14\nlu\n" {
+        return Err(format!(
+            "Blu portable program returned unexpected output {:?}",
+            String::from_utf8_lossy(&output)
+        ));
+    }
     verify_portable_reference("Luau", &args.upstream, &portable_source)?;
     for (name, executable) in &lua_references {
         verify_portable_reference(name, executable, &portable_source)?;
@@ -133,7 +320,9 @@ fn run() -> Result<(), String> {
     println!("pinned Luau revision: {PINNED_REVISION}");
     println!("bytecode version: {bytecode_version}");
     println!("scalar differential corpus: pass ({scalar_count} cases)");
-    println!("program differential corpus: pass (tables and numeric loops)");
+    println!(
+        "program differential corpus: pass (tables, loops, closures, captures, varargs, multret)"
+    );
     println!("portable reference matrix: pass (Luau, Lua 5.1-5.5)");
     Ok(())
 }
@@ -156,9 +345,12 @@ fn verify_program_case(
     ensure_success(compiler, &bytecode)?;
     let chunk = load(&bytecode.stdout, LoadLimits::default())
         .map_err(|error| format!("Blu rejected program case {name:?}: {error}"))?;
-    let result = Vm::default()
-        .execute(&chunk)
-        .map_err(|error| format!("Blu failed program case {name:?}: {error}"))?;
+    let result = Vm::default().execute(&chunk).map_err(|error| {
+        format!(
+            "Blu failed program case {name:?}: {error}\n{}",
+            disassemble(&chunk)
+        )
+    })?;
     if result.len() != 1 {
         return Err(format!(
             "Blu returned {} values for program case {name:?}, expected one",

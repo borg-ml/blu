@@ -1,6 +1,6 @@
 [package]
 name = "blu-runtime"
-description = "Luau-compatible runtime and interpreter for Blu"
+description = "High-performance Lua-family runtime and interpreter for Blu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,4 +10,3 @@ authors.workspace = true
 
 [dependencies]
 blu-bytecode.workspace = true
-

@@ -1,6 +1,6 @@
 [package]
 name = "blu-lang"
-description = "High-performance Rust runtime for Luau, Lua, and the Blu language"
+description = "High-performance Lua-family language and Rust runtime"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -11,4 +11,3 @@ authors.workspace = true
 [dependencies]
 blu-bytecode.workspace = true
 blu-runtime.workspace = true
-

@@ -1,7 +1,10 @@
 # Blu
 
-Blu is a high-performance Rust runtime for the Lua language family, built for
-deeply extensible native applications and the Borg agent runtime.
+Blu is a high-performance Lua-family language and Rust runtime, built for
+deeply extensible native applications and the Borg agent runtime. Its default
+`blu` dialect is a pragmatic superset of Luau and modern Lua; explicit
+compatibility dialects preserve the exact semantics of each upstream language
+version where those semantics conflict.
 
 Blu starts from [Luau](https://github.com/luau-lang/luau)'s optimized language
 and VM design, but it is not confined to Roblox's sandboxed Luau surface. Blu

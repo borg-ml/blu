@@ -4,9 +4,15 @@ Status: early implementation contract
 
 ## Purpose
 
-Blu is a fast Rust runtime for deeply programmable native applications. Luau
-provides Blu's initial compiler/VM architecture and one compatibility target;
-it does not define the complete Blu language or standard library.
+Blu is a fast Lua-family language and Rust runtime for deeply programmable
+native applications. The `blu` dialect is a pragmatic superset of Luau and
+modern Lua features. Luau provides the initial compiler/VM architecture and one
+compatibility target; it does not define the complete Blu language or standard
+library.
+
+Exact compatibility remains dialect-specific because Lua and Luau have
+conflicting observable semantics that no single mode can preserve
+simultaneously.
 
 The runtime must support ordinary system programming where authority permits:
 files, streams, environment variables, processes, sockets, dynamic packages,

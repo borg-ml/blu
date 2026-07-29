@@ -1,6 +1,6 @@
 [package]
 name = "blu-conformance"
-description = "Differential conformance runner for Blu and upstream Luau"
+description = "Differential conformance runner for Blu, Luau, and Lua"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
