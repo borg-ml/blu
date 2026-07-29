@@ -441,6 +441,47 @@ mod tests {
     }
 
     #[test]
+    fn automatic_gc_reclaims_unreachable_objects_before_enforcing_the_heap_limit() {
+        let baseline = Vm::default().heap().live_objects();
+        let mut collecting = Engine::new(
+            Compiler::default(),
+            Vm::default().with_heap_object_limit(baseline + 2),
+        );
+        assert_eq!(
+            collecting.execute(
+                br#"
+                    local value = {}
+                    for _ = 1, 1_000 do
+                        value = {}
+                    end
+                    return type(value)
+                "#
+            ),
+            Ok(vec![Value::String(Arc::from(&b"table"[..]))])
+        );
+        assert!(collecting.vm().heap().live_objects() <= baseline + 2);
+
+        let mut retained = Engine::new(
+            Compiler::default(),
+            Vm::default().with_heap_object_limit(baseline + 3),
+        );
+        assert!(matches!(
+            retained.execute(
+                br#"
+                    local keep = {}
+                    keep[1] = {}
+                    keep[2] = {}
+                    keep[3] = {}
+                "#
+            ),
+            Err(ExecuteError::Runtime(RuntimeError::HeapObjectLimit {
+                limit,
+                ..
+            })) if limit == baseline + 3
+        ));
+    }
+
+    #[test]
     fn suspended_explicit_frames_remain_gc_roots() {
         let mut engine = Engine::default();
         let collect = engine.vm_mut().register_function(|vm, _| {

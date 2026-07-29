@@ -35,6 +35,7 @@ pub struct Vm {
     dialect: Dialect,
     instruction_limit: u64,
     call_limit: usize,
+    heap_object_limit: usize,
     heap: Heap,
     globals: HashMap<Arc<[u8]>, Value>,
     native_functions: Vec<NativeFunction>,
@@ -49,6 +50,7 @@ pub struct Vm {
     main_thread: ThreadId,
     running_thread: Option<ThreadId>,
     output: Vec<u8>,
+    output_limit: usize,
     active_roots: Vec<Vec<Value>>,
 }
 
@@ -69,6 +71,7 @@ impl Vm {
             dialect,
             instruction_limit: 10_000_000,
             call_limit: 1_000,
+            heap_object_limit: 1_000_000,
             heap,
             globals: HashMap::new(),
             native_functions: Vec::new(),
@@ -83,6 +86,7 @@ impl Vm {
             main_thread,
             running_thread: None,
             output: Vec::new(),
+            output_limit: MAX_STRING_BYTES,
             active_roots: Vec::new(),
         };
         vm.install_base_library();
@@ -98,6 +102,18 @@ impl Vm {
     #[must_use]
     pub fn with_call_limit(mut self, limit: usize) -> Self {
         self.call_limit = limit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_output_limit(mut self, limit: usize) -> Self {
+        self.output_limit = limit;
+        self
+    }
+
+    #[must_use]
+    pub fn with_heap_object_limit(mut self, limit: usize) -> Self {
+        self.heap_object_limit = limit;
         self
     }
 
@@ -157,6 +173,27 @@ impl Vm {
         self.threads
             .retain(|thread, _| self.heap.contains_thread(*thread));
         stats
+    }
+
+    fn ensure_heap_objects(
+        &mut self,
+        additional: usize,
+        roots: &[Value],
+    ) -> Result<(), RuntimeError> {
+        let required = self.heap.live_objects().saturating_add(additional);
+        if required <= self.heap_object_limit {
+            return Ok(());
+        }
+        self.collect(roots);
+        let required = self.heap.live_objects().saturating_add(additional);
+        if required <= self.heap_object_limit {
+            Ok(())
+        } else {
+            Err(RuntimeError::HeapObjectLimit {
+                required,
+                limit: self.heap_object_limit,
+            })
+        }
     }
 
     pub fn execute(&mut self, chunk: &Chunk) -> Result<Vec<Value>, RuntimeError> {
@@ -393,6 +430,10 @@ impl Vm {
                         .get(child)
                         .ok_or(RuntimeError::InvalidPrototype(child))?
                         .upvalue_count;
+                    self.ensure_heap_objects(
+                        usize::from(upvalue_count) + 1,
+                        &frame.gc_roots(&self.heap)?,
+                    )?;
                     let closure = self.heap.allocate_closure(chunk.clone(), child, Vec::new());
                     let mut upvalues = Vec::with_capacity(upvalue_count as usize);
                     for capture_index in 0..upvalue_count {
@@ -616,6 +657,7 @@ impl Vm {
                             limit: MAX_TABLE_INITIAL_CAPACITY,
                         });
                     }
+                    self.ensure_heap_objects(1, &frame.gc_roots(&self.heap)?)?;
                     let table = self.heap.allocate_table(array_capacity, hash_capacity);
                     frame.set(instruction.a(), Value::Table(table))?;
                 }
@@ -656,6 +698,7 @@ impl Vm {
                             });
                         }
                     };
+                    self.ensure_heap_objects(1, &frame.gc_roots(&self.heap)?)?;
                     let table = self.heap.allocate_table(0, entries.len());
                     for (key, value) in entries {
                         let key = materialize_constant(&chunk, prototype, key)?;
@@ -1896,6 +1939,28 @@ impl Vm {
         self.set_global(&b"xpcall"[..], Value::NativeFunction(xpcall));
 
         let print = self.register_function(|vm, arguments| {
+            let mut added = 1usize;
+            for (index, argument) in arguments.iter().enumerate() {
+                let Some(length) = added.checked_add(usize::from(index != 0)) else {
+                    added = usize::MAX;
+                    break;
+                };
+                let Some(length) = length.checked_add(rendered_value_len(argument)) else {
+                    added = usize::MAX;
+                    break;
+                };
+                added = length;
+            }
+            let required = vm.output.len().saturating_add(added);
+            if required > vm.output_limit {
+                return Err(RuntimeError::OutputLimit {
+                    required,
+                    limit: vm.output_limit,
+                });
+            }
+            vm.output
+                .try_reserve(added)
+                .map_err(|_| RuntimeError::Allocation { what: "VM output" })?;
             for (index, value) in arguments.iter().enumerate() {
                 if index != 0 {
                     vm.output.push(b'\t');
@@ -2135,6 +2200,7 @@ impl Vm {
                     actual: function.type_name(),
                 });
             }
+            vm.ensure_heap_objects(1, &[])?;
             let thread = vm.heap.allocate_thread(vec![function.clone()]);
             vm.threads.insert(thread, ThreadState::New(function));
             Ok(vec![Value::Thread(thread)])
@@ -2169,6 +2235,7 @@ impl Vm {
                     actual: function.type_name(),
                 });
             }
+            vm.ensure_heap_objects(1, &[])?;
             let thread = vm.heap.allocate_thread(vec![function.clone()]);
             vm.threads.insert(thread, ThreadState::New(function));
             Ok(vec![Value::CoroutineFunction(thread)])
@@ -2555,6 +2622,7 @@ impl Vm {
             Ok(vec![Value::String(Arc::from(result))])
         });
         let pack = self.register_function(|vm, arguments| {
+            vm.ensure_heap_objects(1, &[])?;
             let table = vm.heap.allocate_table(arguments.len(), 1);
             for (index, value) in arguments.iter().enumerate() {
                 vm.heap
@@ -2858,12 +2926,30 @@ fn append_value(output: &mut Vec<u8>, value: &Value) {
     }
 }
 
+fn rendered_value_len(value: &Value) -> usize {
+    match value {
+        Value::Nil => 3,
+        Value::Boolean(true) => 4,
+        Value::Boolean(false) => 5,
+        Value::Number(value) => value.to_string().len(),
+        Value::Integer(value) => value.to_string().len(),
+        Value::String(value) => value.len(),
+        Value::Table(value) => format!("{value:?}").len(),
+        Value::Closure(value) => format!("{value:?}").len(),
+        Value::Thread(value) => format!("{value:?}").len(),
+        Value::CoroutineFunction(value) => format!("CoroutineFunction({value:?})").len(),
+        Value::NativeFunction(value) => format!("{value:?}").len(),
+    }
+}
+
 impl fmt::Debug for Vm {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Vm")
             .field("dialect", &self.dialect)
             .field("instruction_limit", &self.instruction_limit)
             .field("call_limit", &self.call_limit)
+            .field("heap_object_limit", &self.heap_object_limit)
+            .field("output_limit", &self.output_limit)
             .field("heap", &self.heap)
             .field("globals", &self.globals)
             .field("native_function_count", &self.native_functions.len())
@@ -3345,6 +3431,9 @@ fn integer_floor_div(left: i64, right: i64) -> Result<i64, RuntimeError> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeError {
     Validation(ValidationError),
+    Allocation {
+        what: &'static str,
+    },
     DialectNotImplemented(Dialect),
     InvalidMainPrototype(usize),
     InvalidPrototype(usize),
@@ -3423,6 +3512,10 @@ pub enum RuntimeError {
         required: usize,
         limit: usize,
     },
+    HeapObjectLimit {
+        required: usize,
+        limit: usize,
+    },
     MetatableProtected,
     MetatableLoop,
     UnsupportedMetamethod {
@@ -3445,6 +3538,10 @@ pub enum RuntimeError {
         required: usize,
         limit: usize,
     },
+    OutputLimit {
+        required: usize,
+        limit: usize,
+    },
     TableCapacity {
         kind: &'static str,
         requested: u64,
@@ -3460,6 +3557,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Validation(error) => write!(f, "bytecode validation failed: {error}"),
+            Self::Allocation { what } => write!(f, "{what} allocation failed"),
             Self::DialectNotImplemented(dialect) => {
                 write!(f, "{dialect:?} execution is not implemented")
             }
@@ -3536,6 +3634,9 @@ impl fmt::Display for RuntimeError {
                     "dynamic stack requires {required} values, limit is {limit}"
                 )
             }
+            Self::HeapObjectLimit { required, limit } => {
+                write!(f, "heap requires {required} live objects, limit is {limit}")
+            }
             Self::MetatableProtected => f.write_str("cannot change a protected metatable"),
             Self::MetatableLoop => f.write_str("metatable lookup chain is too long"),
             Self::UnsupportedMetamethod { name, actual } => {
@@ -3569,6 +3670,9 @@ impl fmt::Display for RuntimeError {
                     f,
                     "string result requires {required} bytes, limit is {limit}"
                 )
+            }
+            Self::OutputLimit { required, limit } => {
+                write!(f, "VM output requires {required} bytes, limit is {limit}")
             }
             Self::TableCapacity {
                 kind,
@@ -3731,6 +3835,21 @@ mod tests {
         )
         .unwrap();
         assert_eq!(vm.take_output(), b"blu\t3\n");
+
+        let mut limited = Vm::default().with_output_limit(3);
+        let Value::NativeFunction(print) = limited.global(b"print").cloned().unwrap() else {
+            panic!("print is not native");
+        };
+        let print = limited.native_functions[print.0 as usize].clone();
+        let error = print(&mut limited, &[Value::String(Arc::from(&b"blu"[..]))]).unwrap_err();
+        assert_eq!(
+            error,
+            RuntimeError::OutputLimit {
+                required: 4,
+                limit: 3,
+            }
+        );
+        assert!(limited.take_output().is_empty());
 
         let string = table_id(vm.global(b"string").unwrap()).unwrap();
         let sub = vm

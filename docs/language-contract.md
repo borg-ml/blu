@@ -110,10 +110,14 @@ or consuming conversion back to a mutable tooling `Chunk`; converting back
 requires validation again before execution. A `NEWTABLE` instruction may
 request at most 1,048,576
 initial array slots and 1,048,576 initial hash slots. Larger requests fail
-validation or return a structured runtime error before allocation. This
-initial-capacity bound is only one defense; VM-wide byte accounting and
-automatic GC thresholds remain required before confined execution can claim a
-hard memory limit.
+validation or return a structured runtime error before allocation. The VM also
+has configurable captured-output and live arena-object limits. Crossing the
+object threshold first performs tracing collection with active registers,
+callers, globals, modules, and threads rooted; retained objects then fail with
+a structured limit error. Output growth is preflighted and uses fallible
+reservation. These are partial defenses: VM-wide byte accounting for table
+growth, strings, chunks, and temporary/native results remains required before
+confined execution can claim a hard memory limit.
 
 ## Package compatibility
 
