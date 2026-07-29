@@ -136,6 +136,7 @@ pub enum TokenKind {
     Identifier,
     DecimalInteger,
     DecimalNumber,
+    HexInteger,
     StringLiteral,
     Equal,
     Comma,
@@ -434,38 +435,66 @@ pub fn lex(
                 TokenKind::RightParenthesis
             }
             b'0'..=b'9' => {
-                let scan = scan_decimal(bytes, start);
-                offset = scan.end;
-                if let Some(exponent) = scan.malformed_exponent {
-                    let span = source.span(exponent, offset)?;
-                    let diagnostic = diagnostic(
-                        "BLU-LEX-0009",
-                        explicit_profile,
-                        span,
-                        "decimal exponent requires at least one digit",
-                        limits.diagnostic_limits,
-                    )?
-                    .try_with_found(&bytes[exponent..offset])?
-                    .try_with_expected("decimal exponent digit")?;
-                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
-                }
-                if scan.adjacent_dots {
-                    let span = source.span(start, offset)?;
-                    let diagnostic = diagnostic(
-                        "BLU-LEX-0010",
-                        explicit_profile,
-                        span,
-                        "a trailing decimal point must be separated from a following dot",
-                        limits.diagnostic_limits,
-                    )?
-                    .try_with_found(&bytes[start..offset])?
-                    .try_with_help("insert whitespace before a future concatenation operator")?;
-                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
-                }
-                if scan.is_integer {
-                    TokenKind::DecimalInteger
+                if bytes[start] == b'0'
+                    && bytes
+                        .get(start + 1)
+                        .is_some_and(|byte| matches!(byte, b'x' | b'X'))
+                {
+                    offset += 2;
+                    let digits = offset;
+                    while offset < bytes.len() && bytes[offset].is_ascii_hexdigit() {
+                        offset += 1;
+                    }
+                    if offset == digits {
+                        let span = source.span(start, offset)?;
+                        let diagnostic = diagnostic(
+                            "BLU-LEX-0011",
+                            explicit_profile,
+                            span,
+                            "hexadecimal integer requires at least one digit",
+                            limits.diagnostic_limits,
+                        )?
+                        .try_with_found(&bytes[start..offset])?
+                        .try_with_expected("hexadecimal digit")?;
+                        push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                    }
+                    TokenKind::HexInteger
                 } else {
-                    TokenKind::DecimalNumber
+                    let scan = scan_decimal(bytes, start);
+                    offset = scan.end;
+                    if let Some(exponent) = scan.malformed_exponent {
+                        let span = source.span(exponent, offset)?;
+                        let diagnostic = diagnostic(
+                            "BLU-LEX-0009",
+                            explicit_profile,
+                            span,
+                            "decimal exponent requires at least one digit",
+                            limits.diagnostic_limits,
+                        )?
+                        .try_with_found(&bytes[exponent..offset])?
+                        .try_with_expected("decimal exponent digit")?;
+                        push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                    }
+                    if scan.adjacent_dots {
+                        let span = source.span(start, offset)?;
+                        let diagnostic = diagnostic(
+                            "BLU-LEX-0010",
+                            explicit_profile,
+                            span,
+                            "a trailing decimal point must be separated from a following dot",
+                            limits.diagnostic_limits,
+                        )?
+                        .try_with_found(&bytes[start..offset])?
+                        .try_with_help(
+                            "insert whitespace before a future concatenation operator",
+                        )?;
+                        push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                    }
+                    if scan.is_integer {
+                        TokenKind::DecimalInteger
+                    } else {
+                        TokenKind::DecimalNumber
+                    }
                 }
             }
             b'.' if bytes.get(offset + 1).is_some_and(u8::is_ascii_digit) => {

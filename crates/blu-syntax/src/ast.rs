@@ -136,6 +136,7 @@ pub enum ExpressionKind {
     Boolean(bool),
     DecimalInteger,
     DecimalNumber,
+    HexInteger,
     StringLiteral,
     Identifier(Identifier),
     Group(ExpressionId),

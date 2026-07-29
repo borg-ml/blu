@@ -531,6 +531,30 @@ fn malformed_decimal_exponents_are_structured() {
 }
 
 #[test]
+fn hexadecimal_integers_are_shared_and_require_digits() {
+    for profile in SemanticProfile::ALL {
+        let valid = source(b"return 0x10, 0Xff".to_vec());
+        let lexed = lex(&valid, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::Return,
+                TokenKind::HexInteger,
+                TokenKind::Comma,
+                TokenKind::HexInteger,
+            ],
+            "{profile}"
+        );
+
+        let malformed = source(b"return 0x".to_vec());
+        let lexed = lex(&malformed, profile, LexerLimits::default()).unwrap();
+        assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0011");
+        assert_eq!(lexed.diagnostics()[0].found(), Some(b"0x".as_slice()));
+    }
+}
+
+#[test]
 fn only_a_byte_zero_directive_participates_in_reconciliation() {
     let source = source(b"\n--!dialect lua54\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

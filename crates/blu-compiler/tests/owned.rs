@@ -839,6 +839,44 @@ fn fractional_and_exponent_numbers_lower_for_every_profile() {
 }
 
 #[test]
+fn hexadecimal_integers_follow_each_profile_numeric_policy() {
+    let source =
+        make_source(b"return 0x10, 0Xff, 0xffffffffffffffff, 0x10000000000000000".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let constants = compiled.artifact().prototypes()[0].constants.as_slice();
+        if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            assert_eq!(
+                constants,
+                [
+                    Constant::Integer(16),
+                    Constant::Integer(255),
+                    Constant::Integer(-1),
+                    Constant::Integer(0),
+                ],
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                constants,
+                [
+                    Constant::Number(16.0),
+                    Constant::Number(255.0),
+                    Constant::Number(18_446_744_073_709_551_615.0),
+                    Constant::Number(18_446_744_073_709_551_616.0),
+                ],
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn source_and_debug_name_limits_are_checked_before_owned_copies() {
     let source = make_source(b"local answer = 1\nreturn answer".to_vec());
     let mut source_name_limits = OwnedCompileLimits::default();

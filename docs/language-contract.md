@@ -50,7 +50,8 @@ program. It includes byte-zero dialect directives, stable raw-byte spans,
 retained trivia, the documented `//` profile gate, `local name = expression`,
 bare or expression-list `return`, nil/boolean/identifier expressions, shared
 decimal integers plus the digit-bearing fraction/exponent subset (`1.5`, `.25`,
-`1.`, `1.e2`, `2e3`, and `4.5e-2`),
+`1.`, `1.e2`, `2e3`, and `4.5e-2`), hexadecimal integers with explicit
+Lua 5.3–5.5 wrapping-integer versus number-profile lowering,
 single- and double-quoted byte strings with the common Lua/Luau escaped delimiters,
 backslash, and `\a`/`\b`/`\f`/`\n`/`\r`/`\t`/`\v`, and
 `+`/`-`/`*`/`/`/`%`/`^`/`//`

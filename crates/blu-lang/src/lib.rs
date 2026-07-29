@@ -297,7 +297,7 @@ mod tests {
         let source = SourceFile::new(
             SourceId::new(1),
             "answer.blu",
-            b"local empty = nil\nlocal yes = true\nreturn empty, yes, false, 'blu', not empty, not yes, not 0, not 'blu', (40 + 2), 40 - 2 - 3, 2 + 5 * 8, 21 / 2, 20 / 5, -7, -(2 + 3), - -1, -7 % 3, 7 % -3, -2^2, 2^-2, 2^3^2, #'blu', #\"a\\nb\", #'', 1.5, .25, 1., 1.e2, 2e3, 4.5E-2".to_vec(),
+            b"local empty = nil\nlocal yes = true\nreturn empty, yes, false, 'blu', not empty, not yes, not 0, not 'blu', (40 + 2), 40 - 2 - 3, 2 + 5 * 8, 21 / 2, 20 / 5, -7, -(2 + 3), - -1, -7 % 3, 7 % -3, -2^2, 2^-2, 2^3^2, #'blu', #\"a\\nb\", #'', 1.5, .25, 1., 1.e2, 2e3, 4.5E-2, 0x10, 0Xff".to_vec(),
             SourceLimits::default(),
         )
         .unwrap();
@@ -407,6 +407,22 @@ mod tests {
                     Value::Number(100.0),
                     Value::Number(2_000.0),
                     Value::Number(0.045),
+                    if matches!(
+                        profile,
+                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) {
+                        Value::Integer(16)
+                    } else {
+                        Value::Number(16.0)
+                    },
+                    if matches!(
+                        profile,
+                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) {
+                        Value::Integer(255)
+                    } else {
+                        Value::Number(255.0)
+                    },
                 ]),
                 "{profile}"
             );

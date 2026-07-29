@@ -714,6 +714,19 @@ impl<'a> Lowerer<'a> {
                 )?;
                 Ok(destination)
             }
+            ExpressionKind::HexInteger => {
+                let constant = self.hex_integer_constant(expression.span())?;
+                let constant_index = self.push_constant(constant)?;
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::LoadConstant {
+                        destination,
+                        constant: constant_index,
+                    },
+                    expression.span(),
+                )?;
+                Ok(destination)
+            }
             ExpressionKind::StringLiteral => {
                 let constant = self.string_constant(expression.span())?;
                 self.lower_constant(constant, expression.span())
@@ -962,6 +975,45 @@ impl<'a> Lowerer<'a> {
         Ok(Constant::Number(number))
     }
 
+    fn hex_integer_constant(&self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
+        let bytes = self.source.slice(span)?;
+        check_limit(
+            OwnedCompileLimit::IntegerLiteralBytes,
+            bytes.len(),
+            self.limits.max_integer_literal_bytes,
+        )?;
+        let Some(digits) = bytes
+            .strip_prefix(b"0x")
+            .or_else(|| bytes.strip_prefix(b"0X"))
+        else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "hex-integer AST has no hexadecimal prefix",
+            });
+        };
+        if digits.is_empty() || !digits.iter().all(u8::is_ascii_hexdigit) {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "hex-integer AST contains an invalid digit",
+            });
+        }
+
+        if matches!(
+            self.profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            let integer = digits.iter().fold(0_u64, |value, byte| {
+                value
+                    .wrapping_mul(16)
+                    .wrapping_add(u64::from(hex_digit(*byte)))
+            });
+            return Ok(Constant::Integer(integer as i64));
+        }
+
+        let number = digits.iter().fold(0.0_f64, |value, byte| {
+            value.mul_add(16.0, f64::from(hex_digit(*byte)))
+        });
+        Ok(Constant::Number(number))
+    }
+
     fn string_constant(&mut self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
         let bytes = self.source.slice(span)?;
         let Some((&quote, rest)) = bytes.split_first() else {
@@ -1158,6 +1210,15 @@ fn decode_string_escape(escaped: u8) -> Option<u8> {
         b'v' => 0x0b,
         _ => return None,
     })
+}
+
+fn hex_digit(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
 }
 
 fn decoded_string_len(value: &[u8]) -> Result<usize, OwnedCompileError> {
