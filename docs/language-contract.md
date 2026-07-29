@@ -68,7 +68,10 @@ locals (with explicit shadowing), decimal integer
 literals, truthiness-based boolean `not`, numeric `+`/`-`/`*`, profile-gated `//`, and
 an optional final bare or expression-list `return`. Falling off the chunk emits
 an EOF-spanned zero-result return. A local declaration without `= expression`
-is initialized to `nil`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
+is initialized to `nil`. Single-name assignment evaluates its right-hand
+expression before moving the result into the active shadowed local. An
+unresolved assignment target fails in resolution rather than implicitly
+selecting global semantics. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
 BluV1 Integer constants and use normal IEEE-754 parsing above that; Lua 5.1,
 Lua 5.2, and Luau always use the latter Number policy. Blu currently uses the
 Number policy for its bootstrap path, which is not a final Blu

@@ -1,7 +1,7 @@
 use crate::{
-    Ast, BinaryExpression, BinaryOperator, DialectDirective, Expression, ExpressionId,
-    ExpressionKind, Identifier, LexError, Lexed, LexerLimits, LocalStatement, ReturnStatement,
-    Statement, Token, TokenKind, UnaryExpression, UnaryOperator, lex,
+    AssignmentStatement, Ast, BinaryExpression, BinaryOperator, DialectDirective, Expression,
+    ExpressionId, ExpressionKind, Identifier, LexError, Lexed, LexerLimits, LocalStatement,
+    ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -308,6 +308,7 @@ impl<'a> Parser<'a> {
         while let Some(token) = self.current() {
             match token.kind() {
                 TokenKind::Local => self.parse_local()?,
+                TokenKind::Identifier => self.parse_assignment()?,
                 TokenKind::Return => {
                     self.parse_return()?;
                     if self.current().is_some() {
@@ -323,7 +324,7 @@ impl<'a> Parser<'a> {
                     self.report_current(
                         "BLU-PARSE-0001",
                         "expected a supported statement",
-                        &["local", "return"],
+                        &["local", "assignment", "return"],
                     )?;
                     self.bump();
                 }
@@ -412,6 +413,32 @@ impl<'a> Parser<'a> {
 
         let span = keyword.span().merge(end)?;
         self.push_statement(Statement::Return(ReturnStatement::new(values, span)))
+    }
+
+    fn parse_assignment(&mut self) -> Result<(), ParseError> {
+        let Some(target) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "assignment parser entered without a current token",
+            });
+        };
+        if !self.at(TokenKind::Equal) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0006",
+                "expected `=` after assignment target",
+                &["="],
+            )?;
+            return Ok(());
+        }
+        self.bump();
+        let Some(value) = self.parse_expression(0)? else {
+            return Ok(());
+        };
+        let span = target.span().merge(self.expression(value.id)?.span())?;
+        self.push_statement(Statement::Assignment(AssignmentStatement::new(
+            Identifier::new(target.span()),
+            value.id,
+            span,
+        )))
     }
 
     fn parse_expression(

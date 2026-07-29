@@ -28,8 +28,9 @@ use blu_core::{
     Severity, SourceFile, SourceIdentity, SpanError,
 };
 use blu_syntax::{
-    Ast, BinaryOperator, Expression, ExpressionId, ExpressionKind, LocalStatement, ParseError,
-    ParseLimits, ParseOutcome, Rejected, ReturnStatement, Statement, UnaryOperator, parse,
+    AssignmentStatement, Ast, BinaryOperator, Expression, ExpressionId, ExpressionKind,
+    LocalStatement, ParseError, ParseLimits, ParseOutcome, Rejected, ReturnStatement, Statement,
+    UnaryOperator, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -395,6 +396,7 @@ impl<'a> Lowerer<'a> {
         for (index, statement) in ast.statements().iter().enumerate() {
             match statement {
                 Statement::Local(local) => self.lower_local(*local)?,
+                Statement::Assignment(assignment) => self.lower_assignment(*assignment)?,
                 Statement::Return(return_statement) => {
                     if index + 1 != ast.statements().len() {
                         return Err(OwnedCompileError::InternalInvariant {
@@ -511,6 +513,21 @@ impl<'a> Lowerer<'a> {
                 start_pc,
             },
             "local bindings",
+        )
+    }
+
+    fn lower_assignment(
+        &mut self,
+        statement: AssignmentStatement,
+    ) -> Result<(), OwnedCompileError> {
+        let destination = self.resolve(statement.target().span())?;
+        let source = self.lower_expression(statement.value())?;
+        self.emit(
+            Instruction::Move {
+                destination,
+                source,
+            },
+            statement.span(),
         )
     }
 

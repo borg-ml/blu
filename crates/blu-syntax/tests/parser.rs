@@ -105,6 +105,40 @@ fn local_without_initializer_has_no_value_and_ends_at_its_name() {
 }
 
 #[test]
+fn identifier_assignment_preserves_target_value_and_full_span() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"local answer = 40\nanswer = answer + 2\nreturn answer".to_vec());
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::Assignment(assignment) = parsed.ast().statements()[1] else {
+            panic!("expected assignment statement");
+        };
+        assert_eq!(source.slice(assignment.target().span()).unwrap(), b"answer");
+        assert_eq!(
+            source
+                .slice(parsed.ast().expression(assignment.value()).unwrap().span(),)
+                .unwrap(),
+            b"answer + 2"
+        );
+        assert_eq!(
+            source.slice(assignment.span()).unwrap(),
+            b"answer = answer + 2"
+        );
+    }
+}
+
+#[test]
+fn identifier_statement_without_equal_is_rejected_structurally() {
+    let source = source(b"answer\nreturn answer".to_vec());
+    let outcome = parse(&source, SemanticProfile::Blu, ParseLimits::default()).unwrap();
+    let rejected = outcome.rejected().unwrap();
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0006");
+    assert_eq!(
+        rejected.diagnostics()[0].primary().span(),
+        source.span(7, 13).unwrap()
+    );
+}
+
+#[test]
 fn floor_divide_binds_tighter_than_add_and_both_are_left_associative() {
     let source = source(b"return a + b // c // d + e".to_vec());
     let parsed = accepted(&source, SemanticProfile::Lua54, ParseLimits::default());

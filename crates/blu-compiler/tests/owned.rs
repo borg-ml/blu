@@ -222,6 +222,52 @@ fn uninitialized_local_lowers_to_nil_for_every_profile() {
 }
 
 #[test]
+fn local_assignment_mutates_the_active_shadowed_binding_for_every_profile() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(
+            b"local answer = 1\nlocal answer = 40\nanswer = answer + 2\nreturn answer".to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(compiled.artifact().main().code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::Move {
+                    destination: 1,
+                    source: 3,
+                }
+            )
+        }));
+        assert_eq!(
+            Vm::new(Dialect::Blu)
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(42)
+            } else {
+                Value::Number(42.0)
+            }]),
+            "{profile}"
+        );
+    }
+
+    let source = make_source(b"missing = 1".to_vec());
+    let error = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap_err();
+    let diagnostic = error.diagnostic().unwrap();
+    assert_eq!(diagnostic.code().as_str(), "BLU-RESOLVE-0001");
+    assert_eq!(diagnostic.phase(), Phase::Resolve);
+    assert_eq!(
+        source.slice(diagnostic.primary().span()).unwrap(),
+        b"missing"
+    );
+}
+
+#[test]
 fn floor_division_lowers_only_for_assigned_profiles_and_bootstrap_translation_rejects_it() {
     for profile in [
         SemanticProfile::Luau,

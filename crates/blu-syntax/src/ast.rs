@@ -166,6 +166,38 @@ pub struct LocalStatement {
     span: ByteSpan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AssignmentStatement {
+    target: Identifier,
+    value: ExpressionId,
+    span: ByteSpan,
+}
+
+impl AssignmentStatement {
+    pub(crate) const fn new(target: Identifier, value: ExpressionId, span: ByteSpan) -> Self {
+        Self {
+            target,
+            value,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn target(self) -> Identifier {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn value(self) -> ExpressionId {
+        self.value
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl LocalStatement {
     pub(crate) const fn new(name: Identifier, value: Option<ExpressionId>, span: ByteSpan) -> Self {
         Self { name, value, span }
@@ -212,6 +244,7 @@ impl ReturnStatement {
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Statement {
     Local(LocalStatement),
+    Assignment(AssignmentStatement),
     Return(ReturnStatement),
 }
 
@@ -220,6 +253,7 @@ impl Statement {
     pub const fn span(&self) -> ByteSpan {
         match self {
             Self::Local(statement) => statement.span(),
+            Self::Assignment(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
         }
     }
