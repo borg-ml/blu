@@ -30,5 +30,7 @@ for version in "${versions[@]}"; do
     if [[ ! -d "$checkout" ]]; then
         tar --extract --gzip --file "$download_dir/$archive" --directory "$source_dir"
     fi
-    make --directory "$checkout" linux
+    # The generic target avoids an optional readline development dependency.
+    # These binaries are semantic references, not the eventual Blu system API.
+    make --directory "$checkout" generic
 done
