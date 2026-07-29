@@ -193,9 +193,13 @@ reserve fallibly before changing logical state. Resumed protected-error
 unwinding uses fallible independent frame/caller snapshots, including
 registers, constants, varargs, and open-upvalue indexes. Guest-created
 coroutine-state entries and `require` loading/cache bookkeeping reserve their
-maps before insertion. Results returned from a native
-callback are count-bounded (1,000,000 by default, configurable with
-`Vm::with_native_result_limit`) and rejected before caller-frame writes, but
+maps before insertion. Native-function and global registries have configurable
+entry limits; `try_register_function` and `try_set_global` reserve collection
+growth fallibly and reject over-limit mutations atomically. The older
+convenience methods remain panic-on-error compatibility wrappers. Built-in
+registry backing storage is reserved fallibly during `Vm::try_new`. Results
+returned from a native callback are count-bounded (1,000,000 by default,
+configurable with `Vm::with_native_result_limit`) and rejected before caller-frame writes, but
 allocations performed inside host callback code remain the embedder's
 responsibility. Built-in concatenation and the string transformation,
 repetition, character, byte-expansion, and `table.unpack` result buffers use

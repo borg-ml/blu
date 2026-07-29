@@ -23,6 +23,10 @@ const MAX_DYNAMIC_REGISTERS: usize = 1_000_000;
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_HOST_VALUE_LIMIT: usize = 4096;
 const DEFAULT_NATIVE_RESULT_LIMIT: usize = MAX_DYNAMIC_REGISTERS;
+const DEFAULT_NATIVE_FUNCTION_LIMIT: usize = 1_000_000;
+const DEFAULT_GLOBAL_LIMIT: usize = 1_000_000;
+const BUILTIN_NATIVE_CAPACITY: usize = 128;
+const BUILTIN_GLOBAL_CAPACITY: usize = 64;
 
 type NativeFunction =
     Arc<dyn Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync>;
@@ -136,6 +140,8 @@ pub struct Vm {
     host_root_count: usize,
     host_value_limit: usize,
     native_result_limit: usize,
+    native_function_limit: usize,
+    global_limit: usize,
 }
 
 impl Default for Vm {
@@ -190,7 +196,19 @@ impl Vm {
             host_root_count: 0,
             host_value_limit: DEFAULT_HOST_VALUE_LIMIT,
             native_result_limit: DEFAULT_NATIVE_RESULT_LIMIT,
+            native_function_limit: DEFAULT_NATIVE_FUNCTION_LIMIT,
+            global_limit: DEFAULT_GLOBAL_LIMIT,
         };
+        vm.native_functions
+            .try_reserve(BUILTIN_NATIVE_CAPACITY)
+            .map_err(|_| RuntimeError::Allocation {
+                what: "built-in native function registry",
+            })?;
+        vm.globals
+            .try_reserve(BUILTIN_GLOBAL_CAPACITY)
+            .map_err(|_| RuntimeError::Allocation {
+                what: "built-in global registry",
+            })?;
         vm.install_base_library()?;
         Ok(vm)
     }
@@ -225,6 +243,22 @@ impl Vm {
     #[must_use]
     pub fn with_heap_object_limit(mut self, limit: usize) -> Self {
         self.heap_object_limit = limit;
+        self
+    }
+
+    /// Sets the maximum number of registered native functions.
+    #[must_use]
+    pub fn with_native_function_limit(mut self, limit: usize) -> Self {
+        self.native_function_limit = limit;
+        self
+    }
+
+    /// Sets the maximum number of distinct global names.
+    ///
+    /// Replacing an existing global remains legal at the limit.
+    #[must_use]
+    pub fn with_global_limit(mut self, limit: usize) -> Self {
+        self.global_limit = limit;
         self
     }
 
@@ -284,17 +318,87 @@ impl Vm {
             .map_or_else(|| self.configured_profile(), Ok)
     }
 
+    /// Compatibility helper for registering a native callback.
+    ///
+    /// This panics when registry growth is rejected. Strict embedders should
+    /// use [`Self::try_register_function`] and handle its structured error.
     pub fn register_function(
         &mut self,
         function: impl Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync + 'static,
     ) -> NativeFunctionId {
-        let id = NativeFunctionId(self.native_functions.len() as u32);
-        self.native_functions.push(Arc::new(function));
-        id
+        self.try_register_function(function)
+            .expect("native function registry limit exceeded")
     }
 
+    /// Registers a native callback after checking the configured count limit
+    /// and reserving registry growth fallibly.
+    pub fn try_register_function(
+        &mut self,
+        function: impl Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync + 'static,
+    ) -> Result<NativeFunctionId, RuntimeError> {
+        let index = self.native_functions.len();
+        let required = index
+            .checked_add(1)
+            .ok_or(RuntimeError::NativeFunctionLimit {
+                required: usize::MAX,
+                limit: self.native_function_limit,
+            })?;
+        let representable_limit = usize::try_from(u32::MAX)
+            .unwrap_or(usize::MAX)
+            .saturating_add(1);
+        let limit = self.native_function_limit.min(representable_limit);
+        if required > limit {
+            return Err(RuntimeError::NativeFunctionLimit { required, limit });
+        }
+        self.native_functions
+            .try_reserve(1)
+            .map_err(|_| RuntimeError::Allocation {
+                what: "native function registry",
+            })?;
+        let id = NativeFunctionId(index as u32);
+        self.native_functions.push(Arc::new(function));
+        Ok(id)
+    }
+
+    /// Compatibility helper for inserting or replacing a global.
+    ///
+    /// This panics when distinct-name growth is rejected. Strict embedders
+    /// should use [`Self::try_set_global`] and handle its structured error.
     pub fn set_global(&mut self, name: impl Into<Arc<[u8]>>, value: Value) {
-        self.globals.insert(name.into(), value);
+        self.try_set_global(name, value)
+            .expect("global registry limit exceeded");
+    }
+
+    /// Inserts or replaces a global after checking the configured distinct-name
+    /// limit and reserving map growth fallibly.
+    pub fn try_set_global(
+        &mut self,
+        name: impl Into<Arc<[u8]>>,
+        value: Value,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let name = name.into();
+        if !self.globals.contains_key(name.as_ref()) {
+            let required = self
+                .globals
+                .len()
+                .checked_add(1)
+                .ok_or(RuntimeError::GlobalLimit {
+                    required: usize::MAX,
+                    limit: self.global_limit,
+                })?;
+            if required > self.global_limit {
+                return Err(RuntimeError::GlobalLimit {
+                    required,
+                    limit: self.global_limit,
+                });
+            }
+            self.globals
+                .try_reserve(1)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "global registry",
+                })?;
+        }
+        Ok(self.globals.insert(name, value))
     }
 
     pub fn set_module_loader(
@@ -4597,6 +4701,14 @@ pub enum RuntimeError {
         required: usize,
         limit: usize,
     },
+    NativeFunctionLimit {
+        required: usize,
+        limit: usize,
+    },
+    GlobalLimit {
+        required: usize,
+        limit: usize,
+    },
     MetatableProtected,
     MetatableLoop,
     UnsupportedMetamethod {
@@ -4750,6 +4862,18 @@ impl fmt::Display for RuntimeError {
                 write!(
                     f,
                     "native callback returned {required} values, limit is {limit}"
+                )
+            }
+            Self::NativeFunctionLimit { required, limit } => {
+                write!(
+                    f,
+                    "native function registry requires {required} entries, limit is {limit}"
+                )
+            }
+            Self::GlobalLimit { required, limit } => {
+                write!(
+                    f,
+                    "global registry requires {required} distinct names, limit is {limit}"
                 )
             }
             Self::MetatableProtected => f.write_str("cannot change a protected metatable"),
@@ -5403,6 +5527,37 @@ mod tests {
                 limit: 1,
             })
         );
+    }
+
+    #[test]
+    fn fallible_embedding_registries_enforce_limits_without_partial_mutation() {
+        let mut vm = Vm::default();
+        let native_count = vm.native_functions.len();
+        vm.native_function_limit = native_count;
+        assert_eq!(
+            vm.try_register_function(|_, _| Ok(Vec::new())),
+            Err(RuntimeError::NativeFunctionLimit {
+                required: native_count + 1,
+                limit: native_count,
+            })
+        );
+        assert_eq!(vm.native_functions.len(), native_count);
+
+        let global_count = vm.globals.len();
+        vm.global_limit = global_count;
+        assert_eq!(
+            vm.try_set_global(&b"new-global"[..], Value::Integer(1)),
+            Err(RuntimeError::GlobalLimit {
+                required: global_count + 1,
+                limit: global_count,
+            })
+        );
+        assert_eq!(vm.global(&b"new-global"[..]), None);
+
+        let previous = vm.try_set_global(&b"print"[..], Value::Integer(7)).unwrap();
+        assert!(matches!(previous, Some(Value::NativeFunction(_))));
+        assert_eq!(vm.global(&b"print"[..]), Some(&Value::Integer(7)));
+        assert_eq!(vm.globals.len(), global_count);
     }
 
     #[test]
