@@ -286,7 +286,7 @@ fn quoted_strings_and_common_escapes_are_profile_neutral_byte_tokens() {
 #[test]
 fn profile_sensitive_escapes_and_unterminated_strings_fail_explicitly() {
     let escaped = source(br#"return "a\x41b""#.to_vec());
-    let escaped = lex(&escaped, SemanticProfile::Lua54, LexerLimits::default()).unwrap();
+    let escaped = lex(&escaped, SemanticProfile::Lua51, LexerLimits::default()).unwrap();
     assert_eq!(escaped.diagnostics()[0].code().as_str(), "BLU-LEX-0007");
     assert_eq!(escaped.diagnostics()[0].found(), Some(b"\\".as_slice()));
 
@@ -296,6 +296,34 @@ fn profile_sensitive_escapes_and_unterminated_strings_fail_explicitly() {
         unterminated.diagnostics()[0].code().as_str(),
         "BLU-LEX-0008"
     );
+}
+
+#[test]
+fn decimal_and_hexadecimal_byte_escapes_follow_the_profile_matrix() {
+    for profile in SemanticProfile::ALL {
+        let source = source(br#"return "\0\7\65\255", "\x00\x41\xff""#.to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert_eq!(
+            lexed.has_errors(),
+            profile == SemanticProfile::Lua51,
+            "{profile}"
+        );
+        if profile == SemanticProfile::Lua51 {
+            assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0007");
+        }
+    }
+
+    for malformed in [
+        br#"return "\256""#.as_slice(),
+        br#"return "\999""#.as_slice(),
+        br#"return "\x""#.as_slice(),
+        br#"return "\xF""#.as_slice(),
+        br#"return "\xFG""#.as_slice(),
+    ] {
+        let source = source(malformed.to_vec());
+        let lexed = lex(&source, SemanticProfile::Blu, LexerLimits::default()).unwrap();
+        assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0017");
+    }
 }
 
 #[test]

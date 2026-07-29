@@ -379,6 +379,20 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let decimal_byte_escapes = SourceFile::new(
+            SourceId::new(13),
+            "decimal-byte-escapes.blu",
+            br#"return "\0\7\65\255""#.to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
+        let hex_byte_escapes = SourceFile::new(
+            SourceId::new(14),
+            "hex-byte-escapes.blu",
+            br#"return "\x00\x41\xff""#.to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -388,6 +402,26 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&decimal_byte_escapes, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![Value::String(Arc::from(&[0, 7, 65, 255][..]))]),
+                "{profile}"
+            );
+            if profile != SemanticProfile::Lua51 {
+                let compiled = OwnedCompiler::default()
+                    .compile(&hex_byte_escapes, profile, compiler.clone())
+                    .unwrap();
+                assert_eq!(
+                    Engine::default()
+                        .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                    Ok(vec![Value::String(Arc::from(&[0, 65, 255][..]))]),
+                    "{profile}"
+                );
+            }
             if profile != SemanticProfile::Luau {
                 let compiled = OwnedCompiler::default()
                     .compile(&hex_exponents, profile, compiler.clone())

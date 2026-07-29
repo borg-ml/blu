@@ -1190,20 +1190,9 @@ impl<'a> Lowerer<'a> {
         while offset < value.len() {
             let byte = value[offset];
             if byte == b'\\' {
-                let escaped =
-                    *value
-                        .get(offset + 1)
-                        .ok_or(OwnedCompileError::InternalInvariant {
-                            message: "validated string literal ends in a backslash",
-                        })?;
-                push_fallible(
-                    &mut decoded,
-                    decode_string_escape(escaped).ok_or(OwnedCompileError::InternalInvariant {
-                        message: "validated string literal contains an unsupported escape",
-                    })?,
-                    "string literal bytes",
-                )?;
-                offset += 2;
+                let (decoded_byte, consumed) = decode_string_escape(value, offset)?;
+                push_fallible(&mut decoded, decoded_byte, "string literal bytes")?;
+                offset += consumed;
             } else {
                 push_fallible(&mut decoded, byte, "string literal bytes")?;
                 offset += 1;
@@ -1331,7 +1320,7 @@ fn copy_bytes(bytes: &[u8], what: &'static str) -> Result<Vec<u8>, OwnedCompileE
     Ok(copied)
 }
 
-fn decode_string_escape(escaped: u8) -> Option<u8> {
+fn decode_common_string_escape(escaped: u8) -> Option<u8> {
     Some(match escaped {
         b'\\' => b'\\',
         b'\'' => b'\'',
@@ -1344,6 +1333,49 @@ fn decode_string_escape(escaped: u8) -> Option<u8> {
         b't' => b'\t',
         b'v' => 0x0b,
         _ => return None,
+    })
+}
+
+fn decode_string_escape(value: &[u8], offset: usize) -> Result<(u8, usize), OwnedCompileError> {
+    let escaped = *value
+        .get(offset + 1)
+        .ok_or(OwnedCompileError::InternalInvariant {
+            message: "validated string literal ends in a backslash",
+        })?;
+    if let Some(decoded) = decode_common_string_escape(escaped) {
+        return Ok((decoded, 2));
+    }
+    if escaped.is_ascii_digit() {
+        let mut cursor = offset + 1;
+        let mut decoded = 0_u16;
+        let mut digits = 0;
+        while digits < 3 && value.get(cursor).is_some_and(u8::is_ascii_digit) {
+            decoded = decoded * 10 + u16::from(value[cursor] - b'0');
+            cursor += 1;
+            digits += 1;
+        }
+        let decoded = u8::try_from(decoded).map_err(|_| OwnedCompileError::InternalInvariant {
+            message: "validated decimal byte escape is out of range",
+        })?;
+        return Ok((decoded, cursor - offset));
+    }
+    if escaped == b'x' {
+        let high = *value
+            .get(offset + 2)
+            .filter(|byte| byte.is_ascii_hexdigit())
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "validated hexadecimal byte escape has no high digit",
+            })?;
+        let low = *value
+            .get(offset + 3)
+            .filter(|byte| byte.is_ascii_hexdigit())
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "validated hexadecimal byte escape has no low digit",
+            })?;
+        return Ok((hex_digit(high) * 16 + hex_digit(low), 4));
+    }
+    Err(OwnedCompileError::InternalInvariant {
+        message: "validated string literal contains an unsupported escape",
     })
 }
 
@@ -1391,17 +1423,8 @@ fn decoded_string_len(value: &[u8]) -> Result<usize, OwnedCompileError> {
     let mut offset = 0;
     while offset < value.len() {
         if value[offset] == b'\\' {
-            let escaped = *value
-                .get(offset + 1)
-                .ok_or(OwnedCompileError::InternalInvariant {
-                    message: "validated string literal ends in a backslash",
-                })?;
-            if decode_string_escape(escaped).is_none() {
-                return Err(OwnedCompileError::InternalInvariant {
-                    message: "validated string literal contains an unsupported escape",
-                });
-            }
-            offset += 2;
+            let (_, consumed) = decode_string_escape(value, offset)?;
+            offset += consumed;
         } else {
             offset += 1;
         }

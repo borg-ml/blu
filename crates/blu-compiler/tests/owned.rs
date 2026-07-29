@@ -1081,6 +1081,41 @@ fn common_string_escapes_decode_to_bytes_for_every_profile() {
 }
 
 #[test]
+fn decimal_and_hexadecimal_byte_escapes_decode_by_profile() {
+    let decimal = make_source(br#"return "\0\7\65\255""#.to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&decimal, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            compiled.artifact().main().constants,
+            [Constant::String(vec![0, 7, 65, 255])],
+            "{profile}"
+        );
+    }
+
+    let hexadecimal = make_source(br#"return "\x00\x41\xff""#.to_vec());
+    for profile in SemanticProfile::ALL {
+        let result = OwnedCompiler::default().compile(&hexadecimal, profile, compiler_identity());
+        if profile == SemanticProfile::Lua51 {
+            assert_eq!(
+                result.unwrap_err().syntax().unwrap().diagnostics()[0]
+                    .code()
+                    .as_str(),
+                "BLU-LEX-0007"
+            );
+        } else {
+            let compiled = result.unwrap();
+            assert_eq!(
+                compiled.artifact().main().constants,
+                [Constant::String(vec![0, 65, 255])],
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn artifact_register_limit_is_separate_from_bootstrap_translation_limit() {
     use core::fmt::Write;
 

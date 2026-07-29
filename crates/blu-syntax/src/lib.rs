@@ -378,6 +378,7 @@ pub fn lex(
             quote @ (b'\'' | b'"') => {
                 offset += 1;
                 let mut unsupported_escape = None;
+                let mut malformed_escape = None;
                 while offset < bytes.len()
                     && bytes[offset] != quote
                     && !matches!(bytes[offset], b'\r' | b'\n')
@@ -393,6 +394,38 @@ pub fn lex(
                             b'\\' | b'\'' | b'"' | b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v'
                         ) {
                             offset += 2;
+                            continue;
+                        }
+                        if escaped.is_ascii_digit() {
+                            let escape = offset;
+                            offset += 1;
+                            let mut value = 0_u16;
+                            let mut digits = 0;
+                            while digits < 3 && bytes.get(offset).is_some_and(u8::is_ascii_digit) {
+                                value = value * 10 + u16::from(bytes[offset] - b'0');
+                                offset += 1;
+                                digits += 1;
+                            }
+                            if value > u16::from(u8::MAX) {
+                                malformed_escape.get_or_insert((escape, offset));
+                            }
+                            continue;
+                        }
+                        if escaped == b'x' {
+                            let escape = offset;
+                            offset += 2;
+                            let digits = offset;
+                            while offset < bytes.len()
+                                && offset < digits + 2
+                                && bytes[offset].is_ascii_hexdigit()
+                            {
+                                offset += 1;
+                            }
+                            if !supports_hex_byte_escape(explicit_profile) {
+                                unsupported_escape.get_or_insert(escape);
+                            } else if offset != digits + 2 {
+                                malformed_escape.get_or_insert((escape, offset));
+                            }
                             continue;
                         }
                         unsupported_escape.get_or_insert(offset);
@@ -424,6 +457,19 @@ pub fn lex(
                     )?
                     .try_with_found(&bytes[escape..escape + 1])?
                     .try_with_note_parts(&["selected profile: ", explicit_profile.as_str()])?;
+                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                }
+                if let Some((escape, end)) = malformed_escape {
+                    let span = source.span(escape, end)?;
+                    let diagnostic = diagnostic(
+                        "BLU-LEX-0017",
+                        explicit_profile,
+                        span,
+                        "malformed byte escape in quoted string",
+                        limits.diagnostic_limits,
+                    )?
+                    .try_with_found(&bytes[escape..end])?
+                    .try_with_expected("a byte value from 0 through 255")?;
                     push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                 }
                 TokenKind::StringLiteral
@@ -933,6 +979,19 @@ const fn supports_hex_number(profile: SemanticProfile, has_dot: bool, has_expone
         | SemanticProfile::Lua55 => true,
         SemanticProfile::Lua51 => has_exponent && !has_dot,
         SemanticProfile::Luau => false,
+        _ => false,
+    }
+}
+
+const fn supports_hex_byte_escape(profile: SemanticProfile) -> bool {
+    match profile {
+        SemanticProfile::Blu
+        | SemanticProfile::Luau
+        | SemanticProfile::Lua52
+        | SemanticProfile::Lua53
+        | SemanticProfile::Lua54
+        | SemanticProfile::Lua55 => true,
+        SemanticProfile::Lua51 => false,
         _ => false,
     }
 }
