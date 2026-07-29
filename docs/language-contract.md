@@ -49,7 +49,7 @@ bounded byte lexer and small parser/AST slice for the first owned-frontend
 program. It includes byte-zero dialect directives, stable raw-byte spans,
 retained trivia, the documented `//` profile gate, `local name = expression`,
 expression-list `return`, and decimal-integer/identifier expressions with `+`
-and `//` precedence. Parsing retains the explicit profile and rejects
+and `//` precedence plus grouping parentheses. Parsing retains the explicit profile and rejects
 diagnostics without exposing a partial AST. Resolution, lowering, emission,
 and execution are separate explicit stages; the public engine never silently
 selects this frontend as a fallback. Parser-owned arenas, lists, and diagnostic counts are bounded

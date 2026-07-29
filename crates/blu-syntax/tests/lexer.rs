@@ -77,6 +77,27 @@ fn floor_division_gate_covers_all_seven_profiles() {
 }
 
 #[test]
+fn grouping_parentheses_are_profile_neutral_tokens() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return (1 + 2)".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::Return,
+                TokenKind::LeftParenthesis,
+                TokenKind::DecimalInteger,
+                TokenKind::Plus,
+                TokenKind::DecimalInteger,
+                TokenKind::RightParenthesis,
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn conflicting_directive_is_reported_on_its_value() {
     let source = source(b"--!dialect lua54\r\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

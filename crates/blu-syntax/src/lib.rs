@@ -134,6 +134,8 @@ pub enum TokenKind {
     Comma,
     Plus,
     FloorDivide,
+    LeftParenthesis,
+    RightParenthesis,
     Unknown,
 }
 
@@ -327,6 +329,14 @@ pub fn lex(
             b'+' => {
                 offset += 1;
                 TokenKind::Plus
+            }
+            b'(' => {
+                offset += 1;
+                TokenKind::LeftParenthesis
+            }
+            b')' => {
+                offset += 1;
+                TokenKind::RightParenthesis
             }
             b'0'..=b'9' => {
                 offset += 1;

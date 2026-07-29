@@ -297,7 +297,7 @@ mod tests {
         let source = SourceFile::new(
             SourceId::new(1),
             "answer.blu",
-            b"local answer = 40\nreturn answer + 2".to_vec(),
+            b"local answer = (40)\nreturn (answer + 2)".to_vec(),
             SourceLimits::default(),
         )
         .unwrap();

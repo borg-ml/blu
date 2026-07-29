@@ -86,6 +86,7 @@ impl BinaryExpression {
 pub enum ExpressionKind {
     DecimalInteger,
     Identifier(Identifier),
+    Group(ExpressionId),
     Binary(BinaryExpression),
 }
 

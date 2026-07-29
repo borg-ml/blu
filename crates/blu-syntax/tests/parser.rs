@@ -127,6 +127,35 @@ fn floor_divide_binds_tighter_than_add_and_both_are_left_associative() {
 }
 
 #[test]
+fn grouping_parentheses_override_precedence_and_retain_their_span() {
+    let source = source(b"return (a + b) // c".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Lua54, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    let root = binary(&parsed, statement.values()[0]);
+    assert_eq!(root.operator(), BinaryOperator::FloorDivide);
+    let group = parsed.ast().expression(root.left()).unwrap();
+    let ExpressionKind::Group(inner) = group.kind() else {
+        panic!("expected grouped expression");
+    };
+    assert_eq!(source.slice(group.span()).unwrap(), b"(a + b)");
+    assert_eq!(binary(&parsed, inner).operator(), BinaryOperator::Add);
+}
+
+#[test]
+fn missing_group_closer_is_a_structured_rejection() {
+    let source = source(b"return (1 + 2".to_vec());
+    let ParseOutcome::Rejected(rejected) =
+        parse(&source, SemanticProfile::Blu, ParseLimits::default()).unwrap()
+    else {
+        panic!("missing group closer should reject");
+    };
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0006");
+    assert_eq!(rejected.diagnostics()[0].phase(), Phase::Parse);
+}
+
+#[test]
 fn return_expression_lists_are_spanned_and_comma_separated() {
     let source = source(b"return 1, value + 2, 9 // 4".to_vec());
     let parsed = accepted(&source, SemanticProfile::Lua53, ParseLimits::default());

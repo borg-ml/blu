@@ -41,7 +41,8 @@ claim of complete Luau, Lua, or Blu compatibility.
 
 The first Blu-owned frontend substrate is also present: `blu-syntax` performs
 bounded byte-oriented lexing and parses the initial local/return arithmetic
-slice into a spanned arena AST with explicit profile reconciliation.
+slice, including grouping parentheses, into a spanned arena AST with explicit
+profile reconciliation.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into
 canonical BluV1 artifacts without native linkage or fallback; the same
 explicit-profile API is available from the public facade as

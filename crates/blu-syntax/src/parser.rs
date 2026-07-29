@@ -233,7 +233,8 @@ impl ParseOutcome {
 ///
 /// The grammar is limited to `local name = expression`, a final
 /// `return expression (, expression)*`, decimal-integer and identifier
-/// expressions, and left-associative `+` and `//` (`//` binds more tightly).
+/// expressions, grouping parentheses, and left-associative `+` and `//`
+/// (`//` binds more tightly).
 /// Trivia remains available through [`Parsed::tokens`] or
 /// [`Rejected::tokens`]. Lexical diagnostics, including profile gates, reject
 /// before parsing. This function does not resolve names or integer values.
@@ -408,28 +409,9 @@ impl<'a> Parser<'a> {
         &mut self,
         minimum_precedence: u8,
     ) -> Result<Option<BuiltExpression>, ParseError> {
-        let Some(token) = self.current() else {
-            self.report_current_or_eof(
-                "BLU-PARSE-0004",
-                "expected an expression",
-                &["decimal integer", "identifier"],
-            )?;
+        let Some(mut left) = self.parse_primary()? else {
             return Ok(None);
         };
-        let kind = match token.kind() {
-            TokenKind::DecimalInteger => ExpressionKind::DecimalInteger,
-            TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
-            _ => {
-                self.report_current(
-                    "BLU-PARSE-0004",
-                    "expected an expression",
-                    &["decimal integer", "identifier"],
-                )?;
-                return Ok(None);
-            }
-        };
-        self.bump();
-        let mut left = self.push_expression(Expression::new(kind, token.span()), 1)?;
 
         while let Some(operator_token) = self.current() {
             let Some((operator, precedence)) = binary_operator(operator_token.kind()) else {
@@ -461,6 +443,57 @@ impl<'a> Parser<'a> {
             )?;
         }
         Ok(Some(left))
+    }
+
+    fn parse_primary(&mut self) -> Result<Option<BuiltExpression>, ParseError> {
+        let Some(token) = self.current() else {
+            self.report_current_or_eof(
+                "BLU-PARSE-0004",
+                "expected an expression",
+                &["decimal integer", "identifier", "("],
+            )?;
+            return Ok(None);
+        };
+        let kind = match token.kind() {
+            TokenKind::DecimalInteger => ExpressionKind::DecimalInteger,
+            TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
+            TokenKind::LeftParenthesis => {
+                self.bump();
+                let Some(inner) = self.parse_expression(0)? else {
+                    return Ok(None);
+                };
+                let Some(close) = self
+                    .current()
+                    .filter(|token| token.kind() == TokenKind::RightParenthesis)
+                else {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0006",
+                        "expected `)` after grouped expression",
+                        &[")"],
+                    )?;
+                    return Ok(Some(inner));
+                };
+                self.bump();
+                let span = token.span().merge(close.span())?;
+                return self
+                    .push_expression(
+                        Expression::new(ExpressionKind::Group(inner.id), span),
+                        inner.depth.saturating_add(1),
+                    )
+                    .map(Some);
+            }
+            _ => {
+                self.report_current(
+                    "BLU-PARSE-0004",
+                    "expected an expression",
+                    &["decimal integer", "identifier", "("],
+                )?;
+                return Ok(None);
+            }
+        };
+        self.bump();
+        self.push_expression(Expression::new(kind, token.span()), 1)
+            .map(Some)
     }
 
     fn push_expression(

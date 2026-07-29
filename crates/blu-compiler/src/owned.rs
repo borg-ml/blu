@@ -590,6 +590,7 @@ impl<'a> Lowerer<'a> {
                 Ok(destination)
             }
             ExpressionKind::Identifier(identifier) => self.resolve(identifier.span()),
+            ExpressionKind::Group(inner) => self.lower_expression(inner),
             ExpressionKind::Binary(binary) => match binary.operator() {
                 BinaryOperator::Add => {
                     let left = self.lower_expression(binary.left())?;
