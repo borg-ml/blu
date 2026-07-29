@@ -877,6 +877,34 @@ fn hexadecimal_integers_follow_each_profile_numeric_policy() {
 }
 
 #[test]
+fn numeric_separators_lower_only_for_blu_and_luau() {
+    let source = make_source(b"return 1_000, 12_345.1_25, 0xff_ff".to_vec());
+    for profile in SemanticProfile::ALL {
+        let result = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let compiled = result.unwrap();
+            assert_eq!(
+                compiled.artifact().prototypes()[0].constants.as_slice(),
+                [
+                    Constant::Number(1_000.0),
+                    Constant::Number(12_345.125),
+                    Constant::Number(65_535.0),
+                ],
+                "{profile}"
+            );
+        } else {
+            let error = result.unwrap_err();
+            let rejected = error.syntax().expect("numeric separator rejection");
+            assert_eq!(
+                rejected.diagnostics()[0].code().as_str(),
+                "BLU-LEX-0012",
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn source_and_debug_name_limits_are_checked_before_owned_copies() {
     let source = make_source(b"local answer = 1\nreturn answer".to_vec());
     let mut source_name_limits = OwnedCompileLimits::default();

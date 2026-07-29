@@ -915,7 +915,7 @@ impl<'a> Lowerer<'a> {
             self.limits.max_integer_literal_bytes,
         )?;
         for byte in bytes {
-            if !byte.is_ascii_digit() {
+            if !byte.is_ascii_digit() && *byte != b'_' {
                 return Err(OwnedCompileError::InternalInvariant {
                     message: "decimal-integer AST contains a non-decimal byte",
                 });
@@ -929,6 +929,9 @@ impl<'a> Lowerer<'a> {
             let mut integer = 0_i64;
             let mut fits_integer = true;
             for byte in bytes {
+                if *byte == b'_' {
+                    continue;
+                }
                 let digit = i64::from(*byte - b'0');
                 let Some(next) = integer
                     .checked_mul(10)
@@ -944,10 +947,13 @@ impl<'a> Lowerer<'a> {
             }
         }
 
-        let text =
-            core::str::from_utf8(bytes).map_err(|_| OwnedCompileError::InternalInvariant {
+        let mut normalized = allocate_vec(bytes.len(), "normalized decimal integer")?;
+        normalized.extend(bytes.iter().copied().filter(|byte| *byte != b'_'));
+        let text = core::str::from_utf8(&normalized).map_err(|_| {
+            OwnedCompileError::InternalInvariant {
                 message: "decimal-integer AST is not ASCII",
-            })?;
+            }
+        })?;
         let number = text
             .parse::<f64>()
             .map_err(|_| OwnedCompileError::InternalInvariant {
@@ -963,10 +969,13 @@ impl<'a> Lowerer<'a> {
             bytes.len(),
             self.limits.max_number_literal_bytes,
         )?;
-        let text =
-            core::str::from_utf8(bytes).map_err(|_| OwnedCompileError::InternalInvariant {
+        let mut normalized = allocate_vec(bytes.len(), "normalized decimal number")?;
+        normalized.extend(bytes.iter().copied().filter(|byte| *byte != b'_'));
+        let text = core::str::from_utf8(&normalized).map_err(|_| {
+            OwnedCompileError::InternalInvariant {
                 message: "decimal-number AST is not ASCII",
-            })?;
+            }
+        })?;
         let number = text
             .parse::<f64>()
             .map_err(|_| OwnedCompileError::InternalInvariant {
@@ -990,7 +999,12 @@ impl<'a> Lowerer<'a> {
                 message: "hex-integer AST has no hexadecimal prefix",
             });
         };
-        if digits.is_empty() || !digits.iter().all(u8::is_ascii_hexdigit) {
+        if digits.is_empty()
+            || !digits
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit() || *byte == b'_')
+            || !digits.iter().any(u8::is_ascii_hexdigit)
+        {
             return Err(OwnedCompileError::InternalInvariant {
                 message: "hex-integer AST contains an invalid digit",
             });
@@ -1000,17 +1014,23 @@ impl<'a> Lowerer<'a> {
             self.profile,
             SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
         ) {
-            let integer = digits.iter().fold(0_u64, |value, byte| {
-                value
-                    .wrapping_mul(16)
-                    .wrapping_add(u64::from(hex_digit(*byte)))
-            });
+            let integer = digits
+                .iter()
+                .filter(|byte| **byte != b'_')
+                .fold(0_u64, |value, byte| {
+                    value
+                        .wrapping_mul(16)
+                        .wrapping_add(u64::from(hex_digit(*byte)))
+                });
             return Ok(Constant::Integer(integer as i64));
         }
 
-        let number = digits.iter().fold(0.0_f64, |value, byte| {
-            value.mul_add(16.0, f64::from(hex_digit(*byte)))
-        });
+        let number = digits
+            .iter()
+            .filter(|byte| **byte != b'_')
+            .fold(0.0_f64, |value, byte| {
+                value.mul_add(16.0, f64::from(hex_digit(*byte)))
+            });
         Ok(Constant::Number(number))
     }
 

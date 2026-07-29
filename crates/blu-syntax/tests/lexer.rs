@@ -555,6 +555,36 @@ fn hexadecimal_integers_are_shared_and_require_digits() {
 }
 
 #[test]
+fn numeric_separators_are_blu_and_luau_only() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return 12_345.1_25, 0xff_ff".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert!(!lexed.has_errors(), "{profile}");
+            assert_eq!(
+                significant_kinds(&lexed),
+                [
+                    TokenKind::Return,
+                    TokenKind::DecimalNumber,
+                    TokenKind::Comma,
+                    TokenKind::HexInteger,
+                ],
+                "{profile}"
+            );
+        } else {
+            assert!(lexed.has_errors(), "{profile}");
+            assert!(
+                lexed
+                    .diagnostics()
+                    .iter()
+                    .all(|diagnostic| diagnostic.code().as_str() == "BLU-LEX-0012"),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn only_a_byte_zero_directive_participates_in_reconciliation() {
     let source = source(b"\n--!dialect lua54\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

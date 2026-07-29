@@ -441,11 +441,16 @@ pub fn lex(
                         .is_some_and(|byte| matches!(byte, b'x' | b'X'))
                 {
                     offset += 2;
-                    let digits = offset;
-                    while offset < bytes.len() && bytes[offset].is_ascii_hexdigit() {
+                    let mut has_digit = false;
+                    let mut has_separator = false;
+                    while offset < bytes.len()
+                        && (bytes[offset].is_ascii_hexdigit() || bytes[offset] == b'_')
+                    {
+                        has_digit |= bytes[offset].is_ascii_hexdigit();
+                        has_separator |= bytes[offset] == b'_';
                         offset += 1;
                     }
-                    if offset == digits {
+                    if !has_digit {
                         let span = source.span(start, offset)?;
                         let diagnostic = diagnostic(
                             "BLU-LEX-0011",
@@ -457,6 +462,16 @@ pub fn lex(
                         .try_with_found(&bytes[start..offset])?
                         .try_with_expected("hexadecimal digit")?;
                         push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                    }
+                    if has_separator && !supports_numeric_separators(explicit_profile) {
+                        push_numeric_separator_diagnostic(
+                            source,
+                            explicit_profile,
+                            start,
+                            offset,
+                            &mut diagnostics,
+                            limits,
+                        )?;
                     }
                     TokenKind::HexInteger
                 } else {
@@ -490,6 +505,16 @@ pub fn lex(
                         )?;
                         push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                     }
+                    if scan.has_separator && !supports_numeric_separators(explicit_profile) {
+                        push_numeric_separator_diagnostic(
+                            source,
+                            explicit_profile,
+                            start,
+                            offset,
+                            &mut diagnostics,
+                            limits,
+                        )?;
+                    }
                     if scan.is_integer {
                         TokenKind::DecimalInteger
                     } else {
@@ -512,6 +537,16 @@ pub fn lex(
                     .try_with_found(&bytes[exponent..offset])?
                     .try_with_expected("decimal exponent digit")?;
                     push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                }
+                if scan.has_separator && !supports_numeric_separators(explicit_profile) {
+                    push_numeric_separator_diagnostic(
+                        source,
+                        explicit_profile,
+                        start,
+                        offset,
+                        &mut diagnostics,
+                        limits,
+                    )?;
                 }
                 TokenKind::DecimalNumber
             }
@@ -564,18 +599,21 @@ struct DecimalScan {
     is_integer: bool,
     malformed_exponent: Option<usize>,
     adjacent_dots: bool,
+    has_separator: bool,
 }
 
 fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
     let mut offset = start;
     let mut is_integer = true;
     let mut adjacent_dots = false;
+    let mut has_separator = false;
     let leading_dot = bytes[offset] == b'.';
     if leading_dot {
         is_integer = false;
         offset += 1;
     }
-    while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+    while offset < bytes.len() && (bytes[offset].is_ascii_digit() || bytes[offset] == b'_') {
+        has_separator |= bytes[offset] == b'_';
         offset += 1;
     }
     if !leading_dot && bytes.get(offset) == Some(&b'.') {
@@ -586,7 +624,8 @@ fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
         } else {
             offset += 1;
         }
-        while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+        while offset < bytes.len() && (bytes[offset].is_ascii_digit() || bytes[offset] == b'_') {
+            has_separator |= bytes[offset] == b'_';
             offset += 1;
         }
     }
@@ -598,11 +637,13 @@ fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
         if matches!(bytes.get(offset), Some(b'+' | b'-')) {
             offset += 1;
         }
-        let digits = offset;
-        while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+        let mut has_exponent_digit = false;
+        while offset < bytes.len() && (bytes[offset].is_ascii_digit() || bytes[offset] == b'_') {
+            has_exponent_digit |= bytes[offset].is_ascii_digit();
+            has_separator |= bytes[offset] == b'_';
             offset += 1;
         }
-        if offset == digits {
+        if !has_exponent_digit {
             malformed_exponent = Some(exponent);
         }
     }
@@ -611,7 +652,29 @@ fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
         is_integer,
         malformed_exponent,
         adjacent_dots,
+        has_separator,
     }
+}
+
+fn push_numeric_separator_diagnostic(
+    source: &SourceFile,
+    profile: SemanticProfile,
+    start: usize,
+    end: usize,
+    diagnostics: &mut Vec<Diagnostic>,
+    limits: LexerLimits,
+) -> Result<(), LexError> {
+    let span = source.span(start, end)?;
+    let diagnostic = diagnostic(
+        "BLU-LEX-0012",
+        profile,
+        span,
+        "numeric separators are not supported by this profile",
+        limits.diagnostic_limits,
+    )?
+    .try_with_found(source.slice(span)?)?
+    .try_with_note_parts(&["selected profile: ", profile.as_str()])?;
+    push_diagnostic(diagnostics, diagnostic, limits.max_diagnostics)
 }
 
 fn is_initial_directive(bytes: &[u8]) -> bool {
@@ -745,6 +808,10 @@ fn supports_floor_division(profile: SemanticProfile) -> bool {
         SemanticProfile::Lua51 | SemanticProfile::Lua52 => false,
         _ => false,
     }
+}
+
+const fn supports_numeric_separators(profile: SemanticProfile) -> bool {
+    matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
 }
 
 fn long_comment_opener(bytes: &[u8], start: usize) -> Option<(usize, usize)> {
