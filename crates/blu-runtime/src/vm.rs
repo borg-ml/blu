@@ -1,6 +1,9 @@
 use crate::heap::UpvalueId;
 use crate::{ClosureId, Dialect, Heap, HeapError, NativeFunctionId, TableId, ThreadId, Value};
-use blu_bytecode::{Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype};
+use blu_bytecode::{
+    Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype, ValidationError,
+    validate,
+};
 use core::fmt;
 use std::{
     collections::{HashMap, HashSet},
@@ -161,6 +164,7 @@ impl Vm {
     }
 
     pub fn execute_owned(&mut self, chunk: Chunk) -> Result<Vec<Value>, RuntimeError> {
+        validate(&chunk).map_err(RuntimeError::Validation)?;
         if !matches!(self.dialect, Dialect::Blu | Dialect::Luau) {
             return Err(RuntimeError::DialectNotImplemented(self.dialect));
         }
@@ -3229,6 +3233,7 @@ fn integer_floor_div(left: i64, right: i64) -> Result<i64, RuntimeError> {
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeError {
+    Validation(ValidationError),
     DialectNotImplemented(Dialect),
     InvalidMainPrototype(usize),
     InvalidPrototype(usize),
@@ -3343,6 +3348,7 @@ pub enum RuntimeError {
 impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Validation(error) => write!(f, "bytecode validation failed: {error}"),
             Self::DialectNotImplemented(dialect) => {
                 write!(f, "{dialect:?} execution is not implemented")
             }
@@ -3484,6 +3490,7 @@ impl From<HeapError> for RuntimeError {
 impl std::error::Error for RuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Validation(error) => Some(error),
             Self::Heap(error) => Some(error),
             _ => None,
         }
@@ -3561,7 +3568,7 @@ mod tests {
     }
 
     #[test]
-    fn oversized_table_capacities_fail_without_allocating() {
+    fn oversized_table_capacities_fail_validation_without_allocating() {
         let return_none = abc(Opcode::Return, 0, 1, 0);
         let chunk = test_chunk(
             &[],
@@ -3573,14 +3580,10 @@ mod tests {
             ],
             1,
         );
-        assert_eq!(
+        assert!(matches!(
             Vm::default().execute(&chunk),
-            Err(RuntimeError::TableCapacity {
-                kind: "array",
-                requested: (MAX_TABLE_INITIAL_CAPACITY + 1) as u64,
-                limit: MAX_TABLE_INITIAL_CAPACITY,
-            })
-        );
+            Err(RuntimeError::Validation(error)) if error.message.contains("array capacity")
+        ));
 
         let chunk = test_chunk(
             &[],
@@ -3590,7 +3593,7 @@ mod tests {
         );
         assert!(matches!(
             Vm::default().execute(&chunk),
-            Err(RuntimeError::TableCapacity { kind: "hash", .. })
+            Err(RuntimeError::Validation(error)) if error.message.contains("hash capacity")
         ));
     }
 
@@ -3655,13 +3658,10 @@ mod tests {
 
         chunk.prototypes[0].code[1] = 99;
         chunk.prototypes[0].instructions = blu_bytecode::decode(&chunk.prototypes[0].code).unwrap();
-        assert_eq!(
+        assert!(matches!(
             vm.execute(&chunk),
-            Err(RuntimeError::Constant {
-                constant: 99,
-                count: 1,
-            })
-        );
+            Err(RuntimeError::Validation(error)) if error.message.contains("constant 99")
+        ));
     }
 
     #[test]
@@ -3672,7 +3672,7 @@ mod tests {
             0,
             abc(Opcode::GetGlobal, 1, 0, 0),
             0,
-            abc(Opcode::GetImport, 2, 0, 0),
+            ad(Opcode::GetImport, 2, 3),
             (2 << 30) | (1 << 20) | (2 << 10),
             abc(Opcode::Return, 1, 3, 0),
         ];
@@ -3682,6 +3682,7 @@ mod tests {
                 Constant::String(0),
                 Constant::String(1),
                 Constant::String(2),
+                Constant::Import((2 << 30) | (1 << 20) | (2 << 10)),
             ],
             code,
             3,
