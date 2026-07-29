@@ -1,0 +1,251 @@
+use blu_core::{SemanticProfile, SourceFile, SourceId, SourceLimits};
+use blu_syntax::{LexError, LexerLimit, LexerLimits, TokenKind, lex};
+
+fn source(bytes: impl Into<Vec<u8>>) -> SourceFile {
+    SourceFile::new(
+        SourceId::new(17),
+        "lexer-test.lua",
+        bytes,
+        SourceLimits::default(),
+    )
+    .unwrap()
+}
+
+fn significant_kinds(lexed: &blu_syntax::Lexed) -> Vec<TokenKind> {
+    lexed
+        .tokens()
+        .iter()
+        .map(|token| token.kind())
+        .filter(|kind| !matches!(kind, TokenKind::Whitespace | TokenKind::Comment))
+        .collect()
+}
+
+#[test]
+fn vertical_slice_tokens_keep_half_open_byte_spans() {
+    let source = source(b"--!dialect lua54\nlocal answer = 40\nreturn answer + 2".to_vec());
+    let lexed = lex(&source, SemanticProfile::Lua54, LexerLimits::default()).unwrap();
+
+    assert!(!lexed.has_errors());
+    assert_eq!(lexed.profile(), SemanticProfile::Lua54);
+    let directive = lexed.directive().unwrap();
+    assert_eq!(directive.profile(), SemanticProfile::Lua54);
+    assert_eq!(source.slice(directive.span()).unwrap(), b"--!dialect lua54");
+    assert_eq!(source.slice(directive.value_span()).unwrap(), b"lua54");
+    assert_eq!(
+        significant_kinds(&lexed),
+        [
+            TokenKind::DialectDirective,
+            TokenKind::Local,
+            TokenKind::Identifier,
+            TokenKind::Equal,
+            TokenKind::DecimalInteger,
+            TokenKind::Return,
+            TokenKind::Identifier,
+            TokenKind::Plus,
+            TokenKind::DecimalInteger,
+        ]
+    );
+
+    for token in lexed.tokens() {
+        let span = token.span();
+        assert!(span.start() <= span.end());
+        assert!(span.end().as_usize() <= source.len());
+    }
+}
+
+#[test]
+fn floor_division_gate_covers_all_seven_profiles() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return 7 // 2".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(
+            significant_kinds(&lexed).contains(&TokenKind::FloorDivide),
+            "{profile}"
+        );
+        let rejected = matches!(profile, SemanticProfile::Lua51 | SemanticProfile::Lua52);
+        assert_eq!(lexed.has_errors(), rejected, "{profile}");
+        if rejected {
+            let diagnostic = &lexed.diagnostics()[0];
+            assert_eq!(diagnostic.code().as_str(), "BLU-LEX-0002");
+            assert_eq!(diagnostic.profile(), profile);
+            assert_eq!(source.slice(diagnostic.primary().span()).unwrap(), b"//");
+        }
+    }
+}
+
+#[test]
+fn conflicting_directive_is_reported_on_its_value() {
+    let source = source(b"--!dialect lua54\r\nreturn 1".to_vec());
+    let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();
+
+    assert_eq!(lexed.profile(), SemanticProfile::Lua53);
+    assert_eq!(lexed.directive().unwrap().profile(), SemanticProfile::Lua54);
+    assert_eq!(
+        source.slice(lexed.directive().unwrap().span()).unwrap(),
+        b"--!dialect lua54"
+    );
+    assert!(
+        lexed
+            .tokens()
+            .iter()
+            .any(|token| source.slice(token.span()).unwrap() == b"\r\n")
+    );
+    assert_eq!(lexed.diagnostics().len(), 1);
+    let diagnostic = &lexed.diagnostics()[0];
+    assert_eq!(diagnostic.code().as_str(), "BLU-LEX-0005");
+    assert_eq!(diagnostic.profile(), SemanticProfile::Lua53);
+    assert_eq!(source.slice(diagnostic.primary().span()).unwrap(), b"lua54");
+    assert_eq!(diagnostic.primary().span().start().get(), 11);
+    assert_eq!(diagnostic.primary().span().end().get(), 16);
+}
+
+#[test]
+fn unknown_and_non_utf8_bytes_have_deterministic_raw_diagnostics() {
+    let source = source(vec![b'@', 0xff, b'+']);
+    let first = lex(&source, SemanticProfile::Blu, LexerLimits::default()).unwrap();
+    let second = lex(&source, SemanticProfile::Blu, LexerLimits::default()).unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(
+        significant_kinds(&first),
+        [TokenKind::Unknown, TokenKind::Unknown, TokenKind::Plus]
+    );
+    assert_eq!(first.diagnostics().len(), 2);
+    assert_eq!(first.diagnostics()[0].found(), Some(&b"@"[..]));
+    assert_eq!(first.diagnostics()[1].found(), Some(&[0xff][..]));
+    assert_eq!(first.diagnostics()[1].primary().span().start().get(), 1);
+}
+
+#[test]
+fn unknown_non_utf8_directive_profile_preserves_raw_bytes() {
+    let source = source(b"--!dialect \xff\r\nreturn 1".to_vec());
+    let lexed = lex(&source, SemanticProfile::Blu, LexerLimits::default()).unwrap();
+
+    assert_eq!(lexed.directive(), None);
+    assert_eq!(lexed.diagnostics().len(), 1);
+    assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0004");
+    assert_eq!(lexed.diagnostics()[0].found(), Some(&[0xff][..]));
+}
+
+#[test]
+fn crlf_is_one_retained_whitespace_token_with_byte_spans() {
+    let source = source(b"local x\r\nreturn x".to_vec());
+    let lexed = lex(&source, SemanticProfile::Lua51, LexerLimits::default()).unwrap();
+    let crlf = lexed
+        .tokens()
+        .iter()
+        .find(|token| source.slice(token.span()).unwrap() == b"\r\n")
+        .unwrap();
+
+    assert_eq!(crlf.kind(), TokenKind::Whitespace);
+    assert_eq!(crlf.span().start().get(), 7);
+    assert_eq!(crlf.span().end().get(), 9);
+    assert_eq!(
+        source.position(crlf.span().end().as_usize()).unwrap().line,
+        1
+    );
+}
+
+#[test]
+fn line_and_multiline_comments_are_retained_without_inner_tokens() {
+    let source = source(b"-- line\r\n--[=[ long\ncomment ]=]\nreturn 1".to_vec());
+    let lexed = lex(&source, SemanticProfile::Lua55, LexerLimits::default()).unwrap();
+    let comments: Vec<_> = lexed
+        .tokens()
+        .iter()
+        .filter(|token| token.kind() == TokenKind::Comment)
+        .map(|token| source.slice(token.span()).unwrap())
+        .collect();
+
+    assert_eq!(
+        comments,
+        [b"-- line".as_slice(), b"--[=[ long\ncomment ]=]"]
+    );
+    assert!(!lexed.has_errors());
+}
+
+#[test]
+fn truncated_directive_and_long_comment_are_diagnosed() {
+    let directive_source = source(b"--!dialect".to_vec());
+    let directive = lex(
+        &directive_source,
+        SemanticProfile::Blu,
+        LexerLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(directive.diagnostics()[0].code().as_str(), "BLU-LEX-0003");
+    assert!(directive.diagnostics()[0].primary().span().is_empty());
+    assert_eq!(
+        directive.diagnostics()[0].primary().span().start().get(),
+        10
+    );
+
+    let comment_source = source(b"--[=[ never closed".to_vec());
+    let comment = lex(
+        &comment_source,
+        SemanticProfile::Lua52,
+        LexerLimits::default(),
+    )
+    .unwrap();
+    assert_eq!(comment.diagnostics()[0].code().as_str(), "BLU-LEX-0006");
+    assert_eq!(
+        comment_source
+            .slice(comment.diagnostics()[0].primary().span())
+            .unwrap(),
+        b"[=["
+    );
+}
+
+#[test]
+fn token_and_diagnostic_limits_fail_before_unbounded_growth() {
+    let token_source = source(b"a b".to_vec());
+    assert_eq!(
+        lex(
+            &token_source,
+            SemanticProfile::Blu,
+            LexerLimits {
+                max_tokens: 2,
+                ..LexerLimits::default()
+            },
+        ),
+        Err(LexError::Limit {
+            kind: LexerLimit::Tokens,
+            required: 3,
+            limit: 2,
+        })
+    );
+
+    let diagnostic_source = source(b"@@".to_vec());
+    assert_eq!(
+        lex(
+            &diagnostic_source,
+            SemanticProfile::Blu,
+            LexerLimits {
+                max_diagnostics: 1,
+                ..LexerLimits::default()
+            },
+        ),
+        Err(LexError::Limit {
+            kind: LexerLimit::Diagnostics,
+            required: 2,
+            limit: 1,
+        })
+    );
+}
+
+#[test]
+fn only_a_byte_zero_directive_participates_in_reconciliation() {
+    let source = source(b"\n--!dialect lua54\nreturn 1".to_vec());
+    let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();
+
+    assert_eq!(lexed.directive(), None);
+    assert!(!lexed.has_errors());
+    assert_eq!(
+        lexed
+            .tokens()
+            .iter()
+            .filter(|token| token.kind() == TokenKind::Comment)
+            .count(),
+        1
+    );
+}

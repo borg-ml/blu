@@ -12,7 +12,7 @@ pub use codec::{Package, PackageError, PackageLimits};
 pub use model::{
     AuthorityProfile, AuthorityRequirement, BytecodeDescriptor, BytecodeFormat,
     CapabilityRequirement, Digest, Export, Import, ImportSource, Manifest, Name, PackageDialect,
-    PackageIdentity, ServiceId, Version,
+    PackageIdentity, SemanticProfile, ServiceId, Version,
 };
 
 /// The only package-envelope version accepted by this crate.

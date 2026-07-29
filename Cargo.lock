@@ -20,6 +20,9 @@ dependencies = [
 [[package]]
 name = "blu-bytecode"
 version = "0.1.0"
+dependencies = [
+ "blu-core",
+]
 
 [[package]]
 name = "blu-compiler"
@@ -59,6 +62,7 @@ name = "blu-package"
 version = "0.1.0"
 dependencies = [
  "blu-bytecode",
+ "blu-core",
  "sha2",
 ]
 
@@ -67,6 +71,13 @@ name = "blu-runtime"
 version = "0.1.0"
 dependencies = [
  "blu-bytecode",
+]
+
+[[package]]
+name = "blu-syntax"
+version = "0.1.0"
+dependencies = [
+ "blu-core",
 ]
 
 [[package]]

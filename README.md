@@ -39,21 +39,29 @@ the configured engine. Lua 5.1–5.5 profiles are declared but still fail
 explicitly as unimplemented. This is meaningful execution coverage, not yet a
 claim of complete Luau, Lua, or Blu compatibility.
 
+The first Blu-owned frontend substrate is also present: `blu-syntax` performs
+bounded byte-oriented lexing for the initial vertical slice, with explicit
+profile reconciliation and stable byte spans. It is not yet connected to a
+parser or compiler, so public source execution still uses the pinned Luau
+compatibility compiler.
+
 ## Repository layout
 
 - `blu-lang`: public facade crate for embedding Blu.
 - `blu-core`: dependency-free semantic profiles, source identities, byte spans, and diagnostics.
+- `blu-syntax`: bounded byte-oriented lexer for the Blu-owned frontend.
 - `blu-compiler`: isolated in-process Luau source compiler adapter.
-- `blu-bytecode`: versioned Luau instruction decoding and serialized chunk loading.
+- `blu-bytecode`: bounded BluV1 artifacts plus versioned Luau decoding and loading.
 - `blu-package`: bounded canonical package envelopes and artifact validation.
 - `blu-runtime`: values, heap, interpreter, interruption, and Rust host API.
 - `blu-conformance`: differential execution against pinned Luau and Lua runtimes.
 - `.upstream/luau`: ignored checkout created by `just upstream`.
 
-The bytecode, package, runtime, facade, and conformance crates forbid unsafe
-Rust at the crate level. `blu-compiler` contains the isolated native boundary
-for the pinned upstream Luau C++ compiler; a `noexcept` shim translates native
-exceptions and owns allocation/deallocation across that boundary.
+The pure-Rust core, syntax, bytecode, package, runtime, facade, and conformance
+crates forbid unsafe Rust at the crate level. `blu-compiler` contains the
+isolated native boundary for the pinned upstream Luau C++ compiler; a
+`noexcept` shim translates native exceptions and owns
+allocation/deallocation across that boundary.
 
 ## Development
 

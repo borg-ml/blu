@@ -1,5 +1,10 @@
 use core::fmt;
 
+pub use blu_core::SemanticProfile;
+
+/// Backwards-compatible name for a package's semantic profile.
+pub type PackageDialect = SemanticProfile;
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Digest(pub(crate) [u8; 32]);
 
@@ -95,18 +100,6 @@ impl Version {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 #[repr(u8)]
-pub enum PackageDialect {
-    Blu = 1,
-    Luau = 2,
-    Lua51 = 3,
-    Lua52 = 4,
-    Lua53 = 5,
-    Lua54 = 6,
-    Lua55 = 7,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
-#[repr(u8)]
 pub enum BytecodeFormat {
     Luau = 1,
 }
@@ -177,7 +170,7 @@ pub struct AuthorityRequirement {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct Manifest {
     pub package: PackageIdentity,
-    pub dialect: PackageDialect,
+    pub dialect: SemanticProfile,
     pub bytecode: BytecodeDescriptor,
     pub authority: AuthorityRequirement,
     pub imports: Vec<Import>,

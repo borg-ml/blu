@@ -1,7 +1,7 @@
 use crate::{
     AuthorityProfile, AuthorityRequirement, BytecodeDescriptor, BytecodeFormat,
     CapabilityRequirement, Digest, Export, Import, ImportSource, Manifest, Name, PACKAGE_FORMAT_V1,
-    PackageDialect, PackageIdentity, ServiceId, Version,
+    PackageIdentity, SemanticProfile, ServiceId, Version,
 };
 use blu_bytecode::{Chunk, ChunkError, LoadLimits, ValidatedChunk, load_validated};
 use core::fmt;
@@ -200,7 +200,7 @@ pub enum PackageError {
     InvalidBoolean(u8),
     NonCanonical(&'static str),
     InvalidAuthority(&'static str),
-    UnsupportedDialect(PackageDialect),
+    UnsupportedDialect(SemanticProfile),
     ZeroSchema(&'static str),
     DescriptorMismatch {
         what: &'static str,
@@ -368,7 +368,10 @@ fn validate_descriptor(manifest: &Manifest, chunk: &Chunk) -> Result<(), Package
         // `blu_bytecode::load` is the validator for this payload format.
         BytecodeFormat::Luau => {}
     }
-    if !matches!(manifest.dialect, PackageDialect::Blu | PackageDialect::Luau) {
+    if !matches!(
+        manifest.dialect,
+        SemanticProfile::Blu | SemanticProfile::Luau
+    ) {
         return Err(PackageError::UnsupportedDialect(manifest.dialect));
     }
     if manifest.bytecode.version != chunk.version {
@@ -409,7 +412,7 @@ fn encode_manifest(manifest: &Manifest) -> Result<Vec<u8>, PackageError> {
     let mut bytes = Vec::new();
     put_name(&mut bytes, &manifest.package.name)?;
     put_version(&mut bytes, manifest.package.version);
-    bytes.push(manifest.dialect as u8);
+    bytes.push(semantic_profile_tag(manifest.dialect)?);
     bytes.push(manifest.bytecode.format as u8);
     bytes.push(manifest.bytecode.version);
     bytes.push(manifest.bytecode.typeinfo_version);
@@ -443,13 +446,13 @@ fn decode_manifest(bytes: &[u8], limits: &PackageLimits) -> Result<Manifest, Pac
         version: reader.version()?,
     };
     let dialect = match reader.byte()? {
-        1 => PackageDialect::Blu,
-        2 => PackageDialect::Luau,
-        3 => PackageDialect::Lua51,
-        4 => PackageDialect::Lua52,
-        5 => PackageDialect::Lua53,
-        6 => PackageDialect::Lua54,
-        7 => PackageDialect::Lua55,
+        1 => SemanticProfile::Blu,
+        2 => SemanticProfile::Luau,
+        3 => SemanticProfile::Lua51,
+        4 => SemanticProfile::Lua52,
+        5 => SemanticProfile::Lua53,
+        6 => SemanticProfile::Lua54,
+        7 => SemanticProfile::Lua55,
         value => {
             return Err(PackageError::UnknownTag {
                 what: "dialect",
@@ -538,6 +541,19 @@ fn decode_manifest(bytes: &[u8], limits: &PackageLimits) -> Result<Manifest, Pac
         imports,
         exports,
     })
+}
+
+fn semantic_profile_tag(profile: SemanticProfile) -> Result<u8, PackageError> {
+    match profile {
+        SemanticProfile::Blu => Ok(1),
+        SemanticProfile::Luau => Ok(2),
+        SemanticProfile::Lua51 => Ok(3),
+        SemanticProfile::Lua52 => Ok(4),
+        SemanticProfile::Lua53 => Ok(5),
+        SemanticProfile::Lua54 => Ok(6),
+        SemanticProfile::Lua55 => Ok(7),
+        _ => Err(PackageError::UnsupportedDialect(profile)),
+    }
 }
 
 fn put_name(bytes: &mut Vec<u8>, name: &Name) -> Result<(), PackageError> {
@@ -684,5 +700,17 @@ impl<'a> Reader<'a> {
         let mut digest = [0; 32];
         digest.copy_from_slice(self.bytes(32)?);
         Ok(Digest::new(digest))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn v1_semantic_profile_encoder_tags_are_stable() {
+        for (profile, tag) in SemanticProfile::ALL.into_iter().zip(1_u8..=7) {
+            assert_eq!(semantic_profile_tag(profile), Ok(tag));
+        }
     }
 }

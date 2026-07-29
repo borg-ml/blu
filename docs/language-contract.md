@@ -44,7 +44,11 @@ Current implementation status: the public engine defaults to `blu`, accepts
 `blu` and `luau` source through the pinned Luau compiler, and rejects a source
 directive that conflicts with the configured engine. The Lua 5.1–5.5 profiles
 remain explicit, structured `not implemented` errors until their own frontends
-and semantic profiles exist.
+and runtime semantics exist. The separate `blu-syntax` crate now implements
+the bounded byte lexer for the first owned-frontend slice, including
+byte-zero dialect directives, stable raw-byte spans, retained trivia, and the
+documented `//` profile gate. It does not yet parse, lower, emit, or execute
+source, and the public engine does not silently select it as a compiler.
 
 Ordinary bytecode calls currently run on an owned, bounded VM frame stack.
 Suspended callers and their registers are traced as GC roots. Generational
@@ -123,9 +127,33 @@ closure-upvalue buffers, and thread-root buffers. Collection releases live
 object-buffer charges while retaining reusable arena-slot charges. This is
 still a partial accounting boundary: strings, chunks, VM stacks, the arena
 free list, collection work queues, temporary/native results, and host-owned
-values are not included, and the byte threshold does not yet trigger
-collection automatically. Confined execution therefore cannot claim a hard
-process-wide memory limit.
+values are not included. Accounted guest heap growth triggers collection at
+the configured byte threshold before reserving more storage. Active and saved
+frames trace both their values and every live open-upvalue cell.
+
+Heap handles returned by `Vm::execute*` (and therefore `Engine::execute*`) stay
+rooted across later calls. Each returned table, closure, or thread occurrence
+uses one entry in a bounded host-value retention set (4096 by default,
+configurable with `Vm::with_host_value_limit`). Embedders must call
+`Vm::release_value`, `Vm::release_values`, or `Vm::release_all_values` after
+they no longer use those returned handles. A result that would exceed the
+configured retention limit fails atomically with `RuntimeError::HostValueLimit`;
+it does not retain only a prefix or alter existing entries. Embedders can
+observe the current occurrence count and configured bound with
+`Vm::retained_value_count` and `Vm::host_value_limit`. Cloning a `Value` does
+not add a retention entry, while returning the same handle again does. Release
+exactly once per returned occurrence, after all host clones of that occurrence
+are unused.
+
+Automatic execute-result retention is a compatibility convenience, not a
+complete ownership-inference system. Values cloned from `Vm::global` or read
+through the low-level `Vm::heap` accessor are not execute results. The host
+must call `Vm::retain_value` or the atomic batch `Vm::retain_values` before
+removing their existing VM root or allowing later VM work to collect. Each
+successful explicit retain creates one occurrence that likewise requires one
+release. Standalone `Heap` users instead own the root contract directly and
+must include every live returned handle in each call to `Heap::collect`. This
+accounting remains logical rather than a hard process-wide memory limit.
 
 ## Package compatibility
 

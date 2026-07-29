@@ -1,7 +1,6 @@
 [package]
-name = "blu-bytecode"
-description = "Validated Luau bytecode decoding and disassembly for the Blu runtime"
-keywords = ["lua", "luau", "bytecode", "decoder", "virtual-machine"]
+name = "blu-syntax"
+description = "Byte-oriented profile-aware source syntax for Blu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

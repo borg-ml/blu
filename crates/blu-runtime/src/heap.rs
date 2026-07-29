@@ -100,6 +100,12 @@ impl std::error::Error for HeapError {
 /// Cloning a heap duplicates its object graph and accounting snapshot. The
 /// original and clone then account and collect independently; handles retain
 /// their numeric identities but belong to the corresponding heap snapshot.
+///
+/// `Heap` is the low-level embedding surface and does not retain handles
+/// returned by allocation or lookup methods. Callers must include every live
+/// returned handle in the roots passed to [`Self::collect`]. Hosts using
+/// [`crate::Vm`] should call [`crate::Vm::retain_value`] for handles cloned
+/// through [`crate::Vm::heap`] that must outlive their current VM root.
 #[derive(Clone, Debug, Default)]
 pub struct Heap {
     slots: Vec<Slot>,
@@ -132,6 +138,36 @@ impl Heap {
     #[must_use]
     pub const fn memory_usage(&self) -> MemoryUsage {
         self.memory.usage()
+    }
+
+    #[must_use]
+    pub(crate) const fn should_collect(&self, requested: usize) -> bool {
+        self.memory.should_collect(requested)
+    }
+
+    pub(crate) fn table_allocation_bytes(
+        &self,
+        array_capacity: usize,
+        hash_capacity: usize,
+    ) -> Result<usize, HeapError> {
+        let array_bytes = checked_vector_bytes::<Value>(array_capacity)?;
+        let hash_bytes = checked_hash_bytes::<Key, Value>(hash_capacity)?;
+        self.allocation_bytes(checked_add(array_bytes, hash_bytes)?)
+    }
+
+    pub(crate) fn upvalue_allocation_bytes(&self) -> Result<usize, HeapError> {
+        self.allocation_bytes(0)
+    }
+
+    pub(crate) fn closure_allocation_bytes(
+        &self,
+        upvalue_capacity: usize,
+    ) -> Result<usize, HeapError> {
+        self.allocation_bytes(checked_vector_bytes::<UpvalueId>(upvalue_capacity)?)
+    }
+
+    pub(crate) fn thread_allocation_bytes(&self, root_capacity: usize) -> Result<usize, HeapError> {
+        self.allocation_bytes(checked_vector_bytes::<Value>(root_capacity)?)
     }
 
     pub fn allocate_table(
@@ -199,6 +235,8 @@ impl Heap {
             Ok(Object::Thread(Thread {
                 roots: try_clone_slice(roots)?,
                 root_capacity,
+                upvalues: Vec::new(),
+                upvalue_capacity: 0,
             }))
         })?;
         Ok(ThreadId {
@@ -207,27 +245,62 @@ impl Heap {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn thread_set_roots(
         &mut self,
         thread: ThreadId,
         roots: &[Value],
     ) -> Result<(), HeapError> {
-        let old_capacity = match self.object(thread.into()) {
-            Some(Object::Thread(value)) => value.root_capacity,
+        self.thread_set_gc_roots(thread, roots, &[])
+    }
+
+    pub(crate) fn thread_set_gc_roots(
+        &mut self,
+        thread: ThreadId,
+        roots: &[Value],
+        upvalues: &[UpvalueId],
+    ) -> Result<(), HeapError> {
+        let (old_root_capacity, old_upvalue_capacity) = match self.object(thread.into()) {
+            Some(Object::Thread(value)) => (value.root_capacity, value.upvalue_capacity),
             _ => return Err(HeapError::StaleThread(thread)),
         };
-        let old_bytes = checked_vector_bytes::<Value>(old_capacity)?;
+        let old_bytes = checked_add(
+            checked_vector_bytes::<Value>(old_root_capacity)?,
+            checked_vector_bytes::<UpvalueId>(old_upvalue_capacity)?,
+        )?;
         let root_capacity = roots.len();
-        let new_bytes = checked_vector_bytes::<Value>(root_capacity)?;
+        let upvalue_capacity = upvalues.len();
+        let new_bytes = checked_add(
+            checked_vector_bytes::<Value>(root_capacity)?,
+            checked_vector_bytes::<UpvalueId>(upvalue_capacity)?,
+        )?;
         let reservation = self.memory.reserve(new_bytes)?;
         let roots = try_clone_slice(roots)?;
+        let upvalues = try_clone_slice(upvalues)?;
         reservation.commit_replacing(old_bytes)?;
         match self.object_mut(thread.into()) {
             Some(Object::Thread(value)) => {
                 value.roots = roots;
                 value.root_capacity = root_capacity;
+                value.upvalues = upvalues;
+                value.upvalue_capacity = upvalue_capacity;
                 Ok(())
             }
+            _ => Err(HeapError::StaleThread(thread)),
+        }
+    }
+
+    pub(crate) fn thread_set_gc_roots_bytes(
+        &self,
+        thread: ThreadId,
+        root_capacity: usize,
+        upvalue_capacity: usize,
+    ) -> Result<usize, HeapError> {
+        match self.object(thread.into()) {
+            Some(Object::Thread(_)) => Ok(checked_add(
+                checked_vector_bytes::<Value>(root_capacity)?,
+                checked_vector_bytes::<UpvalueId>(upvalue_capacity)?,
+            )?),
             _ => Err(HeapError::StaleThread(thread)),
         }
     }
@@ -241,6 +314,11 @@ impl Heap {
         self.live
     }
 
+    /// Reads a table value without adding a GC root for a returned heap handle.
+    ///
+    /// Standalone heap callers must pass any live returned handle to
+    /// [`Self::collect`]. VM callers can explicitly retain it with
+    /// [`crate::Vm::retain_value`].
     pub fn table_get(&self, table: TableId, key: &Value) -> Result<Value, HeapError> {
         let key = Key::from_value(key)?;
         let table = self.table(table)?;
@@ -251,6 +329,16 @@ impl Heap {
         let key = Key::from_value(&key)?;
         let Self { slots, memory, .. } = self;
         table_mut_in_slots(slots, table)?.set(key, value, memory)
+    }
+
+    pub(crate) fn table_set_bytes(
+        &self,
+        table: TableId,
+        key: &Value,
+        value: &Value,
+    ) -> Result<usize, HeapError> {
+        let key = Key::from_value(key)?;
+        self.table(table)?.set_bytes(&key, value)
     }
 
     pub fn table_length(&self, table: TableId) -> Result<usize, HeapError> {
@@ -273,6 +361,11 @@ impl Heap {
         Ok(())
     }
 
+    /// Iterates a table without adding GC roots for returned heap handles.
+    ///
+    /// Standalone heap callers must pass any live returned handles to
+    /// [`Self::collect`]. VM callers can explicitly retain them with
+    /// [`crate::Vm::retain_values`].
     pub fn table_next(
         &self,
         table: TableId,
@@ -353,6 +446,23 @@ impl Heap {
         }
     }
 
+    pub(crate) fn closure_push_upvalue_bytes(
+        &self,
+        closure: ClosureId,
+    ) -> Result<usize, HeapError> {
+        let closure = self.closure(closure)?;
+        let required = closure
+            .upvalues
+            .len()
+            .checked_add(1)
+            .ok_or(MemoryError::SizeOverflow)?;
+        if required <= closure.upvalue_capacity {
+            Ok(0)
+        } else {
+            Ok(checked_vector_bytes::<UpvalueId>(required)?)
+        }
+    }
+
     pub(crate) fn upvalue_get(&self, upvalue: UpvalueId) -> Result<Value, HeapError> {
         match self.object(upvalue.into()) {
             Some(Object::Upvalue(value)) => Ok(value.clone()),
@@ -374,15 +484,30 @@ impl Heap {
         }
     }
 
+    /// Collects objects unreachable from the supplied roots.
+    ///
+    /// Standalone `Heap` callers own this root contract: every live heap-handle
+    /// `Value`, including values returned by [`Self::table_get`] or
+    /// [`Self::table_next`], must be supplied on every collection. The heap
+    /// does not retain those returned values automatically.
     pub fn collect<'a>(
         &mut self,
         roots: impl IntoIterator<Item = &'a Value>,
+    ) -> Result<CollectionStats, HeapError> {
+        self.collect_with_upvalues(roots, std::iter::empty())
+    }
+
+    pub(crate) fn collect_with_upvalues<'a>(
+        &mut self,
+        roots: impl IntoIterator<Item = &'a Value>,
+        upvalues: impl IntoIterator<Item = UpvalueId>,
     ) -> Result<CollectionStats, HeapError> {
         let before = self.live;
         let mut queue = VecDeque::new();
         for root in roots {
             enqueue_value(root, &mut queue);
         }
+        queue.extend(upvalues.into_iter().map(ObjectId::from));
 
         while let Some(id) = queue.pop_front() {
             let Some(slot) = self.slots.get_mut(id.index as usize) else {
@@ -415,6 +540,7 @@ impl Heap {
                     for root in &thread.roots {
                         enqueue_value(root, &mut queue);
                     }
+                    queue.extend(thread.upvalues.iter().copied().map(ObjectId::from));
                 }
             }
         }
@@ -514,6 +640,15 @@ impl Heap {
         }
     }
 
+    fn allocation_bytes(&self, dynamic_bytes: usize) -> Result<usize, HeapError> {
+        let slot_bytes = if self.free.is_empty() {
+            checked_vector_bytes::<Slot>(1)?
+        } else {
+            0
+        };
+        Ok(checked_add(slot_bytes, dynamic_bytes)?)
+    }
+
     fn object(&self, id: ObjectId) -> Option<&Object> {
         self.slots
             .get(id.index as usize)
@@ -609,7 +744,10 @@ impl Object {
                 checked_hash_bytes::<Key, Value>(table.hash_capacity)?,
             ),
             Self::Closure(closure) => checked_vector_bytes::<UpvalueId>(closure.upvalue_capacity),
-            Self::Thread(thread) => checked_vector_bytes::<Value>(thread.root_capacity),
+            Self::Thread(thread) => checked_add(
+                checked_vector_bytes::<Value>(thread.root_capacity)?,
+                checked_vector_bytes::<UpvalueId>(thread.upvalue_capacity)?,
+            ),
             Self::Upvalue(_) => Ok(0),
         }
     }
@@ -627,6 +765,8 @@ struct Closure {
 struct Thread {
     roots: Vec<Value>,
     root_capacity: usize,
+    upvalues: Vec<UpvalueId>,
+    upvalue_capacity: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -688,6 +828,46 @@ impl Table {
             self.hash.insert(key, value);
         }
         Ok(())
+    }
+
+    fn set_bytes(&self, key: &Key, value: &Value) -> Result<usize, HeapError> {
+        if let Some(index) = key.array_index() {
+            if index <= self.array.len() {
+                return Ok(0);
+            }
+            let next_array_index = self
+                .array
+                .len()
+                .checked_add(1)
+                .ok_or(MemoryError::SizeOverflow)?;
+            if index == next_array_index && !matches!(value, Value::Nil) {
+                let promoted = self.contiguous_hash_values_after(index)?;
+                let additional = promoted.checked_add(1).ok_or(MemoryError::SizeOverflow)?;
+                let required = self
+                    .array
+                    .len()
+                    .checked_add(additional)
+                    .ok_or(MemoryError::SizeOverflow)?;
+                return if required <= self.array_capacity {
+                    Ok(0)
+                } else {
+                    Ok(checked_vector_bytes::<Value>(required)?)
+                };
+            }
+        }
+        if matches!(value, Value::Nil) || self.hash.contains_key(key) {
+            return Ok(0);
+        }
+        let required = self
+            .hash
+            .len()
+            .checked_add(1)
+            .ok_or(MemoryError::SizeOverflow)?;
+        if required <= self.hash_capacity {
+            Ok(0)
+        } else {
+            Ok(checked_hash_bytes::<Key, Value>(required)?)
+        }
     }
 
     fn length(&self) -> usize {

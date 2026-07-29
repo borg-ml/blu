@@ -81,6 +81,7 @@ impl Engine {
                     package.manifest().dialect,
                 ));
             }
+            profile => return Err(ExecutePackageError::UnsupportedDialect(profile)),
         };
         let configured = self.vm.dialect();
         if package_dialect != configured {
@@ -480,6 +481,285 @@ mod tests {
                 limit,
                 ..
             })) if limit == baseline + 3
+        ));
+    }
+
+    #[test]
+    fn automatic_byte_gc_preserves_guest_globals_frames_and_suspended_threads() {
+        let vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            blu_runtime::MemoryConfig {
+                hard_limit_bytes: None,
+                gc_start_bytes: 0,
+                gc_growth_percent: 0,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let mut engine = Engine::new(Compiler::default(), vm);
+
+        assert_eq!(
+            engine.execute(
+                br#"
+                    byte_gc_global = { value = 11 }
+                    local frame_value = { value = 22 }
+                    local thread = coroutine.create(function()
+                        local suspended_value = { value = 33 }
+                        coroutine.yield()
+                        return suspended_value.value
+                    end)
+                    local started = coroutine.resume(thread)
+                    local garbage = { 1, 2, 3, 4 }
+                    garbage = {}
+                    local resumed, thread_value = coroutine.resume(thread)
+                    return byte_gc_global.value, frame_value.value,
+                        started, resumed, thread_value, type(garbage)
+                "#
+            ),
+            Ok(vec![
+                Value::Number(11.0),
+                Value::Number(22.0),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Number(33.0),
+                Value::String(Arc::from(&b"table"[..])),
+            ])
+        );
+        assert!(engine.vm().memory_usage().collections > 0);
+    }
+
+    #[test]
+    fn automatic_byte_gc_preserves_unattached_open_upvalue_cells_for_reuse() {
+        let vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            blu_runtime::MemoryConfig {
+                hard_limit_bytes: None,
+                gc_start_bytes: 0,
+                gc_growth_percent: 0,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let mut engine = Engine::new(Compiler::default(), vm);
+
+        assert_eq!(
+            engine.execute(
+                br#"
+                    local captured = { answer = 41 }
+                    local discarded = function()
+                        return captured
+                    end
+                    discarded = nil
+                    local reuse_collected_cell = {}
+                    local reused = function()
+                        captured.answer = captured.answer + 1
+                        return captured.answer
+                    end
+                    return reused(), type(reuse_collected_cell)
+                "#
+            ),
+            Ok(vec![
+                Value::Number(42.0),
+                Value::String(Arc::from(&b"table"[..])),
+            ])
+        );
+        assert!(engine.vm().memory_usage().collections > 0);
+    }
+
+    #[test]
+    fn returned_heap_values_remain_rooted_until_explicit_release() {
+        let vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            blu_runtime::MemoryConfig {
+                hard_limit_bytes: None,
+                gc_start_bytes: 0,
+                gc_growth_percent: 0,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let mut engine = Engine::new(Compiler::default(), vm);
+        let values = engine
+            .execute(
+                br#"
+                    local retained = { answer = 42 }
+                    local closure = function(addend)
+                        return retained.answer + addend
+                    end
+                    local thread = coroutine.create(function()
+                        return retained.answer
+                    end)
+                    return retained, closure, thread
+                "#,
+            )
+            .unwrap();
+        let table = match values[0] {
+            Value::Table(table) => table,
+            ref value => panic!("expected table, got {value:?}"),
+        };
+        assert_eq!(engine.vm().retained_value_count(), 3);
+
+        assert_eq!(
+            engine.execute(
+                br#"
+                    for index = 1, 100 do
+                        local garbage = { index, index + 1, index + 2 }
+                    end
+                    return "allocated"
+                "#
+            ),
+            Ok(vec![Value::String(Arc::from(&b"allocated"[..]))])
+        );
+        engine
+            .vm_mut()
+            .set_global(&b"held_table"[..], values[0].clone());
+        engine
+            .vm_mut()
+            .set_global(&b"held_closure"[..], values[1].clone());
+        engine
+            .vm_mut()
+            .set_global(&b"held_thread"[..], values[2].clone());
+        assert_eq!(
+            engine.execute(
+                br#"
+                    local ok, thread_value = coroutine.resume(held_thread)
+                    return held_table.answer, held_closure(1), ok, thread_value
+                "#
+            ),
+            Ok(vec![
+                Value::Number(42.0),
+                Value::Number(43.0),
+                Value::Boolean(true),
+                Value::Number(42.0),
+            ])
+        );
+
+        assert_eq!(engine.vm_mut().release_values(&values), 3);
+        assert_eq!(engine.vm().retained_value_count(), 0);
+        engine.vm_mut().set_global(&b"held_table"[..], Value::Nil);
+        engine.vm_mut().set_global(&b"held_closure"[..], Value::Nil);
+        engine.vm_mut().set_global(&b"held_thread"[..], Value::Nil);
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
+        assert!(matches!(
+            engine
+                .vm()
+                .heap()
+                .table_get(table, &Value::Integer(1)),
+            Err(blu_runtime::HeapError::StaleTable(stale)) if stale == table
+        ));
+    }
+
+    #[test]
+    fn returned_heap_value_retention_limit_is_atomic() {
+        let mut engine = Engine::new(Compiler::default(), Vm::default().with_host_value_limit(2));
+        let retained = engine.execute(b"return {}").unwrap();
+        let retained_table = match retained[0] {
+            Value::Table(table) => table,
+            ref value => panic!("expected table, got {value:?}"),
+        };
+        assert_eq!(engine.vm().retained_value_count(), 1);
+        assert_eq!(engine.vm().host_value_limit(), 2);
+
+        assert!(matches!(
+            engine.execute(
+                br#"
+                    return {}, function() return 1 end
+                "#
+            ),
+            Err(ExecuteError::Runtime(RuntimeError::HostValueLimit {
+                required: 3,
+                limit: 2,
+            }))
+        ));
+        assert_eq!(
+            engine.vm().retained_value_count(),
+            1,
+            "a rejected result must not alter existing retained occurrences"
+        );
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
+        assert_eq!(engine.vm().heap().table_length(retained_table), Ok(0));
+        assert_eq!(engine.vm_mut().release_values(&retained), 1);
+    }
+
+    #[test]
+    fn duplicate_returned_handles_release_one_occurrence_at_a_time() {
+        let mut engine = Engine::default();
+        let values = engine
+            .execute(b"local value = {}; return value, value")
+            .unwrap();
+        let table = match values[0] {
+            Value::Table(table) => table,
+            ref value => panic!("expected table, got {value:?}"),
+        };
+        assert_eq!(engine.vm().retained_value_count(), 2);
+
+        assert!(engine.vm_mut().release_value(&values[0]));
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
+        assert_eq!(
+            engine.vm().heap().table_length(table),
+            Ok(0),
+            "the second returned occurrence must remain rooted"
+        );
+
+        assert!(engine.vm_mut().release_value(&values[1]));
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
+        assert!(matches!(
+            engine.vm().heap().table_length(table),
+            Err(blu_runtime::HeapError::StaleTable(stale)) if stale == table
+        ));
+    }
+
+    #[test]
+    fn heap_accessor_values_can_be_explicitly_retained() {
+        let vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            blu_runtime::MemoryConfig {
+                hard_limit_bytes: None,
+                gc_start_bytes: 0,
+                gc_growth_percent: 0,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let mut engine = Engine::new(Compiler::default(), vm);
+        engine
+            .execute(b"accessor_holder = { child = { answer = 42 } }")
+            .unwrap();
+        let holder = match engine.vm().global(b"accessor_holder") {
+            Some(Value::Table(table)) => *table,
+            value => panic!("expected table global, got {value:?}"),
+        };
+        let child = engine
+            .vm()
+            .heap()
+            .table_get(holder, &Value::String(Arc::from(&b"child"[..])))
+            .unwrap();
+        let child_table = match child {
+            Value::Table(table) => table,
+            ref value => panic!("expected child table, got {value:?}"),
+        };
+        assert_eq!(engine.vm_mut().retain_value(&child), Ok(true));
+        engine
+            .vm_mut()
+            .set_global(&b"accessor_holder"[..], Value::Nil);
+
+        assert_eq!(
+            engine.execute(b"local garbage = {}; return 1"),
+            Ok(vec![Value::Number(1.0)])
+        );
+        assert_eq!(
+            engine
+                .vm()
+                .heap()
+                .table_get(child_table, &Value::String(Arc::from(&b"answer"[..])),),
+            Ok(Value::Number(42.0))
+        );
+
+        assert!(engine.vm_mut().release_value(&child));
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
+        assert!(matches!(
+            engine.vm().heap().table_length(child_table),
+            Err(blu_runtime::HeapError::StaleTable(stale)) if stale == child_table
         ));
     }
 

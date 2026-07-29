@@ -7,6 +7,7 @@ members = [
     "crates/blu-lang",
     "crates/blu-package",
     "crates/blu-runtime",
+    "crates/blu-syntax",
 ]
 resolver = "2"
 
@@ -21,7 +22,9 @@ authors = ["Borg contributors"]
 [workspace.dependencies]
 blu-bytecode = { version = "0.1.0", path = "crates/blu-bytecode" }
 blu-compiler = { version = "0.1.0", path = "crates/blu-compiler" }
+blu-core = { version = "0.1.0", path = "crates/blu-core" }
 blu-package = { version = "0.1.0", path = "crates/blu-package" }
 blu-runtime = { version = "0.1.0", path = "crates/blu-runtime" }
+blu-syntax = { version = "0.1.0", path = "crates/blu-syntax" }
 sha2 = "0.10.9"
 tempfile = "3.23"

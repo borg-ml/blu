@@ -3,7 +3,8 @@
 use blu_package::{
     AuthorityProfile, AuthorityRequirement, BytecodeDescriptor, BytecodeFormat,
     CapabilityRequirement, Digest, Export, Import, ImportSource, Manifest, Name, Package,
-    PackageDialect, PackageError, PackageIdentity, PackageLimits, ServiceId, Version,
+    PackageDialect, PackageError, PackageIdentity, PackageLimits, SemanticProfile, ServiceId,
+    Version,
 };
 use sha2::{Digest as _, Sha256};
 
@@ -35,7 +36,7 @@ fn manifest() -> Manifest {
             name: name("example.plugin"),
             version: Version::new(1, 2, 3),
         },
-        dialect: PackageDialect::Blu,
+        dialect: SemanticProfile::Blu,
         bytecode: BytecodeDescriptor {
             format: BytecodeFormat::Luau,
             version: 12,
@@ -213,11 +214,11 @@ fn rejects_payload_descriptor_mismatch() {
 #[test]
 fn v1_rejects_dialects_without_a_luau_bytecode_execution_profile() {
     for dialect in [
-        PackageDialect::Lua51,
-        PackageDialect::Lua52,
-        PackageDialect::Lua53,
-        PackageDialect::Lua54,
-        PackageDialect::Lua55,
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
     ] {
         let mut unsupported = manifest();
         unsupported.dialect = dialect;
@@ -230,6 +231,33 @@ fn v1_rejects_dialects_without_a_luau_bytecode_execution_profile() {
             .unwrap_err(),
             PackageError::UnsupportedDialect(dialect)
         );
+    }
+}
+
+#[test]
+fn package_dialect_remains_a_semantic_profile_alias() {
+    let dialect: PackageDialect = SemanticProfile::Blu;
+    assert_eq!(dialect, SemanticProfile::Blu);
+}
+
+#[test]
+fn v1_semantic_profile_wire_tags_remain_one_through_seven() {
+    let dialect_offset = 22 + 2 + "example.plugin".len() + 12;
+    for (profile, tag) in SemanticProfile::ALL.into_iter().zip(1_u8..=7) {
+        let mut bytes = package().encode();
+        bytes[dialect_offset] = tag;
+        resign(&mut bytes);
+
+        match profile {
+            SemanticProfile::Blu | SemanticProfile::Luau => {
+                let decoded = Package::decode(&bytes, PackageLimits::default()).unwrap();
+                assert_eq!(decoded.manifest().dialect, profile);
+            }
+            _ => assert_eq!(
+                Package::decode(&bytes, PackageLimits::default()).unwrap_err(),
+                PackageError::UnsupportedDialect(profile)
+            ),
+        }
     }
 }
 

@@ -6,6 +6,7 @@
 //! from Luau's `Common/include/Luau/Bytecode.h` at the revision recorded in
 //! the repository's `UPSTREAM.toml`.
 
+pub mod blu;
 mod chunk;
 mod disassemble;
 mod instruction;

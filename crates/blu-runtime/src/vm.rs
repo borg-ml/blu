@@ -15,6 +15,7 @@ use std::{
 
 const MAX_DYNAMIC_REGISTERS: usize = 1_000_000;
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
+const DEFAULT_HOST_VALUE_LIMIT: usize = 4096;
 
 type NativeFunction =
     Arc<dyn Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync>;
@@ -31,6 +32,56 @@ enum ThreadState {
 enum Resumable {
     New(Value),
     Continuation(Continuation),
+}
+
+#[derive(Clone, Debug, Default)]
+struct GcRoots {
+    values: Vec<Value>,
+    upvalues: Vec<UpvalueId>,
+}
+
+impl GcRoots {
+    fn from_values(values: &[Value]) -> Self {
+        Self {
+            values: values.to_vec(),
+            upvalues: Vec::new(),
+        }
+    }
+
+    fn push_value(&mut self, value: Value) {
+        self.values.push(value);
+    }
+
+    fn extend(&mut self, other: Self) {
+        self.values.extend(other.values);
+        self.upvalues.extend(other.upvalues);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum HostRoot {
+    Table(TableId),
+    Closure(ClosureId),
+    Thread(ThreadId),
+}
+
+impl HostRoot {
+    fn from_value(value: &Value) -> Option<Self> {
+        match value {
+            Value::Table(value) => Some(Self::Table(*value)),
+            Value::Closure(value) => Some(Self::Closure(*value)),
+            Value::Thread(value) | Value::CoroutineFunction(value) => Some(Self::Thread(*value)),
+            _ => None,
+        }
+    }
+
+    fn to_value(self) -> Value {
+        match self {
+            Self::Table(value) => Value::Table(value),
+            Self::Closure(value) => Value::Closure(value),
+            Self::Thread(value) => Value::Thread(value),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -54,7 +105,10 @@ pub struct Vm {
     running_thread: Option<ThreadId>,
     output: Vec<u8>,
     output_limit: usize,
-    active_roots: Vec<Vec<Value>>,
+    active_roots: Vec<GcRoots>,
+    host_roots: HashMap<HostRoot, usize>,
+    host_root_count: usize,
+    host_value_limit: usize,
 }
 
 impl Default for Vm {
@@ -104,6 +158,9 @@ impl Vm {
             output: Vec::new(),
             output_limit: MAX_STRING_BYTES,
             active_roots: Vec::new(),
+            host_roots: HashMap::new(),
+            host_root_count: 0,
+            host_value_limit: DEFAULT_HOST_VALUE_LIMIT,
         };
         vm.install_base_library()?;
         Ok(vm)
@@ -142,7 +199,25 @@ impl Vm {
         self
     }
 
+    /// Sets the maximum number of heap-handle occurrences retained for the
+    /// host, whether automatically from `execute*` or through
+    /// [`Self::retain_value`].
+    ///
+    /// The default is 4096. An operation that would exceed this limit returns
+    /// [`RuntimeError::HostValueLimit`] without retaining only part of its
+    /// result.
     #[must_use]
+    pub fn with_host_value_limit(mut self, limit: usize) -> Self {
+        self.host_value_limit = limit;
+        self
+    }
+
+    #[must_use]
+    /// Returns the low-level heap for inspection.
+    ///
+    /// Heap handles cloned from values read through this reference are not
+    /// retained automatically. Call [`Self::retain_value`] before removing
+    /// their VM root or allowing a later VM operation to collect.
     pub const fn heap(&self) -> &Heap {
         &self.heap
     }
@@ -182,6 +257,11 @@ impl Vm {
     }
 
     #[must_use]
+    /// Borrows a global value.
+    ///
+    /// The value remains rooted while it is stored in globals. If the host
+    /// clones a heap handle and may later replace that global, it must call
+    /// [`Self::retain_value`] first.
     pub fn global(&self, name: &[u8]) -> Option<&Value> {
         self.globals.get(name)
     }
@@ -190,16 +270,106 @@ impl Vm {
         core::mem::take(&mut self.output)
     }
 
+    /// Retains one occurrence of a heap handle obtained through a public VM or
+    /// heap accessor.
+    ///
+    /// Returns `false` for scalar, string, and native-function values, which do
+    /// not need tracing. A successful `true` result must be paired with exactly
+    /// one [`Self::release_value`] call after all associated host clones are no
+    /// longer used.
+    pub fn retain_value(&mut self, value: &Value) -> Result<bool, RuntimeError> {
+        let retained = usize::from(HostRoot::from_value(value).is_some());
+        self.retain_host_occurrences(std::slice::from_ref(value))?;
+        Ok(retained != 0)
+    }
+
+    /// Atomically retains one occurrence of every heap handle in `values`.
+    ///
+    /// Returns the number retained. No occurrence is retained if the bounded
+    /// host-value limit or the bookkeeping allocation fails.
+    pub fn retain_values(&mut self, values: &[Value]) -> Result<usize, RuntimeError> {
+        let retained = values
+            .iter()
+            .filter(|value| HostRoot::from_value(value).is_some())
+            .count();
+        self.retain_host_occurrences(values)?;
+        Ok(retained)
+    }
+
+    /// Releases one retained occurrence of a heap handle returned by an
+    /// `execute*` method or passed to [`Self::retain_value`].
+    ///
+    /// If the same handle occurs in multiple results, release each occurrence
+    /// only after the host no longer needs the corresponding returned value.
+    pub fn release_value(&mut self, value: &Value) -> bool {
+        let Some(root) = HostRoot::from_value(value) else {
+            return false;
+        };
+        let Some(count) = self.host_roots.get_mut(&root) else {
+            return false;
+        };
+        *count -= 1;
+        self.host_root_count -= 1;
+        if *count == 0 {
+            self.host_roots.remove(&root);
+        }
+        true
+    }
+
+    /// Releases one retained occurrence for each matching value.
+    pub fn release_values(&mut self, values: &[Value]) -> usize {
+        values
+            .iter()
+            .filter(|value| self.release_value(value))
+            .count()
+    }
+
+    /// Releases every automatically or explicitly retained host value.
+    pub fn release_all_values(&mut self) {
+        self.host_roots.clear();
+        self.host_root_count = 0;
+    }
+
+    #[must_use]
+    pub const fn retained_value_count(&self) -> usize {
+        self.host_root_count
+    }
+
+    /// Returns the configured maximum retained heap-handle occurrence count.
+    #[must_use]
+    pub const fn host_value_limit(&self) -> usize {
+        self.host_value_limit
+    }
+
     pub fn collect<'a>(
         &mut self,
         roots: impl IntoIterator<Item = &'a Value>,
     ) -> Result<crate::CollectionStats, RuntimeError> {
+        self.collect_internal(roots, std::iter::empty())
+    }
+
+    fn collect_internal<'a>(
+        &mut self,
+        roots: impl IntoIterator<Item = &'a Value>,
+        upvalues: impl IntoIterator<Item = UpvalueId>,
+    ) -> Result<crate::CollectionStats, RuntimeError> {
         let mut all_roots: Vec<Value> = self.globals.values().cloned().collect();
         all_roots.push(Value::Thread(self.main_thread));
         all_roots.extend(self.module_cache.values().cloned());
-        all_roots.extend(self.active_roots.iter().flatten().cloned());
+        all_roots.extend(
+            self.active_roots
+                .iter()
+                .flat_map(|roots| roots.values.iter().cloned()),
+        );
+        all_roots.extend(self.host_roots.keys().copied().map(HostRoot::to_value));
         all_roots.extend(roots.into_iter().cloned());
-        let stats = self.heap.collect(&all_roots)?;
+        let active_upvalues = self
+            .active_roots
+            .iter()
+            .flat_map(|roots| roots.upvalues.iter().copied());
+        let stats = self
+            .heap
+            .collect_with_upvalues(&all_roots, active_upvalues.chain(upvalues))?;
         self.threads
             .retain(|thread, _| self.heap.contains_thread(*thread));
         Ok(stats)
@@ -208,13 +378,13 @@ impl Vm {
     fn ensure_heap_objects(
         &mut self,
         additional: usize,
-        roots: &[Value],
+        roots: &GcRoots,
     ) -> Result<(), RuntimeError> {
         let required = self.heap.live_objects().saturating_add(additional);
         if required <= self.heap_object_limit {
             return Ok(());
         }
-        self.collect(roots)?;
+        self.collect_internal(roots.values.iter(), roots.upvalues.iter().copied())?;
         let required = self.heap.live_objects().saturating_add(additional);
         if required <= self.heap_object_limit {
             Ok(())
@@ -224,6 +394,132 @@ impl Vm {
                 limit: self.heap_object_limit,
             })
         }
+    }
+
+    fn collect_if_needed<'a>(
+        &mut self,
+        requested: usize,
+        roots: &'a GcRoots,
+        values: impl IntoIterator<Item = &'a Value>,
+        upvalues: impl IntoIterator<Item = UpvalueId>,
+    ) -> Result<(), RuntimeError> {
+        if requested != 0 && self.heap.should_collect(requested) {
+            self.collect_internal(
+                roots.values.iter().chain(values),
+                roots.upvalues.iter().copied().chain(upvalues),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn allocate_table(
+        &mut self,
+        array_capacity: usize,
+        hash_capacity: usize,
+        roots: &GcRoots,
+    ) -> Result<TableId, RuntimeError> {
+        let requested = self
+            .heap
+            .table_allocation_bytes(array_capacity, hash_capacity)?;
+        self.collect_if_needed(requested, roots, std::iter::empty(), std::iter::empty())?;
+        Ok(self.heap.allocate_table(array_capacity, hash_capacity)?)
+    }
+
+    fn allocate_upvalue(
+        &mut self,
+        value: Value,
+        roots: &GcRoots,
+    ) -> Result<UpvalueId, RuntimeError> {
+        let requested = self.heap.upvalue_allocation_bytes()?;
+        self.collect_if_needed(
+            requested,
+            roots,
+            std::iter::once(&value),
+            std::iter::empty(),
+        )?;
+        Ok(self.heap.allocate_upvalue(value)?)
+    }
+
+    fn allocate_closure(
+        &mut self,
+        chunk: Arc<Chunk>,
+        prototype: usize,
+        upvalue_capacity: usize,
+        roots: &GcRoots,
+    ) -> Result<ClosureId, RuntimeError> {
+        let requested = self.heap.closure_allocation_bytes(upvalue_capacity)?;
+        self.collect_if_needed(requested, roots, std::iter::empty(), std::iter::empty())?;
+        Ok(self
+            .heap
+            .allocate_closure(chunk, prototype, upvalue_capacity)?)
+    }
+
+    fn allocate_thread(
+        &mut self,
+        thread_roots: &[Value],
+        roots: &GcRoots,
+    ) -> Result<ThreadId, RuntimeError> {
+        let requested = self.heap.thread_allocation_bytes(thread_roots.len())?;
+        self.collect_if_needed(requested, roots, thread_roots, std::iter::empty())?;
+        Ok(self.heap.allocate_thread(thread_roots)?)
+    }
+
+    fn closure_push_upvalue(
+        &mut self,
+        closure: ClosureId,
+        upvalue: UpvalueId,
+        roots: &GcRoots,
+    ) -> Result<(), RuntimeError> {
+        let requested = self.heap.closure_push_upvalue_bytes(closure)?;
+        let closure_root = Value::Closure(closure);
+        self.collect_if_needed(
+            requested,
+            roots,
+            std::iter::once(&closure_root),
+            std::iter::once(upvalue),
+        )?;
+        Ok(self.heap.closure_push_upvalue(closure, upvalue)?)
+    }
+
+    fn table_set(
+        &mut self,
+        table: TableId,
+        key: Value,
+        value: Value,
+        roots: &GcRoots,
+    ) -> Result<(), RuntimeError> {
+        let requested = self.heap.table_set_bytes(table, &key, &value)?;
+        let table_root = Value::Table(table);
+        self.collect_if_needed(
+            requested,
+            roots,
+            [&table_root, &key, &value],
+            std::iter::empty(),
+        )?;
+        Ok(self.heap.table_set(table, key, value)?)
+    }
+
+    fn thread_set_roots(
+        &mut self,
+        thread: ThreadId,
+        thread_roots: &GcRoots,
+        roots: &GcRoots,
+    ) -> Result<(), RuntimeError> {
+        let requested = self.heap.thread_set_gc_roots_bytes(
+            thread,
+            thread_roots.values.len(),
+            thread_roots.upvalues.len(),
+        )?;
+        let thread_root = Value::Thread(thread);
+        self.collect_if_needed(
+            requested,
+            roots,
+            std::iter::once(&thread_root).chain(thread_roots.values.iter()),
+            thread_roots.upvalues.iter().copied(),
+        )?;
+        Ok(self
+            .heap
+            .thread_set_gc_roots(thread, &thread_roots.values, &thread_roots.upvalues)?)
     }
 
     pub fn execute(&mut self, chunk: &Chunk) -> Result<Vec<Value>, RuntimeError> {
@@ -251,7 +547,40 @@ impl Vm {
         }
         let chunk = Arc::new(chunk.into_chunk());
         let mut remaining = self.instruction_limit;
-        self.execute_frame(&chunk, chunk.main, None, &[], &mut remaining, 0)
+        let values = self.execute_frame(&chunk, chunk.main, None, &[], &mut remaining, 0)?;
+        self.retain_host_occurrences(&values)?;
+        Ok(values)
+    }
+
+    fn retain_host_occurrences(&mut self, values: &[Value]) -> Result<(), RuntimeError> {
+        let additional = values
+            .iter()
+            .filter(|value| HostRoot::from_value(value).is_some())
+            .count();
+        let Some(required) = self.host_root_count.checked_add(additional) else {
+            return Err(RuntimeError::HostValueLimit {
+                required: usize::MAX,
+                limit: self.host_value_limit,
+            });
+        };
+        if required > self.host_value_limit {
+            return Err(RuntimeError::HostValueLimit {
+                required,
+                limit: self.host_value_limit,
+            });
+        }
+        self.host_roots
+            .try_reserve(additional)
+            .map_err(|_| RuntimeError::Allocation {
+                what: "host value roots",
+            })?;
+        // `required` is the checked sum of every existing and new occurrence,
+        // so no individual counter can overflow while committing this batch.
+        for root in values.iter().filter_map(HostRoot::from_value) {
+            *self.host_roots.entry(root).or_insert(0) += 1;
+        }
+        self.host_root_count = required;
+        Ok(())
     }
 
     fn execute_frame(
@@ -460,14 +789,13 @@ impl Vm {
                         .get(child)
                         .ok_or(RuntimeError::InvalidPrototype(child))?
                         .upvalue_count;
-                    self.ensure_heap_objects(
-                        usize::from(upvalue_count) + 1,
-                        &frame.gc_roots(&self.heap)?,
-                    )?;
-                    let closure = self.heap.allocate_closure(
+                    let frame_roots = frame.gc_roots(&self.heap)?;
+                    self.ensure_heap_objects(usize::from(upvalue_count) + 1, &frame_roots)?;
+                    let closure = self.allocate_closure(
                         chunk.clone(),
                         child,
                         usize::from(upvalue_count),
+                        &frame_roots,
                     )?;
                     for capture_index in 0..upvalue_count {
                         let capture = frame.instruction()?;
@@ -479,14 +807,24 @@ impl Vm {
                             });
                         }
                         frame.pc = capture.pc() + 1;
+                        let mut roots = frame.gc_roots(&self.heap)?;
+                        roots.push_value(Value::Closure(closure));
                         let upvalue = match capture.a() {
                             0 if capture.b() == instruction.a() => {
-                                self.heap.allocate_upvalue(Value::Closure(closure))?
+                                self.allocate_upvalue(Value::Closure(closure), &roots)?
                             }
-                            0 => self
-                                .heap
-                                .allocate_upvalue(frame.get(capture.b())?.clone())?,
-                            1 => frame.capture_ref(&mut self.heap, capture.b())?,
+                            0 => self.allocate_upvalue(frame.get(capture.b())?.clone(), &roots)?,
+                            1 => match frame.open_upvalue(capture.b()) {
+                                Some(upvalue) => upvalue,
+                                None => {
+                                    let upvalue = self.allocate_upvalue(
+                                        frame.get(capture.b())?.clone(),
+                                        &roots,
+                                    )?;
+                                    frame.insert_open_upvalue(capture.b(), upvalue);
+                                    upvalue
+                                }
+                            },
                             2 => frame.upvalue(&self.heap, capture.b())?,
                             kind => {
                                 return Err(RuntimeError::CaptureType {
@@ -495,7 +833,7 @@ impl Vm {
                                 });
                             }
                         };
-                        self.heap.closure_push_upvalue(closure, upvalue)?;
+                        self.closure_push_upvalue(closure, upvalue, &roots)?;
                     }
                     frame.set(instruction.a(), Value::Closure(closure))?;
                 }
@@ -691,8 +1029,9 @@ impl Vm {
                             limit: MAX_TABLE_INITIAL_CAPACITY,
                         });
                     }
-                    self.ensure_heap_objects(1, &frame.gc_roots(&self.heap)?)?;
-                    let table = self.heap.allocate_table(array_capacity, hash_capacity)?;
+                    let roots = frame.gc_roots(&self.heap)?;
+                    self.ensure_heap_objects(1, &roots)?;
+                    let table = self.allocate_table(array_capacity, hash_capacity, &roots)?;
                     frame.set(instruction.a(), Value::Table(table))?;
                 }
                 Opcode::DupTable => {
@@ -732,11 +1071,12 @@ impl Vm {
                             });
                         }
                     };
-                    self.ensure_heap_objects(1, &frame.gc_roots(&self.heap)?)?;
-                    let table = self.heap.allocate_table(0, entries.len())?;
+                    let roots = frame.gc_roots(&self.heap)?;
+                    self.ensure_heap_objects(1, &roots)?;
+                    let table = self.allocate_table(0, entries.len(), &roots)?;
                     for (key, value) in entries {
                         let key = materialize_constant(&chunk, prototype, key)?;
-                        self.heap.table_set(table, key, value)?;
+                        self.table_set(table, key, value, &roots)?;
                     }
                     frame.set(instruction.a(), Value::Table(table))?;
                 }
@@ -833,10 +1173,12 @@ impl Vm {
                                 count: frame.registers.len(),
                             })?;
                         let value = frame.get(register)?.clone();
-                        self.heap.table_set(
+                        let roots = frame.gc_roots(&self.heap)?;
+                        self.table_set(
                             table,
                             Value::Integer((start + offset) as i64),
                             value,
+                            &roots,
                         )?;
                     }
                 }
@@ -1171,7 +1513,7 @@ impl Vm {
         arguments: &[Value],
         remaining: &mut u64,
         depth: usize,
-        roots: Vec<Value>,
+        roots: GcRoots,
     ) -> Result<Vec<Value>, RuntimeError> {
         match function {
             Value::Closure(closure) => {
@@ -1391,11 +1733,11 @@ impl Vm {
         for _ in 0..100 {
             let existing = self.heap.table_get(table, &key)?;
             if !matches!(existing, Value::Nil) {
-                self.heap.table_set(table, key, assigned)?;
+                self.table_set(table, key, assigned, &context.roots)?;
                 return Ok(());
             }
             let Some(metatable) = self.heap.table_metatable(table)? else {
-                self.heap.table_set(table, key, assigned)?;
+                self.table_set(table, key, assigned, &context.roots)?;
                 return Ok(());
             };
             let newindex = self
@@ -1403,7 +1745,7 @@ impl Vm {
                 .table_get(metatable, &Value::String(Arc::from(&b"__newindex"[..])))?;
             match newindex {
                 Value::Nil => {
-                    self.heap.table_set(table, key, assigned)?;
+                    self.table_set(table, key, assigned, &context.roots)?;
                     return Ok(());
                 }
                 Value::Table(next) => table = next,
@@ -1877,7 +2219,8 @@ impl Vm {
                 function: "rawset",
                 index: 3,
             })?;
-            vm.heap.table_set(table, key.clone(), assigned.clone())?;
+            let roots = GcRoots::from_values(arguments);
+            vm.table_set(table, key.clone(), assigned.clone(), &roots)?;
             Ok(vec![value.clone()])
         });
         self.set_global(&b"rawset"[..], Value::NativeFunction(rawset));
@@ -2219,8 +2562,9 @@ impl Vm {
                     actual: function.type_name(),
                 });
             }
-            vm.ensure_heap_objects(1, &[])?;
-            let thread = vm.heap.allocate_thread(std::slice::from_ref(&function))?;
+            let roots = GcRoots::from_values(arguments);
+            vm.ensure_heap_objects(1, &roots)?;
+            let thread = vm.allocate_thread(std::slice::from_ref(&function), &roots)?;
             vm.threads.insert(thread, ThreadState::New(function));
             Ok(vec![Value::Thread(thread)])
         });
@@ -2254,8 +2598,9 @@ impl Vm {
                     actual: function.type_name(),
                 });
             }
-            vm.ensure_heap_objects(1, &[])?;
-            let thread = vm.heap.allocate_thread(std::slice::from_ref(&function))?;
+            let roots = GcRoots::from_values(arguments);
+            vm.ensure_heap_objects(1, &roots)?;
+            let thread = vm.allocate_thread(std::slice::from_ref(&function), &roots)?;
             vm.threads.insert(thread, ThreadState::New(function));
             Ok(vec![Value::CoroutineFunction(thread)])
         });
@@ -2296,7 +2641,9 @@ impl Vm {
                 }
                 ThreadState::New(_) | ThreadState::Suspended(_) => {
                     vm.threads.insert(thread, ThreadState::Dead(None));
-                    vm.heap.thread_set_roots(thread, &[])?;
+                    let empty = GcRoots::default();
+                    let roots = GcRoots::from_values(arguments);
+                    vm.thread_set_roots(thread, &empty, &roots)?;
                     vec![Value::Boolean(true)]
                 }
             };
@@ -2329,7 +2676,7 @@ impl Vm {
         arguments: &[Value],
         remaining: &mut u64,
         depth: usize,
-        roots: Vec<Value>,
+        roots: GcRoots,
     ) -> Result<Vec<Value>, RuntimeError> {
         let thread = thread_argument(arguments, 0, "coroutine.resume")?;
         let state = self
@@ -2349,9 +2696,12 @@ impl Vm {
         };
         self.threads.insert(thread, ThreadState::Running);
         let mut thread_roots = roots;
-        thread_roots.push(Value::Thread(thread));
-        thread_roots.extend_from_slice(arguments.get(1..).unwrap_or_default());
-        self.heap.thread_set_roots(thread, &thread_roots)?;
+        thread_roots.push_value(Value::Thread(thread));
+        thread_roots
+            .values
+            .extend_from_slice(arguments.get(1..).unwrap_or_default());
+        let argument_roots = GcRoots::from_values(arguments);
+        self.thread_set_roots(thread, &thread_roots, &argument_roots)?;
         let previous_thread = self.running_thread.replace(thread);
         let result = match resumable {
             Resumable::New(function) => self.call_value(
@@ -2387,7 +2737,8 @@ impl Vm {
         Ok(match result {
             Ok(values) => {
                 self.threads.insert(thread, ThreadState::Dead(None));
-                self.heap.thread_set_roots(thread, &[])?;
+                let empty = GcRoots::default();
+                self.thread_set_roots(thread, &empty, &empty)?;
                 let mut resumed = Vec::with_capacity(values.len() + 1);
                 resumed.push(Value::Boolean(true));
                 resumed.extend(values);
@@ -2405,7 +2756,9 @@ impl Vm {
                 let error_value = runtime_error_value(error);
                 self.threads
                     .insert(thread, ThreadState::Dead(Some(error_value.clone())));
-                self.heap.thread_set_roots(thread, &[])?;
+                let empty = GcRoots::default();
+                let roots = GcRoots::from_values(std::slice::from_ref(&error_value));
+                self.thread_set_roots(thread, &empty, &roots)?;
                 vec![Value::Boolean(false), error_value]
             }
         })
@@ -2519,7 +2872,7 @@ impl Vm {
             None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
         };
         let roots = continuation_roots(&continuation.frame, &continuation.callers, &self.heap)?;
-        self.heap.thread_set_roots(thread, &roots)?;
+        self.thread_set_roots(thread, &roots, &GcRoots::default())?;
         self.threads
             .insert(thread, ThreadState::Suspended(continuation));
         Ok(())
@@ -2527,6 +2880,7 @@ impl Vm {
 
     fn install_table_library(&mut self) -> Result<(), RuntimeError> {
         let insert = self.register_function(|vm, arguments| {
+            let roots = GcRoots::from_values(arguments);
             let table = arguments.first().ok_or(RuntimeError::Argument {
                 function: "table.insert",
                 index: 1,
@@ -2565,11 +2919,9 @@ impl Vm {
             }
             for index in (position..=length).rev() {
                 let value = vm.heap.table_get(table, &Value::Integer(index as i64))?;
-                vm.heap
-                    .table_set(table, Value::Integer((index + 1) as i64), value)?;
+                vm.table_set(table, Value::Integer((index + 1) as i64), value, &roots)?;
             }
-            vm.heap
-                .table_set(table, Value::Integer(position as i64), value)?;
+            vm.table_set(table, Value::Integer(position as i64), value, &roots)?;
             Ok(Vec::new())
         });
 
@@ -2588,15 +2940,15 @@ impl Vm {
                 return Ok(vec![Value::Nil]);
             }
             let removed = vm.heap.table_get(table, &Value::Integer(position))?;
+            let mut roots = GcRoots::from_values(arguments);
+            roots.push_value(removed.clone());
             for index in position as usize..length {
                 let value = vm
                     .heap
                     .table_get(table, &Value::Integer((index + 1) as i64))?;
-                vm.heap
-                    .table_set(table, Value::Integer(index as i64), value)?;
+                vm.table_set(table, Value::Integer(index as i64), value, &roots)?;
             }
-            vm.heap
-                .table_set(table, Value::Integer(length as i64), Value::Nil)?;
+            vm.table_set(table, Value::Integer(length as i64), Value::Nil, &roots)?;
             Ok(vec![removed])
         });
 
@@ -2640,16 +2992,22 @@ impl Vm {
             Ok(vec![Value::String(Arc::from(result))])
         });
         let pack = self.register_function(|vm, arguments| {
-            vm.ensure_heap_objects(1, &[])?;
-            let table = vm.heap.allocate_table(arguments.len(), 1)?;
+            let roots = GcRoots::from_values(arguments);
+            vm.ensure_heap_objects(1, &roots)?;
+            let table = vm.allocate_table(arguments.len(), 1, &roots)?;
             for (index, value) in arguments.iter().enumerate() {
-                vm.heap
-                    .table_set(table, Value::Integer((index + 1) as i64), value.clone())?;
+                vm.table_set(
+                    table,
+                    Value::Integer((index + 1) as i64),
+                    value.clone(),
+                    &roots,
+                )?;
             }
-            vm.heap.table_set(
+            vm.table_set(
                 table,
                 Value::String(Arc::from(&b"n"[..])),
                 Value::Integer(arguments.len() as i64),
+                &roots,
             )?;
             Ok(vec![Value::Table(table)])
         });
@@ -2975,6 +3333,8 @@ impl fmt::Debug for Vm {
             .field("has_module_loader", &self.module_loader.is_some())
             .field("module_cache", &self.module_cache)
             .field("active_frame_count", &self.active_roots.len())
+            .field("retained_value_count", &self.host_root_count)
+            .field("host_value_limit", &self.host_value_limit)
             .finish_non_exhaustive()
     }
 }
@@ -2982,11 +3342,11 @@ impl fmt::Debug for Vm {
 struct CallContext<'a> {
     remaining: &'a mut u64,
     depth: usize,
-    roots: Vec<Value>,
+    roots: GcRoots,
 }
 
 impl<'a> CallContext<'a> {
-    fn new(remaining: &'a mut u64, depth: usize, roots: Vec<Value>) -> Self {
+    fn new(remaining: &'a mut u64, depth: usize, roots: GcRoots) -> Self {
         Self {
             remaining,
             depth,
@@ -3200,13 +3560,12 @@ impl Frame {
             })
     }
 
-    fn capture_ref(&mut self, heap: &mut Heap, register: u8) -> Result<UpvalueId, RuntimeError> {
-        if let Some(upvalue) = self.open_upvalues.get(&register) {
-            return Ok(*upvalue);
-        }
-        let upvalue = heap.allocate_upvalue(self.get(register)?.clone())?;
+    fn open_upvalue(&self, register: u8) -> Option<UpvalueId> {
+        self.open_upvalues.get(&register).copied()
+    }
+
+    fn insert_open_upvalue(&mut self, register: u8, upvalue: UpvalueId) {
         self.open_upvalues.insert(register, upvalue);
-        Ok(upvalue)
     }
 
     fn sync_open_upvalues(&mut self, heap: &mut Heap) -> Result<(), RuntimeError> {
@@ -3234,24 +3593,27 @@ impl Frame {
         Ok(())
     }
 
-    fn gc_roots(&self, heap: &Heap) -> Result<Vec<Value>, RuntimeError> {
-        let mut roots = Vec::with_capacity(
+    fn gc_roots(&self, heap: &Heap) -> Result<GcRoots, RuntimeError> {
+        let mut values = Vec::with_capacity(
             self.constants.len()
                 + self.registers.len()
                 + self.varargs.len()
                 + self.open_upvalues.len()
                 + usize::from(self.closure.is_some()),
         );
-        roots.extend(self.constants.iter().cloned());
-        roots.extend(self.registers.iter().cloned());
-        roots.extend(self.varargs.iter().cloned());
+        values.extend(self.constants.iter().cloned());
+        values.extend(self.registers.iter().cloned());
+        values.extend(self.varargs.iter().cloned());
         if let Some(closure) = self.closure {
-            roots.push(Value::Closure(closure));
+            values.push(Value::Closure(closure));
         }
         for upvalue in self.open_upvalues.values() {
-            roots.push(heap.upvalue_get(*upvalue)?);
+            values.push(heap.upvalue_get(*upvalue)?);
         }
-        Ok(roots)
+        Ok(GcRoots {
+            values,
+            upvalues: self.open_upvalues.values().copied().collect(),
+        })
     }
 
     fn constant(&self, index: i32) -> Result<Value, RuntimeError> {
@@ -3302,7 +3664,7 @@ fn continuation_roots(
     frame: &Frame,
     callers: &[Caller],
     heap: &Heap,
-) -> Result<Vec<Value>, RuntimeError> {
+) -> Result<GcRoots, RuntimeError> {
     let mut roots = frame.gc_roots(heap)?;
     for caller in callers {
         roots.extend(caller.frame.gc_roots(heap)?);
@@ -3533,6 +3895,10 @@ pub enum RuntimeError {
         required: usize,
         limit: usize,
     },
+    HostValueLimit {
+        required: usize,
+        limit: usize,
+    },
     MetatableProtected,
     MetatableLoop,
     UnsupportedMetamethod {
@@ -3653,6 +4019,12 @@ impl fmt::Display for RuntimeError {
             }
             Self::HeapObjectLimit { required, limit } => {
                 write!(f, "heap requires {required} live objects, limit is {limit}")
+            }
+            Self::HostValueLimit { required, limit } => {
+                write!(
+                    f,
+                    "retained host values require {required} entries, limit is {limit}"
+                )
             }
             Self::MetatableProtected => f.write_str("cannot change a protected metatable"),
             Self::MetatableLoop => f.write_str("metatable lookup chain is too long"),
@@ -4091,5 +4463,178 @@ mod tests {
                 ..
             }))
         ));
+    }
+
+    #[test]
+    fn automatic_byte_collection_makes_room_for_heap_allocation() {
+        let probe = Vm::default();
+        let baseline = probe.memory_usage().current_bytes;
+        let allocation = probe.heap.table_allocation_bytes(4, 0).unwrap();
+        let limit = baseline.checked_add(allocation).unwrap();
+        let mut vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                hard_limit_bytes: Some(limit),
+                gc_start_bytes: limit,
+                gc_growth_percent: 50,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        assert_eq!(vm.memory_usage().current_bytes, baseline);
+
+        let garbage = vm.heap.allocate_table(4, 0).unwrap();
+        assert_eq!(vm.memory_usage().current_bytes, limit);
+        let replacement = vm.allocate_table(4, 0, &GcRoots::default()).unwrap();
+
+        assert_eq!(vm.memory_usage().collections, 1);
+        assert_eq!(vm.memory_usage().current_bytes, limit);
+        assert_eq!(
+            vm.heap.table_get(garbage, &Value::Integer(1)),
+            Err(HeapError::StaleTable(garbage))
+        );
+        assert_eq!(
+            vm.heap.table_get(replacement, &Value::Integer(1)),
+            Ok(Value::Nil)
+        );
+    }
+
+    #[test]
+    fn automatic_byte_collection_makes_room_for_table_growth() {
+        let mut probe = Vm::default();
+        probe.heap.allocate_table(0, 0).unwrap();
+        probe.heap.allocate_table(4, 0).unwrap();
+        let limit = probe.memory_usage().current_bytes;
+        let mut vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                hard_limit_bytes: Some(limit),
+                gc_start_bytes: limit,
+                gc_growth_percent: 50,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+
+        let retained = vm.heap.allocate_table(0, 0).unwrap();
+        vm.set_global(&b"retained"[..], Value::Table(retained));
+        let garbage = vm.heap.allocate_table(4, 0).unwrap();
+        assert_eq!(vm.memory_usage().current_bytes, limit);
+
+        vm.table_set(
+            retained,
+            Value::Integer(1),
+            Value::Integer(42),
+            &GcRoots::default(),
+        )
+        .unwrap();
+
+        assert_eq!(vm.memory_usage().collections, 1);
+        assert_eq!(
+            vm.heap.table_get(retained, &Value::Integer(1)),
+            Ok(Value::Integer(42))
+        );
+        assert_eq!(
+            vm.heap.table_get(garbage, &Value::Integer(1)),
+            Err(HeapError::StaleTable(garbage))
+        );
+    }
+
+    #[test]
+    fn retained_bytes_fail_with_the_structured_memory_error_after_collection() {
+        let probe = Vm::default();
+        let baseline = probe.memory_usage().current_bytes;
+        let allocation = probe.heap.table_allocation_bytes(4, 0).unwrap();
+        let limit = baseline.checked_add(allocation).unwrap();
+        let mut vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                hard_limit_bytes: Some(limit),
+                gc_start_bytes: limit,
+                gc_growth_percent: 50,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let retained = vm.heap.allocate_table(4, 0).unwrap();
+        vm.set_global(&b"retained"[..], Value::Table(retained));
+
+        assert_eq!(
+            vm.allocate_table(4, 0, &GcRoots::default()),
+            Err(RuntimeError::Heap(HeapError::Memory(
+                crate::MemoryError::LimitExceeded {
+                    requested: allocation,
+                    used: limit,
+                    limit,
+                }
+            )))
+        );
+        assert_eq!(vm.memory_usage().collections, 1);
+        assert_eq!(vm.memory_usage().current_bytes, limit);
+        assert_eq!(
+            vm.heap.table_get(retained, &Value::Integer(1)),
+            Ok(Value::Nil)
+        );
+    }
+
+    #[test]
+    fn automatic_collection_preserves_globals_active_frames_and_threads() {
+        let mut probe = Vm::default();
+        probe.heap.allocate_table(1, 0).unwrap();
+        probe.heap.allocate_table(1, 0).unwrap();
+        let thread_value = probe.heap.allocate_table(1, 0).unwrap();
+        probe
+            .heap
+            .allocate_thread(&[Value::Table(thread_value)])
+            .unwrap();
+        probe.heap.allocate_table(4, 0).unwrap();
+        let threshold = probe.memory_usage().current_bytes;
+
+        let mut vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                hard_limit_bytes: None,
+                gc_start_bytes: threshold,
+                gc_growth_percent: 50,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let global = vm.heap.allocate_table(1, 0).unwrap();
+        vm.set_global(&b"retained"[..], Value::Table(global));
+        let active = vm.heap.allocate_table(1, 0).unwrap();
+        vm.active_roots
+            .push(GcRoots::from_values(&[Value::Table(active)]));
+        let thread_value = vm.heap.allocate_table(1, 0).unwrap();
+        let thread = vm
+            .heap
+            .allocate_thread(&[Value::Table(thread_value)])
+            .unwrap();
+        vm.threads.insert(thread, ThreadState::Dead(None));
+        vm.set_global(&b"thread"[..], Value::Thread(thread));
+        let garbage = vm.heap.allocate_table(4, 0).unwrap();
+        assert_eq!(vm.memory_usage().current_bytes, threshold);
+
+        vm.allocate_table(0, 0, &GcRoots::default()).unwrap();
+
+        assert_eq!(vm.memory_usage().collections, 1);
+        assert_eq!(
+            vm.heap.table_get(global, &Value::Integer(1)),
+            Ok(Value::Nil)
+        );
+        assert_eq!(
+            vm.heap.table_get(active, &Value::Integer(1)),
+            Ok(Value::Nil)
+        );
+        assert_eq!(
+            vm.heap.table_get(thread_value, &Value::Integer(1)),
+            Ok(Value::Nil)
+        );
+        assert!(vm.heap.contains_thread(thread));
+        assert!(vm.threads.contains_key(&thread));
+        assert_eq!(
+            vm.heap.table_get(garbage, &Value::Integer(1)),
+            Err(HeapError::StaleTable(garbage))
+        );
     }
 }
