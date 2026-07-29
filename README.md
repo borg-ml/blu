@@ -42,7 +42,7 @@ claim of complete Luau, Lua, or Blu compatibility.
 The first Blu-owned frontend substrate is also present: `blu-syntax` performs
 bounded byte-oriented lexing and parses the initial local declaration/assignment/return arithmetic
 slice, including nil, boolean, and escape-free quoted byte-string literals
-plus grouping parentheses and profile-neutral `+`/`-`/`*`, into a spanned arena AST with explicit profile
+plus semicolon separators, grouping parentheses, and profile-neutral `+`/`-`/`*`, into a spanned arena AST with explicit profile
 reconciliation. String escapes fail explicitly until their profile-specific
 rules are implemented. Unary `not` follows common Lua truthiness and produces
 a boolean under every profile.

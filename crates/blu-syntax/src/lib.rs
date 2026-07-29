@@ -138,6 +138,7 @@ pub enum TokenKind {
     StringLiteral,
     Equal,
     Comma,
+    Semicolon,
     Plus,
     Minus,
     Star,
@@ -333,6 +334,10 @@ pub fn lex(
             b',' => {
                 offset += 1;
                 TokenKind::Comma
+            }
+            b';' => {
+                offset += 1;
+                TokenKind::Semicolon
             }
             b'+' => {
                 offset += 1;

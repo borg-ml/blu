@@ -139,6 +139,38 @@ fn identifier_statement_without_equal_is_rejected_structurally() {
 }
 
 #[test]
+fn semicolons_separate_statements_represent_empty_statements_and_trail_return() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b";;local answer = 40;answer = answer + 2;;return answer;;;".to_vec());
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        assert_eq!(parsed.ast().statements().len(), 3, "{profile}");
+        assert!(matches!(parsed.ast().statements()[0], Statement::Local(_)));
+        assert!(matches!(
+            parsed.ast().statements()[1],
+            Statement::Assignment(_)
+        ));
+        assert!(matches!(parsed.ast().statements()[2], Statement::Return(_)));
+        assert_eq!(
+            parsed
+                .tokens()
+                .iter()
+                .filter(|token| token.kind() == TokenKind::Semicolon)
+                .count(),
+            8,
+            "{profile}"
+        );
+    }
+
+    let source = source(b"return;".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    assert!(statement.values().is_empty());
+    assert_eq!(source.slice(statement.span()).unwrap(), b"return");
+}
+
+#[test]
 fn floor_divide_binds_tighter_than_add_and_both_are_left_associative() {
     let source = source(b"return a + b // c // d + e".to_vec());
     let parsed = accepted(&source, SemanticProfile::Lua54, ParseLimits::default());

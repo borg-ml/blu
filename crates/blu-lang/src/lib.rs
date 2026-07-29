@@ -329,6 +329,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let semicolons = SourceFile::new(
+            SourceId::new(6),
+            "semicolons.blu",
+            b";local answer = 40;answer = answer + 2;;return answer;".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -404,6 +411,22 @@ mod tests {
                     Value::Number(42.0)
                 }]),
                 "local assignment under {profile}"
+            );
+            let compiled = OwnedCompiler::default()
+                .compile(&semicolons, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![if matches!(
+                    profile,
+                    SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) {
+                    Value::Integer(42)
+                } else {
+                    Value::Number(42.0)
+                }]),
+                "semicolon-separated statements under {profile}"
             );
         }
     }

@@ -307,10 +307,16 @@ impl<'a> Parser<'a> {
     fn run(mut self) -> Result<(Option<Ast>, Vec<Diagnostic>), ParseError> {
         while let Some(token) = self.current() {
             match token.kind() {
+                TokenKind::Semicolon => {
+                    self.bump();
+                }
                 TokenKind::Local => self.parse_local()?,
                 TokenKind::Identifier => self.parse_assignment()?,
                 TokenKind::Return => {
                     self.parse_return()?;
+                    while self.at(TokenKind::Semicolon) {
+                        self.bump();
+                    }
                     if self.current().is_some() {
                         self.report_current(
                             "BLU-PARSE-0005",
@@ -390,7 +396,7 @@ impl<'a> Parser<'a> {
             });
         };
         let mut values = allocate_vec(1, "return expression list")?;
-        if self.current().is_none() {
+        if self.current().is_none() || self.at(TokenKind::Semicolon) {
             return self.push_statement(Statement::Return(ReturnStatement::new(
                 values,
                 keyword.span(),
