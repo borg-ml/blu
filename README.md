@@ -1,4 +1,4 @@
-# Blu: a Lua/Luau superset runtime in Rust
+# Blu: A language extending Lua with a fast Rust runtime
 
 Blu is a fast, embeddable Lua/Luau superset language and runtime written in
 Rust. It is built for deeply extensible native applications. Its default `blu`
