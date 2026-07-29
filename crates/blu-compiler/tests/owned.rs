@@ -268,6 +268,16 @@ fn local_lists_evaluate_before_binding_and_fill_missing_values_with_nil() {
             .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
         Ok(vec![Value::Number(1.0)])
     );
+
+    let source = make_source(b"local value\nvalue, value = 1, 2\nreturn value".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::new(Dialect::Blu)
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Number(2.0)])
+    );
 }
 
 #[test]
@@ -313,6 +323,65 @@ fn local_assignment_mutates_the_active_shadowed_binding_for_every_profile() {
     assert_eq!(
         source.slice(diagnostic.primary().span()).unwrap(),
         b"missing"
+    );
+}
+
+#[test]
+fn assignment_lists_snapshot_rhs_and_adjust_fixed_scalar_values() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(
+            b"local first, second = 1, 2\nfirst, second = second, first\nreturn first, second"
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let numeric = matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        );
+        assert_eq!(
+            Vm::new(Dialect::Blu)
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                if numeric {
+                    Value::Integer(2)
+                } else {
+                    Value::Number(2.0)
+                },
+                if numeric {
+                    Value::Integer(1)
+                } else {
+                    Value::Number(1.0)
+                },
+            ]),
+            "{profile}"
+        );
+    }
+
+    let source =
+        make_source(b"local first, missing\nfirst, missing = 9\nreturn first, missing".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::new(Dialect::Blu)
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Number(9.0), Value::Nil])
+    );
+
+    let source = make_source(b"local kept\nkept = 1, 2\nreturn kept".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        compiled.artifact().main().constants,
+        [Constant::Nil, Constant::Number(1.0), Constant::Number(2.0)]
+    );
+    assert_eq!(
+        Vm::new(Dialect::Blu)
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Number(1.0)])
     );
 }
 

@@ -28,9 +28,9 @@ use blu_core::{
     Severity, SourceFile, SourceIdentity, SpanError,
 };
 use blu_syntax::{
-    AssignmentStatement, Ast, BinaryOperator, Expression, ExpressionId, ExpressionKind,
-    LocalListStatement, LocalStatement, ParseError, ParseLimits, ParseOutcome, Rejected,
-    ReturnStatement, Statement, UnaryOperator, parse,
+    AssignmentListStatement, AssignmentStatement, Ast, BinaryOperator, Expression, ExpressionId,
+    ExpressionKind, LocalListStatement, LocalStatement, ParseError, ParseLimits, ParseOutcome,
+    Rejected, ReturnStatement, Statement, UnaryOperator, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -398,6 +398,7 @@ impl<'a> Lowerer<'a> {
                 Statement::Local(local) => self.lower_local(*local)?,
                 Statement::LocalList(local) => self.lower_local_list(local)?,
                 Statement::Assignment(assignment) => self.lower_assignment(*assignment)?,
+                Statement::AssignmentList(assignment) => self.lower_assignment_list(assignment)?,
                 Statement::Return(return_statement) => {
                     if index + 1 != ast.statements().len() {
                         return Err(OwnedCompileError::InternalInvariant {
@@ -575,6 +576,53 @@ impl<'a> Lowerer<'a> {
                     start_pc,
                 },
                 "local bindings",
+            )?;
+        }
+        Ok(())
+    }
+
+    fn lower_assignment_list(
+        &mut self,
+        statement: &AssignmentListStatement,
+    ) -> Result<(), OwnedCompileError> {
+        let mut destinations = allocate_vec(
+            statement.targets().len(),
+            "assignment destination registers",
+        )?;
+        for target in statement.targets() {
+            destinations.push(self.resolve(target.span())?);
+        }
+        let capacity = statement.targets().len().max(statement.values().len());
+        let mut sources = allocate_vec(capacity, "assignment source registers")?;
+        for (index, value) in statement.values().iter().copied().enumerate() {
+            let source = self.lower_expression(value)?;
+            if index < destinations.len() {
+                let snapshot = self.allocate_register()?;
+                self.emit(
+                    Instruction::Move {
+                        destination: snapshot,
+                        source,
+                    },
+                    self.expression(value)?.span(),
+                )?;
+                sources.push(snapshot);
+            }
+        }
+        while sources.len() < destinations.len() {
+            let Some(target) = statement.targets().get(sources.len()).copied() else {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "assignment target/value adjustment index is out of bounds",
+                });
+            };
+            sources.push(self.lower_constant(Constant::Nil, target.span())?);
+        }
+        for (destination, source) in destinations.into_iter().zip(sources) {
+            self.emit(
+                Instruction::Move {
+                    destination,
+                    source,
+                },
+                statement.span(),
             )?;
         }
         Ok(())

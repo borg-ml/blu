@@ -12,9 +12,9 @@ mod ast;
 mod parser;
 
 pub use ast::{
-    AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Expression, ExpressionId,
-    ExpressionKind, Identifier, LocalListStatement, LocalStatement, ReturnStatement, Statement,
-    UnaryExpression, UnaryOperator,
+    AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator,
+    Expression, ExpressionId, ExpressionKind, Identifier, LocalListStatement, LocalStatement,
+    ReturnStatement, Statement, UnaryExpression, UnaryOperator,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 

@@ -343,6 +343,14 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let assignment_list = SourceFile::new(
+            SourceId::new(8),
+            "assignment-list.blu",
+            b"local first, second = 1, 2\nfirst, second = second, first\nreturn first, second"
+                .to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -459,6 +467,26 @@ mod tests {
                     Value::Nil,
                 ]),
                 "local list adjustment under {profile}"
+            );
+            let compiled = OwnedCompiler::default()
+                .compile(&assignment_list, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![
+                    if numeric {
+                        Value::Integer(2)
+                    } else {
+                        Value::Number(2.0)
+                    },
+                    if numeric {
+                        Value::Integer(1)
+                    } else {
+                        Value::Number(1.0)
+                    },
+                ]),
+                "assignment list swap under {profile}"
             );
         }
     }

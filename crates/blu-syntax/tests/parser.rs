@@ -147,6 +147,33 @@ fn identifier_assignment_preserves_target_value_and_full_span() {
 }
 
 #[test]
+fn assignment_target_and_value_lists_preserve_order_and_full_span() {
+    for profile in SemanticProfile::ALL {
+        let source = source(
+            b"local first, second = 1, 2\nfirst, second = second, first\nreturn first".to_vec(),
+        );
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::AssignmentList(assignment) = &parsed.ast().statements()[1] else {
+            panic!("expected assignment-list statement");
+        };
+        assert_eq!(assignment.targets().len(), 2);
+        assert_eq!(assignment.values().len(), 2);
+        assert_eq!(
+            source.slice(assignment.targets()[0].span()).unwrap(),
+            b"first"
+        );
+        assert_eq!(
+            source.slice(assignment.targets()[1].span()).unwrap(),
+            b"second"
+        );
+        assert_eq!(
+            source.slice(assignment.span()).unwrap(),
+            b"first, second = second, first"
+        );
+    }
+}
+
+#[test]
 fn identifier_statement_without_equal_is_rejected_structurally() {
     let source = source(b"answer\nreturn answer".to_vec());
     let outcome = parse(&source, SemanticProfile::Blu, ParseLimits::default()).unwrap();

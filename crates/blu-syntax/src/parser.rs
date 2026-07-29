@@ -1,8 +1,8 @@
 use crate::{
-    AssignmentStatement, Ast, BinaryExpression, BinaryOperator, DialectDirective, Expression,
-    ExpressionId, ExpressionKind, Identifier, LexError, Lexed, LexerLimits, LocalListStatement,
-    LocalStatement, ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator,
-    lex,
+    AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator,
+    DialectDirective, Expression, ExpressionId, ExpressionKind, Identifier, LexError, Lexed,
+    LexerLimits, LocalListStatement, LocalStatement, ReturnStatement, Statement, Token, TokenKind,
+    UnaryExpression, UnaryOperator, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -483,6 +483,29 @@ impl<'a> Parser<'a> {
                 message: "assignment parser entered without a current token",
             });
         };
+        let mut targets = allocate_vec(1, "assignment target list")?;
+        targets.push(Identifier::new(target.span()));
+        while self.at(TokenKind::Comma) {
+            self.bump();
+            if !self.at(TokenKind::Identifier) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0007",
+                    "expected an assignment target",
+                    &["identifier"],
+                )?;
+                return Ok(());
+            }
+            let Some(target) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "assignment target check succeeded without a current token",
+                });
+            };
+            push_fallible(
+                &mut targets,
+                Identifier::new(target.span()),
+                "assignment target list",
+            )?;
+        }
         if !self.at(TokenKind::Equal) {
             self.report_current_or_eof(
                 "BLU-PARSE-0006",
@@ -492,15 +515,40 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         self.bump();
-        let Some(value) = self.parse_expression(0)? else {
+        let Some(first_value) = self.parse_expression(0)? else {
             return Ok(());
         };
-        let span = target.span().merge(self.expression(value.id)?.span())?;
-        self.push_statement(Statement::Assignment(AssignmentStatement::new(
-            Identifier::new(target.span()),
-            value.id,
-            span,
-        )))
+        let mut values = allocate_vec(1, "assignment value list")?;
+        values.push(first_value.id);
+        while self.at(TokenKind::Comma) {
+            self.bump();
+            let Some(value) = self.parse_expression(0)? else {
+                return Ok(());
+            };
+            push_fallible(&mut values, value.id, "assignment value list")?;
+        }
+        let Some(last_value) = values.last().copied() else {
+            return Err(ParseError::InternalInvariant {
+                message: "assignment value list became empty",
+            });
+        };
+        let span = target.span().merge(self.expression(last_value)?.span())?;
+        if targets.len() == 1 && values.len() == 1 {
+            let Some(target) = targets.first().copied() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "single assignment target list became empty",
+                });
+            };
+            self.push_statement(Statement::Assignment(AssignmentStatement::new(
+                target,
+                first_value.id,
+                span,
+            )))
+        } else {
+            self.push_statement(Statement::AssignmentList(AssignmentListStatement::new(
+                targets, values, span,
+            )))
+        }
     }
 
     fn parse_expression(

@@ -198,6 +198,42 @@ impl AssignmentStatement {
     }
 }
 
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct AssignmentListStatement {
+    targets: Vec<Identifier>,
+    values: Vec<ExpressionId>,
+    span: ByteSpan,
+}
+
+impl AssignmentListStatement {
+    pub(crate) const fn new(
+        targets: Vec<Identifier>,
+        values: Vec<ExpressionId>,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            targets,
+            values,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub fn targets(&self) -> &[Identifier] {
+        &self.targets
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[ExpressionId] {
+        &self.values
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl LocalStatement {
     pub(crate) const fn new(name: Identifier, value: Option<ExpressionId>, span: ByteSpan) -> Self {
         Self { name, value, span }
@@ -282,6 +318,7 @@ pub enum Statement {
     Local(LocalStatement),
     LocalList(LocalListStatement),
     Assignment(AssignmentStatement),
+    AssignmentList(AssignmentListStatement),
     Return(ReturnStatement),
 }
 
@@ -292,6 +329,7 @@ impl Statement {
             Self::Local(statement) => statement.span(),
             Self::LocalList(statement) => statement.span(),
             Self::Assignment(statement) => statement.span(),
+            Self::AssignmentList(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
         }
     }

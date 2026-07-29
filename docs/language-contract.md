@@ -70,8 +70,10 @@ an optional final bare or expression-list `return`. Falling off the chunk emits
 an EOF-spanned zero-result return. Fixed scalar local name/value lists evaluate
 all right-hand expressions before introducing any listed binding, discard
 extra values, and initialize missing values to `nil`. Function-call/MULTRET
-adjustment remains outside this owned slice. Single-name assignment evaluates its right-hand
-expression before moving the result into the active shadowed local. An
+adjustment remains outside this owned slice. Fixed scalar assignment lists
+likewise snapshot every right-hand expression before moving adjusted values
+into targets from left to right, permitting swaps without partial-write
+observations. An
 unresolved assignment target fails in resolution rather than implicitly
 selecting global semantics. Semicolons are retained tokens and act as optional
 statement separators or empty statements, including after `return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
