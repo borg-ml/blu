@@ -2881,10 +2881,19 @@ impl Vm {
             }
         };
         self.running_thread = previous_thread;
-        Ok(match result {
+        let finalized = match result {
             Ok(values) => {
-                let resumed =
-                    try_prepend_value(values, Value::Boolean(true), "coroutine resume results")?;
+                let resumed = match try_prepend_value(
+                    values,
+                    Value::Boolean(true),
+                    "coroutine resume results",
+                ) {
+                    Ok(resumed) => resumed,
+                    Err(error) => {
+                        self.threads.insert(thread, ThreadState::Dead(None));
+                        return Err(error);
+                    }
+                };
                 self.threads.insert(thread, ThreadState::Dead(None));
                 let empty = GcRoots::default();
                 self.thread_set_roots(thread, &empty, &empty)?;
@@ -2893,18 +2902,43 @@ impl Vm {
             Err(RuntimeError::CoroutineYield(values))
                 if matches!(self.threads.get(&thread), Some(ThreadState::Suspended(_))) =>
             {
-                try_prepend_value(values, Value::Boolean(true), "coroutine yield results")?
+                match try_prepend_value(values, Value::Boolean(true), "coroutine yield results") {
+                    Ok(yielded) => yielded,
+                    Err(error) => {
+                        self.threads.insert(thread, ThreadState::Dead(None));
+                        return Err(error);
+                    }
+                }
             }
             Err(error) => {
                 let error_value = runtime_error_value(error);
-                self.threads
-                    .insert(thread, ThreadState::Dead(Some(error_value.clone())));
                 let empty = GcRoots::default();
-                let roots = GcRoots::from_values(std::slice::from_ref(&error_value))?;
-                self.thread_set_roots(thread, &empty, &roots)?;
-                vec![Value::Boolean(false), error_value]
+                let error_roots = match GcRoots::from_values(std::slice::from_ref(&error_value)) {
+                    Ok(roots) => roots,
+                    Err(error) => {
+                        self.threads.insert(thread, ThreadState::Dead(None));
+                        return Err(error);
+                    }
+                };
+                let mut failed = match try_vec_with_capacity(2, "coroutine error results") {
+                    Ok(failed) => failed,
+                    Err(error) => {
+                        self.threads.insert(thread, ThreadState::Dead(None));
+                        return Err(error);
+                    }
+                };
+                failed.push(Value::Boolean(false));
+                failed.push(error_value.clone());
+                if let Err(error) = self.thread_set_roots(thread, &error_roots, &empty) {
+                    self.threads.insert(thread, ThreadState::Dead(None));
+                    return Err(error);
+                }
+                self.threads
+                    .insert(thread, ThreadState::Dead(Some(error_value)));
+                failed
             }
-        })
+        };
+        Ok(finalized)
     }
 
     fn run_resumed_frames(
@@ -4953,6 +4987,65 @@ mod tests {
         assert!(
             matches!(vm.threads.get(&thread), Some(ThreadState::New(value)) if value == &function)
         );
+    }
+
+    #[test]
+    fn post_execution_root_failure_leaves_coroutine_dead() {
+        let mut vm = Vm::default();
+        let function = Value::NativeFunction(vm.register_function(|vm, _| {
+            vm.heap.collect(std::iter::empty())?;
+            Ok(Vec::new())
+        }));
+        let thread = vm
+            .heap
+            .allocate_thread(std::slice::from_ref(&function))
+            .unwrap();
+        vm.threads.insert(thread, ThreadState::New(function));
+        let arguments = [Value::Thread(thread)];
+        let roots = GcRoots::from_values(&arguments).unwrap();
+        let mut remaining = 10;
+
+        assert_eq!(
+            vm.resume_thread(&arguments, &mut remaining, 0, roots),
+            Err(RuntimeError::Heap(HeapError::StaleThread(thread)))
+        );
+        assert!(matches!(
+            vm.threads.get(&thread),
+            Some(ThreadState::Dead(None))
+        ));
+        assert_eq!(vm.running_thread, None);
+    }
+
+    #[test]
+    fn dead_coroutine_heap_error_value_remains_rooted() {
+        let mut vm = Vm::default();
+        let function = Value::NativeFunction(vm.register_function(|vm, _| {
+            let error = vm.heap.allocate_table(0, 0)?;
+            Err(RuntimeError::Raised(Value::Table(error)))
+        }));
+        let thread = vm
+            .heap
+            .allocate_thread(std::slice::from_ref(&function))
+            .unwrap();
+        vm.threads.insert(thread, ThreadState::New(function));
+        let arguments = [Value::Thread(thread)];
+        let roots = GcRoots::from_values(&arguments).unwrap();
+        let mut remaining = 10;
+
+        let result = vm
+            .resume_thread(&arguments, &mut remaining, 0, roots)
+            .unwrap();
+        let Value::Table(error) = &result[1] else {
+            panic!("coroutine error result is not a table");
+        };
+        let error = *error;
+        assert!(matches!(
+            vm.threads.get(&thread),
+            Some(ThreadState::Dead(Some(Value::Table(stored)))) if *stored == error
+        ));
+
+        vm.heap.collect([&Value::Thread(thread)]).unwrap();
+        assert_eq!(vm.heap.table_get(error, &Value::Integer(1)), Ok(Value::Nil));
     }
 
     #[test]
