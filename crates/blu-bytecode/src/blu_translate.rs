@@ -97,6 +97,8 @@ pub fn translate_baseline_to_luau(
                     | BluInstruction::Equal { .. }
                     | BluInstruction::LessThan { .. }
                     | BluInstruction::LessEqual { .. }
+                    | BluInstruction::JumpIfTruthy { .. }
+                    | BluInstruction::JumpIfFalsy { .. }
             )
         }) {
             let instruction = if prototype
@@ -111,8 +113,17 @@ pub fn translate_baseline_to_luau(
                 .any(|instruction| matches!(instruction, BluInstruction::Concatenate { .. }))
             {
                 "concatenation"
-            } else {
+            } else if prototype.code.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    BluInstruction::Equal { .. }
+                        | BluInstruction::LessThan { .. }
+                        | BluInstruction::LessEqual { .. }
+                )
+            }) {
                 "comparisons"
+            } else {
+                "forward branches"
             };
             return Err(TranslationError::UnsupportedInstruction {
                 prototype: prototype_index,
@@ -347,6 +358,12 @@ fn translate_instruction(
             prototype,
             instruction: "comparisons",
         }),
+        BluInstruction::JumpIfTruthy { .. } | BluInstruction::JumpIfFalsy { .. } => {
+            Err(TranslationError::UnsupportedInstruction {
+                prototype,
+                instruction: "forward branches",
+            })
+        }
         BluInstruction::Return { first, count } => {
             let result_field = count
                 .checked_add(1)

@@ -335,6 +335,29 @@ fn comparisons_are_left_associative_below_concatenation() {
 }
 
 #[test]
+fn logical_operators_are_left_associative_below_comparisons() {
+    let source = source(b"return a or b and c < d and e or f".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    let outer_or = binary(&parsed, statement.values()[0]);
+    assert_eq!(outer_or.operator(), BinaryOperator::Or);
+    let inner_or = binary(&parsed, outer_or.left());
+    assert_eq!(inner_or.operator(), BinaryOperator::Or);
+    let second_and = binary(&parsed, inner_or.right());
+    assert_eq!(second_and.operator(), BinaryOperator::And);
+    assert_eq!(
+        binary(&parsed, second_and.left()).operator(),
+        BinaryOperator::And
+    );
+    assert_eq!(
+        binary(&parsed, binary(&parsed, second_and.left()).right()).operator(),
+        BinaryOperator::LessThan
+    );
+}
+
+#[test]
 fn multiplication_binds_above_addition_and_is_left_associative() {
     let source = source(b"return a + b * c * d + e".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());

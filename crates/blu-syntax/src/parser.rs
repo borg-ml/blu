@@ -604,7 +604,7 @@ impl<'a> Parser<'a> {
             _ => return self.parse_primary(),
         };
         self.bump();
-        let Some(operand) = self.parse_expression(5)? else {
+        let Some(operand) = self.parse_expression(7)? else {
             return Ok(None);
         };
         let span = operator.span().merge(self.expression(operand.id)?.span())?;
@@ -836,20 +836,22 @@ impl<'a> Parser<'a> {
 
 fn binary_operator(kind: TokenKind) -> Option<(BinaryOperator, u8, u8)> {
     match kind {
-        TokenKind::EqualEqual => Some((BinaryOperator::Equal, 1, 2)),
-        TokenKind::NotEqual => Some((BinaryOperator::NotEqual, 1, 2)),
-        TokenKind::LessThan => Some((BinaryOperator::LessThan, 1, 2)),
-        TokenKind::LessEqual => Some((BinaryOperator::LessEqual, 1, 2)),
-        TokenKind::GreaterThan => Some((BinaryOperator::GreaterThan, 1, 2)),
-        TokenKind::GreaterEqual => Some((BinaryOperator::GreaterEqual, 1, 2)),
-        TokenKind::Concatenate => Some((BinaryOperator::Concatenate, 2, 2)),
-        TokenKind::Plus => Some((BinaryOperator::Add, 3, 4)),
-        TokenKind::Minus => Some((BinaryOperator::Subtract, 3, 4)),
-        TokenKind::Star => Some((BinaryOperator::Multiply, 4, 5)),
-        TokenKind::Slash => Some((BinaryOperator::Divide, 4, 5)),
-        TokenKind::Percent => Some((BinaryOperator::Modulo, 4, 5)),
-        TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 4, 5)),
-        TokenKind::Caret => Some((BinaryOperator::Power, 6, 6)),
+        TokenKind::Or => Some((BinaryOperator::Or, 1, 2)),
+        TokenKind::And => Some((BinaryOperator::And, 2, 3)),
+        TokenKind::EqualEqual => Some((BinaryOperator::Equal, 3, 4)),
+        TokenKind::NotEqual => Some((BinaryOperator::NotEqual, 3, 4)),
+        TokenKind::LessThan => Some((BinaryOperator::LessThan, 3, 4)),
+        TokenKind::LessEqual => Some((BinaryOperator::LessEqual, 3, 4)),
+        TokenKind::GreaterThan => Some((BinaryOperator::GreaterThan, 3, 4)),
+        TokenKind::GreaterEqual => Some((BinaryOperator::GreaterEqual, 3, 4)),
+        TokenKind::Concatenate => Some((BinaryOperator::Concatenate, 4, 4)),
+        TokenKind::Plus => Some((BinaryOperator::Add, 5, 6)),
+        TokenKind::Minus => Some((BinaryOperator::Subtract, 5, 6)),
+        TokenKind::Star => Some((BinaryOperator::Multiply, 6, 7)),
+        TokenKind::Slash => Some((BinaryOperator::Divide, 6, 7)),
+        TokenKind::Percent => Some((BinaryOperator::Modulo, 6, 7)),
+        TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 6, 7)),
+        TokenKind::Caret => Some((BinaryOperator::Power, 8, 8)),
         _ => None,
     }
 }

@@ -34,6 +34,8 @@ impl Identifier {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum BinaryOperator {
+    And,
+    Or,
     Add,
     Subtract,
     Multiply,

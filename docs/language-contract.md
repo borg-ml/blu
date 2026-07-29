@@ -145,6 +145,14 @@ two byte strings and otherwise fails structurally at runtime. These rules are
 shared by the current scalar owned slice across all profiles. The bootstrap
 translator rejects canonical comparisons explicitly rather than substituting
 Luau conditional-skip instructions whose control-flow shape is different.
+Canonical `JumpIfTruthy` and `JumpIfFalsy` instructions use absolute
+instruction targets and are restricted to forward targets in BluV1. Artifact
+validation merges definite register initialization from the taken and
+fallthrough paths, so a branch cannot make a skipped write appear initialized.
+The owned compiler uses these branches for operand-returning, short-circuit
+`and` and `or` in every profile. The bootstrap translator rejects them rather
+than mapping unproved control-flow structure to Luau jumps. Backward branches
+remain unsupported until bounded loop CFG validation is implemented.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

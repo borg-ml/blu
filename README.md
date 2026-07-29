@@ -88,6 +88,9 @@ still rejects it until Blu numeric and metamethod semantics are assigned.
 The owned path also directly executes profile-neutral `==`, `~=`, `<`, `<=`,
 `>`, and `>=`; ordered comparisons accept only compatible numbers or byte
 strings, while equality between unlike scalar types is false.
+Operand-returning `and` and `or` use validated forward branches and preserve
+short-circuit evaluation in every profile. Backward canonical branches remain
+unsupported until loop control-flow validation is assigned.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

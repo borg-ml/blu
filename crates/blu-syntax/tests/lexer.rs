@@ -706,6 +706,27 @@ fn comparison_tokens_are_shared_across_profiles() {
 }
 
 #[test]
+fn logical_operator_keywords_are_shared_across_profiles() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return left and right or fallback".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::Return,
+                TokenKind::Identifier,
+                TokenKind::And,
+                TokenKind::Identifier,
+                TokenKind::Or,
+                TokenKind::Identifier,
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn malformed_decimal_exponents_are_structured() {
     let source = source(b"return 1e+".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua54, LexerLimits::default()).unwrap();

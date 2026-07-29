@@ -443,6 +443,14 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let logical_operators = SourceFile::new(
+            SourceId::new(22),
+            "logical-operators.blu",
+            br#"return "left" and "right", nil or "fallback", false and (1 + "2"), true or (1 + "2"), false or nil, nil and "unused""#
+                .to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -452,6 +460,22 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&logical_operators, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![
+                    Value::String(Arc::from(&b"right"[..])),
+                    Value::String(Arc::from(&b"fallback"[..])),
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Nil,
+                    Value::Nil,
+                ]),
+                "{profile}"
+            );
             let compiled = OwnedCompiler::default()
                 .compile(&comparisons, profile, compiler.clone())
                 .unwrap();

@@ -57,12 +57,15 @@ impl FeatureBits {
     pub const CONCATENATION: Self = Self(1 << 3);
     /// Profile-neutral value-producing equality and ordering comparisons.
     pub const COMPARISONS: Self = Self(1 << 4);
+    /// Forward conditional branches with explicit absolute instruction targets.
+    pub const FORWARD_BRANCHES: Self = Self(1 << 5);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
             | Self::FLOOR_DIVISION.0
             | Self::CONCATENATION.0
-            | Self::COMPARISONS.0,
+            | Self::COMPARISONS.0
+            | Self::FORWARD_BRANCHES.0,
     );
 
     #[must_use]
@@ -305,6 +308,14 @@ pub enum Instruction {
         left: u16,
         right: u16,
     },
+    JumpIfTruthy {
+        condition: u16,
+        target: u32,
+    },
+    JumpIfFalsy {
+        condition: u16,
+        target: u32,
+    },
     Return {
         first: u16,
         count: u16,
@@ -343,6 +354,8 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::Equal { .. }
             | Instruction::LessThan { .. }
             | Instruction::LessEqual { .. }
+            | Instruction::JumpIfTruthy { .. }
+            | Instruction::JumpIfFalsy { .. }
             | Instruction::Return { .. } => true,
         },
         SemanticProfile::Blu | SemanticProfile::Lua51 | SemanticProfile::Lua52 => matches!(
@@ -362,6 +375,8 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::Equal { .. }
                 | Instruction::LessThan { .. }
                 | Instruction::LessEqual { .. }
+                | Instruction::JumpIfTruthy { .. }
+                | Instruction::JumpIfFalsy { .. }
                 | Instruction::Return { .. }
         ),
         _ => false,
@@ -1134,6 +1149,20 @@ fn validate_prototype(
             feature: "comparisons",
         });
     }
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. }
+        )
+    }) && !prototype
+        .required_features
+        .contains(FeatureBits::FORWARD_BRANCHES)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "forward branches",
+        });
+    }
     let Some(&source_len) = sources.get(&prototype.source) else {
         return Err(ValidationError::InvalidSourceMap {
             prototype: index,
@@ -1176,7 +1205,13 @@ fn validate_prototype(
     try_reserve_validation(&mut initialized, "register initialization", registers)?;
     initialized.resize(registers, false);
     initialized[..prototype.parameter_count as usize].fill(true);
+    let mut incoming = HashMap::<usize, Vec<bool>>::new();
     for (pc, instruction) in prototype.code.iter().copied().enumerate() {
+        if let Some(branch_state) = incoming.remove(&pc) {
+            for (current, incoming) in initialized.iter_mut().zip(branch_state) {
+                *current &= incoming;
+            }
+        }
         if !instruction_is_legal(prototype.profile, instruction) {
             return Err(ValidationError::InvalidInstruction {
                 prototype: index,
@@ -1291,6 +1326,57 @@ fn validate_prototype(
                 check_read(index, pc, left, &initialized)?;
                 check_read(index, pc, right, &initialized)?;
                 initialized[destination as usize] = true;
+            }
+            Instruction::JumpIfTruthy { condition, target }
+            | Instruction::JumpIfFalsy { condition, target } => {
+                check_read(index, pc, condition, &initialized)?;
+                let target =
+                    usize::try_from(target).map_err(|_| ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "branch target does not fit this platform",
+                    })?;
+                if target <= pc || target >= prototype.code.len() {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "branch target must be a later instruction",
+                    });
+                }
+                if let Some(state) = incoming.get_mut(&target) {
+                    for (current, incoming) in state.iter_mut().zip(&initialized) {
+                        *current &= *incoming;
+                    }
+                } else {
+                    let state_bytes = incoming
+                        .len()
+                        .checked_add(1)
+                        .and_then(|count| count.checked_mul(registers))
+                        .ok_or(ValidationError::Limit {
+                            what: "branch validation state bytes",
+                            actual: usize::MAX,
+                            limit: limits.max_decoded_bytes,
+                        })?;
+                    check_limit(
+                        "branch validation state bytes",
+                        state_bytes,
+                        limits.max_decoded_bytes,
+                    )?;
+                    incoming
+                        .try_reserve(1)
+                        .map_err(|_| ValidationError::Allocation {
+                            what: "branch validation targets",
+                            requested: incoming.len().saturating_add(1),
+                        })?;
+                    let mut state = Vec::new();
+                    try_reserve_validation(
+                        &mut state,
+                        "branch register initialization",
+                        registers,
+                    )?;
+                    state.extend_from_slice(&initialized);
+                    incoming.insert(target, state);
+                }
             }
             Instruction::Return { first, count } => {
                 let end = usize::from(first).checked_add(usize::from(count)).ok_or(
@@ -1565,6 +1651,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::Equal { .. }
                     | Instruction::LessThan { .. }
                     | Instruction::LessEqual { .. } => 7,
+                    Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. } => 7,
                     Instruction::Move { .. }
                     | Instruction::Not { .. }
                     | Instruction::Negate { .. }
@@ -1808,6 +1895,16 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 put_u16(out, *destination);
                 put_u16(out, *left);
                 put_u16(out, *right);
+            }
+            Instruction::JumpIfTruthy { condition, target } => {
+                out.push(17);
+                put_u16(out, *condition);
+                put_u32(out, *target);
+            }
+            Instruction::JumpIfFalsy { condition, target } => {
+                out.push(18);
+                put_u16(out, *condition);
+                put_u32(out, *target);
             }
             Instruction::Return { first, count } => {
                 out.push(2);
@@ -2449,6 +2546,14 @@ fn read_prototype(
                 destination: reader.u16()?,
                 left: reader.u16()?,
                 right: reader.u16()?,
+            },
+            17 => Instruction::JumpIfTruthy {
+                condition: reader.u16()?,
+                target: reader.u32()?,
+            },
+            18 => Instruction::JumpIfFalsy {
+                condition: reader.u16()?,
+                target: reader.u32()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

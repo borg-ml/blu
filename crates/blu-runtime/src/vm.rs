@@ -1042,6 +1042,33 @@ impl Vm {
                     )?;
                     set_blu_register(&mut registers, destination, Value::Boolean(value))?;
                 }
+                BluInstruction::JumpIfTruthy { condition, target }
+                | BluInstruction::JumpIfFalsy { condition, target } => {
+                    let should_jump = match instruction {
+                        BluInstruction::JumpIfTruthy { .. } => {
+                            blu_register(&registers, condition)?.is_truthy()
+                        }
+                        BluInstruction::JumpIfFalsy { .. } => {
+                            !blu_register(&registers, condition)?.is_truthy()
+                        }
+                        _ => unreachable!(),
+                    };
+                    if should_jump {
+                        pc = usize::try_from(target).map_err(|_| {
+                            RuntimeError::InvalidProgramCounter {
+                                pc: usize::MAX,
+                                code_words: prototype.code.len(),
+                            }
+                        })?;
+                        if pc >= prototype.code.len() {
+                            return Err(RuntimeError::InvalidProgramCounter {
+                                pc,
+                                code_words: prototype.code.len(),
+                            });
+                        }
+                        continue;
+                    }
+                }
                 BluInstruction::Return { first, count } => {
                     let start = usize::from(first);
                     let end =

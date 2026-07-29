@@ -199,6 +199,18 @@ fn comparison_fixture(profile: SemanticProfile, instruction: Instruction) -> Art
     artifact
 }
 
+fn forward_branch_fixture(profile: SemanticProfile) -> Artifact {
+    let mut artifact = baseline_fixture(profile);
+    artifact.prototypes[0].required_features =
+        FeatureBits::BASELINE | FeatureBits::FORWARD_BRANCHES;
+    artifact.prototypes[0].code[2] = Instruction::JumpIfTruthy {
+        condition: 0,
+        target: 3,
+    };
+    artifact.prototypes[0].code[3] = Instruction::Return { first: 0, count: 1 };
+    artifact
+}
+
 #[test]
 fn canonical_round_trip_preserves_profiles_and_metadata() {
     let limits = BluLimits::default();
@@ -825,6 +837,76 @@ fn comparison_wire_feature_is_explicit_and_profile_neutral() {
             })
         );
     }
+}
+
+#[test]
+fn forward_branches_are_feature_gated_and_merge_register_initialization() {
+    let limits = BluLimits::default();
+    for profile in SemanticProfile::ALL {
+        let artifact = forward_branch_fixture(profile);
+        let validated = ValidatedArtifact::new(artifact, limits).unwrap();
+        let bytes = encode(&validated, limits).unwrap();
+        let decoded = decode_validated(&bytes, limits).unwrap();
+        assert!(
+            decoded
+                .main()
+                .required_features
+                .contains(FeatureBits::FORWARD_BRANCHES),
+            "{profile}"
+        );
+        assert_eq!(
+            decoded.main().code[2],
+            Instruction::JumpIfTruthy {
+                condition: 0,
+                target: 3,
+            },
+            "{profile}"
+        );
+
+        let mut missing = forward_branch_fixture(profile);
+        missing.prototypes[0].required_features = FeatureBits::BASELINE;
+        assert_eq!(
+            ValidatedArtifact::new(missing, limits),
+            Err(ValidationError::MissingFeature {
+                prototype: 0,
+                feature: "forward branches",
+            }),
+            "{profile}"
+        );
+    }
+
+    let mut skipped_initialization = baseline_fixture(SemanticProfile::Blu);
+    skipped_initialization.prototypes[0].required_features =
+        FeatureBits::BASELINE | FeatureBits::FORWARD_BRANCHES;
+    skipped_initialization.prototypes[0].code[1] = Instruction::JumpIfFalsy {
+        condition: 0,
+        target: 3,
+    };
+    skipped_initialization.prototypes[0].code[2] = Instruction::LoadConstant {
+        destination: 1,
+        constant: 1,
+    };
+    skipped_initialization.prototypes[0].code[3] = Instruction::Return { first: 1, count: 1 };
+    assert!(matches!(
+        ValidatedArtifact::new(skipped_initialization, limits),
+        Err(ValidationError::InvalidInstruction {
+            what: "register is read before initialization",
+            ..
+        })
+    ));
+
+    let mut backward = forward_branch_fixture(SemanticProfile::Blu);
+    backward.prototypes[0].code[2] = Instruction::JumpIfTruthy {
+        condition: 0,
+        target: 1,
+    };
+    assert!(matches!(
+        ValidatedArtifact::new(backward, limits),
+        Err(ValidationError::InvalidInstruction {
+            what: "branch target must be a later instruction",
+            ..
+        })
+    ));
 }
 
 #[test]

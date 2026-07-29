@@ -755,6 +755,66 @@ fn comparisons_are_canonical_profile_neutral_and_directly_executable() {
 }
 
 #[test]
+fn logical_operators_short_circuit_and_return_operands_for_every_profile() {
+    let source = make_source(
+        br#"return "left" and "right", nil or "fallback", false and (1 + "2"), true or (1 + "2"), false or nil, nil and "unused""#
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .required_features
+                .contains(FeatureBits::FORWARD_BRANCHES),
+            "{profile}"
+        );
+        assert!(
+            compiled.artifact().main().code.iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. }
+                )
+            }),
+            "{profile}"
+        );
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let translation_error = translate_baseline_to_luau(
+                decode_validated(compiled.bytes(), BluLimits::default()).unwrap(),
+                profile,
+                BluLimits::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    translation_error,
+                    TranslationError::UnsupportedInstruction {
+                        instruction: "forward branches",
+                        ..
+                    }
+                ),
+                "{profile}: {translation_error:?}"
+            );
+        }
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::String(std::sync::Arc::from(&b"right"[..])),
+                Value::String(std::sync::Arc::from(&b"fallback"[..])),
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Nil,
+                Value::Nil,
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {

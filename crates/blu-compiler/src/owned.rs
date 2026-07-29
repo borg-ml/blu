@@ -493,6 +493,14 @@ impl<'a> Lowerer<'a> {
         }) {
             required_features = required_features | FeatureBits::COMPARISONS;
         }
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. }
+            )
+        }) {
+            required_features = required_features | FeatureBits::FORWARD_BRANCHES;
+        }
         Ok(Prototype {
             profile: ast.profile(),
             source: self.source.identity().id(),
@@ -815,6 +823,40 @@ impl<'a> Lowerer<'a> {
                 }
             },
             ExpressionKind::Binary(binary) => match binary.operator() {
+                BinaryOperator::And | BinaryOperator::Or => {
+                    let left = self.lower_expression(binary.left())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::Move {
+                            destination,
+                            source: left,
+                        },
+                        expression.span(),
+                    )?;
+                    let branch = self.code.len();
+                    let instruction = if binary.operator() == BinaryOperator::And {
+                        Instruction::JumpIfFalsy {
+                            condition: left,
+                            target: 0,
+                        }
+                    } else {
+                        Instruction::JumpIfTruthy {
+                            condition: left,
+                            target: 0,
+                        }
+                    };
+                    self.emit(instruction, expression.span())?;
+                    let right = self.lower_expression(binary.right())?;
+                    self.emit(
+                        Instruction::Move {
+                            destination,
+                            source: right,
+                        },
+                        expression.span(),
+                    )?;
+                    self.patch_forward_branch(branch, self.code.len())?;
+                    Ok(destination)
+                }
                 BinaryOperator::Add => {
                     let left = self.lower_expression(binary.left())?;
                     let right = self.lower_expression(binary.right())?;
@@ -1393,6 +1435,37 @@ impl<'a> Lowerer<'a> {
         check_limit(OwnedCompileLimit::Instructions, required, limit)?;
         push_fallible(&mut self.code, instruction, "instructions")?;
         push_fallible(&mut self.source_map, span, "source map")
+    }
+
+    fn patch_forward_branch(
+        &mut self,
+        instruction: usize,
+        target: usize,
+    ) -> Result<(), OwnedCompileError> {
+        let target = u32::try_from(target).map_err(|_| OwnedCompileError::InternalInvariant {
+            message: "branch target passed limits but cannot fit BluV1",
+        })?;
+        let Some(slot) = self.code.get_mut(instruction) else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "branch patch instruction is missing",
+            });
+        };
+        match slot {
+            Instruction::JumpIfTruthy {
+                target: branch_target,
+                ..
+            }
+            | Instruction::JumpIfFalsy {
+                target: branch_target,
+                ..
+            } => *branch_target = target,
+            _ => {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "branch patch did not reference a branch",
+                });
+            }
+        }
+        Ok(())
     }
 }
 
