@@ -1,4 +1,7 @@
-use blu_core::{SemanticProfile, SourceFile, SourceId, SourceLimits};
+use blu_core::{
+    DiagnosticError, DiagnosticLimit, DiagnosticLimits, SemanticProfile, SourceFile, SourceId,
+    SourceLimits,
+};
 use blu_syntax::{LexError, LexerLimit, LexerLimits, TokenKind, lex};
 
 fn source(bytes: impl Into<Vec<u8>>) -> SourceFile {
@@ -231,6 +234,29 @@ fn token_and_diagnostic_limits_fail_before_unbounded_growth() {
             limit: 1,
         })
     );
+}
+
+#[test]
+fn diagnostic_value_limits_map_through_lex_error() {
+    let source = source(b"@".to_vec());
+    assert!(matches!(
+        lex(
+            &source,
+            SemanticProfile::Blu,
+            LexerLimits {
+                diagnostic_limits: DiagnosticLimits {
+                    max_found_bytes: 0,
+                    ..DiagnosticLimits::default()
+                },
+                ..LexerLimits::default()
+            },
+        ),
+        Err(LexError::Diagnostic(DiagnosticError::Limit {
+            kind: DiagnosticLimit::FoundBytes,
+            required: 1,
+            limit: 0,
+        }))
+    ));
 }
 
 #[test]

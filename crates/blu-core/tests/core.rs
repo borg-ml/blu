@@ -1,8 +1,8 @@
 use blu_core::{
     ByteOffset, ByteSpan, CompilerId, CompilerIdentity, Diagnostic, DiagnosticCode,
-    DiagnosticCodeError, IdentityError, IdentityLimits, Label, LineIndexError, Phase,
-    SemanticProfile, Severity, SourceError, SourceFile, SourceId, SourceLimit, SourceLimits,
-    SpanError,
+    DiagnosticCodeError, DiagnosticError, DiagnosticLimit, DiagnosticLimits, IdentityError,
+    IdentityLimits, LineIndexError, Phase, SemanticProfile, Severity, SourceError, SourceFile,
+    SourceId, SourceLimit, SourceLimits, SpanError,
 };
 
 #[test]
@@ -118,14 +118,18 @@ fn source_contents_and_diagnostic_found_tokens_accept_non_utf8() {
     assert_eq!(source.line_index().line_count(), 2);
     assert_eq!(source.slice(source.span(2, 3).unwrap()).unwrap(), &[0xfe]);
 
-    let diagnostic = Diagnostic::new(
-        DiagnosticCode::new("BLU-LEX-0001").unwrap(),
+    let diagnostic = Diagnostic::try_new(
+        "BLU-LEX-0001",
         Phase::Lex,
         SemanticProfile::Lua54,
         Severity::Error,
-        Label::new(source.span(0, 1).unwrap(), "invalid source byte"),
+        source.span(0, 1).unwrap(),
+        "invalid source byte",
+        DiagnosticLimits::default(),
     )
-    .with_found(vec![0xff]);
+    .unwrap()
+    .try_with_found(&[0xff])
+    .unwrap();
     assert_eq!(diagnostic.found(), Some(&[0xff][..]));
     assert_eq!(diagnostic.primary().span().start().get(), 0);
     assert_eq!(diagnostic.primary().span().end().get(), 1);
@@ -228,54 +232,71 @@ fn diagnostics_are_structured_and_deterministic() {
         SourceLimits::default(),
     )
     .unwrap();
-    let primary = Label::new(source.span(6, 7).unwrap(), "expected a binding name");
-    let earlier = Label::new(source.span(0, 5).unwrap(), "declaration starts here");
-    let later = Label::new(source.span(5, 6).unwrap(), "whitespace before token");
-    let code = DiagnosticCode::new("BLU-PARSE-0001").unwrap();
-
-    let first = Diagnostic::new(
-        code.clone(),
+    let first = Diagnostic::try_new(
+        "BLU-PARSE-0001",
         Phase::Parse,
         SemanticProfile::Blu,
         Severity::Error,
-        primary.clone(),
+        source.span(6, 7).unwrap(),
+        "expected a binding name",
+        DiagnosticLimits {
+            max_help_item_bytes: 2_048,
+            ..DiagnosticLimits::default()
+        },
     )
-    .with_secondary(later.clone())
-    .with_secondary(earlier.clone())
-    .with_expected("identifier")
-    .with_expected("local function")
-    .with_expected("identifier")
-    .with_found(b"=".to_vec())
-    .with_note("profile: blu")
-    .with_help("name the local binding");
+    .unwrap()
+    .try_with_secondary(source.span(5, 6).unwrap(), "whitespace before token")
+    .unwrap()
+    .try_with_secondary(source.span(0, 5).unwrap(), "declaration starts here")
+    .unwrap()
+    .try_with_expected("identifier")
+    .unwrap()
+    .try_with_expected("local function")
+    .unwrap()
+    .try_with_expected("identifier")
+    .unwrap()
+    .try_with_found(b"=")
+    .unwrap()
+    .try_with_note_parts(&["profile: ", "blu"])
+    .unwrap()
+    .try_with_help("name the local binding")
+    .unwrap();
 
-    let second = Diagnostic::new(
-        code,
+    let second = Diagnostic::try_new(
+        "BLU-PARSE-0001",
         Phase::Parse,
         SemanticProfile::Blu,
         Severity::Error,
-        primary,
+        source.span(6, 7).unwrap(),
+        "expected a binding name",
+        DiagnosticLimits::default(),
     )
-    .with_secondary(earlier.clone())
-    .with_secondary(later)
-    .with_expected("local function")
-    .with_expected("identifier")
-    .with_found(b"=".to_vec())
-    .with_note("profile: blu")
-    .with_help("name the local binding");
+    .unwrap()
+    .try_with_secondary(source.span(0, 5).unwrap(), "declaration starts here")
+    .unwrap()
+    .try_with_secondary(source.span(5, 6).unwrap(), "whitespace before token")
+    .unwrap()
+    .try_with_expected("local function")
+    .unwrap()
+    .try_with_expected("identifier")
+    .unwrap()
+    .try_with_found(b"=")
+    .unwrap()
+    .try_with_note("profile: blu")
+    .unwrap()
+    .try_with_help("name the local binding")
+    .unwrap();
 
     assert_eq!(first, second);
     assert_eq!(first.code().as_str(), "BLU-PARSE-0001");
     assert_eq!(first.phase(), Phase::Parse);
     assert_eq!(first.profile(), SemanticProfile::Blu);
     assert_eq!(first.severity(), Severity::Error);
-    assert_eq!(
-        first.secondary(),
-        &[
-            earlier,
-            Label::new(source.span(5, 6).unwrap(), "whitespace before token")
-        ]
-    );
+    assert_eq!(first.secondary().len(), 2);
+    assert_eq!(first.secondary()[0].span(), source.span(0, 5).unwrap());
+    assert_eq!(first.secondary()[0].message(), "declaration starts here");
+    assert_eq!(first.secondary()[1].span(), source.span(5, 6).unwrap());
+    assert_eq!(first.secondary()[1].message(), "whitespace before token");
     assert_eq!(
         first.expected(),
         &["identifier".to_owned(), "local function".to_owned()]
@@ -294,5 +315,85 @@ fn diagnostic_codes_reject_unstable_shapes() {
     assert!(matches!(
         DiagnosticCode::new("BLU_PARSE_1"),
         Err(DiagnosticCodeError::InvalidByte { .. })
+    ));
+}
+
+#[test]
+fn diagnostic_text_and_collection_limits_are_structured() {
+    let source = SourceFile::new(
+        SourceId::new(9),
+        "limits.lua",
+        b"x".to_vec(),
+        SourceLimits::default(),
+    )
+    .unwrap();
+    let span = source.span(0, 1).unwrap();
+    let limits = DiagnosticLimits {
+        max_label_message_bytes: 3,
+        ..DiagnosticLimits::default()
+    };
+    assert!(matches!(
+        Diagnostic::try_new(
+            "BLU-LEX-0001",
+            Phase::Lex,
+            SemanticProfile::Blu,
+            Severity::Error,
+            span,
+            "four",
+            limits,
+        ),
+        Err(DiagnosticError::Limit {
+            kind: DiagnosticLimit::LabelMessageBytes,
+            required: 4,
+            limit: 3,
+        })
+    ));
+
+    let limits = DiagnosticLimits {
+        max_expected_items: 1,
+        max_found_bytes: 1,
+        ..DiagnosticLimits::default()
+    };
+    let diagnostic = Diagnostic::try_new(
+        "BLU-PARSE-0001",
+        Phase::Parse,
+        SemanticProfile::Blu,
+        Severity::Error,
+        span,
+        "bad token",
+        limits,
+    )
+    .unwrap()
+    .try_with_expected("identifier")
+    .unwrap()
+    .try_with_expected("identifier")
+    .unwrap();
+    assert_eq!(diagnostic.expected(), ["identifier"]);
+    assert!(matches!(
+        diagnostic.try_with_expected("number"),
+        Err(DiagnosticError::Limit {
+            kind: DiagnosticLimit::ExpectedItems,
+            required: 2,
+            limit: 1,
+        })
+    ));
+
+    let diagnostic = Diagnostic::try_new(
+        "BLU-LEX-0001",
+        Phase::Lex,
+        SemanticProfile::Blu,
+        Severity::Error,
+        span,
+        "bad token",
+        limits,
+    )
+    .unwrap();
+    assert!(matches!(
+        diagnostic.try_with_found(&[0xff, 0xfe]),
+        Err(DiagnosticError::Limit {
+            kind: DiagnosticLimit::FoundBytes,
+            required: 2,
+            limit: 1,
+        })
     ));
 }

@@ -18,19 +18,20 @@ pub use ast::{
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
 use blu_core::{
-    ByteSpan, Diagnostic, DiagnosticCode, Label, Phase, SemanticProfile, Severity, SourceFile,
-    SpanError,
+    ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
+    SourceFile, SpanError,
 };
 use core::fmt;
 
 const DIRECTIVE_PREFIX: &[u8] = b"--!dialect";
-const FOUND_BYTE_LIMIT: usize = 32;
 
 /// Resource limits applied while lexing one already-bounded [`SourceFile`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct LexerLimits {
     pub max_tokens: usize,
     pub max_diagnostics: usize,
+    /// Per-diagnostic owned-value limits used by the lexer and parser.
+    pub diagnostic_limits: DiagnosticLimits,
 }
 
 impl Default for LexerLimits {
@@ -38,6 +39,7 @@ impl Default for LexerLimits {
         Self {
             max_tokens: 1_000_000,
             max_diagnostics: 10_000,
+            diagnostic_limits: DiagnosticLimits::default(),
         }
     }
 }
@@ -68,6 +70,7 @@ pub enum LexError {
         what: &'static str,
         requested: usize,
     },
+    Diagnostic(DiagnosticError),
     Span(SpanError),
 }
 
@@ -88,6 +91,7 @@ impl fmt::Display for LexError {
                     "failed to allocate {what} for {requested} entries"
                 )
             }
+            Self::Diagnostic(error) => error.fmt(formatter),
             Self::Span(error) => error.fmt(formatter),
         }
     }
@@ -96,6 +100,7 @@ impl fmt::Display for LexError {
 impl std::error::Error for LexError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
+            Self::Diagnostic(error) => Some(error),
             Self::Span(error) => Some(error),
             Self::Limit { .. } | Self::AllocationFailed { .. } => None,
         }
@@ -105,6 +110,12 @@ impl std::error::Error for LexError {
 impl From<SpanError> for LexError {
     fn from(error: SpanError) -> Self {
         Self::Span(error)
+    }
+}
+
+impl From<DiagnosticError> for LexError {
+    fn from(error: DiagnosticError) -> Self {
+        Self::Diagnostic(error)
     }
 }
 
@@ -250,6 +261,7 @@ pub fn lex(
             span,
             &mut diagnostics,
             limits.max_diagnostics,
+            limits.diagnostic_limits,
         )?;
         offset = directive_end;
     }
@@ -277,8 +289,9 @@ pub fn lex(
                             explicit_profile,
                             opener_span,
                             "unterminated long comment",
-                        )
-                        .with_expected("long-comment closing delimiter");
+                            limits.diagnostic_limits,
+                        )?
+                        .try_with_expected("long-comment closing delimiter")?;
                         push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                     }
                 } else {
@@ -295,9 +308,10 @@ pub fn lex(
                         explicit_profile,
                         span,
                         "floor-division syntax is unavailable in this profile",
-                    )
-                    .with_found(copy_found(&bytes[start..offset])?)
-                    .with_note(format!("selected profile: {explicit_profile}"));
+                        limits.diagnostic_limits,
+                    )?
+                    .try_with_found(&bytes[start..offset])?
+                    .try_with_note_parts(&["selected profile: ", explicit_profile.as_str()])?;
                     push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                 }
                 TokenKind::FloorDivide
@@ -340,8 +354,9 @@ pub fn lex(
                     explicit_profile,
                     span,
                     "unrecognized source byte",
-                )
-                .with_found(copy_found(&bytes[start..offset])?);
+                    limits.diagnostic_limits,
+                )?
+                .try_with_found(&bytes[start..offset])?;
                 push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                 TokenKind::Unknown
             }
@@ -374,6 +389,7 @@ fn parse_directive(
     directive_span: ByteSpan,
     diagnostics: &mut Vec<Diagnostic>,
     diagnostic_limit: usize,
+    diagnostic_limits: DiagnosticLimits,
 ) -> Result<Option<DialectDirective>, LexError> {
     let bytes = source.bytes();
     let content_end = if line_end > 0 && bytes[line_end - 1] == b'\r' {
@@ -401,7 +417,8 @@ fn parse_directive(
             explicit_profile,
             span,
             "dialect directive is missing a profile",
-        ));
+            diagnostic_limits,
+        )?)?;
         push_diagnostic(diagnostics, diagnostic, diagnostic_limit)?;
         return Ok(None);
     }
@@ -413,9 +430,10 @@ fn parse_directive(
             explicit_profile,
             span,
             "unexpected bytes after dialect profile",
-        )
-        .with_found(copy_found(&bytes[trailing..content_end])?)
-        .with_expected("end of directive");
+            diagnostic_limits,
+        )?
+        .try_with_found(&bytes[trailing..content_end])?
+        .try_with_expected("end of directive")?;
         push_diagnostic(diagnostics, diagnostic, diagnostic_limit)?;
         return Ok(None);
     }
@@ -428,9 +446,10 @@ fn parse_directive(
                 explicit_profile,
                 value_span,
                 "unknown dialect profile",
-            )
-            .with_found(copy_found(&bytes[value_start..value_end])?),
-        );
+                diagnostic_limits,
+            )?
+            .try_with_found(&bytes[value_start..value_end])?,
+        )?;
         push_diagnostic(diagnostics, diagnostic, diagnostic_limit)?;
         return Ok(None);
     };
@@ -446,20 +465,21 @@ fn parse_directive(
             explicit_profile,
             value_span,
             "source directive conflicts with the explicit profile",
-        )
-        .with_found(copy_found(&bytes[value_start..value_end])?)
-        .with_note(format!("explicit profile: {explicit_profile}"))
-        .with_expected(explicit_profile.as_str());
+            diagnostic_limits,
+        )?
+        .try_with_found(&bytes[value_start..value_end])?
+        .try_with_note_parts(&["explicit profile: ", explicit_profile.as_str()])?
+        .try_with_expected(explicit_profile.as_str())?;
         push_diagnostic(diagnostics, diagnostic, diagnostic_limit)?;
     }
     Ok(Some(directive))
 }
 
-fn add_profile_expectations(mut diagnostic: Diagnostic) -> Diagnostic {
+fn add_profile_expectations(mut diagnostic: Diagnostic) -> Result<Diagnostic, LexError> {
     for profile in SemanticProfile::ALL {
-        diagnostic = diagnostic.with_expected(profile.as_str());
+        diagnostic = diagnostic.try_with_expected(profile.as_str())?;
     }
-    diagnostic
+    Ok(diagnostic)
 }
 
 fn profile_from_bytes(bytes: &[u8]) -> Option<SemanticProfile> {
@@ -553,21 +573,18 @@ fn diagnostic(
     profile: SemanticProfile,
     span: ByteSpan,
     message: &'static str,
-) -> Diagnostic {
-    Diagnostic::new(
-        DiagnosticCode::new(code).expect("fixed lexer diagnostic code must be valid"),
+    limits: DiagnosticLimits,
+) -> Result<Diagnostic, LexError> {
+    Diagnostic::try_new(
+        code,
         Phase::Lex,
         profile,
         Severity::Error,
-        Label::new(span, message),
+        span,
+        message,
+        limits,
     )
-}
-
-fn copy_found(bytes: &[u8]) -> Result<Vec<u8>, LexError> {
-    let copied_len = bytes.len().min(FOUND_BYTE_LIMIT);
-    let mut copied = allocate_vec(copied_len, "diagnostic found bytes")?;
-    copied.extend_from_slice(&bytes[..copied_len]);
-    Ok(copied)
+    .map_err(LexError::Diagnostic)
 }
 
 fn allocate_vec<T>(capacity: usize, what: &'static str) -> Result<Vec<T>, LexError> {

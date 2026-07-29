@@ -1,4 +1,7 @@
-use blu_core::{Phase, SemanticProfile, SourceFile, SourceId, SourceLimits};
+use blu_core::{
+    DiagnosticError, DiagnosticLimit, DiagnosticLimits, Phase, SemanticProfile, SourceFile,
+    SourceId, SourceLimits,
+};
 use blu_syntax::{
     BinaryOperator, ExpressionId, ExpressionKind, ParseError, ParseLimit, ParseLimits,
     ParseOutcome, Statement, TokenKind, parse,
@@ -253,6 +256,32 @@ fn ast_depth_and_diagnostic_limits_are_structured() {
             limit: 1,
         })
     );
+}
+
+#[test]
+fn diagnostic_value_limits_map_through_parse_error() {
+    let source = source(b"return".to_vec());
+    assert!(matches!(
+        parse(
+            &source,
+            SemanticProfile::Blu,
+            ParseLimits {
+                lexer: blu_syntax::LexerLimits {
+                    diagnostic_limits: DiagnosticLimits {
+                        max_expected_items: 0,
+                        ..DiagnosticLimits::default()
+                    },
+                    ..blu_syntax::LexerLimits::default()
+                },
+                ..ParseLimits::default()
+            },
+        ),
+        Err(ParseError::Diagnostic(DiagnosticError::Limit {
+            kind: DiagnosticLimit::ExpectedItems,
+            required: 1,
+            limit: 0,
+        }))
+    ));
 }
 
 #[test]

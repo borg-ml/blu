@@ -4,12 +4,10 @@ use crate::{
     Statement, Token, TokenKind, lex,
 };
 use blu_core::{
-    ByteSpan, Diagnostic, DiagnosticCode, Label, Phase, SemanticProfile, Severity, SourceFile,
-    SpanError,
+    ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
+    SourceFile, SpanError,
 };
 use core::fmt;
-
-const FOUND_BYTE_LIMIT: usize = 32;
 
 /// Resource limits for one parser invocation.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -61,6 +59,7 @@ pub enum ParseError {
         what: &'static str,
         requested: usize,
     },
+    Diagnostic(DiagnosticError),
     InternalInvariant {
         message: &'static str,
     },
@@ -85,6 +84,7 @@ impl fmt::Display for ParseError {
                     "failed to allocate {what} for {requested} entries"
                 )
             }
+            Self::Diagnostic(error) => error.fmt(formatter),
             Self::InternalInvariant { message } => {
                 write!(formatter, "parser internal invariant failed: {message}")
             }
@@ -97,6 +97,7 @@ impl std::error::Error for ParseError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Lex(error) => Some(error),
+            Self::Diagnostic(error) => Some(error),
             Self::Span(error) => Some(error),
             Self::Limit { .. } | Self::AllocationFailed { .. } | Self::InternalInvariant { .. } => {
                 None
@@ -114,6 +115,12 @@ impl From<LexError> for ParseError {
 impl From<SpanError> for ParseError {
     fn from(error: SpanError) -> Self {
         Self::Span(error)
+    }
+}
+
+impl From<DiagnosticError> for ParseError {
+    fn from(error: DiagnosticError) -> Self {
+        Self::Diagnostic(error)
     }
 }
 
@@ -539,7 +546,7 @@ impl<'a> Parser<'a> {
                 message: "current-token diagnostic requested at end of source",
             });
         };
-        let found = copy_found(self.source.slice(token.span())?)?;
+        let found = self.source.slice(token.span())?;
         let diagnostic = parser_diagnostic(
             code,
             self.lexed.profile(),
@@ -547,6 +554,7 @@ impl<'a> Parser<'a> {
             message,
             expected,
             Some(found),
+            self.limits.lexer.diagnostic_limits,
         )?;
         self.push_diagnostic(diagnostic)
     }
@@ -561,8 +569,15 @@ impl<'a> Parser<'a> {
             self.report_current(code, message, expected)
         } else {
             let span = self.source.span(self.source.len(), self.source.len())?;
-            let diagnostic =
-                parser_diagnostic(code, self.lexed.profile(), span, message, expected, None)?;
+            let diagnostic = parser_diagnostic(
+                code,
+                self.lexed.profile(),
+                span,
+                message,
+                expected,
+                None,
+                self.limits.lexer.diagnostic_limits,
+            )?;
             self.push_diagnostic(diagnostic)
         }
     }
@@ -601,32 +616,25 @@ fn parser_diagnostic(
     span: ByteSpan,
     message: &'static str,
     expected: &[&'static str],
-    found: Option<Vec<u8>>,
+    found: Option<&[u8]>,
+    limits: DiagnosticLimits,
 ) -> Result<Diagnostic, ParseError> {
-    let code = DiagnosticCode::new(code).map_err(|_| ParseError::InternalInvariant {
-        message: "fixed parser diagnostic code is invalid",
-    })?;
-    let mut diagnostic = Diagnostic::new(
+    let mut diagnostic = Diagnostic::try_new(
         code,
         Phase::Parse,
         profile,
         Severity::Error,
-        Label::new(span, message),
-    );
+        span,
+        message,
+        limits,
+    )?;
     for value in expected {
-        diagnostic = diagnostic.with_expected(*value);
+        diagnostic = diagnostic.try_with_expected(value)?;
     }
     if let Some(found) = found {
-        diagnostic = diagnostic.with_found(found);
+        diagnostic = diagnostic.try_with_found(found)?;
     }
     Ok(diagnostic)
-}
-
-fn copy_found(bytes: &[u8]) -> Result<Vec<u8>, ParseError> {
-    let copied_len = bytes.len().min(FOUND_BYTE_LIMIT);
-    let mut copied = allocate_vec(copied_len, "parser diagnostic found bytes")?;
-    copied.extend_from_slice(&bytes[..copied_len]);
-    Ok(copied)
 }
 
 fn allocate_vec<T>(capacity: usize, what: &'static str) -> Result<Vec<T>, ParseError> {

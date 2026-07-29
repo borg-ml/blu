@@ -44,20 +44,32 @@ struct GcRoots {
 }
 
 impl GcRoots {
-    fn from_values(values: &[Value]) -> Self {
-        Self {
-            values: values.to_vec(),
+    fn from_values(values: &[Value]) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            values: try_clone_values(values, "GC roots")?,
             upvalues: Vec::new(),
-        }
+        })
     }
 
-    fn push_value(&mut self, value: Value) {
+    fn push_value(&mut self, value: Value) -> Result<(), RuntimeError> {
+        try_reserve_exact(&mut self.values, 1, "GC roots")?;
         self.values.push(value);
+        Ok(())
     }
 
-    fn extend(&mut self, other: Self) {
+    fn try_clone(&self) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            values: try_clone_slice(&self.values, "GC roots")?,
+            upvalues: try_clone_slice(&self.upvalues, "GC upvalue roots")?,
+        })
+    }
+
+    fn extend(&mut self, other: Self) -> Result<(), RuntimeError> {
+        try_reserve_exact(&mut self.values, other.values.len(), "GC roots")?;
+        try_reserve_exact(&mut self.upvalues, other.upvalues.len(), "GC upvalue roots")?;
         self.values.extend(other.values);
         self.upvalues.extend(other.upvalues);
+        Ok(())
     }
 }
 
@@ -374,7 +386,25 @@ impl Vm {
         roots: impl IntoIterator<Item = &'a Value>,
         upvalues: impl IntoIterator<Item = UpvalueId>,
     ) -> Result<crate::CollectionStats, RuntimeError> {
-        let mut all_roots: Vec<Value> = self.globals.values().cloned().collect();
+        let active_value_count = self.active_roots.iter().try_fold(0usize, |count, roots| {
+            count
+                .checked_add(roots.values.len())
+                .ok_or(RuntimeError::Allocation {
+                    what: "collection roots",
+                })
+        })?;
+        let root_capacity = self
+            .globals
+            .len()
+            .checked_add(1)
+            .and_then(|count| count.checked_add(self.module_cache.len()))
+            .and_then(|count| count.checked_add(active_value_count))
+            .and_then(|count| count.checked_add(self.host_roots.len()))
+            .ok_or(RuntimeError::Allocation {
+                what: "collection roots",
+            })?;
+        let mut all_roots = try_vec_with_capacity(root_capacity, "collection roots")?;
+        all_roots.extend(self.globals.values().cloned());
         all_roots.push(Value::Thread(self.main_thread));
         all_roots.extend(self.module_cache.values().cloned());
         all_roots.extend(
@@ -383,7 +413,10 @@ impl Vm {
                 .flat_map(|roots| roots.values.iter().cloned()),
         );
         all_roots.extend(self.host_roots.keys().copied().map(HostRoot::to_value));
-        all_roots.extend(roots.into_iter().cloned());
+        for root in roots {
+            try_reserve_exact(&mut all_roots, 1, "collection roots")?;
+            all_roots.push(root.clone());
+        }
         let active_upvalues = self
             .active_roots
             .iter()
@@ -653,6 +686,12 @@ impl Vm {
         result
     }
 
+    fn push_active_roots(&mut self, roots: GcRoots) -> Result<(), RuntimeError> {
+        try_reserve_exact(&mut self.active_roots, 1, "active GC roots")?;
+        self.active_roots.push(roots);
+        Ok(())
+    }
+
     fn execute_frame_inner(
         &mut self,
         chunk: &Arc<Chunk>,
@@ -862,7 +901,7 @@ impl Vm {
                         }
                         frame.pc = capture.pc() + 1;
                         let mut roots = frame.gc_roots(&self.heap)?;
-                        roots.push_value(Value::Closure(closure));
+                        roots.push_value(Value::Closure(closure))?;
                         let upvalue = match capture.a() {
                             0 if capture.b() == instruction.a() => {
                                 self.allocate_upvalue(Value::Closure(closure), &roots)?
@@ -897,26 +936,8 @@ impl Vm {
                     });
                 }
                 Opcode::GetVarargs => {
-                    let count = if instruction.b() == 0 {
-                        frame.varargs.len()
-                    } else {
-                        usize::from(instruction.b() - 1)
-                    };
-                    let values = frame.varargs.clone();
-                    if instruction.b() == 0 {
-                        frame.ensure_dynamic(usize::from(instruction.a()) + count)?;
-                    }
-                    for offset in 0..count {
-                        let register = u8::try_from(usize::from(instruction.a()) + offset)
-                            .map_err(|_| RuntimeError::Register {
-                                register: usize::from(instruction.a()) + offset,
-                                count: frame.registers.len(),
-                            })?;
-                        frame.set(register, values.get(offset).cloned().unwrap_or(Value::Nil))?;
-                    }
-                    if instruction.b() == 0 {
-                        frame.top = usize::from(instruction.a()) + count;
-                    }
+                    let values = try_clone_values(&frame.varargs, "vararg results")?;
+                    frame.write_results(instruction.a(), instruction.b(), values)?;
                 }
                 Opcode::Add
                 | Opcode::Sub
@@ -1375,7 +1396,9 @@ impl Vm {
                                 instruction,
                             }),
                         };
-                        self.active_roots.push(caller.gc_roots(&self.heap)?);
+                        let roots = caller.gc_roots(&self.heap)?;
+                        try_reserve_exact(&mut callers, 1, "VM caller stack")?;
+                        self.push_active_roots(roots)?;
                         callers.push(caller);
                         frame = child_frame;
                         continue;
@@ -1484,7 +1507,8 @@ impl Vm {
                     } else {
                         usize::from(instruction.b() - 1)
                     };
-                    let arguments = frame.register_slice(start, count)?.to_vec();
+                    let arguments =
+                        try_clone_values(frame.register_slice(start, count)?, "call arguments")?;
                     let suspended_return_mode = match &function {
                         Value::NativeFunction(function)
                             if self.protected_call == Some(*function) =>
@@ -1518,7 +1542,8 @@ impl Vm {
                         let child_frame =
                             Frame::new(child_chunk, child, constants, Some(closure), &arguments)?;
                         let roots = frame.gc_roots(&self.heap)?;
-                        self.active_roots.push(roots);
+                        try_reserve_exact(&mut callers, 1, "VM caller stack")?;
+                        self.push_active_roots(roots)?;
                         callers.push(Caller {
                             frame,
                             register: instruction.a(),
@@ -1573,7 +1598,7 @@ impl Vm {
                             count: frame.registers.len(),
                         });
                     }
-                    let results = frame.registers[start..end].to_vec();
+                    let results = try_clone_values(&frame.registers[start..end], "call results")?;
                     if let Some(caller) = callers.pop() {
                         self.active_roots.pop();
                         frame = caller.complete_success(&self.heap, results)?;
@@ -1602,7 +1627,7 @@ impl Vm {
         match function {
             Value::Closure(closure) => {
                 let (closure_chunk, child, _) = self.heap.closure_parts(closure)?;
-                self.active_roots.push(roots);
+                self.push_active_roots(roots)?;
                 let result = self.execute_frame(
                     &closure_chunk,
                     child,
@@ -1615,9 +1640,11 @@ impl Vm {
                 result
             }
             Value::CoroutineFunction(thread) => {
-                let mut resume_arguments = Vec::with_capacity(arguments.len() + 1);
-                resume_arguments.push(Value::Thread(thread));
-                resume_arguments.extend_from_slice(arguments);
+                let resume_arguments = try_prefixed_values(
+                    Value::Thread(thread),
+                    arguments,
+                    "coroutine resume arguments",
+                )?;
                 let mut results = self.resume_thread(&resume_arguments, remaining, depth, roots)?;
                 if results.first().is_some_and(Value::is_truthy) {
                     results.remove(0);
@@ -1636,7 +1663,10 @@ impl Vm {
                     return self.resume_thread(arguments, remaining, depth, roots);
                 }
                 if self.coroutine_yield == Some(function) {
-                    return Err(RuntimeError::CoroutineYield(arguments.to_vec()));
+                    return Err(RuntimeError::CoroutineYield(try_clone_values(
+                        arguments,
+                        "coroutine yield values",
+                    )?));
                 }
                 if self.protected_call == Some(function) {
                     let target = arguments.first().cloned().ok_or(RuntimeError::Argument {
@@ -1651,12 +1681,11 @@ impl Vm {
                         roots,
                     );
                     return Ok(match result {
-                        Ok(values) => {
-                            let mut protected = Vec::with_capacity(values.len() + 1);
-                            protected.push(Value::Boolean(true));
-                            protected.extend(values);
-                            protected
-                        }
+                        Ok(values) => try_prepend_value(
+                            values,
+                            Value::Boolean(true),
+                            "protected call results",
+                        )?,
                         Err(error @ RuntimeError::CoroutineYield(_)) => return Err(error),
                         Err(RuntimeError::Raised(value)) => {
                             vec![Value::Boolean(false), value]
@@ -1681,15 +1710,14 @@ impl Vm {
                         arguments.get(2..).unwrap_or_default(),
                         remaining,
                         depth,
-                        roots.clone(),
+                        roots.try_clone()?,
                     );
                     return Ok(match result {
-                        Ok(values) => {
-                            let mut protected = Vec::with_capacity(values.len() + 1);
-                            protected.push(Value::Boolean(true));
-                            protected.extend(values);
-                            protected
-                        }
+                        Ok(values) => try_prepend_value(
+                            values,
+                            Value::Boolean(true),
+                            "protected call results",
+                        )?,
                         Err(error @ RuntimeError::CoroutineYield(_)) => return Err(error),
                         Err(error) => {
                             let handled = self.call_value(
@@ -1716,7 +1744,7 @@ impl Vm {
                     .get(function.0 as usize)
                     .cloned()
                     .ok_or(RuntimeError::NativeFunction(function.0))?;
-                self.active_roots.push(roots);
+                self.push_active_roots(roots)?;
                 let result = function(self, arguments);
                 self.active_roots.pop();
                 let values = result?;
@@ -1736,9 +1764,8 @@ impl Vm {
                             expected: "function or __call metamethod",
                             actual: "table",
                         })?;
-                let mut metamethod_arguments = Vec::with_capacity(arguments.len() + 1);
-                metamethod_arguments.push(Value::Table(table));
-                metamethod_arguments.extend_from_slice(arguments);
+                let metamethod_arguments =
+                    try_prefixed_values(Value::Table(table), arguments, "metamethod arguments")?;
                 self.call_value(function, &metamethod_arguments, remaining, depth, roots)
             }
             other => Err(RuntimeError::Type {
@@ -2323,7 +2350,7 @@ impl Vm {
                 function: "rawset",
                 index: 3,
             })?;
-            let roots = GcRoots::from_values(arguments);
+            let roots = GcRoots::from_values(arguments)?;
             vm.table_set(table, key.clone(), assigned.clone(), &roots)?;
             Ok(vec![value.clone()])
         });
@@ -2375,7 +2402,7 @@ impl Vm {
                 index: 1,
             })?;
             if value.is_truthy() {
-                Ok(arguments.to_vec())
+                try_clone_values(arguments, "assert results")
             } else {
                 Err(RuntimeError::Raised(arguments.get(1).cloned().unwrap_or(
                     Value::String(Arc::from(&b"assertion failed!"[..])),
@@ -2407,7 +2434,10 @@ impl Vm {
             if index < 1 {
                 return Err(RuntimeError::SelectIndex(index));
             }
-            Ok(arguments.get(index as usize..).unwrap_or_default().to_vec())
+            try_clone_values(
+                arguments.get(index as usize..).unwrap_or_default(),
+                "select results",
+            )
         });
         self.set_global(&b"select"[..], Value::NativeFunction(select));
 
@@ -2675,7 +2705,7 @@ impl Vm {
                     actual: function.type_name(),
                 });
             }
-            let roots = GcRoots::from_values(arguments);
+            let roots = GcRoots::from_values(arguments)?;
             vm.ensure_heap_objects(1, &roots)?;
             let thread = vm.allocate_thread(std::slice::from_ref(&function), &roots)?;
             vm.threads.insert(thread, ThreadState::New(function));
@@ -2711,7 +2741,7 @@ impl Vm {
                     actual: function.type_name(),
                 });
             }
-            let roots = GcRoots::from_values(arguments);
+            let roots = GcRoots::from_values(arguments)?;
             vm.ensure_heap_objects(1, &roots)?;
             let thread = vm.allocate_thread(std::slice::from_ref(&function), &roots)?;
             vm.threads.insert(thread, ThreadState::New(function));
@@ -2732,31 +2762,21 @@ impl Vm {
         });
         let close = self.register_function(|vm, arguments| {
             let thread = thread_argument(arguments, 0, "coroutine.close")?;
-            let state = vm
-                .threads
-                .remove(&thread)
-                .ok_or(RuntimeError::Heap(HeapError::StaleThread(thread)))?;
-            let result = match state {
-                ThreadState::Running => {
-                    vm.threads.insert(thread, ThreadState::Running);
-                    vec![
-                        Value::Boolean(false),
-                        Value::String(Arc::from(&b"cannot close a running coroutine"[..])),
-                    ]
-                }
-                ThreadState::Dead(error) => {
-                    let result = match &error {
-                        Some(error) => vec![Value::Boolean(false), error.clone()],
-                        None => vec![Value::Boolean(true)],
-                    };
-                    vm.threads.insert(thread, ThreadState::Dead(error));
-                    result
-                }
-                ThreadState::New(_) | ThreadState::Suspended(_) => {
-                    vm.threads.insert(thread, ThreadState::Dead(None));
+            let result = match vm.threads.get(&thread) {
+                None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
+                Some(ThreadState::Running) => vec![
+                    Value::Boolean(false),
+                    Value::String(Arc::from(&b"cannot close a running coroutine"[..])),
+                ],
+                Some(ThreadState::Dead(error)) => match error {
+                    Some(error) => vec![Value::Boolean(false), error.clone()],
+                    None => vec![Value::Boolean(true)],
+                },
+                Some(ThreadState::New(_) | ThreadState::Suspended(_)) => {
                     let empty = GcRoots::default();
-                    let roots = GcRoots::from_values(arguments);
+                    let roots = GcRoots::from_values(arguments)?;
                     vm.thread_set_roots(thread, &empty, &roots)?;
+                    vm.threads.insert(thread, ThreadState::Dead(None));
                     vec![Value::Boolean(true)]
                 }
             };
@@ -2792,29 +2812,39 @@ impl Vm {
         roots: GcRoots,
     ) -> Result<Vec<Value>, RuntimeError> {
         let thread = thread_argument(arguments, 0, "coroutine.resume")?;
-        let state = self
-            .threads
-            .remove(&thread)
-            .ok_or(RuntimeError::Heap(HeapError::StaleThread(thread)))?;
-        let resumable = match state {
-            ThreadState::New(function) => Resumable::New(function),
-            ThreadState::Suspended(continuation) => Resumable::Continuation(continuation),
-            state @ (ThreadState::Running | ThreadState::Dead(_)) => {
-                self.threads.insert(thread, state);
+        match self.threads.get(&thread) {
+            None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
+            Some(ThreadState::Running | ThreadState::Dead(_)) => {
                 return Ok(vec![
                     Value::Boolean(false),
                     Value::String(Arc::from(&b"cannot resume non-suspended coroutine"[..])),
                 ]);
             }
+            Some(ThreadState::New(_) | ThreadState::Suspended(_)) => {}
+        }
+        let mut thread_roots = roots;
+        thread_roots.push_value(Value::Thread(thread))?;
+        let resumed_arguments = arguments.get(1..).unwrap_or_default();
+        try_reserve_exact(
+            &mut thread_roots.values,
+            resumed_arguments.len(),
+            "coroutine GC roots",
+        )?;
+        thread_roots.values.extend_from_slice(resumed_arguments);
+        let argument_roots = GcRoots::from_values(arguments)?;
+        self.thread_set_roots(thread, &thread_roots, &argument_roots)?;
+        let state = self
+            .threads
+            .remove(&thread)
+            .expect("resumable thread was checked above");
+        let resumable = match state {
+            ThreadState::New(function) => Resumable::New(function),
+            ThreadState::Suspended(continuation) => Resumable::Continuation(continuation),
+            ThreadState::Running | ThreadState::Dead(_) => {
+                unreachable!("resumable thread state changed without re-entry")
+            }
         };
         self.threads.insert(thread, ThreadState::Running);
-        let mut thread_roots = roots;
-        thread_roots.push_value(Value::Thread(thread));
-        thread_roots
-            .values
-            .extend_from_slice(arguments.get(1..).unwrap_or_default());
-        let argument_roots = GcRoots::from_values(arguments);
-        self.thread_set_roots(thread, &thread_roots, &argument_roots)?;
         let previous_thread = self.running_thread.replace(thread);
         let result = match resumable {
             Resumable::New(function) => self.call_value(
@@ -2830,10 +2860,14 @@ impl Vm {
                     continuation.frame.write_results(
                         continuation.register,
                         continuation.encoded_count,
-                        arguments.get(1..).unwrap_or_default().to_vec(),
+                        try_clone_values(
+                            arguments.get(1..).unwrap_or_default(),
+                            "coroutine continuation arguments",
+                        )?,
                     )?;
                     for caller in &continuation.callers {
-                        self.active_roots.push(caller.gc_roots(&self.heap)?);
+                        let roots = caller.gc_roots(&self.heap)?;
+                        self.push_active_roots(roots)?;
                     }
                     self.run_resumed_frames(
                         continuation.frame,
@@ -2849,28 +2883,24 @@ impl Vm {
         self.running_thread = previous_thread;
         Ok(match result {
             Ok(values) => {
+                let resumed =
+                    try_prepend_value(values, Value::Boolean(true), "coroutine resume results")?;
                 self.threads.insert(thread, ThreadState::Dead(None));
                 let empty = GcRoots::default();
                 self.thread_set_roots(thread, &empty, &empty)?;
-                let mut resumed = Vec::with_capacity(values.len() + 1);
-                resumed.push(Value::Boolean(true));
-                resumed.extend(values);
                 resumed
             }
             Err(RuntimeError::CoroutineYield(values))
                 if matches!(self.threads.get(&thread), Some(ThreadState::Suspended(_))) =>
             {
-                let mut yielded = Vec::with_capacity(values.len() + 1);
-                yielded.push(Value::Boolean(true));
-                yielded.extend(values);
-                yielded
+                try_prepend_value(values, Value::Boolean(true), "coroutine yield results")?
             }
             Err(error) => {
                 let error_value = runtime_error_value(error);
                 self.threads
                     .insert(thread, ThreadState::Dead(Some(error_value.clone())));
                 let empty = GcRoots::default();
-                let roots = GcRoots::from_values(std::slice::from_ref(&error_value));
+                let roots = GcRoots::from_values(std::slice::from_ref(&error_value))?;
                 self.thread_set_roots(thread, &empty, &roots)?;
                 vec![Value::Boolean(false), error_value]
             }
@@ -2954,12 +2984,23 @@ impl Vm {
         &mut self,
         thread: ThreadId,
         frame: Frame,
-        callers: Vec<Caller>,
+        mut callers: Vec<Caller>,
         register: u8,
         encoded_count: u8,
         return_mode: ReturnMode,
         depth: usize,
     ) -> Result<(), RuntimeError> {
+        if let Some(ThreadState::Suspended(continuation)) = self.threads.get(&thread) {
+            let additional =
+                continuation
+                    .callers
+                    .len()
+                    .checked_add(1)
+                    .ok_or(RuntimeError::Allocation {
+                        what: "coroutine continuation callers",
+                    })?;
+            try_reserve_exact(&mut callers, additional, "coroutine continuation callers")?;
+        }
         let continuation = match self.threads.remove(&thread) {
             Some(ThreadState::Suspended(mut continuation)) => {
                 let mut prefix = callers;
@@ -2986,8 +3027,20 @@ impl Vm {
             }
             None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
         };
-        let roots = continuation_roots(&continuation.frame, &continuation.callers, &self.heap)?;
-        self.thread_set_roots(thread, &roots, &GcRoots::default())?;
+        let roots = match continuation_roots(&continuation.frame, &continuation.callers, &self.heap)
+        {
+            Ok(roots) => roots,
+            Err(error) => {
+                self.threads
+                    .insert(thread, ThreadState::Suspended(continuation));
+                return Err(error);
+            }
+        };
+        if let Err(error) = self.thread_set_roots(thread, &roots, &GcRoots::default()) {
+            self.threads
+                .insert(thread, ThreadState::Suspended(continuation));
+            return Err(error);
+        }
         self.threads
             .insert(thread, ThreadState::Suspended(continuation));
         Ok(())
@@ -2995,7 +3048,7 @@ impl Vm {
 
     fn install_table_library(&mut self) -> Result<(), RuntimeError> {
         let insert = self.register_function(|vm, arguments| {
-            let roots = GcRoots::from_values(arguments);
+            let roots = GcRoots::from_values(arguments)?;
             let table = arguments.first().ok_or(RuntimeError::Argument {
                 function: "table.insert",
                 index: 1,
@@ -3055,8 +3108,8 @@ impl Vm {
                 return Ok(vec![Value::Nil]);
             }
             let removed = vm.heap.table_get(table, &Value::Integer(position))?;
-            let mut roots = GcRoots::from_values(arguments);
-            roots.push_value(removed.clone());
+            let mut roots = GcRoots::from_values(arguments)?;
+            roots.push_value(removed.clone())?;
             for index in position as usize..length {
                 let value = vm
                     .heap
@@ -3107,7 +3160,7 @@ impl Vm {
             Ok(vec![Value::String(Arc::from(result))])
         });
         let pack = self.register_function(|vm, arguments| {
-            let roots = GcRoots::from_values(arguments);
+            let roots = GcRoots::from_values(arguments)?;
             vm.ensure_heap_objects(1, &roots)?;
             let table = vm.allocate_table(arguments.len(), 1, &roots)?;
             for (index, value) in arguments.iter().enumerate() {
@@ -3393,9 +3446,52 @@ fn concat_bytes(value: &Value) -> Option<Cow<'_, [u8]>> {
 
 fn try_vec_with_capacity<T>(capacity: usize, what: &'static str) -> Result<Vec<T>, RuntimeError> {
     let mut values = Vec::new();
+    try_reserve_exact(&mut values, capacity, what)?;
+    Ok(values)
+}
+
+fn try_reserve_exact<T>(
+    values: &mut Vec<T>,
+    additional: usize,
+    what: &'static str,
+) -> Result<(), RuntimeError> {
     values
-        .try_reserve_exact(capacity)
-        .map_err(|_| RuntimeError::Allocation { what })?;
+        .try_reserve_exact(additional)
+        .map_err(|_| RuntimeError::Allocation { what })
+}
+
+fn try_clone_values(values: &[Value], what: &'static str) -> Result<Vec<Value>, RuntimeError> {
+    try_clone_slice(values, what)
+}
+
+fn try_clone_slice<T: Clone>(values: &[T], what: &'static str) -> Result<Vec<T>, RuntimeError> {
+    let mut cloned = try_vec_with_capacity(values.len(), what)?;
+    cloned.extend_from_slice(values);
+    Ok(cloned)
+}
+
+fn try_prefixed_values(
+    prefix: Value,
+    values: &[Value],
+    what: &'static str,
+) -> Result<Vec<Value>, RuntimeError> {
+    let capacity = values
+        .len()
+        .checked_add(1)
+        .ok_or(RuntimeError::Allocation { what })?;
+    let mut prefixed = try_vec_with_capacity(capacity, what)?;
+    prefixed.push(prefix);
+    prefixed.extend_from_slice(values);
+    Ok(prefixed)
+}
+
+fn try_prepend_value(
+    mut values: Vec<Value>,
+    prefix: Value,
+    what: &'static str,
+) -> Result<Vec<Value>, RuntimeError> {
+    try_reserve_exact(&mut values, 1, what)?;
+    values.insert(0, prefix);
     Ok(values)
 }
 
@@ -3506,12 +3602,7 @@ impl Caller {
     fn gc_roots(&self, heap: &Heap) -> Result<GcRoots, RuntimeError> {
         let mut roots = self.frame.gc_roots(heap)?;
         if let ReturnMode::Operation(operation) = &self.return_mode {
-            roots
-                .values
-                .try_reserve_exact(3)
-                .map_err(|_| RuntimeError::Allocation {
-                    what: "pending operation GC roots",
-                })?;
+            try_reserve_exact(&mut roots.values, 3, "pending operation GC roots")?;
             roots.values.extend(operation.values().into_iter().cloned());
         }
         Ok(roots)
@@ -3522,7 +3613,7 @@ impl Caller {
         match self.return_mode {
             ReturnMode::Operation(operation) => operation.complete(&mut self.frame, results)?,
             return_mode => {
-                let results = return_mode.success_results(results);
+                let results = return_mode.success_results(results)?;
                 self.frame
                     .write_results(self.register, self.encoded_count, results)?;
             }
@@ -3545,19 +3636,16 @@ impl ReturnMode {
         matches!(self, Self::Protected | Self::ErrorHandler(_))
     }
 
-    fn success_results(&self, results: Vec<Value>) -> Vec<Value> {
+    fn success_results(&self, results: Vec<Value>) -> Result<Vec<Value>, RuntimeError> {
         match self {
-            Self::Direct => results,
+            Self::Direct => Ok(results),
             Self::Protected | Self::ErrorHandler(_) => {
-                let mut protected = Vec::with_capacity(results.len() + 1);
-                protected.push(Value::Boolean(true));
-                protected.extend(results);
-                protected
+                try_prepend_value(results, Value::Boolean(true), "protected call results")
             }
-            Self::ErrorHandlerResult => vec![
+            Self::ErrorHandlerResult => Ok(vec![
                 Value::Boolean(false),
                 results.into_iter().next().unwrap_or(Value::Nil),
-            ],
+            ]),
             Self::Operation(_) => unreachable!("operations complete through Caller"),
         }
     }
@@ -3644,19 +3732,22 @@ impl Frame {
             .prototypes
             .get(prototype_index)
             .ok_or(RuntimeError::InvalidPrototype(prototype_index))?;
-        let mut registers = vec![Value::Nil; usize::from(prototype.max_stack_size)];
+        let register_count = usize::from(prototype.max_stack_size);
+        let mut registers = try_vec_with_capacity(register_count, "VM frame registers")?;
+        registers.resize(register_count, Value::Nil);
         let parameter_count = usize::from(prototype.parameter_count);
         let copied = arguments.len().min(parameter_count).min(registers.len());
         registers[..copied].clone_from_slice(&arguments[..copied]);
+        let varargs = try_clone_values(
+            arguments.get(parameter_count..).unwrap_or_default(),
+            "VM frame varargs",
+        )?;
         Ok(Self {
             chunk,
             prototype_index,
             constants,
             registers,
-            varargs: arguments
-                .get(parameter_count..)
-                .unwrap_or_default()
-                .to_vec(),
+            varargs,
             closure,
             open_upvalues: HashMap::new(),
             open_upvalues_dirty: false,
@@ -3733,20 +3824,32 @@ impl Frame {
         } else {
             usize::from(encoded_count - 1)
         };
+        let start = usize::from(register);
+        let required = start.checked_add(count).ok_or(RuntimeError::Register {
+            register: usize::MAX,
+            count: self.registers.len(),
+        })?;
+        if encoded_count != 0 && required > self.registers.len() {
+            return Err(RuntimeError::Register {
+                register: required.saturating_sub(1),
+                count: self.registers.len(),
+            });
+        }
         if encoded_count == 0 {
-            self.ensure_dynamic(usize::from(register) + count)?;
+            self.ensure_dynamic(required)?;
         }
         for offset in 0..count {
-            let target = u8::try_from(usize::from(register) + offset).map_err(|_| {
-                RuntimeError::Register {
-                    register: usize::from(register) + offset,
-                    count: self.registers.len(),
-                }
-            })?;
-            self.set(target, results.get(offset).cloned().unwrap_or(Value::Nil))?;
+            self.registers[start + offset] = results.get(offset).cloned().unwrap_or(Value::Nil);
         }
+        if self.open_upvalues.keys().any(|register| {
+            let register = usize::from(*register);
+            start <= register && register < required
+        }) {
+            self.open_upvalues_dirty = true;
+        }
+        self.top = self.top.max(required);
         if encoded_count == 0 {
-            self.top = usize::from(register) + count;
+            self.top = required;
         }
         Ok(())
     }
@@ -3759,9 +3862,8 @@ impl Frame {
             });
         }
         if required > self.registers.len() {
-            self.registers
-                .try_reserve_exact(required - self.registers.len())
-                .map_err(|_| RuntimeError::Allocation { what: "VM stack" })?;
+            let additional = required - self.registers.len();
+            try_reserve_exact(&mut self.registers, additional, "VM stack")?;
             self.registers.resize(required, Value::Nil);
         }
         Ok(())
@@ -3813,13 +3915,17 @@ impl Frame {
     }
 
     fn gc_roots(&self, heap: &Heap) -> Result<GcRoots, RuntimeError> {
-        let mut values = Vec::with_capacity(
-            self.constants.len()
-                + self.registers.len()
-                + self.varargs.len()
-                + self.open_upvalues.len()
-                + usize::from(self.closure.is_some()),
-        );
+        let capacity = self
+            .constants
+            .len()
+            .checked_add(self.registers.len())
+            .and_then(|capacity| capacity.checked_add(self.varargs.len()))
+            .and_then(|capacity| capacity.checked_add(self.open_upvalues.len()))
+            .and_then(|capacity| capacity.checked_add(usize::from(self.closure.is_some())))
+            .ok_or(RuntimeError::Allocation {
+                what: "frame GC roots",
+            })?;
+        let mut values = try_vec_with_capacity(capacity, "frame GC roots")?;
         values.extend(self.constants.iter().cloned());
         values.extend(self.registers.iter().cloned());
         values.extend(self.varargs.iter().cloned());
@@ -3829,10 +3935,10 @@ impl Frame {
         for upvalue in self.open_upvalues.values() {
             values.push(heap.upvalue_get(*upvalue)?);
         }
-        Ok(GcRoots {
-            values,
-            upvalues: self.open_upvalues.values().copied().collect(),
-        })
+        let mut upvalues =
+            try_vec_with_capacity(self.open_upvalues.len(), "frame GC upvalue roots")?;
+        upvalues.extend(self.open_upvalues.values().copied());
+        Ok(GcRoots { values, upvalues })
     }
 
     fn constant(&self, index: i32) -> Result<Value, RuntimeError> {
@@ -3886,17 +3992,15 @@ fn continuation_roots(
 ) -> Result<GcRoots, RuntimeError> {
     let mut roots = frame.gc_roots(heap)?;
     for caller in callers {
-        roots.extend(caller.gc_roots(heap)?);
+        roots.extend(caller.gc_roots(heap)?)?;
     }
     Ok(roots)
 }
 
 fn materialize_constants(chunk: &Chunk, prototype: &Prototype) -> Result<Vec<Value>, RuntimeError> {
-    prototype
-        .constants
-        .iter()
-        .enumerate()
-        .map(|(index, constant)| match constant {
+    let mut values = try_vec_with_capacity(prototype.constants.len(), "VM frame constants")?;
+    for (index, constant) in prototype.constants.iter().enumerate() {
+        let value = match constant {
             Constant::Nil => Ok(Value::Nil),
             Constant::Boolean(value) => Ok(Value::Boolean(*value)),
             Constant::Number(value) => Ok(Value::Number(*value)),
@@ -3916,8 +4020,10 @@ fn materialize_constants(chunk: &Chunk, prototype: &Prototype) -> Result<Vec<Val
             | Constant::TableWithConstants(_)
             | Constant::Closure(_) => Ok(Value::Nil),
             _ => Err(RuntimeError::UnsupportedConstant { constant: index }),
-        })
-        .collect()
+        }?;
+        values.push(value);
+    }
+    Ok(values)
 }
 
 fn materialize_constant(
@@ -4669,6 +4775,27 @@ mod tests {
         let before = frame.registers.clone();
 
         assert_eq!(
+            frame.write_results(0, 3, vec![Value::Integer(1), Value::Integer(2)],),
+            Err(RuntimeError::Register {
+                register: 1,
+                count: 1,
+            })
+        );
+        assert_eq!(frame.registers, before);
+        assert_eq!(frame.top, 0);
+
+        frame
+            .write_results(u8::MAX, 0, vec![Value::Integer(1), Value::Integer(2)])
+            .unwrap();
+        assert_eq!(frame.registers.len(), usize::from(u8::MAX) + 2);
+        assert_eq!(frame.registers[usize::from(u8::MAX)], Value::Integer(1));
+        assert_eq!(frame.registers[usize::from(u8::MAX) + 1], Value::Integer(2));
+        assert_eq!(frame.top, usize::from(u8::MAX) + 2);
+
+        let chunk = Arc::new(test_chunk(&[], Vec::new(), vec![Opcode::Return as u32], 1));
+        let mut frame = Frame::new(chunk, 0, Vec::new(), None, &[]).unwrap();
+        let before = frame.registers.clone();
+        assert_eq!(
             frame.ensure_dynamic(MAX_DYNAMIC_REGISTERS + 1),
             Err(RuntimeError::StackLimit {
                 required: MAX_DYNAMIC_REGISTERS + 1,
@@ -4690,6 +4817,141 @@ mod tests {
             RuntimeError::Allocation {
                 what: "test values",
             }
+        );
+    }
+
+    #[test]
+    fn failed_root_reservation_preserves_logical_contents() {
+        let mut values = vec![Value::Integer(7)];
+        assert_eq!(
+            try_reserve_exact(&mut values, usize::MAX, "test roots"),
+            Err(RuntimeError::Allocation { what: "test roots" })
+        );
+        assert_eq!(values, [Value::Integer(7)]);
+
+        let mut roots = GcRoots::from_values(&[Value::Integer(1)]).unwrap();
+        roots.push_value(Value::Integer(2)).unwrap();
+        roots
+            .extend(GcRoots::from_values(&[Value::Integer(3)]).unwrap())
+            .unwrap();
+        assert_eq!(
+            roots.values,
+            [Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+        );
+    }
+
+    #[test]
+    fn frame_construction_fallibly_copies_registers_varargs_and_constants() {
+        let mut chunk = test_chunk(&[], Vec::new(), vec![Opcode::Return as u32], 2);
+        chunk.prototypes[0].parameter_count = 1;
+        let constants = vec![Value::Integer(9)];
+        let frame = Frame::new(
+            Arc::new(chunk),
+            0,
+            constants.clone(),
+            None,
+            &[Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+        )
+        .unwrap();
+
+        assert_eq!(frame.constants, constants);
+        assert_eq!(frame.registers, [Value::Integer(1), Value::Nil]);
+        assert_eq!(frame.varargs, [Value::Integer(2), Value::Integer(3)]);
+        assert_eq!(frame.top, 1);
+    }
+
+    #[test]
+    fn continuation_root_assembly_preserves_frame_and_caller_values() {
+        let mut heap = Heap::default();
+        let current = heap.allocate_table(0, 0).unwrap();
+        let caller_value = heap.allocate_table(0, 0).unwrap();
+        let garbage = heap.allocate_table(0, 0).unwrap();
+        let chunk = Arc::new(test_chunk(&[], Vec::new(), vec![Opcode::Return as u32], 1));
+        let frame = Frame::new(chunk.clone(), 0, vec![Value::Table(current)], None, &[]).unwrap();
+        let caller = Caller {
+            frame: Frame::new(chunk, 0, vec![Value::Table(caller_value)], None, &[]).unwrap(),
+            register: 0,
+            encoded_count: 1,
+            return_mode: ReturnMode::Direct,
+        };
+
+        let roots = continuation_roots(&frame, &[caller], &heap).unwrap();
+        heap.collect(&roots.values).unwrap();
+        assert_eq!(heap.table_get(current, &Value::Integer(1)), Ok(Value::Nil));
+        assert_eq!(
+            heap.table_get(caller_value, &Value::Integer(1)),
+            Ok(Value::Nil)
+        );
+        assert_eq!(
+            heap.table_get(garbage, &Value::Integer(1)),
+            Err(HeapError::StaleTable(garbage))
+        );
+    }
+
+    #[test]
+    fn resume_root_allocation_failure_preserves_resumable_state() {
+        let probe = Vm::default();
+        let baseline = probe.memory_usage().current_bytes;
+        let thread_allocation = probe.heap.thread_allocation_bytes(1).unwrap();
+        let limit = baseline.checked_add(thread_allocation).unwrap();
+        let mut vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                hard_limit_bytes: Some(limit),
+                gc_start_bytes: limit,
+                gc_growth_percent: 50,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap();
+        let function = vm.global(b"print").unwrap().clone();
+        let roots = GcRoots::from_values(std::slice::from_ref(&function)).unwrap();
+        let thread = vm
+            .allocate_thread(std::slice::from_ref(&function), &roots)
+            .unwrap();
+        vm.threads
+            .insert(thread, ThreadState::New(function.clone()));
+        assert_eq!(vm.memory_usage().current_bytes, limit);
+
+        let arguments = [Value::Thread(thread), Value::Integer(1)];
+        let call_roots = GcRoots::from_values(&arguments).unwrap();
+        let mut remaining = 10;
+        assert!(matches!(
+            vm.resume_thread(&arguments, &mut remaining, 0, call_roots),
+            Err(RuntimeError::Heap(HeapError::Memory(
+                crate::MemoryError::LimitExceeded {
+                    used,
+                    limit: error_limit,
+                    ..
+                }
+            ))) if used == limit && error_limit == limit
+        ));
+        assert!(
+            matches!(vm.threads.get(&thread), Some(ThreadState::New(value)) if value == &function)
+        );
+        assert_eq!(vm.running_thread, None);
+        assert_eq!(vm.memory_usage().current_bytes, limit);
+    }
+
+    #[test]
+    fn close_root_update_failure_preserves_resumable_state() {
+        let mut vm = Vm::default();
+        let close = native(&vm, b"coroutine", b"close");
+        let function = vm.global(b"print").unwrap().clone();
+        let thread = vm
+            .heap
+            .allocate_thread(std::slice::from_ref(&function))
+            .unwrap();
+        vm.threads
+            .insert(thread, ThreadState::New(function.clone()));
+        vm.heap.collect(std::iter::empty()).unwrap();
+
+        assert_eq!(
+            close(&mut vm, &[Value::Thread(thread)]),
+            Err(RuntimeError::Heap(HeapError::StaleThread(thread)))
+        );
+        assert!(
+            matches!(vm.threads.get(&thread), Some(ThreadState::New(value)) if value == &function)
         );
     }
 
@@ -5014,7 +5276,7 @@ mod tests {
         vm.set_global(&b"retained"[..], Value::Table(global));
         let active = vm.heap.allocate_table(1, 0).unwrap();
         vm.active_roots
-            .push(GcRoots::from_values(&[Value::Table(active)]));
+            .push(GcRoots::from_values(&[Value::Table(active)]).unwrap());
         let thread_value = vm.heap.allocate_table(1, 0).unwrap();
         let thread = vm
             .heap

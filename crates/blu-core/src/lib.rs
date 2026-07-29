@@ -3,7 +3,9 @@
 //!
 //! This crate deliberately does not migrate existing compiler, package, or
 //! runtime consumers. It establishes bounded byte-source, identity, span,
-//! semantic-profile, and diagnostic contracts for that later work.
+//! semantic-profile, and bounded, fallibly allocated diagnostic contracts for
+//! that later work. These object limits do not constitute process-wide memory
+//! accounting.
 
 mod diagnostic;
 mod identity;
@@ -11,7 +13,10 @@ mod profile;
 mod source;
 mod span;
 
-pub use diagnostic::{Diagnostic, DiagnosticCode, DiagnosticCodeError, Label, Phase, Severity};
+pub use diagnostic::{
+    Diagnostic, DiagnosticCode, DiagnosticCodeError, DiagnosticError, DiagnosticLimit,
+    DiagnosticLimits, Label, Phase, Severity,
+};
 pub use identity::{
     CompilerId, CompilerIdentity, IdentityError, IdentityLimits, SourceId, SourceIdentity,
 };
