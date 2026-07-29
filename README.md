@@ -49,8 +49,10 @@ reconciliation. Numeric, hex, Unicode, `\z`, and line-continuation escapes fail
 explicitly until their profile-specific rules are implemented. Unary `not`
 follows common Lua truthiness and produces a boolean under every profile;
 unary `-` preserves integers in Lua 5.3–5.5 and negates numbers in the other
-profiles. Exponentiation follows the shared right-associative precedence above
-unary negation and always produces a number.
+profiles. Unary `#` measures byte strings, returning an integer for Lua
+5.3–5.5 and a number elsewhere; table length remains outside this frontend
+slice. Exponentiation follows the shared right-associative precedence above
+unary operators and always produces a number.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into
 canonical BluV1 artifacts without native linkage or fallback; the same
 explicit-profile API is available from the public facade as

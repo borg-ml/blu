@@ -600,6 +600,7 @@ impl<'a> Parser<'a> {
         let unary_operator = match operator.kind() {
             TokenKind::Not => UnaryOperator::Not,
             TokenKind::Minus => UnaryOperator::Negate,
+            TokenKind::Hash => UnaryOperator::Length,
             _ => return self.parse_primary(),
         };
         self.bump();
@@ -634,6 +635,7 @@ impl<'a> Parser<'a> {
                     "identifier",
                     "not",
                     "-",
+                    "#",
                     "(",
                 ],
             )?;

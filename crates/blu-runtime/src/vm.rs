@@ -957,6 +957,33 @@ impl Vm {
                     };
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::Length {
+                    destination,
+                    source,
+                } => {
+                    let source = blu_register(&registers, source)?;
+                    let Value::String(bytes) = source else {
+                        return Err(RuntimeError::Type {
+                            operation: "length",
+                            expected: "string",
+                            actual: source.type_name(),
+                        });
+                    };
+                    let length = i64::try_from(bytes.len()).map_err(|_| {
+                        RuntimeError::UnsupportedBluV1Structure {
+                            what: "string length exceeds i64",
+                        }
+                    })?;
+                    let value = if matches!(
+                        prototype.profile,
+                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) {
+                        Value::Integer(length)
+                    } else {
+                        Value::Number(length as f64)
+                    };
+                    set_blu_register(&mut registers, destination, value)?;
+                }
                 BluInstruction::FloorDivide {
                     destination,
                     left,
@@ -5470,6 +5497,56 @@ mod tests {
         assert_eq!(
             vm.execute_blu_v1(modulo_program(7, 0), BluLimits::default()),
             Err(RuntimeError::DivideByZero)
+        );
+    }
+
+    #[test]
+    fn direct_blu_v1_byte_string_length_is_profile_typed_and_structured() {
+        let length_program = |profile, constant| {
+            validated_blu_program(
+                profile,
+                vec![constant],
+                vec![
+                    BluInstruction::LoadConstant {
+                        destination: 0,
+                        constant: 0,
+                    },
+                    BluInstruction::Length {
+                        destination: 1,
+                        source: 0,
+                    },
+                    BluInstruction::Return { first: 1, count: 1 },
+                ],
+                FeatureBits::BASELINE,
+                2,
+            )
+        };
+
+        let mut vm = Vm::new(Dialect::Blu);
+        assert_eq!(
+            vm.execute_blu_v1(
+                length_program(SemanticProfile::Luau, BluConstant::String(b"blu".to_vec())),
+                BluLimits::default()
+            ),
+            Ok(vec![Value::Number(3.0)])
+        );
+        assert_eq!(
+            vm.execute_blu_v1(
+                length_program(SemanticProfile::Lua54, BluConstant::String(b"blu".to_vec())),
+                BluLimits::default()
+            ),
+            Ok(vec![Value::Integer(3)])
+        );
+        assert_eq!(
+            vm.execute_blu_v1(
+                length_program(SemanticProfile::Blu, BluConstant::Boolean(true)),
+                BluLimits::default()
+            ),
+            Err(RuntimeError::Type {
+                operation: "length",
+                expected: "string",
+                actual: "boolean",
+            })
         );
     }
 

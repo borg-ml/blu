@@ -434,6 +434,27 @@ fn unary_negation_binds_tighter_than_binary_operators_and_associates_right() {
 }
 
 #[test]
+fn unary_length_binds_tightly_and_associates_right() {
+    let source = source(b"return ##value + #'blu'".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    let add = binary(&parsed, statement.values()[0]);
+    let outer = unary(&parsed, add.left());
+    assert_eq!(outer.operator(), UnaryOperator::Length);
+    assert_eq!(
+        unary(&parsed, outer.operand()).operator(),
+        UnaryOperator::Length
+    );
+    assert_eq!(
+        unary(&parsed, add.right()).operator(),
+        UnaryOperator::Length
+    );
+    assert_eq!(source.slice(outer.operator_span()).unwrap(), b"#");
+}
+
+#[test]
 fn missing_group_closer_is_a_structured_rejection() {
     let source = source(b"return (1 + 2".to_vec());
     let ParseOutcome::Rejected(rejected) =

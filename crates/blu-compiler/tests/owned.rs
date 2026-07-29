@@ -694,6 +694,27 @@ fn unary_negation_lowers_for_every_profile() {
 }
 
 #[test]
+fn byte_string_length_lowers_for_every_profile() {
+    let source = make_source(br#"return #'blu', #"a\nb", #''"#.to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            compiled
+                .artifact()
+                .main()
+                .code
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::Length { .. }))
+                .count(),
+            3,
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn decimal_constants_follow_each_profile_numeric_policy() {
     let number_source = make_source(b"return 9007199254740993, 18446744073709551616".to_vec());
     for profile in [

@@ -52,7 +52,8 @@ bare or expression-list `return`, nil/boolean/decimal-integer/identifier express
 single- and double-quoted byte strings with the common Lua/Luau escaped delimiters,
 backslash, and `\a`/`\b`/`\f`/`\n`/`\r`/`\t`/`\v`, and
 `+`/`-`/`*`/`/`/`%`/`^`/`//`
-precedence plus grouping parentheses and unary `not`/`-`. Numeric, hex, Unicode, `\z`,
+precedence plus grouping parentheses and unary `not`/`-`/`#` for byte strings.
+Numeric, hex, Unicode, `\z`,
 and line-continuation escapes are rejected until their profile-specific rules are
 implemented. Parsing retains the explicit profile and rejects
 diagnostics without exposing a partial AST. Resolution, lowering, emission,

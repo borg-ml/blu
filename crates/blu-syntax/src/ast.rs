@@ -47,6 +47,7 @@ pub enum BinaryOperator {
 pub enum UnaryOperator {
     Not,
     Negate,
+    Length,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
