@@ -444,6 +444,58 @@ pub struct DoStatement {
     span: ByteSpan,
 }
 
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct NumericForStatement {
+    name: Identifier,
+    initial: ExpressionId,
+    limit: ExpressionId,
+    body: Block,
+    span: ByteSpan,
+}
+
+impl NumericForStatement {
+    pub(crate) const fn new(
+        name: Identifier,
+        initial: ExpressionId,
+        limit: ExpressionId,
+        body: Block,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            name,
+            initial,
+            limit,
+            body,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(&self) -> Identifier {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn initial(&self) -> ExpressionId {
+        self.initial
+    }
+
+    #[must_use]
+    pub const fn limit(&self) -> ExpressionId {
+        self.limit
+    }
+
+    #[must_use]
+    pub const fn body(&self) -> &Block {
+        &self.body
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl DoStatement {
     pub(crate) const fn new(body: Block, span: ByteSpan) -> Self {
         Self { body, span }
@@ -527,6 +579,7 @@ pub enum Statement {
     While(WhileStatement),
     Repeat(RepeatStatement),
     Do(DoStatement),
+    NumericFor(NumericForStatement),
     Break(BreakStatement),
     Continue(ContinueStatement),
     Return(ReturnStatement),
@@ -544,6 +597,7 @@ impl Statement {
             Self::While(statement) => statement.span(),
             Self::Repeat(statement) => statement.span(),
             Self::Do(statement) => statement.span(),
+            Self::NumericFor(statement) => statement.span(),
             Self::Break(statement) => statement.span(),
             Self::Continue(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
@@ -584,6 +638,7 @@ impl Block {
                 Statement::While(statement) => statement.body().node_count(),
                 Statement::Repeat(statement) => statement.body().node_count(),
                 Statement::Do(statement) => statement.body().node_count(),
+                Statement::NumericFor(statement) => statement.body().node_count(),
                 _ => 0,
             };
             count.saturating_add(1).saturating_add(nested)

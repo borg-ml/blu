@@ -29,9 +29,9 @@ use blu_core::{
 };
 use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryOperator, Expression, ExpressionId,
-    ExpressionKind, IfStatement, LocalListStatement, LocalStatement, ParseError, ParseLimits,
-    ParseOutcome, Rejected, RepeatStatement, ReturnStatement, Statement, UnaryOperator,
-    WhileStatement, parse,
+    ExpressionKind, IfStatement, LocalListStatement, LocalStatement, NumericForStatement,
+    ParseError, ParseLimits, ParseOutcome, Rejected, RepeatStatement, ReturnStatement, Statement,
+    UnaryOperator, WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -557,6 +557,10 @@ impl<'a> Lowerer<'a> {
                     self.close_scope(scope)?;
                     terminated
                 }
+                Statement::NumericFor(statement) => {
+                    self.lower_numeric_for(statement)?;
+                    false
+                }
                 Statement::Break(statement) => {
                     self.lower_break(statement.span())?;
                     true
@@ -723,6 +727,143 @@ impl<'a> Lowerer<'a> {
             self.patch_forward_branch(branch, end)?;
         }
         Ok(())
+    }
+
+    fn lower_numeric_for(
+        &mut self,
+        statement: &NumericForStatement,
+    ) -> Result<(), OwnedCompileError> {
+        let initial_source = self.lower_expression(statement.initial())?;
+        let limit_source = self.lower_expression(statement.limit())?;
+        let initial = self.allocate_register()?;
+        self.emit(
+            Instruction::Move {
+                destination: initial,
+                source: initial_source,
+            },
+            statement.span(),
+        )?;
+        let limit = self.allocate_register()?;
+        self.emit(
+            Instruction::Move {
+                destination: limit,
+                source: limit_source,
+            },
+            statement.span(),
+        )?;
+        let index = self.allocate_register()?;
+        self.emit(
+            Instruction::Move {
+                destination: index,
+                source: initial,
+            },
+            statement.span(),
+        )?;
+        let step_constant = if matches!(
+            self.profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Constant::Integer(1)
+        } else {
+            Constant::Number(1.0)
+        };
+        let step = self.lower_constant(step_constant, statement.span())?;
+
+        let loop_scope = self.bindings.len();
+        let binding_limit = self
+            .limits
+            .max_bindings
+            .min(self.limits.artifact.max_debug_entries_per_prototype)
+            .min(self.limits.artifact.max_total_debug_entries);
+        check_limit(
+            OwnedCompileLimit::Bindings,
+            self.closed_bindings
+                .len()
+                .saturating_add(self.bindings.len())
+                .saturating_add(1),
+            binding_limit,
+        )?;
+        let start_pc =
+            u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "instruction count passed limits but cannot fit a debug PC",
+            })?;
+        push_fallible(
+            &mut self.bindings,
+            Binding {
+                name: statement.name().span(),
+                register: index,
+                start_pc,
+                end_pc: None,
+            },
+            "local bindings",
+        )?;
+
+        let start = self.code.len();
+        let condition = self.allocate_register()?;
+        self.emit(
+            Instruction::LessEqual {
+                destination: condition,
+                left: index,
+                right: limit,
+            },
+            statement.span(),
+        )?;
+        let exit = self.code.len();
+        self.emit(
+            Instruction::JumpIfFalsy {
+                condition,
+                target: 0,
+            },
+            statement.span(),
+        )?;
+        push_fallible(
+            &mut self.loop_breaks,
+            allocate_vec(2, "loop break branches")?,
+            "loop control stack",
+        )?;
+        push_fallible(
+            &mut self.loop_continues,
+            allocate_vec(2, "loop continue branches")?,
+            "loop continue stack",
+        )?;
+        let body_scope = self.bindings.len();
+        let lowered = self.lower_statements(statement.body().statements());
+        let continues = self
+            .loop_continues
+            .pop()
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "loop continue stack became empty during lowering",
+            })?;
+        let breaks = self
+            .loop_breaks
+            .pop()
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "loop control stack became empty during lowering",
+            })?;
+        lowered?;
+        self.close_scope(body_scope)?;
+        let increment = self.code.len();
+        for branch in continues {
+            self.patch_forward_branch(branch, increment)?;
+        }
+        self.emit(
+            Instruction::Add {
+                destination: index,
+                left: index,
+                right: step,
+            },
+            statement.span(),
+        )?;
+        let target = u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
+            message: "loop target passed limits but cannot fit BluV1",
+        })?;
+        self.emit(Instruction::Jump { target }, statement.span())?;
+        let end = self.code.len();
+        self.patch_forward_branch(exit, end)?;
+        for branch in breaks {
+            self.patch_forward_branch(branch, end)?;
+        }
+        self.close_scope(loop_scope)
     }
 
     fn lower_break(&mut self, span: ByteSpan) -> Result<(), OwnedCompileError> {

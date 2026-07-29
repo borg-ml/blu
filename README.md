@@ -106,6 +106,11 @@ Lua 5.1–5.5 profiles reject it during lexing.
 Profile-neutral `repeat`/`until` loops execute their body at least once and
 retain body locals through the trailing condition. In Blu and Luau, `continue`
 in a repeat loop transfers to that trailing condition.
+Shared numeric `for name = initial, limit do` loops snapshot both controls
+once, use the profile's numeric representation for the implicit positive unit
+step, and scope the index to the loop. Explicit third-step expressions remain
+an explicit syntax error until negative and zero-step behavior is assigned per
+profile.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

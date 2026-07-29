@@ -14,8 +14,8 @@ mod parser;
 pub use ast::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
     BreakStatement, ContinueStatement, DoStatement, Expression, ExpressionId, ExpressionKind,
-    Identifier, IfClause, IfStatement, LocalListStatement, LocalStatement, RepeatStatement,
-    ReturnStatement, Statement, UnaryExpression, UnaryOperator, WhileStatement,
+    Identifier, IfClause, IfStatement, LocalListStatement, LocalStatement, NumericForStatement,
+    RepeatStatement, ReturnStatement, Statement, UnaryExpression, UnaryOperator, WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
@@ -142,6 +142,7 @@ pub enum TokenKind {
     Do,
     Repeat,
     Until,
+    For,
     Break,
     Continue,
     Nil,
@@ -840,6 +841,7 @@ pub fn lex(
                     b"do" => TokenKind::Do,
                     b"repeat" => TokenKind::Repeat,
                     b"until" => TokenKind::Until,
+                    b"for" => TokenKind::For,
                     b"break" => TokenKind::Break,
                     b"continue" => {
                         if !supports_continue(explicit_profile) {

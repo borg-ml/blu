@@ -1066,6 +1066,52 @@ fn do_blocks_restore_shadowed_bindings_and_propagate_returns() {
 }
 
 #[test]
+fn numeric_for_snapshots_bounds_scopes_index_and_supports_loop_control() {
+    let source = make_source(
+        b"local first = 1\nlocal last = 5\nlocal total = 0\nfor index = first, last do\nlast = 1\nif index == 2 then continue end\nif index == 4 then break end\ntotal = total + index\nend\nreturn total, last"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert_eq!(
+                Vm::default().execute_blu_v1(
+                    compiled.unwrap().into_validated_artifact(),
+                    BluLimits::default()
+                ),
+                Ok(vec![Value::Number(4.0), Value::Number(1.0)]),
+                "{profile}"
+            );
+        } else {
+            assert!(matches!(compiled, Err(OwnedCompileError::Syntax(_))));
+        }
+    }
+
+    let shared = make_source(
+        b"local index = 99\nlocal total = 0\nfor index = 1, 3 do total = total + index end\nreturn total, index"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&shared, profile, compiler_identity())
+            .expect("numeric for should compile");
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            vec![Value::Integer(6), Value::Integer(99)]
+        } else {
+            vec![Value::Number(6.0), Value::Number(99.0)]
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(expected),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {

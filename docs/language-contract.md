@@ -179,6 +179,13 @@ innermost loop condition.
 condition, and body-local bindings remain in scope through that condition.
 For Blu and Luau, `continue` inside `repeat` transfers to the trailing
 condition; it does not skip the condition by restarting the body.
+The initial shared numeric-for slice accepts
+`for name = initial, limit do ... end`. Initial and limit expressions are
+evaluated exactly once and copied into hidden registers before the loop
+variable enters scope. The implicit step is positive one in the profile's
+number representation. A third step expression is rejected with
+`BLU-PARSE-0029`; dynamic, negative, and zero-step semantics remain unassigned
+rather than inheriting an undocumented compromise.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

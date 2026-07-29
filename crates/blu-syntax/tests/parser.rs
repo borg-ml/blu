@@ -439,6 +439,30 @@ fn do_blocks_are_shared_and_own_nested_statements() {
 }
 
 #[test]
+fn numeric_for_retains_controls_body_and_explicit_step_rejection() {
+    for profile in SemanticProfile::ALL {
+        let source_file = source(b"for index = 1, 3 do local value = index end".to_vec());
+        let parsed = accepted(&source_file, profile, ParseLimits::default());
+        let Statement::NumericFor(statement) = &parsed.ast().statements()[0] else {
+            panic!("expected numeric for statement");
+        };
+        assert_eq!(
+            source_file.slice(statement.name().span()).unwrap(),
+            b"index"
+        );
+        assert_eq!(statement.body().statements().len(), 1);
+    }
+
+    let explicit_step = source(b"for index = 3, 1, -1 do end".to_vec());
+    let outcome = parse(&explicit_step, SemanticProfile::Blu, ParseLimits::default())
+        .expect("parsing should complete");
+    let rejected = outcome
+        .rejected()
+        .expect("explicit step should be rejected");
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0029");
+}
+
+#[test]
 fn break_is_scoped_to_loop_bodies_and_terminates_its_block() {
     let source_file = source(b"while true do if ready then break end end".to_vec());
     let parsed = accepted(&source_file, SemanticProfile::Blu, ParseLimits::default());

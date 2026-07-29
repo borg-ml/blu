@@ -792,6 +792,22 @@ fn repeat_loop_keywords_are_shared_across_profiles() {
 }
 
 #[test]
+fn numeric_for_keywords_are_shared_across_profiles() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"for index = 1, 3 do end".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed)
+                .into_iter()
+                .filter(|kind| matches!(kind, TokenKind::For | TokenKind::Do | TokenKind::End))
+                .collect::<Vec<_>>(),
+            [TokenKind::For, TokenKind::Do, TokenKind::End]
+        );
+    }
+}
+
+#[test]
 fn break_is_a_shared_loop_keyword() {
     for profile in SemanticProfile::ALL {
         let source = source(b"while true do break end".to_vec());

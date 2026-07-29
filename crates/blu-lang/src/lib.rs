@@ -512,6 +512,14 @@ return value"#
             SourceLimits::default(),
         )
         .unwrap();
+        let numeric_for = SourceFile::new(
+            SourceId::new(29),
+            "numeric-for.blu",
+            b"local total = 0\nfor index = 1, 4 do total = total + index end\nreturn total"
+                .to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -521,6 +529,23 @@ return value"#
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&numeric_for, profile, compiler.clone())
+                .unwrap();
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(10)
+            } else {
+                Value::Number(10.0)
+            };
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![expected]),
+                "{profile}"
+            );
             let compiled = OwnedCompiler::default()
                 .compile(&do_block, profile, compiler.clone())
                 .unwrap();

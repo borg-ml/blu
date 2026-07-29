@@ -2,8 +2,8 @@ use crate::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
     BreakStatement, ContinueStatement, DialectDirective, DoStatement, Expression, ExpressionId,
     ExpressionKind, Identifier, IfClause, IfStatement, LexError, Lexed, LexerLimits,
-    LocalListStatement, LocalStatement, RepeatStatement, ReturnStatement, Statement, Token,
-    TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
+    LocalListStatement, LocalStatement, NumericForStatement, RepeatStatement, ReturnStatement,
+    Statement, Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -346,6 +346,7 @@ impl<'a> Parser<'a> {
                 TokenKind::While => self.parse_while()?,
                 TokenKind::Repeat => self.parse_repeat()?,
                 TokenKind::Do => self.parse_do()?,
+                TokenKind::For => self.parse_numeric_for()?,
                 TokenKind::Break | TokenKind::Continue => {
                     let Some(keyword) = self.bump() else {
                         return Err(ParseError::InternalInvariant {
@@ -423,6 +424,7 @@ impl<'a> Parser<'a> {
                             "while",
                             "repeat",
                             "do",
+                            "for",
                             "break",
                             "continue",
                             "return",
@@ -607,6 +609,93 @@ impl<'a> Parser<'a> {
             });
         };
         self.push_statement(Statement::Do(DoStatement::new(
+            body,
+            keyword.span().merge(end.span())?,
+        )))
+    }
+
+    fn parse_numeric_for(&mut self) -> Result<(), ParseError> {
+        let Some(keyword) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "for parser entered without a current token",
+            });
+        };
+        if !self.at(TokenKind::Identifier) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0026",
+                "expected loop variable after `for`",
+                &["identifier"],
+            )?;
+            return Ok(());
+        }
+        let Some(name) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "identifier check succeeded without a current token",
+            });
+        };
+        let name = Identifier::new(name.span());
+        if !self.at(TokenKind::Equal) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0027",
+                "only numeric `for name = initial, limit do` is currently supported",
+                &["="],
+            )?;
+            return Ok(());
+        }
+        self.bump();
+        let Some(initial) = self.parse_expression(0)? else {
+            return Ok(());
+        };
+        if !self.at(TokenKind::Comma) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0028",
+                "expected `,` after numeric for initial value",
+                &[","],
+            )?;
+            return Ok(());
+        }
+        self.bump();
+        let Some(limit) = self.parse_expression(0)? else {
+            return Ok(());
+        };
+        if self.at(TokenKind::Comma) {
+            self.report_current(
+                "BLU-PARSE-0029",
+                "explicit numeric for steps are not yet supported",
+                &["do"],
+            )?;
+            return Ok(());
+        }
+        if !self.at(TokenKind::Do) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0030",
+                "expected `do` after numeric for controls",
+                &["do"],
+            )?;
+            return Ok(());
+        }
+        self.bump();
+        self.loop_depth += 1;
+        let parsed_body = self.parse_nested_block(&[TokenKind::End]);
+        self.loop_depth -= 1;
+        let body = parsed_body?;
+        if !self.at(TokenKind::End) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0031",
+                "expected `end` to close numeric for statement",
+                &["end"],
+            )?;
+            return Ok(());
+        }
+        let Some(end) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "end check succeeded without a current token",
+            });
+        };
+        self.push_statement(Statement::NumericFor(NumericForStatement::new(
+            name,
+            initial.id,
+            limit.id,
             body,
             keyword.span().merge(end.span())?,
         )))
