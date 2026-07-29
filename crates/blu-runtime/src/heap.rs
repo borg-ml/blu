@@ -95,6 +95,11 @@ impl std::error::Error for HeapError {
     }
 }
 
+/// A generational object arena with deterministic logical memory accounting.
+///
+/// Cloning a heap duplicates its object graph and accounting snapshot. The
+/// original and clone then account and collect independently; handles retain
+/// their numeric identities but belong to the corresponding heap snapshot.
 #[derive(Clone, Debug, Default)]
 pub struct Heap {
     slots: Vec<Slot>,
@@ -106,9 +111,15 @@ pub struct Heap {
 impl Heap {
     /// Creates an empty heap with deterministic logical-capacity accounting.
     ///
-    /// Accounted storage is limited to arena slots and heap-owned table,
-    /// closure, and thread containers. Allocator slack, strings, chunks,
-    /// native-owned values, and collection work queues are not included.
+    /// Accounted storage is limited to one logical `Slot` charge for every
+    /// arena index ever created plus heap-owned table, closure, and thread
+    /// logical capacities. Slot charges persist when an index moves to the
+    /// free list and are reused with that index.
+    ///
+    /// These deterministic charges are not actual `Vec`/`HashMap` capacities
+    /// or process memory confinement. Allocator slack, the persistent free
+    /// list, strings, chunks, native-owned values, and collection work queues
+    /// are not metered.
     pub fn try_new(memory: MemoryConfig) -> Result<Self, HeapError> {
         Ok(Self {
             slots: Vec::new(),
@@ -408,15 +419,40 @@ impl Heap {
             }
         }
 
+        let sweep = self
+            .slots
+            .iter()
+            .filter(|slot| !slot.marked)
+            .filter_map(|slot| slot.object.as_ref())
+            .try_fold((0usize, 0usize), |(total, dead), object| {
+                Ok::<_, MemoryError>((
+                    checked_add(total, object.dynamic_bytes()?)?,
+                    dead.checked_add(1).ok_or(MemoryError::SizeOverflow)?,
+                ))
+            });
+        let (release, dead) = match sweep {
+            Ok(sweep) => sweep,
+            Err(error) => {
+                self.clear_marks();
+                return Err(error.into());
+            }
+        };
+        if let Err(error) = try_reserve_vec_exact(&mut self.free, dead) {
+            self.clear_marks();
+            return Err(error);
+        }
+        if let Err(error) = self.memory.release(release) {
+            self.clear_marks();
+            return Err(error.into());
+        }
+
         for (index, slot) in self.slots.iter_mut().enumerate() {
-            let Some(object) = slot.object.as_ref() else {
+            if slot.object.is_none() {
                 continue;
-            };
+            }
             if slot.marked {
                 slot.marked = false;
             } else {
-                let dynamic_bytes = object.dynamic_bytes()?;
-                self.memory.release(dynamic_bytes)?;
                 slot.object = None;
                 slot.generation = slot.generation.wrapping_add(1);
                 self.free.push(index as u32);
@@ -429,6 +465,12 @@ impl Heap {
             retained: self.live,
             collected: before - self.live,
         })
+    }
+
+    fn clear_marks(&mut self) {
+        for slot in &mut self.slots {
+            slot.marked = false;
+        }
     }
 
     fn allocate(
