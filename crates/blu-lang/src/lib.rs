@@ -228,4 +228,39 @@ mod tests {
             )))
         );
     }
+
+    #[test]
+    fn expanded_standard_libraries_preserve_bytes_multret_and_math() {
+        assert_eq!(
+            Engine::default().execute(
+                br#"
+                    local packed = table.pack(4, nil, 6)
+                    return string.char(65, 0, 255),
+                        string.rep("ab", 3, "-"),
+                        string.lower("A\255Z"),
+                        string.upper("a\255z"),
+                        packed.n,
+                        math.deg(math.pi),
+                        math.log(8, 2),
+                        table.unpack(packed, 1, 3)
+                "#
+            ),
+            Ok(vec![
+                Value::String(Arc::from(&b"A\0\xff"[..])),
+                Value::String(Arc::from(&b"ab-ab-ab"[..])),
+                Value::String(Arc::from(&b"a\xffz"[..])),
+                Value::String(Arc::from(&b"A\xffZ"[..])),
+                Value::Integer(3),
+                Value::Number(180.0),
+                Value::Number(3.0),
+                Value::Number(4.0),
+                Value::Nil,
+                Value::Number(6.0),
+            ])
+        );
+        assert_eq!(
+            Engine::for_dialect(Dialect::Luau).execute(b"return string.rep('ab', 3, '-')"),
+            Ok(vec![Value::String(Arc::from(&b"ababab"[..]))])
+        );
+    }
 }

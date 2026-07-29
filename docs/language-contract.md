@@ -66,6 +66,12 @@ between language versions, including:
 Calls across dialects convert values but execute the callee under the callee's
 profile.
 
+Implemented profile decisions are recorded when the references conflict. For
+example, pinned Luau ignores the optional separator passed to `string.rep`,
+while the `blu` profile accepts the modern Lua separator form. Blu
+`string.lower` and `string.upper` operate deterministically on ASCII bytes and
+leave all other bytes unchanged.
+
 ## Authority profiles
 
 Language compatibility and host authority are orthogonal.

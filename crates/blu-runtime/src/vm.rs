@@ -8,6 +8,7 @@ use std::{
 };
 
 const MAX_DYNAMIC_REGISTERS: usize = 1_000_000;
+const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 
 type NativeFunction =
     Arc<dyn Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync>;
@@ -1799,6 +1800,114 @@ impl Vm {
                 Value::NativeFunction(string_reverse),
             )
             .expect("valid built-in table key");
+        let string_char = self.register_function(|_, arguments| {
+            let mut result = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                let index = result.len();
+                let value = argument.as_number().ok_or(RuntimeError::Type {
+                    operation: "string.char",
+                    expected: "number",
+                    actual: argument.type_name(),
+                })? as i64;
+                if !(0..=255).contains(&value) {
+                    return Err(RuntimeError::StringByte { index, value });
+                }
+                result.push(value as u8);
+            }
+            Ok(vec![Value::String(Arc::from(result))])
+        });
+        self.heap
+            .table_set(
+                string,
+                Value::String(Arc::from(&b"char"[..])),
+                Value::NativeFunction(string_char),
+            )
+            .expect("valid built-in table key");
+        let string_rep = self.register_function(|vm, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.rep",
+                index: 1,
+            })?;
+            let value = string_bytes(value, "string.rep")?;
+            let count = integer_argument(arguments, 1, "string.rep")?.max(0) as usize;
+            let separator = match (vm.dialect, arguments.get(2)) {
+                (Dialect::Luau, _) | (_, None) => &[],
+                (_, Some(separator)) => string_bytes(separator, "string.rep")?,
+            };
+            let value_bytes = value
+                .len()
+                .checked_mul(count)
+                .ok_or(RuntimeError::StringLimit {
+                    required: usize::MAX,
+                    limit: MAX_STRING_BYTES,
+                })?;
+            let separator_bytes = separator.len().checked_mul(count.saturating_sub(1)).ok_or(
+                RuntimeError::StringLimit {
+                    required: usize::MAX,
+                    limit: MAX_STRING_BYTES,
+                },
+            )?;
+            let required =
+                value_bytes
+                    .checked_add(separator_bytes)
+                    .ok_or(RuntimeError::StringLimit {
+                        required: usize::MAX,
+                        limit: MAX_STRING_BYTES,
+                    })?;
+            if required > MAX_STRING_BYTES {
+                return Err(RuntimeError::StringLimit {
+                    required,
+                    limit: MAX_STRING_BYTES,
+                });
+            }
+            let mut result = Vec::with_capacity(required);
+            for index in 0..count {
+                if index != 0 {
+                    result.extend_from_slice(separator);
+                }
+                result.extend_from_slice(value);
+            }
+            Ok(vec![Value::String(Arc::from(result))])
+        });
+        self.heap
+            .table_set(
+                string,
+                Value::String(Arc::from(&b"rep"[..])),
+                Value::NativeFunction(string_rep),
+            )
+            .expect("valid built-in table key");
+        let string_lower = self.register_function(|_, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.lower",
+                index: 1,
+            })?;
+            let mut result = string_bytes(value, "string.lower")?.to_vec();
+            result.make_ascii_lowercase();
+            Ok(vec![Value::String(Arc::from(result))])
+        });
+        self.heap
+            .table_set(
+                string,
+                Value::String(Arc::from(&b"lower"[..])),
+                Value::NativeFunction(string_lower),
+            )
+            .expect("valid built-in table key");
+        let string_upper = self.register_function(|_, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.upper",
+                index: 1,
+            })?;
+            let mut result = string_bytes(value, "string.upper")?.to_vec();
+            result.make_ascii_uppercase();
+            Ok(vec![Value::String(Arc::from(result))])
+        });
+        self.heap
+            .table_set(
+                string,
+                Value::String(Arc::from(&b"upper"[..])),
+                Value::NativeFunction(string_upper),
+            )
+            .expect("valid built-in table key");
         self.set_global(&b"string"[..], Value::Table(string));
 
         self.install_table_library();
@@ -1919,12 +2028,62 @@ impl Vm {
             }
             Ok(vec![Value::String(Arc::from(result))])
         });
+        let pack = self.register_function(|vm, arguments| {
+            let table = vm.heap.allocate_table(arguments.len(), 1);
+            for (index, value) in arguments.iter().enumerate() {
+                vm.heap
+                    .table_set(table, Value::Integer((index + 1) as i64), value.clone())?;
+            }
+            vm.heap.table_set(
+                table,
+                Value::String(Arc::from(&b"n"[..])),
+                Value::Integer(arguments.len() as i64),
+            )?;
+            Ok(vec![Value::Table(table)])
+        });
+        let unpack = self.register_function(|vm, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.unpack",
+                index: 1,
+            })?;
+            let table = table_id(table)?;
+            let start = arguments
+                .get(1)
+                .map(|_| integer_argument(arguments, 1, "table.unpack"))
+                .transpose()?
+                .unwrap_or(1);
+            let end = arguments
+                .get(2)
+                .map(|_| integer_argument(arguments, 2, "table.unpack"))
+                .transpose()?
+                .unwrap_or(vm.heap.table_length(table)? as i64);
+            if end < start {
+                return Ok(Vec::new());
+            }
+            let count = usize::try_from(end - start + 1).map_err(|_| RuntimeError::StackLimit {
+                required: usize::MAX,
+                limit: MAX_DYNAMIC_REGISTERS,
+            })?;
+            if count > MAX_DYNAMIC_REGISTERS {
+                return Err(RuntimeError::StackLimit {
+                    required: count,
+                    limit: MAX_DYNAMIC_REGISTERS,
+                });
+            }
+            let mut values = Vec::with_capacity(count);
+            for index in start..=end {
+                values.push(vm.heap.table_get(table, &Value::Integer(index))?);
+            }
+            Ok(values)
+        });
 
-        let table = self.heap.allocate_table(0, 3);
+        let table = self.heap.allocate_table(0, 5);
         for (name, function) in [
             (&b"insert"[..], insert),
             (&b"remove"[..], remove),
             (&b"concat"[..], concat),
+            (&b"pack"[..], pack),
+            (&b"unpack"[..], unpack),
         ] {
             self.heap
                 .table_set(
@@ -1953,6 +2112,43 @@ impl Vm {
         let sqrt = self.register_function(|_, arguments| {
             let value = number_argument(arguments, 0, "math.sqrt")?;
             Ok(vec![Value::Number(value.sqrt())])
+        });
+        let exp = self.register_function(|_, arguments| {
+            let value = number_argument(arguments, 0, "math.exp")?;
+            Ok(vec![Value::Number(value.exp())])
+        });
+        let log = self.register_function(|_, arguments| {
+            let value = number_argument(arguments, 0, "math.log")?;
+            let result = match arguments.get(1) {
+                Some(_) => value.log(number_argument(arguments, 1, "math.log")?),
+                None => value.ln(),
+            };
+            Ok(vec![Value::Number(result)])
+        });
+        let sin = self.register_function(|_, arguments| {
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.sin")?.sin(),
+            )])
+        });
+        let cos = self.register_function(|_, arguments| {
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.cos")?.cos(),
+            )])
+        });
+        let tan = self.register_function(|_, arguments| {
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.tan")?.tan(),
+            )])
+        });
+        let rad = self.register_function(|_, arguments| {
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.rad")?.to_radians(),
+            )])
+        });
+        let deg = self.register_function(|_, arguments| {
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.deg")?.to_degrees(),
+            )])
         });
         let min = self.register_function(|_, arguments| {
             let mut values = arguments.iter();
@@ -1997,12 +2193,19 @@ impl Vm {
             Ok(vec![Value::Number(result)])
         });
 
-        let table = self.heap.allocate_table(0, 8);
+        let table = self.heap.allocate_table(0, 15);
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
             (&b"ceil"[..], Value::NativeFunction(ceil)),
             (&b"sqrt"[..], Value::NativeFunction(sqrt)),
+            (&b"exp"[..], Value::NativeFunction(exp)),
+            (&b"log"[..], Value::NativeFunction(log)),
+            (&b"sin"[..], Value::NativeFunction(sin)),
+            (&b"cos"[..], Value::NativeFunction(cos)),
+            (&b"tan"[..], Value::NativeFunction(tan)),
+            (&b"rad"[..], Value::NativeFunction(rad)),
+            (&b"deg"[..], Value::NativeFunction(deg)),
             (&b"min"[..], Value::NativeFunction(min)),
             (&b"max"[..], Value::NativeFunction(max)),
             (&b"pi"[..], Value::Number(core::f64::consts::PI)),
@@ -2606,6 +2809,14 @@ pub enum RuntimeError {
         length: usize,
     },
     ConversionBase(u32),
+    StringByte {
+        index: usize,
+        value: i64,
+    },
+    StringLimit {
+        required: usize,
+        limit: usize,
+    },
     ModuleLoaderMissing,
     CircularModule(Arc<[u8]>),
 }
@@ -2709,6 +2920,19 @@ impl fmt::Display for RuntimeError {
             ),
             Self::ConversionBase(base) => {
                 write!(f, "tonumber base {base} is outside the range 2..=36")
+            }
+            Self::StringByte { index, value } => {
+                write!(
+                    f,
+                    "string.char argument {} is outside 0..=255: {value}",
+                    index + 1
+                )
+            }
+            Self::StringLimit { required, limit } => {
+                write!(
+                    f,
+                    "string result requires {required} bytes, limit is {limit}"
+                )
             }
             Self::ModuleLoaderMissing => f.write_str("require has no configured module loader"),
             Self::CircularModule(name) => write!(

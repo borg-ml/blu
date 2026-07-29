@@ -1,6 +1,6 @@
 use blu_compiler::Compiler as SourceCompiler;
 use blu_runtime::{
-    Value, Vm,
+    Dialect, Value, Vm,
     bytecode::{LoadLimits, disassemble, load},
 };
 use std::{
@@ -423,8 +423,16 @@ table.insert(values, 2, "b")
 local removed = table.remove(values, 3)
 local joined = table.concat(values, "-")
 local first, second = string.byte("AZ", 1, 2)
+local packed = table.pack(7, nil, 9)
+local packed_first, packed_second, packed_third = table.unpack(packed, 1, 3)
 return string.len(joined) + first + second
-    + (string.reverse(joined) == "b-a" and removed == "c" and 1 or 0)
+    + (string.reverse(joined) == "b-a" and removed == "c"
+        and string.char(65, 0, 255) == "A\0\255"
+        and string.rep("ab", 3, "-") == "ababab"
+        and string.lower("A\255Z") == "a\255z"
+        and string.upper("a\255z") == "A\255Z"
+        and packed.n == 3 and packed_first == 7
+        and packed_second == nil and packed_third == 9 and 1 or 0)
 "#;
 const TABLE_STRING_LIBRARY_REFERENCE_SOURCE: &str = r#"
 local values = { "a", "c" }
@@ -432,18 +440,32 @@ table.insert(values, 2, "b")
 local removed = table.remove(values, 3)
 local joined = table.concat(values, "-")
 local first, second = string.byte("AZ", 1, 2)
+local packed = table.pack(7, nil, 9)
+local packed_first, packed_second, packed_third = table.unpack(packed, 1, 3)
 local result = string.len(joined) + first + second
-    + (string.reverse(joined) == "b-a" and removed == "c" and 1 or 0)
+    + (string.reverse(joined) == "b-a" and removed == "c"
+        and string.char(65, 0, 255) == "A\0\255"
+        and string.rep("ab", 3, "-") == "ababab"
+        and string.lower("A\255Z") == "a\255z"
+        and string.upper("a\255z") == "A\255Z"
+        and packed.n == 3 and packed_first == 7
+        and packed_second == nil and packed_third == 9 and 1 or 0)
 print(type(result) .. ":" .. tostring(result))
 "#;
 const MATH_LIBRARY_SOURCE: &str = r#"
 return math.abs(-3) + math.floor(2.9) + math.ceil(2.1) + math.sqrt(16)
     + math.min(8, 1, 5) + math.max(2, 9, 4)
+    + math.floor(math.exp(1)) + math.floor(math.log(8, 2))
+    + math.sin(0) + math.cos(0) + math.tan(0)
+    + math.floor(math.deg(math.rad(90)))
     + (math.pi > 3 and 1 or 0) + (math.huge > 1e300 and 1 or 0)
 "#;
 const MATH_LIBRARY_REFERENCE_SOURCE: &str = r#"
 local result = math.abs(-3) + math.floor(2.9) + math.ceil(2.1) + math.sqrt(16)
     + math.min(8, 1, 5) + math.max(2, 9, 4)
+    + math.floor(math.exp(1)) + math.floor(math.log(8, 2))
+    + math.sin(0) + math.cos(0) + math.tan(0)
+    + math.floor(math.deg(math.rad(90)))
     + (math.pi > 3 and 1 or 0) + (math.huge > 1e300 and 1 or 0)
 print(type(result) .. ":" .. tostring(result))
 "#;
@@ -801,7 +823,7 @@ fn verify_program_case(
     ensure_success(compiler, &bytecode)?;
     let chunk = load(&bytecode.stdout, LoadLimits::default())
         .map_err(|error| format!("Blu rejected program case {name:?}: {error}"))?;
-    let result = Vm::default().execute(&chunk).map_err(|error| {
+    let result = Vm::new(Dialect::Luau).execute(&chunk).map_err(|error| {
         format!(
             "Blu failed program case {name:?}: {error}\n{}",
             disassemble(&chunk)
@@ -856,7 +878,7 @@ fn verify_scalar_cases(
         let chunk = load(&bytecode.stdout, LoadLimits::default())
             .map_err(|error| format!("Blu rejected scalar case {name:?}: {error}"))?;
         bytecode_version.get_or_insert(chunk.version);
-        let blu_result = Vm::default()
+        let blu_result = Vm::new(Dialect::Luau)
             .execute(&chunk)
             .map_err(|error| format!("Blu failed scalar case {name:?}: {error}"))?;
         if blu_result.len() != 1 {
