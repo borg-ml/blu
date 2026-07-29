@@ -17,6 +17,7 @@ pub struct Vm {
     heap: Heap,
     globals: HashMap<Arc<[u8]>, Value>,
     native_functions: Vec<NativeFunction>,
+    protected_call: Option<NativeFunctionId>,
     output: Vec<u8>,
     active_roots: Vec<Vec<Value>>,
 }
@@ -37,6 +38,7 @@ impl Vm {
             heap: Heap::default(),
             globals: HashMap::new(),
             native_functions: Vec::new(),
+            protected_call: None,
             output: Vec::new(),
             active_roots: Vec::new(),
         };
@@ -908,6 +910,35 @@ impl Vm {
                 result
             }
             Value::NativeFunction(function) => {
+                if self.protected_call == Some(function) {
+                    let target = arguments.first().cloned().ok_or(RuntimeError::Argument {
+                        function: "pcall",
+                        index: 1,
+                    })?;
+                    let result = self.call_value(
+                        chunk,
+                        target,
+                        arguments.get(1..).unwrap_or_default(),
+                        remaining,
+                        depth,
+                        roots,
+                    );
+                    return Ok(match result {
+                        Ok(values) => {
+                            let mut protected = Vec::with_capacity(values.len() + 1);
+                            protected.push(Value::Boolean(true));
+                            protected.extend(values);
+                            protected
+                        }
+                        Err(RuntimeError::Raised(value)) => {
+                            vec![Value::Boolean(false), value]
+                        }
+                        Err(error) => vec![
+                            Value::Boolean(false),
+                            Value::String(Arc::from(error.to_string().into_bytes())),
+                        ],
+                    });
+                }
                 let function = self
                     .native_functions
                     .get(function.0 as usize)
@@ -1467,6 +1498,59 @@ impl Vm {
         });
         self.set_global(&b"rawlen"[..], Value::NativeFunction(rawlen));
 
+        let error = self.register_function(|_, arguments| {
+            Err(RuntimeError::Raised(
+                arguments.first().cloned().unwrap_or(Value::Nil),
+            ))
+        });
+        self.set_global(&b"error"[..], Value::NativeFunction(error));
+
+        let assert = self.register_function(|_, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "assert",
+                index: 1,
+            })?;
+            if value.is_truthy() {
+                Ok(arguments.to_vec())
+            } else {
+                Err(RuntimeError::Raised(arguments.get(1).cloned().unwrap_or(
+                    Value::String(Arc::from(&b"assertion failed!"[..])),
+                )))
+            }
+        });
+        self.set_global(&b"assert"[..], Value::NativeFunction(assert));
+
+        let select = self.register_function(|_, arguments| {
+            let selector = arguments.first().ok_or(RuntimeError::Argument {
+                function: "select",
+                index: 1,
+            })?;
+            if matches!(selector, Value::String(value) if &**value == b"#") {
+                return Ok(vec![Value::Integer(
+                    arguments.len().saturating_sub(1) as i64
+                )]);
+            }
+            let index = selector.as_number().ok_or(RuntimeError::Type {
+                operation: "select",
+                expected: "number or '#'",
+                actual: selector.type_name(),
+            })? as i64;
+            if index == 0 {
+                return Err(RuntimeError::SelectIndex(index));
+            }
+            let count = arguments.len().saturating_sub(1) as i64;
+            let index = if index < 0 { count + index + 1 } else { index };
+            if index < 1 {
+                return Err(RuntimeError::SelectIndex(index));
+            }
+            Ok(arguments.get(index as usize..).unwrap_or_default().to_vec())
+        });
+        self.set_global(&b"select"[..], Value::NativeFunction(select));
+
+        let pcall = self.register_function(|_, _| Err(RuntimeError::NativeFunction(u32::MAX)));
+        self.protected_call = Some(pcall);
+        self.set_global(&b"pcall"[..], Value::NativeFunction(pcall));
+
         let print = self.register_function(|vm, arguments| {
             for (index, value) in arguments.iter().enumerate() {
                 if index != 0 {
@@ -1587,6 +1671,7 @@ impl fmt::Debug for Vm {
             .field("heap", &self.heap)
             .field("globals", &self.globals)
             .field("native_function_count", &self.native_functions.len())
+            .field("protected_call", &self.protected_call)
             .field("active_frame_count", &self.active_roots.len())
             .finish_non_exhaustive()
     }
@@ -2070,6 +2155,8 @@ pub enum RuntimeError {
         name: &'static str,
         actual: &'static str,
     },
+    Raised(Value),
+    SelectIndex(i64),
 }
 
 impl fmt::Display for RuntimeError {
@@ -2159,6 +2246,8 @@ impl fmt::Display for RuntimeError {
                     "{name} metamethod with {actual} value is not implemented"
                 )
             }
+            Self::Raised(value) => write!(f, "runtime error: {value:?}"),
+            Self::SelectIndex(index) => write!(f, "select index {index} is out of range"),
         }
     }
 }

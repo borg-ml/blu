@@ -388,6 +388,34 @@ rawset(object, "answer", 3)
 local result = rawget(object, "answer") + rawlen(object) + (rawequal(object, object) and 1 or 0)
 print(type(result) .. ":" .. tostring(result))
 "#;
+const ASSERT_SELECT_SOURCE: &str = r##"
+local result = select("#", 1, 2, 3) + select(2, 10, 20, 30)
+return assert(result == 23, "unexpected select result") and result
+"##;
+const ASSERT_SELECT_REFERENCE_SOURCE: &str = r##"
+local result = select("#", 1, 2, 3) + select(2, 10, 20, 30)
+result = assert(result == 23, "unexpected select result") and result
+print(type(result) .. ":" .. tostring(result))
+"##;
+const PROTECTED_CALL_SOURCE: &str = r#"
+local ok, first, second = pcall(function(value)
+    return value, value + 1
+end, 4)
+local failed, message = pcall(function()
+    error("boom")
+end)
+return ok and not failed and first == 4 and second == 5 and type(message) == "string"
+"#;
+const PROTECTED_CALL_REFERENCE_SOURCE: &str = r#"
+local ok, first, second = pcall(function(value)
+    return value, value + 1
+end, 4)
+local failed, message = pcall(function()
+    error("boom")
+end)
+local result = ok and not failed and first == 4 and second == 5 and type(message) == "string"
+print(type(result) .. ":" .. tostring(result))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -578,6 +606,22 @@ fn run() -> Result<(), String> {
         "raw base operations",
         RAW_BASE_SOURCE,
         RAW_BASE_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "assert and select",
+        ASSERT_SELECT_SOURCE,
+        ASSERT_SELECT_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "protected calls",
+        PROTECTED_CALL_SOURCE,
+        PROTECTED_CALL_REFERENCE_SOURCE,
         &compiler,
         &args.upstream,
         temporary.path(),
