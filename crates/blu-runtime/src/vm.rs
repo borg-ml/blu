@@ -281,6 +281,45 @@ impl Vm {
                         )?;
                     }
                 }
+                Opcode::ForNPrep | Opcode::ForNLoop => {
+                    let base = instruction.a();
+                    let limit = frame.get(base)?.as_number().ok_or(RuntimeError::Type {
+                        operation: "numeric for limit",
+                        expected: "number",
+                        actual: frame.get(base)?.type_name(),
+                    })?;
+                    let step_register = base + 1;
+                    let step = frame
+                        .get(step_register)?
+                        .as_number()
+                        .ok_or(RuntimeError::Type {
+                            operation: "numeric for step",
+                            expected: "number",
+                            actual: frame.get(step_register)?.type_name(),
+                        })?;
+                    let index_register = base + 2;
+                    let mut index =
+                        frame
+                            .get(index_register)?
+                            .as_number()
+                            .ok_or(RuntimeError::Type {
+                                operation: "numeric for index",
+                                expected: "number",
+                                actual: frame.get(index_register)?.type_name(),
+                            })?;
+                    if instruction.opcode() == Opcode::ForNLoop {
+                        index += step;
+                        frame.set(index_register, Value::Number(index))?;
+                    }
+                    let continues = if step > 0.0 {
+                        index <= limit
+                    } else {
+                        limit <= index
+                    };
+                    if continues == (instruction.opcode() == Opcode::ForNLoop) {
+                        frame.jump(instruction)?;
+                    }
+                }
                 Opcode::Jump | Opcode::JumpBack | Opcode::JumpX => {
                     frame.jump(instruction)?;
                 }
@@ -314,6 +353,48 @@ impl Vm {
                     if compare(instruction.opcode(), left, right)? {
                         frame.jump(instruction)?;
                     }
+                }
+                Opcode::JumpXEqKNil | Opcode::JumpXEqKB | Opcode::JumpXEqKN | Opcode::JumpXEqKS => {
+                    let left = frame.get(instruction.a())?;
+                    let aux = instruction.aux().ok_or(RuntimeError::MissingAux {
+                        pc: instruction.pc(),
+                        opcode: instruction.opcode(),
+                    })?;
+                    let expected = match instruction.opcode() {
+                        Opcode::JumpXEqKNil => Value::Nil,
+                        Opcode::JumpXEqKB => Value::Boolean(aux & 1 != 0),
+                        Opcode::JumpXEqKN | Opcode::JumpXEqKS => {
+                            frame.constant_u32(aux & 0x00ff_ffff)?
+                        }
+                        _ => unreachable!(),
+                    };
+                    let equal = left == &expected;
+                    let negate = aux >> 31 != 0;
+                    if equal != negate {
+                        frame.jump(instruction)?;
+                    }
+                }
+                Opcode::Concat => {
+                    let mut bytes = Vec::new();
+                    for register in instruction.b()..=instruction.c() {
+                        match frame.get(register)? {
+                            Value::String(value) => bytes.extend_from_slice(value),
+                            Value::Integer(value) => {
+                                bytes.extend_from_slice(value.to_string().as_bytes());
+                            }
+                            Value::Number(value) => {
+                                bytes.extend_from_slice(value.to_string().as_bytes());
+                            }
+                            other => {
+                                return Err(RuntimeError::Type {
+                                    operation: "concatenation",
+                                    expected: "string or number",
+                                    actual: other.type_name(),
+                                });
+                            }
+                        }
+                    }
+                    frame.set(instruction.a(), Value::String(Arc::from(bytes)))?;
                 }
                 Opcode::Return => {
                     let start = usize::from(instruction.a());

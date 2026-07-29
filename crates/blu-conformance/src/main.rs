@@ -58,6 +58,20 @@ values[1] = 3
 values.answer = 4
 print(type(values[1] + values.answer) .. ":" .. tostring(values[1] + values.answer))
 "#;
+const LOOP_SOURCE: &str = r#"
+local total = 0
+for index = 1, 5 do
+    total += index
+end
+return total
+"#;
+const LOOP_REFERENCE_SOURCE: &str = r#"
+local total = 0
+for index = 1, 5 do
+    total += index
+end
+print(type(total) .. ":" .. tostring(total))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -92,6 +106,14 @@ fn run() -> Result<(), String> {
         &args.upstream,
         temporary.path(),
     )?;
+    verify_program_case(
+        "numeric for loop",
+        LOOP_SOURCE,
+        LOOP_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
 
     let portable_source = temporary.path().join("portable.lua");
     fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
@@ -111,7 +133,7 @@ fn run() -> Result<(), String> {
     println!("pinned Luau revision: {PINNED_REVISION}");
     println!("bytecode version: {bytecode_version}");
     println!("scalar differential corpus: pass ({scalar_count} cases)");
-    println!("heap differential corpus: pass (table identity and access)");
+    println!("program differential corpus: pass (tables and numeric loops)");
     println!("portable reference matrix: pass (Luau, Lua 5.1-5.5)");
     Ok(())
 }
