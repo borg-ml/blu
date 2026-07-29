@@ -41,6 +41,10 @@ dependencies = [
 ]
 
 [[package]]
+name = "blu-core"
+version = "0.1.0"
+
+[[package]]
 name = "blu-lang"
 version = "0.1.0"
 dependencies = [

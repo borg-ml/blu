@@ -3,6 +3,7 @@ members = [
     "crates/blu-bytecode",
     "crates/blu-compiler",
     "crates/blu-conformance",
+    "crates/blu-core",
     "crates/blu-lang",
     "crates/blu-package",
     "crates/blu-runtime",

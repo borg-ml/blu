@@ -42,6 +42,7 @@ claim of complete Luau, Lua, or Blu compatibility.
 ## Repository layout
 
 - `blu-lang`: public facade crate for embedding Blu.
+- `blu-core`: dependency-free semantic profiles, source identities, byte spans, and diagnostics.
 - `blu-compiler`: isolated in-process Luau source compiler adapter.
 - `blu-bytecode`: versioned Luau instruction decoding and serialized chunk loading.
 - `blu-package`: bounded canonical package envelopes and artifact validation.
