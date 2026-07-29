@@ -350,6 +350,27 @@ fn whitespace_escape_is_profile_gated_and_spans_lines() {
 }
 
 #[test]
+fn escaped_physical_line_endings_are_shared() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return \"a\\\nb\", \"c\\\r\nd\", \"e\\\rf\"".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::Return,
+                TokenKind::StringLiteral,
+                TokenKind::Comma,
+                TokenKind::StringLiteral,
+                TokenKind::Comma,
+                TokenKind::StringLiteral,
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn conflicting_directive_is_reported_on_its_value() {
     let source = source(b"--!dialect lua54\r\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

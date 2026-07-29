@@ -389,6 +389,18 @@ pub fn lex(
                             offset += 1;
                             continue;
                         };
+                        if escaped == b'\n' {
+                            offset += 2;
+                            continue;
+                        }
+                        if escaped == b'\r' {
+                            offset += if bytes.get(offset + 2) == Some(&b'\n') {
+                                3
+                            } else {
+                                2
+                            };
+                            continue;
+                        }
                         if matches!(
                             escaped,
                             b'\\' | b'\'' | b'"' | b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v'

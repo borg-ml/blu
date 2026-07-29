@@ -1134,6 +1134,25 @@ fn whitespace_escape_consumes_all_following_ascii_space() {
 }
 
 #[test]
+fn escaped_physical_line_endings_normalize_to_lf() {
+    let source = make_source(b"return \"a\\\nb\", \"c\\\r\nd\", \"e\\\rf\"".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            compiled.artifact().main().constants,
+            [
+                Constant::String(b"a\nb".to_vec()),
+                Constant::String(b"c\nd".to_vec()),
+                Constant::String(b"e\nf".to_vec()),
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn artifact_register_limit_is_separate_from_bootstrap_translation_limit() {
     use core::fmt::Write;
 

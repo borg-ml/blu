@@ -1350,6 +1350,17 @@ fn decode_string_escape(
     if let Some(decoded) = decode_common_string_escape(escaped) {
         return Ok((Some(decoded), 2));
     }
+    if escaped == b'\n' {
+        return Ok((Some(b'\n'), 2));
+    }
+    if escaped == b'\r' {
+        let consumed = if value.get(offset + 2) == Some(&b'\n') {
+            3
+        } else {
+            2
+        };
+        return Ok((Some(b'\n'), consumed));
+    }
     if escaped.is_ascii_digit() {
         let mut cursor = offset + 1;
         let mut decoded = 0_u16;

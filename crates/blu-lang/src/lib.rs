@@ -400,6 +400,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let line_continuations = SourceFile::new(
+            SourceId::new(16),
+            "line-continuations.blu",
+            b"return \"a\\\nb\", \"c\\\r\nd\", \"e\\\rf\"".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -409,6 +416,19 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&line_continuations, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![
+                    Value::String(Arc::from(&b"a\nb"[..])),
+                    Value::String(Arc::from(&b"c\nd"[..])),
+                    Value::String(Arc::from(&b"e\nf"[..])),
+                ]),
+                "{profile}"
+            );
             let compiled = OwnedCompiler::default()
                 .compile(&decimal_byte_escapes, profile, compiler.clone())
                 .unwrap();
