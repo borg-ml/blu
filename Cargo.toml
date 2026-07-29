@@ -21,7 +21,7 @@ authors = ["Borg contributors"]
 
 [workspace.dependencies]
 blu-bytecode = { version = "0.1.0", path = "crates/blu-bytecode" }
-blu-compiler = { version = "0.1.0", path = "crates/blu-compiler" }
+blu-compiler = { version = "0.1.0", path = "crates/blu-compiler", default-features = false }
 blu-core = { version = "0.1.0", path = "crates/blu-core" }
 blu-package = { version = "0.1.0", path = "crates/blu-package" }
 blu-runtime = { version = "0.1.0", path = "crates/blu-runtime" }

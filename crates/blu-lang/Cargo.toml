@@ -12,6 +12,6 @@ authors.workspace = true
 
 [dependencies]
 blu-bytecode.workspace = true
-blu-compiler.workspace = true
+blu-compiler = { workspace = true, features = ["legacy-luau"] }
 blu-package.workspace = true
 blu-runtime.workspace = true

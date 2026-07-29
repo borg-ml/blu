@@ -1,5 +1,9 @@
 #![forbid(unsafe_code)]
 
+#[cfg(not(feature = "legacy-luau"))]
+fn main() {}
+
+#[cfg(feature = "legacy-luau")]
 fn main() {
     let mut shim = cc::Build::new();
     shim.cpp(true).std("c++17").file("native/compiler_shim.cpp");

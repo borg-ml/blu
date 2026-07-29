@@ -4,7 +4,7 @@ use blu_bytecode::blu::{
     UpvalueDebug, ValidatedArtifact, ValidationError, decode, decode_validated, encode,
     instruction_is_legal, translate_baseline_to_luau,
 };
-use blu_bytecode::{ChunkError, LoadLimits, Opcode, load};
+use blu_bytecode::{ChunkError, Constant as LuauConstant, LoadLimits, Opcode, load};
 use blu_core::{
     ByteSpan, CompilerId, CompilerIdentity, IdentityLimits, SemanticProfile, SourceId,
     SourceIdentity,
@@ -62,6 +62,7 @@ fn first_constant_and_instruction_offsets(bytes: &[u8]) -> (usize, usize) {
                 let mut length_offset = offset + 1;
                 1 + 4 + read_u32(bytes, &mut length_offset) as usize
             }
+            5 => 9,
             _ => panic!("fixture has an invalid constant tag"),
         };
     }
@@ -194,6 +195,25 @@ fn canonical_round_trip_preserves_profiles_and_metadata() {
 }
 
 #[test]
+fn pre_integer_baseline_encoding_remains_byte_for_byte_stable() {
+    const EXPECTED: &[u8] = &[
+        66, 76, 85, 0, 1, 0, 0, 0, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66, 66,
+        3, 0, 0, 0, 98, 108, 117, 3, 0, 0, 0, 48, 46, 49, 0, 1, 0, 0, 0, 7, 0, 0, 0, 8, 0, 0, 0,
+        116, 101, 115, 116, 46, 98, 108, 117, 80, 0, 0, 0, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90,
+        90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 1,
+        0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 7, 0, 0, 0, 3, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2, 0, 0,
+        0, 3, 0, 0, 0, 0, 0, 0, 68, 64, 3, 0, 0, 0, 0, 0, 0, 0, 64, 0, 0, 0, 0, 0, 0, 0, 0, 4, 0,
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 1, 0, 0, 0, 1, 2, 0, 0, 0, 1, 0, 2, 2, 0, 1, 0, 4, 0,
+        0, 0, 7, 0, 0, 0, 34, 0, 0, 0, 36, 0, 0, 0, 7, 0, 0, 0, 71, 0, 0, 0, 72, 0, 0, 0, 7, 0, 0,
+        0, 34, 0, 0, 0, 72, 0, 0, 0, 7, 0, 0, 0, 64, 0, 0, 0, 72, 0, 0, 0, 1, 0, 0, 0, 6, 0, 0, 0,
+        97, 110, 115, 119, 101, 114, 0, 0, 1, 0, 0, 0, 4, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    let limits = BluLimits::default();
+    let validated = ValidatedArtifact::new(baseline_fixture(SemanticProfile::Blu), limits).unwrap();
+    assert_eq!(encode(&validated, limits).unwrap(), EXPECTED);
+}
+
+#[test]
 fn all_seven_profile_tags_round_trip_canonically() {
     let limits = BluLimits::default();
     let golden = [
@@ -277,6 +297,111 @@ fn floating_constants_preserve_ieee_bits_canonically() {
 }
 
 #[test]
+fn integer_constants_have_a_stable_tag_and_canonical_round_trip() {
+    let limits = BluLimits::default();
+    let values = [
+        i64::MIN,
+        -(1_i64 << 54),
+        -(1_i64 << 53) - 1,
+        -(1_i64 << 53),
+        -1,
+        0,
+        1,
+        1_i64 << 53,
+        1_i64 << 54,
+        i64::MAX,
+    ];
+    let mut artifact = baseline_fixture(SemanticProfile::Blu);
+    artifact.prototypes[0].required_features =
+        FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS;
+    artifact.prototypes[0].constants = values.into_iter().map(Constant::Integer).collect();
+    artifact.prototypes[0].code[0] = Instruction::LoadConstant {
+        destination: 0,
+        constant: 0,
+    };
+    artifact.prototypes[0].code[1] = Instruction::LoadConstant {
+        destination: 1,
+        constant: values.len() as u32 - 1,
+    };
+    let validated = ValidatedArtifact::new(artifact, limits).unwrap();
+    let bytes = encode(&validated, limits).unwrap();
+    let (first_constant, _) = first_constant_and_instruction_offsets(&bytes);
+
+    assert_eq!(bytes[first_constant], 5);
+    assert_eq!(
+        &bytes[first_constant + 1..first_constant + 9],
+        &i64::MIN.to_le_bytes()
+    );
+    assert_eq!(format!("{:?}", Constant::Integer(-7)), "Integer(-7)");
+
+    let decoded = decode_validated(&bytes, limits).unwrap();
+    assert_eq!(decoded, validated);
+    assert_eq!(encode(&decoded, limits).unwrap(), bytes);
+    assert_eq!(
+        decoded.prototypes()[0].constants,
+        values.map(Constant::Integer)
+    );
+
+    let mut mutated_tag = bytes.clone();
+    mutated_tag[first_constant] = 6;
+    assert!(matches!(
+        decode(&mutated_tag, limits),
+        Err(DecodeError::InvalidTag {
+            what: "constant",
+            tag: 6,
+            ..
+        })
+    ));
+
+    let exact_size_limits = BluLimits {
+        max_bytes: bytes.len(),
+        ..limits
+    };
+    assert!(ValidatedArtifact::new(decode(&bytes, limits).unwrap(), exact_size_limits).is_ok());
+    let below_size_limits = BluLimits {
+        max_bytes: bytes.len() - 1,
+        ..limits
+    };
+    assert!(matches!(
+        ValidatedArtifact::new(decode(&bytes, limits).unwrap(), below_size_limits),
+        Err(ValidationError::Limit {
+            what: "encoded artifact bytes",
+            ..
+        })
+    ));
+
+    for available_body_bytes in 0..8 {
+        let end = first_constant + 1 + available_body_bytes;
+        assert!(
+            decode(&bytes[..end], limits).is_err(),
+            "integer body prefix {available_body_bytes}"
+        );
+    }
+}
+
+#[test]
+fn integer_storage_is_feature_gated_but_profile_neutral() {
+    let limits = BluLimits::default();
+    for profile in SemanticProfile::ALL {
+        let mut missing = baseline_fixture(profile);
+        missing.prototypes[0].constants[0] = Constant::Integer(1);
+        assert!(matches!(
+            ValidatedArtifact::new(missing, limits),
+            Err(ValidationError::MissingFeature {
+                prototype: 0,
+                feature: "integer constants",
+            })
+        ));
+
+        let mut declared = baseline_fixture(profile);
+        declared.prototypes[0].constants[0] = Constant::Integer(1);
+        declared.prototypes[0].required_features =
+            FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS;
+        assert!(ValidatedArtifact::new(declared, limits).is_ok());
+    }
+}
+
+#[test]
 fn blu_v1_is_not_accepted_as_a_luau_chunk() {
     let limits = BluLimits::default();
     let bytes = encode(&ValidatedArtifact::new(fixture(), limits).unwrap(), limits).unwrap();
@@ -305,6 +430,60 @@ fn baseline_translation_is_explicit_validated_and_profile_preserving() {
     assert_eq!(main.instructions[2].opcode(), Opcode::Add);
     assert_eq!(main.instructions[3].opcode(), Opcode::Return);
     assert_eq!(main.instructions[3].b(), 2);
+}
+
+#[test]
+fn baseline_translation_only_converts_exact_integer_numbers() {
+    let limits = BluLimits::default();
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        for value in [
+            0,
+            -(1_i64 << 54),
+            -(1_i64 << 53),
+            1_i64 << 53,
+            (1_i64 << 53) + 2,
+            1_i64 << 54,
+            i64::MIN,
+        ] {
+            let mut artifact = baseline_fixture(profile);
+            artifact.prototypes[0].constants[0] = Constant::Integer(value);
+            artifact.prototypes[0].required_features =
+                FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS;
+            let artifact = ValidatedArtifact::new(artifact, limits).unwrap();
+            let translated = translate_baseline_to_luau(artifact, profile, limits).unwrap();
+            assert!(matches!(
+                translated.into_validated_chunk().prototypes[0].constants[0],
+                LuauConstant::Number(number) if number.to_bits() == (value as f64).to_bits()
+            ));
+        }
+    }
+
+    for value in [-(1_i64 << 53) - 1, (1_i64 << 53) + 1, i64::MAX] {
+        let mut artifact = baseline_fixture(SemanticProfile::Blu);
+        artifact.prototypes[0].constants[0] = Constant::Integer(value);
+        artifact.prototypes[0].required_features =
+            FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS;
+        let artifact = ValidatedArtifact::new(artifact, limits).unwrap();
+        assert_eq!(
+            translate_baseline_to_luau(artifact, SemanticProfile::Blu, limits),
+            Err(TranslationError::IntegerNotExactlyRepresentable {
+                prototype: 0,
+                constant: 0,
+                value,
+            })
+        );
+    }
+
+    let mut lua54 = baseline_fixture(SemanticProfile::Lua54);
+    lua54.prototypes[0].constants[0] = Constant::Integer(1);
+    lua54.prototypes[0].required_features = FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS;
+    let lua54 = ValidatedArtifact::new(lua54, limits).unwrap();
+    assert_eq!(
+        translate_baseline_to_luau(lua54, SemanticProfile::Lua54, limits),
+        Err(TranslationError::UnsupportedExecutionProfile(
+            SemanticProfile::Lua54
+        ))
+    );
 }
 
 #[test]

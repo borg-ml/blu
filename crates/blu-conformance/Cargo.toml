@@ -10,6 +10,6 @@ authors.workspace = true
 publish = false
 
 [dependencies]
-blu-compiler.workspace = true
+blu-compiler = { workspace = true, features = ["legacy-luau"] }
 blu-runtime.workspace = true
 tempfile.workspace = true

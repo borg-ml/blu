@@ -29,9 +29,12 @@ name = "blu-compiler"
 version = "0.1.0"
 dependencies = [
  "blu-bytecode",
+ "blu-core",
  "blu-runtime",
+ "blu-syntax",
  "cc",
  "luau0-src",
+ "sha2",
 ]
 
 [[package]]

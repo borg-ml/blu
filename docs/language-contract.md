@@ -52,10 +52,33 @@ expression-list `return`, and decimal-integer/identifier expressions with `+`
 and `//` precedence. Parsing retains the explicit profile and rejects
 diagnostics without exposing a partial AST. It does not resolve, lower, emit,
 compile, or execute source, and the public engine does not silently select it
-as a compiler. Parser-owned arenas, lists, copied found-bytes, and diagnostic
-counts are bounded and reserve fallibly; construction of diagnostic strings
-and expected-token lists still inherits infallible allocation from
-`blu-core` and remains an explicit hardening gap.
+as a compiler. Parser-owned arenas, lists, and diagnostic counts are bounded
+and reserve fallibly. `blu-core::DiagnosticLimits` separately bounds each
+diagnostic's label text, secondary labels, expected items, raw found bytes,
+notes, and help; the lexer and parser construct these values through fallible
+APIs and surface `DiagnosticError` through `LexError` or `ParseError`. These
+are frontend object limits with structured allocation failures, not a claim
+that every process or host allocation is VM-accounted.
+
+The separate `blu_compiler::owned::OwnedCompiler` compiles exactly this AST
+slice: declaration-ordered locals (with explicit shadowing), decimal integer
+literals, numeric `+`, and a final expression-list `return`. Lua 5.3--5.5
+artifacts store literals through `i64::MAX` as exact BluV1 Integer constants
+and use normal IEEE-754 parsing above that; Lua 5.1, Lua 5.2, and Luau always
+use the latter Number policy. Blu currently uses the Number policy for its
+bootstrap path, which is not a final Blu numeric-semantics commitment. The
+compiler emits canonical, source-digested artifacts tagged for all seven
+profiles, but rejects `//` because BluV1 has no floor-division opcode. It does
+not replace the legacy `Compiler`, call the native Luau compiler, or fall back
+to it after rejection. Only matching `blu` and `luau` artifacts can currently
+use the profile-safe bootstrap translator and VM execution entry point.
+Resolution and lowering rejections use bounded, fallibly constructed
+`blu-core::Diagnostic` values with stable codes, phases, profiles, and byte
+spans; diagnostic-construction failures remain separate structured errors.
+`blu-compiler` disables its `legacy-luau` feature by default, so direct owned
+compiler builds do not compile or link the native oracle. The current facade
+and conformance runner enable that compatibility feature explicitly until
+their source paths migrate.
 
 The BluV1 baseline artifact can be translated only for an explicitly matching
 `blu` or `luau` profile. Translation revalidates the artifact under caller
@@ -144,7 +167,10 @@ object-buffer charges while retaining reusable arena-slot charges. This is
 still a partial accounting boundary: strings, chunks, VM stacks, the arena
 free list, collection work queues, temporary results, and host-owned values are
 not included. Dynamic VM-register growth is nevertheless capped and uses
-fallible reservation before changing a frame. Results returned from a native
+fallible reservation before changing a frame. Initial frame registers,
+constants, varargs, call arguments and results, active/continuation root
+vectors, caller-stack growth, and coroutine/protected-call wrappers likewise
+reserve fallibly before changing logical state. Results returned from a native
 callback are count-bounded (1,000,000 by default, configurable with
 `Vm::with_native_result_limit`) and rejected before caller-frame writes, but
 allocations performed inside host callback code remain the embedder's

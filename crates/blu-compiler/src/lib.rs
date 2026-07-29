@@ -1,21 +1,34 @@
 #![deny(unsafe_code)]
 #![deny(unsafe_op_in_unsafe_fn)]
 
-//! In-process Luau source compilation for Blu.
+//! Source compiler APIs for Blu.
 //!
-//! The foreign compiler boundary is isolated in this crate. Every returned
-//! buffer is copied into Rust-owned memory, released with the matching C
-//! allocator, and decoded under [`blu_bytecode::LoadLimits`] before use.
+//! The [`owned`] module is a safe-Rust, byte-oriented BluV1 compiler slice and
+//! never calls a native compiler. Native compiler support is disabled by
+//! default. Explicitly enabling the `legacy-luau` feature additionally exposes
+//! the crate-level `Compiler` API backed by the pinned Luau C++ oracle.
+//!
+//! ```
+//! let compiler = blu_compiler::owned::OwnedCompiler::default();
+//! let _ = compiler.limits();
+//! ```
 
+#[cfg(feature = "legacy-luau")]
 use blu_bytecode::{Chunk, ChunkError, LoadLimits, ValidatedChunk, load_validated};
+#[cfg(feature = "legacy-luau")]
 use core::fmt;
 
+pub mod owned;
+
+#[cfg(feature = "legacy-luau")]
 #[allow(unsafe_code)]
 mod ffi;
 
 /// The bundled compiler's Luau release number.
+#[cfg(feature = "legacy-luau")]
 pub const LUAU_COMPILER_RELEASE: &str = env!("LUAU_VERSION");
 
+#[cfg(feature = "legacy-luau")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CompileOptions {
     pub optimization_level: u8,
@@ -24,6 +37,7 @@ pub struct CompileOptions {
     pub coverage_level: u8,
 }
 
+#[cfg(feature = "legacy-luau")]
 impl Default for CompileOptions {
     fn default() -> Self {
         Self {
@@ -35,18 +49,21 @@ impl Default for CompileOptions {
     }
 }
 
+#[cfg(feature = "legacy-luau")]
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Compiler {
     options: CompileOptions,
     load_limits: LoadLimits,
 }
 
+#[cfg(feature = "legacy-luau")]
 #[derive(Clone, Debug)]
 pub struct CompiledBytecode {
     pub bytes: Vec<u8>,
     pub chunk: ValidatedChunk,
 }
 
+#[cfg(feature = "legacy-luau")]
 impl Compiler {
     #[must_use]
     pub const fn new(options: CompileOptions, load_limits: LoadLimits) -> Self {
@@ -84,6 +101,7 @@ impl Compiler {
     }
 }
 
+#[cfg(feature = "legacy-luau")]
 fn validate_level(name: &'static str, value: u8, maximum: u8) -> Result<(), CompileError> {
     if value <= maximum {
         Ok(())
@@ -96,6 +114,7 @@ fn validate_level(name: &'static str, value: u8, maximum: u8) -> Result<(), Comp
     }
 }
 
+#[cfg(feature = "legacy-luau")]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum CompileError {
     Option {
@@ -113,6 +132,7 @@ pub enum CompileError {
     Chunk(ChunkError),
 }
 
+#[cfg(feature = "legacy-luau")]
 impl CompileError {
     fn from_ffi(error: ffi::Error) -> Self {
         match error {
@@ -136,6 +156,7 @@ impl CompileError {
     }
 }
 
+#[cfg(feature = "legacy-luau")]
 impl fmt::Display for CompileError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -162,6 +183,7 @@ impl fmt::Display for CompileError {
     }
 }
 
+#[cfg(feature = "legacy-luau")]
 impl std::error::Error for CompileError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
@@ -171,7 +193,7 @@ impl std::error::Error for CompileError {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "legacy-luau"))]
 mod tests {
     use super::*;
     use blu_runtime::{Value, Vm};

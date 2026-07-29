@@ -44,7 +44,13 @@ pub struct FeatureBits(u64);
 impl FeatureBits {
     /// Straight-line constant loads, numeric addition, and return.
     pub const BASELINE: Self = Self(1);
-    pub const SUPPORTED: Self = Self(Self::BASELINE.0);
+    /// Lossless `i64` constant storage, without implying integer execution.
+    ///
+    /// Feature declarations are rejected by validation after bounded decoding.
+    /// A decoder predating integer tag 5 may instead safely reject that tag as
+    /// an unknown constant.
+    pub const INTEGER_CONSTANTS: Self = Self(1 << 1);
+    pub const SUPPORTED: Self = Self(Self::BASELINE.0 | Self::INTEGER_CONSTANTS.0);
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -178,20 +184,25 @@ pub enum Constant {
     Nil,
     Boolean(bool),
     Number(f64),
+    Integer(i64),
     String(Vec<u8>),
 }
 
-/// Numeric constants use bitwise IEEE-754 identity.
+/// Floating constants use bitwise IEEE-754 identity; integer constants use
+/// exact `i64` identity.
 ///
 /// Encoding preserves every `f64::to_bits` pattern exactly, including NaN
 /// payloads, signed zero, infinities, and subnormals. Distinct bit patterns
-/// are distinct BluV1 constants.
+/// are distinct BluV1 constants. `Integer` is a profile-neutral storage form:
+/// it requires `FeatureBits::INTEGER_CONSTANTS` but does not claim integer
+/// arithmetic semantics for any profile.
 impl PartialEq for Constant {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (Self::Nil, Self::Nil) => true,
             (Self::Boolean(left), Self::Boolean(right)) => left == right,
             (Self::Number(left), Self::Number(right)) => left.to_bits() == right.to_bits(),
+            (Self::Integer(left), Self::Integer(right)) => left == right,
             (Self::String(left), Self::String(right)) => left == right,
             _ => false,
         }
@@ -921,6 +932,19 @@ fn validate_prototype(
             feature: "baseline",
         });
     }
+    if prototype
+        .constants
+        .iter()
+        .any(|constant| matches!(constant, Constant::Integer(_)))
+        && !prototype
+            .required_features
+            .contains(FeatureBits::INTEGER_CONSTANTS)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "integer constants",
+        });
+    }
     let Some(&source_len) = sources.get(&prototype.source) else {
         return Err(ValidationError::InvalidSourceMap {
             prototype: index,
@@ -1244,7 +1268,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                 &mut size,
                 match constant {
                     Constant::Nil | Constant::Boolean(_) => 1,
-                    Constant::Number(_) => 9,
+                    Constant::Number(_) | Constant::Integer(_) => 9,
                     Constant::String(bytes) => 1 + 4 + bytes.len(),
                 },
             )?;
@@ -1322,6 +1346,10 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
             Constant::String(bytes) => {
                 out.push(4);
                 put_bytes(out, "constant bytes", bytes)?;
+            }
+            Constant::Integer(value) => {
+                out.push(5);
+                put_i64(out, *value);
             }
         }
     }
@@ -1414,6 +1442,10 @@ fn put_u32(out: &mut Vec<u8>, value: u32) {
 }
 
 fn put_u64(out: &mut Vec<u8>, value: u64) {
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn put_i64(out: &mut Vec<u8>, value: i64) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
@@ -1856,6 +1888,7 @@ fn read_prototype(
                 budget.charge_owned(bytes.len(), limits)?;
                 Constant::String(owned_decode_bytes("constant bytes", bytes)?)
             }
+            5 => Constant::Integer(reader.i64()?),
             tag => {
                 return Err(DecodeError::InvalidTag {
                     offset,
@@ -2118,6 +2151,10 @@ impl<'a> Reader<'a> {
 
     fn u64(&mut self) -> Result<u64, DecodeError> {
         Ok(u64::from_le_bytes(self.array()?))
+    }
+
+    fn i64(&mut self) -> Result<i64, DecodeError> {
+        Ok(i64::from_le_bytes(self.array()?))
     }
 
     fn remaining(&self) -> usize {

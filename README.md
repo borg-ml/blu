@@ -41,30 +41,34 @@ claim of complete Luau, Lua, or Blu compatibility.
 
 The first Blu-owned frontend substrate is also present: `blu-syntax` performs
 bounded byte-oriented lexing and parses the initial local/return arithmetic
-slice into a spanned arena AST with explicit profile reconciliation. It is not
-yet connected to resolution or code generation, so public source execution
-still uses the pinned Luau compatibility compiler. Hand-built BluV1 baseline
-artifacts can be revalidated under execution limits, translated into a
-profile-tagged bootstrap chunk, and consumed by the VM without discarding the
-authorized Blu/Luau profile.
+slice into a spanned arena AST with explicit profile reconciliation.
+`blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into
+canonical BluV1 artifacts without native linkage or fallback. Public
+`blu-lang` source execution still explicitly enables the pinned Luau
+compatibility compiler while the owned execution path is incomplete. BluV1
+baseline artifacts can be revalidated under execution limits, translated into
+a profile-tagged bootstrap chunk, and consumed by the VM without discarding
+the authorized Blu/Luau profile.
 
 ## Repository layout
 
 - `blu-lang`: public facade crate for embedding Blu.
 - `blu-core`: dependency-free semantic profiles, source identities, byte spans, and diagnostics.
 - `blu-syntax`: bounded byte lexer and initial parser/AST for the Blu-owned frontend.
-- `blu-compiler`: isolated in-process Luau source compiler adapter.
+- `blu-compiler`: safe-Rust BluV1 compiler slice, with an opt-in legacy Luau compiler adapter.
 - `blu-bytecode`: bounded BluV1 artifacts plus versioned Luau decoding and loading.
 - `blu-package`: bounded canonical package envelopes and artifact validation.
 - `blu-runtime`: values, heap, interpreter, interruption, and Rust host API.
 - `blu-conformance`: differential execution against pinned Luau and Lua runtimes.
 - `.upstream/luau`: ignored checkout created by `just upstream`.
 
-The pure-Rust core, syntax, bytecode, package, runtime, facade, and conformance
-crates forbid unsafe Rust at the crate level. `blu-compiler` contains the
-isolated native boundary for the pinned upstream Luau C++ compiler; a
-`noexcept` shim translates native exceptions and owns
-allocation/deallocation across that boundary.
+The Rust core, syntax, bytecode, package, runtime, facade, and conformance
+crates forbid unsafe Rust at the crate level. `blu-compiler` builds its owned
+compiler without native dependencies by default. Its opt-in `legacy-luau`
+feature contains the isolated boundary for the pinned upstream Luau C++
+compiler; a `noexcept` shim translates native exceptions and owns
+allocation/deallocation across that boundary. The current `blu-lang` facade
+and conformance runner enable that compatibility feature explicitly.
 
 ## Development
 

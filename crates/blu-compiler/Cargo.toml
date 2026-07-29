@@ -1,6 +1,6 @@
 [package]
 name = "blu-compiler"
-description = "In-process Luau source compiler adapter for Blu"
+description = "Blu-owned compiler slice and explicit legacy Luau compiler adapter"
 keywords = ["lua", "luau", "compiler", "scripting", "ffi"]
 version.workspace = true
 edition.workspace = true
@@ -9,12 +9,19 @@ license.workspace = true
 repository.workspace = true
 authors.workspace = true
 
+[features]
+default = []
+legacy-luau = ["dep:cc", "dep:luau0-src"]
+
 [dependencies]
 blu-bytecode.workspace = true
+blu-core.workspace = true
+blu-syntax.workspace = true
+sha2.workspace = true
 
 [build-dependencies]
-cc = "1.2"
-luau0-src = "=0.20.7"
+cc = { version = "1.2", optional = true }
+luau0-src = { version = "=0.20.7", optional = true }
 
 [dev-dependencies]
 blu-runtime.workspace = true

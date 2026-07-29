@@ -17,6 +17,10 @@ use core::fmt;
 /// `blu` or `luau` execution profile and rejects nested prototypes and
 /// upvalues, whose profile and capture metadata cannot yet be represented
 /// faithfully by the bootstrap chunk model.
+///
+/// BluV1 integer constants are mapped to the bootstrap's Luau numeric
+/// constant only when the `i64` is exactly representable as an IEEE-754
+/// `f64`; values which would round are rejected explicitly.
 pub fn translate_baseline_to_luau(
     artifact: ValidatedArtifact,
     execution_profile: SemanticProfile,
@@ -104,11 +108,21 @@ pub fn translate_baseline_to_luau(
             prototype.constants.len(),
             "prototype constants",
         )?;
-        for constant in prototype.constants {
+        for (constant_index, constant) in prototype.constants.into_iter().enumerate() {
             constants.push(match constant {
                 BluConstant::Nil => crate::Constant::Nil,
                 BluConstant::Boolean(value) => crate::Constant::Boolean(value),
                 BluConstant::Number(value) => crate::Constant::Number(value),
+                BluConstant::Integer(value) => {
+                    if !integer_is_exact_f64(value) {
+                        return Err(TranslationError::IntegerNotExactlyRepresentable {
+                            prototype: prototype_index,
+                            constant: constant_index,
+                            value,
+                        });
+                    }
+                    crate::Constant::Number(value as f64)
+                }
                 BluConstant::String(bytes) => {
                     let index = strings.len();
                     strings.push(bytes);
@@ -163,6 +177,13 @@ pub fn translate_baseline_to_luau(
         profile: execution_profile,
         chunk,
     })
+}
+
+fn integer_is_exact_f64(value: i64) -> bool {
+    let magnitude = value.unsigned_abs();
+    let significant_bits = u64::BITS - magnitude.leading_zeros();
+    significant_bits <= f64::MANTISSA_DIGITS
+        || magnitude.trailing_zeros() >= significant_bits - f64::MANTISSA_DIGITS
 }
 
 fn translate_instruction(
@@ -278,6 +299,11 @@ pub enum TranslationError {
         prototype: usize,
         what: &'static str,
     },
+    IntegerNotExactlyRepresentable {
+        prototype: usize,
+        constant: usize,
+        value: i64,
+    },
     TooLarge {
         prototype: Option<usize>,
         what: &'static str,
@@ -316,6 +342,15 @@ impl fmt::Display for TranslationError {
             Self::UnsupportedStructure { prototype, what } => write!(
                 formatter,
                 "prototype {prototype} uses {what}, which the baseline translator cannot preserve"
+            ),
+            Self::IntegerNotExactlyRepresentable {
+                prototype,
+                constant,
+                value,
+            } => write!(
+                formatter,
+                "prototype {prototype} integer constant {constant} value {value} \
+                 is not exactly representable by the Luau bootstrap number type"
             ),
             Self::TooLarge {
                 prototype,

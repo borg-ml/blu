@@ -1,0 +1,839 @@
+//! Blu-owned compilation for the first dependency-gated frontend slice.
+//!
+//! This module is intentionally separate from the legacy crate-level
+//! [`crate::Compiler`]. It emits the shared BluV1 baseline for all seven
+//! established profiles, parses through `blu-syntax`, resolves local names,
+//! and round-trips the result through the canonical encoder and validated
+//! decoder. It never calls the native Luau compiler. Bootstrap translation and
+//! execution remain separately restricted to `blu` and `luau`.
+//! Locals resolve in declaration order: use before declaration is an error,
+//! while a repeated name explicitly shadows the earlier binding.
+//! Lua 5.3--5.5 decimal literals use an exact `Integer` constant when they fit
+//! `i64`, then fall back to normal IEEE-754 parsing. Lua 5.1, Lua 5.2, and Luau
+//! always use IEEE-754 parsing. Blu currently follows that Number-only
+//! bootstrap policy; this is not a final Blu numeric-semantics claim.
+
+// Keeping the bounded Diagnostic inline avoids introducing an infallible
+// boxing allocation on an error path.
+#![allow(clippy::result_large_err)]
+
+use blu_bytecode::blu::{
+    Artifact, BluLimits, BytecodeFormat, Constant, DecodeError, EncodeError, FeatureBits,
+    Instruction, LocalDebug, Prototype, SourceRecord, ValidatedArtifact, ValidationError,
+    decode_validated, encode,
+};
+use blu_core::{
+    ByteSpan, CompilerIdentity, Diagnostic, DiagnosticError, IdentityError, Phase, SemanticProfile,
+    Severity, SourceFile, SourceIdentity, SpanError,
+};
+use blu_syntax::{
+    Ast, BinaryOperator, Expression, ExpressionId, ExpressionKind, LocalStatement, ParseError,
+    ParseLimits, ParseOutcome, Rejected, ReturnStatement, Statement, parse,
+};
+use core::fmt;
+use sha2::{Digest, Sha256};
+
+/// Explicit limits for one owned compilation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OwnedCompileLimits {
+    pub parse: ParseLimits,
+    pub artifact: BluLimits,
+    pub max_bindings: usize,
+    pub max_registers: usize,
+    pub max_constants: usize,
+    pub max_instructions: usize,
+    pub max_return_values: usize,
+    /// Maximum decimal-token length; defaults to 256 bytes.
+    pub max_integer_literal_bytes: usize,
+}
+
+impl Default for OwnedCompileLimits {
+    fn default() -> Self {
+        Self {
+            parse: ParseLimits::default(),
+            artifact: BluLimits::default(),
+            max_bindings: 65_535,
+            max_registers: 65_535,
+            max_constants: 1_000_000,
+            max_instructions: 8_000_000,
+            max_return_values: 65_535,
+            // Bounded independently from source size while permitting the
+            // decimal-to-float fallback used by the supported profiles.
+            max_integer_literal_bytes: 256,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum OwnedCompileLimit {
+    Bindings,
+    Registers,
+    Constants,
+    Instructions,
+    ReturnValues,
+    IntegerLiteralBytes,
+    SourceNameBytes,
+    DebugNameBytes,
+    TotalDebugBytes,
+}
+
+impl fmt::Display for OwnedCompileLimit {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Bindings => formatter.write_str("local bindings"),
+            Self::Registers => formatter.write_str("registers"),
+            Self::Constants => formatter.write_str("constants"),
+            Self::Instructions => formatter.write_str("instructions"),
+            Self::ReturnValues => formatter.write_str("return values"),
+            Self::IntegerLiteralBytes => formatter.write_str("integer literal bytes"),
+            Self::SourceNameBytes => formatter.write_str("source identity name bytes"),
+            Self::DebugNameBytes => formatter.write_str("local debug name bytes"),
+            Self::TotalDebugBytes => formatter.write_str("total local debug name bytes"),
+        }
+    }
+}
+
+/// Stateless entry point for the explicitly selected owned backend.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OwnedCompiler {
+    limits: OwnedCompileLimits,
+}
+
+impl OwnedCompiler {
+    #[must_use]
+    pub const fn new(limits: OwnedCompileLimits) -> Self {
+        Self { limits }
+    }
+
+    #[must_use]
+    pub const fn limits(&self) -> OwnedCompileLimits {
+        self.limits
+    }
+
+    /// Compile one source using only Blu-owned Rust frontend code.
+    ///
+    /// `compiler_identity` is consumed into the artifact, avoiding an
+    /// infallible deep clone. The source identity, source bytes, and semantic
+    /// profile come from explicit caller-owned contracts. Source records use
+    /// SHA-256 over the exact source bytes.
+    pub fn compile(
+        &self,
+        source: &SourceFile,
+        profile: SemanticProfile,
+        compiler_identity: CompilerIdentity,
+    ) -> Result<OwnedCompilation, OwnedCompileError> {
+        match profile {
+            SemanticProfile::Blu
+            | SemanticProfile::Luau
+            | SemanticProfile::Lua51
+            | SemanticProfile::Lua52
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55 => {}
+            _ => return Err(OwnedCompileError::UnsupportedProfile(profile)),
+        }
+        check_limit(
+            OwnedCompileLimit::SourceNameBytes,
+            source.identity().name().len(),
+            self.limits.artifact.identity.max_source_name_bytes,
+        )?;
+
+        let parsed = match parse(source, profile, self.limits.parse)? {
+            ParseOutcome::Accepted(parsed) => parsed,
+            ParseOutcome::Rejected(rejected) => {
+                return Err(OwnedCompileError::Syntax(rejected));
+            }
+        };
+        let prototype = Lowerer::new(source, parsed.ast(), self.limits)?.run(parsed.ast())?;
+        let source_name = copy_string(source.identity().name(), "source identity name")?;
+        let source_identity = SourceIdentity::new(
+            source.identity().id(),
+            source_name,
+            self.limits.artifact.identity,
+        )
+        .map_err(OwnedCompileError::Identity)?;
+        let byte_len =
+            u32::try_from(source.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "SourceFile length is not representable by its byte-span contract",
+            })?;
+        let digest: [u8; 32] = Sha256::digest(source.bytes()).into();
+
+        let mut sources = allocate_vec(1, "artifact sources")?;
+        sources.push(SourceRecord {
+            identity: source_identity,
+            byte_len,
+            digest,
+        });
+        let mut prototypes = allocate_vec(1, "artifact prototypes")?;
+        prototypes.push(prototype);
+        let artifact = Artifact {
+            format: BytecodeFormat::BluV1,
+            compiler: compiler_identity,
+            sources,
+            prototypes,
+            main: 0,
+        };
+        let validated = ValidatedArtifact::new(artifact, self.limits.artifact)
+            .map_err(OwnedCompileError::Validation)?;
+        let bytes = encode(&validated, self.limits.artifact).map_err(OwnedCompileError::Encode)?;
+
+        // Return the canonical decoded representation. Dropping the original
+        // first keeps the round trip fallible without retaining two artifacts.
+        drop(validated);
+        let artifact =
+            decode_validated(&bytes, self.limits.artifact).map_err(OwnedCompileError::Decode)?;
+        Ok(OwnedCompilation { bytes, artifact })
+    }
+}
+
+/// Canonically encoded bytes and their validated decoded BluV1 artifact.
+///
+/// This owning result intentionally does not implement `Clone`. Callers can
+/// borrow either representation or consume the result.
+#[derive(Debug, PartialEq)]
+pub struct OwnedCompilation {
+    bytes: Vec<u8>,
+    artifact: ValidatedArtifact,
+}
+
+impl OwnedCompilation {
+    #[must_use]
+    pub fn bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    #[must_use]
+    pub const fn artifact(&self) -> &ValidatedArtifact {
+        &self.artifact
+    }
+
+    #[must_use]
+    pub fn into_validated_artifact(self) -> ValidatedArtifact {
+        self.artifact
+    }
+
+    #[must_use]
+    pub fn into_parts(self) -> (Vec<u8>, ValidatedArtifact) {
+        (self.bytes, self.artifact)
+    }
+}
+
+#[derive(Debug)]
+pub enum OwnedCompileError {
+    UnsupportedProfile(SemanticProfile),
+    Parse(ParseError),
+    Syntax(Rejected),
+    Limit {
+        kind: OwnedCompileLimit,
+        required: usize,
+        limit: usize,
+    },
+    Allocation {
+        what: &'static str,
+        requested: usize,
+    },
+    Diagnostic(Diagnostic),
+    DiagnosticConstruction(DiagnosticError),
+    Identity(IdentityError),
+    Span(SpanError),
+    Validation(ValidationError),
+    Encode(EncodeError),
+    Decode(DecodeError),
+    InternalInvariant {
+        message: &'static str,
+    },
+}
+
+impl OwnedCompileError {
+    #[must_use]
+    pub const fn syntax(&self) -> Option<&Rejected> {
+        match self {
+            Self::Syntax(rejected) => Some(rejected),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub const fn diagnostic(&self) -> Option<&Diagnostic> {
+        match self {
+            Self::Diagnostic(diagnostic) => Some(diagnostic),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for OwnedCompileError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedProfile(profile) => {
+                write!(formatter, "owned compiler profile {profile} is unsupported")
+            }
+            Self::Parse(error) => error.fmt(formatter),
+            Self::Syntax(rejected) => {
+                if let Some(diagnostic) = rejected.diagnostics().first() {
+                    write!(formatter, "source rejected with {}", diagnostic.code())
+                } else {
+                    formatter.write_str("source rejected without a diagnostic")
+                }
+            }
+            Self::Limit {
+                kind,
+                required,
+                limit,
+            } => write!(
+                formatter,
+                "{kind} require {required}, exceeding compiler limit {limit}"
+            ),
+            Self::Allocation { what, requested } => {
+                write!(formatter, "failed to allocate {requested} {what}")
+            }
+            Self::Diagnostic(diagnostic) => write!(
+                formatter,
+                "{}: {}",
+                diagnostic.code(),
+                diagnostic.primary().message()
+            ),
+            Self::DiagnosticConstruction(error) => error.fmt(formatter),
+            Self::Identity(error) => error.fmt(formatter),
+            Self::Span(error) => error.fmt(formatter),
+            Self::Validation(error) => error.fmt(formatter),
+            Self::Encode(error) => error.fmt(formatter),
+            Self::Decode(error) => error.fmt(formatter),
+            Self::InternalInvariant { message } => {
+                write!(formatter, "owned compiler invariant failed: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for OwnedCompileError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Parse(error) => Some(error),
+            Self::DiagnosticConstruction(error) => Some(error),
+            Self::Identity(error) => Some(error),
+            Self::Span(error) => Some(error),
+            Self::Validation(error) => Some(error),
+            Self::Encode(error) => Some(error),
+            Self::Decode(error) => Some(error),
+            Self::UnsupportedProfile(_)
+            | Self::Syntax(_)
+            | Self::Limit { .. }
+            | Self::Allocation { .. }
+            | Self::Diagnostic(_)
+            | Self::InternalInvariant { .. } => None,
+        }
+    }
+}
+
+impl From<ParseError> for OwnedCompileError {
+    fn from(error: ParseError) -> Self {
+        Self::Parse(error)
+    }
+}
+
+impl From<SpanError> for OwnedCompileError {
+    fn from(error: SpanError) -> Self {
+        Self::Span(error)
+    }
+}
+
+impl From<DiagnosticError> for OwnedCompileError {
+    fn from(error: DiagnosticError) -> Self {
+        Self::DiagnosticConstruction(error)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Binding {
+    name: ByteSpan,
+    register: u16,
+    start_pc: u32,
+}
+
+struct Lowerer<'a> {
+    source: &'a SourceFile,
+    profile: SemanticProfile,
+    expressions: &'a [Expression],
+    limits: OwnedCompileLimits,
+    bindings: Vec<Binding>,
+    register_count: usize,
+    constants: Vec<Constant>,
+    code: Vec<Instruction>,
+    source_map: Vec<ByteSpan>,
+}
+
+impl<'a> Lowerer<'a> {
+    fn new(
+        source: &'a SourceFile,
+        ast: &'a Ast,
+        limits: OwnedCompileLimits,
+    ) -> Result<Self, OwnedCompileError> {
+        let capacity = ast.node_count().min(4_096);
+        Ok(Self {
+            source,
+            profile: ast.profile(),
+            expressions: ast.expressions(),
+            limits,
+            bindings: allocate_vec(capacity.min(limits.max_bindings), "local bindings")?,
+            register_count: 0,
+            constants: allocate_vec(capacity.min(limits.max_constants), "constants")?,
+            code: allocate_vec(capacity.min(limits.max_instructions), "instructions")?,
+            source_map: allocate_vec(capacity.min(limits.max_instructions), "source map")?,
+        })
+    }
+
+    fn run(mut self, ast: &Ast) -> Result<Prototype, OwnedCompileError> {
+        let mut saw_return = false;
+        for (index, statement) in ast.statements().iter().enumerate() {
+            match statement {
+                Statement::Local(local) => self.lower_local(*local)?,
+                Statement::Return(return_statement) => {
+                    if index + 1 != ast.statements().len() {
+                        return Err(OwnedCompileError::InternalInvariant {
+                            message: "parser exposed a non-final return statement",
+                        });
+                    }
+                    self.lower_return(return_statement)?;
+                    saw_return = true;
+                }
+            }
+        }
+        if !saw_return {
+            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                "BLU-LOWER-0003",
+                Phase::Lower,
+                ast.span(),
+                "owned compiler slice requires a final return",
+            )?));
+        }
+
+        let end_pc =
+            u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "instruction count passed limits but cannot fit a debug PC",
+            })?;
+        let mut debug_bytes = 0_usize;
+        for binding in &self.bindings {
+            let name_len = self.source.slice(binding.name)?.len();
+            check_limit(
+                OwnedCompileLimit::DebugNameBytes,
+                name_len,
+                self.limits.artifact.max_debug_name_bytes,
+            )?;
+            debug_bytes = debug_bytes
+                .checked_add(name_len)
+                .ok_or(OwnedCompileError::Limit {
+                    kind: OwnedCompileLimit::TotalDebugBytes,
+                    required: usize::MAX,
+                    limit: self.limits.artifact.max_total_debug_bytes,
+                })?;
+            check_limit(
+                OwnedCompileLimit::TotalDebugBytes,
+                debug_bytes,
+                self.limits.artifact.max_total_debug_bytes,
+            )?;
+        }
+        let mut locals = allocate_vec(self.bindings.len(), "local debug entries")?;
+        for binding in self.bindings {
+            let name = copy_bytes(self.source.slice(binding.name)?, "local debug name")?;
+            locals.push(LocalDebug {
+                name,
+                register: binding.register,
+                start_pc: binding.start_pc,
+                end_pc,
+            });
+        }
+
+        let register_count = u16::try_from(self.register_count).map_err(|_| {
+            OwnedCompileError::InternalInvariant {
+                message: "register count passed limits but cannot fit BluV1",
+            }
+        })?;
+        Ok(Prototype {
+            profile: ast.profile(),
+            source: self.source.identity().id(),
+            register_count,
+            parameter_count: 0,
+            is_vararg: false,
+            required_features: if self
+                .constants
+                .iter()
+                .any(|constant| matches!(constant, Constant::Integer(_)))
+            {
+                FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS
+            } else {
+                FeatureBits::BASELINE
+            },
+            constants: self.constants,
+            upvalues: Vec::new(),
+            children: Vec::new(),
+            code: self.code,
+            source_map: self.source_map,
+            locals,
+            upvalue_debug: Vec::new(),
+        })
+    }
+
+    fn lower_local(&mut self, statement: LocalStatement) -> Result<(), OwnedCompileError> {
+        let register = self.lower_expression(statement.value())?;
+        let limit = self
+            .limits
+            .max_bindings
+            .min(self.limits.artifact.max_debug_entries_per_prototype)
+            .min(self.limits.artifact.max_total_debug_entries);
+        check_limit(
+            OwnedCompileLimit::Bindings,
+            self.bindings.len().saturating_add(1),
+            limit,
+        )?;
+        let start_pc =
+            u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "instruction count passed limits but cannot fit a debug PC",
+            })?;
+        push_fallible(
+            &mut self.bindings,
+            Binding {
+                name: statement.name().span(),
+                register,
+                start_pc,
+            },
+            "local bindings",
+        )
+    }
+
+    fn lower_return(&mut self, statement: &ReturnStatement) -> Result<(), OwnedCompileError> {
+        let values = statement.values();
+        let limit = self.limits.max_return_values.min(u16::MAX as usize);
+        check_limit(OwnedCompileLimit::ReturnValues, values.len(), limit)?;
+        if values.is_empty() {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "parser exposed an empty return list",
+            });
+        }
+        let mut registers = allocate_vec(values.len(), "return registers")?;
+        for expression_id in values.iter().copied() {
+            registers.push(self.lower_expression(expression_id)?);
+        }
+        let contiguous = registers
+            .windows(2)
+            .all(|pair| pair[0].checked_add(1) == Some(pair[1]));
+        let first = if contiguous {
+            registers[0]
+        } else {
+            self.copy_return_values(values, &registers)?
+        };
+        let count =
+            u16::try_from(values.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "return count passed limits but cannot fit BluV1",
+            })?;
+        self.emit(Instruction::Return { first, count }, statement.span())
+    }
+
+    /// BluV1 has no baseline move instruction. This slice proves every
+    /// expression numeric, so adding the profile-appropriate zero is an identity
+    /// operation and can normalize a non-contiguous return list.
+    fn copy_return_values(
+        &mut self,
+        values: &[ExpressionId],
+        registers: &[u16],
+    ) -> Result<u16, OwnedCompileError> {
+        let zero = self.push_constant(self.zero_constant())?;
+        let zero_register = self.allocate_register()?;
+        let zero_span = self.expression(values[0])?.span();
+        self.emit(
+            Instruction::LoadConstant {
+                destination: zero_register,
+                constant: zero,
+            },
+            zero_span,
+        )?;
+
+        let mut first = None;
+        for (expression_id, source) in values.iter().copied().zip(registers.iter().copied()) {
+            let destination = self.allocate_register()?;
+            first.get_or_insert(destination);
+            self.emit(
+                Instruction::Add {
+                    destination,
+                    left: source,
+                    right: zero_register,
+                },
+                self.expression(expression_id)?.span(),
+            )?;
+        }
+        first.ok_or(OwnedCompileError::InternalInvariant {
+            message: "non-contiguous empty return list reached copy lowering",
+        })
+    }
+
+    fn lower_expression(&mut self, id: ExpressionId) -> Result<u16, OwnedCompileError> {
+        let expression = *self.expression(id)?;
+        match expression.kind() {
+            ExpressionKind::DecimalInteger => {
+                let constant = self.decimal_constant(expression.span())?;
+                let constant_index = self.push_constant(constant)?;
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::LoadConstant {
+                        destination,
+                        constant: constant_index,
+                    },
+                    expression.span(),
+                )?;
+                Ok(destination)
+            }
+            ExpressionKind::Identifier(identifier) => self.resolve(identifier.span()),
+            ExpressionKind::Binary(binary) => match binary.operator() {
+                BinaryOperator::Add => {
+                    let left = self.lower_expression(binary.left())?;
+                    let right = self.lower_expression(binary.right())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::Add {
+                            destination,
+                            left,
+                            right,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
+                }
+                BinaryOperator::FloorDivide => {
+                    Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-LOWER-0001",
+                        Phase::Lower,
+                        binary.operator_span(),
+                        "operator has no BluV1 baseline opcode",
+                    )?))
+                }
+            },
+        }
+    }
+
+    fn expression(&self, id: ExpressionId) -> Result<&Expression, OwnedCompileError> {
+        self.expressions
+            .get(id.as_usize())
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "AST expression index is out of bounds",
+            })
+    }
+
+    fn decimal_constant(&self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
+        let bytes = self.source.slice(span)?;
+        check_limit(
+            OwnedCompileLimit::IntegerLiteralBytes,
+            bytes.len(),
+            self.limits.max_integer_literal_bytes,
+        )?;
+        for byte in bytes {
+            if !byte.is_ascii_digit() {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "decimal-integer AST contains a non-decimal byte",
+                });
+            }
+        }
+
+        if matches!(
+            self.profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            let mut integer = 0_i64;
+            let mut fits_integer = true;
+            for byte in bytes {
+                let digit = i64::from(*byte - b'0');
+                let Some(next) = integer
+                    .checked_mul(10)
+                    .and_then(|current| current.checked_add(digit))
+                else {
+                    fits_integer = false;
+                    break;
+                };
+                integer = next;
+            }
+            if fits_integer {
+                return Ok(Constant::Integer(integer));
+            }
+        }
+
+        let text =
+            core::str::from_utf8(bytes).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "decimal-integer AST is not ASCII",
+            })?;
+        let number = text
+            .parse::<f64>()
+            .map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "validated decimal-integer text failed numeric parsing",
+            })?;
+        Ok(Constant::Number(number))
+    }
+
+    fn zero_constant(&self) -> Constant {
+        if matches!(
+            self.profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Constant::Integer(0)
+        } else {
+            Constant::Number(0.0)
+        }
+    }
+
+    fn source_diagnostic(
+        &self,
+        code: &str,
+        phase: Phase,
+        span: ByteSpan,
+        message: &str,
+    ) -> Result<Diagnostic, OwnedCompileError> {
+        Ok(Diagnostic::try_new(
+            code,
+            phase,
+            self.profile,
+            Severity::Error,
+            span,
+            message,
+            self.limits.parse.lexer.diagnostic_limits,
+        )?)
+    }
+
+    fn resolve(&self, name: ByteSpan) -> Result<u16, OwnedCompileError> {
+        let bytes = self.source.slice(name)?;
+        for binding in self.bindings.iter().rev() {
+            if self.source.slice(binding.name)? == bytes {
+                return Ok(binding.register);
+            }
+        }
+        Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+            "BLU-RESOLVE-0001",
+            Phase::Resolve,
+            name,
+            "local name is unresolved",
+        )?))
+    }
+
+    fn allocate_register(&mut self) -> Result<u16, OwnedCompileError> {
+        let required = self.register_count.saturating_add(1);
+        let limit = self
+            .limits
+            .max_registers
+            .min(self.limits.artifact.max_registers_per_prototype)
+            .min(self.limits.artifact.max_total_registers)
+            .min(u16::MAX as usize);
+        check_limit(OwnedCompileLimit::Registers, required, limit)?;
+        let register = u16::try_from(self.register_count).map_err(|_| {
+            OwnedCompileError::InternalInvariant {
+                message: "register index passed limits but cannot fit BluV1",
+            }
+        })?;
+        self.register_count = required;
+        Ok(register)
+    }
+
+    fn push_constant(&mut self, constant: Constant) -> Result<u32, OwnedCompileError> {
+        let required = self.constants.len().saturating_add(1);
+        let limit = self
+            .limits
+            .max_constants
+            .min(self.limits.artifact.max_constants_per_prototype)
+            .min(self.limits.artifact.max_total_constants)
+            .min(u32::MAX as usize);
+        check_limit(OwnedCompileLimit::Constants, required, limit)?;
+        let index = u32::try_from(self.constants.len()).map_err(|_| {
+            OwnedCompileError::InternalInvariant {
+                message: "constant index passed limits but cannot fit BluV1",
+            }
+        })?;
+        push_fallible(&mut self.constants, constant, "constants")?;
+        Ok(index)
+    }
+
+    fn emit(&mut self, instruction: Instruction, span: ByteSpan) -> Result<(), OwnedCompileError> {
+        let required = self.code.len().saturating_add(1);
+        let limit = self
+            .limits
+            .max_instructions
+            .min(self.limits.artifact.max_code_per_prototype)
+            .min(self.limits.artifact.max_total_code)
+            .min(self.limits.artifact.max_total_source_map_entries)
+            .min(u32::MAX as usize);
+        check_limit(OwnedCompileLimit::Instructions, required, limit)?;
+        push_fallible(&mut self.code, instruction, "instructions")?;
+        push_fallible(&mut self.source_map, span, "source map")
+    }
+}
+
+fn check_limit(
+    kind: OwnedCompileLimit,
+    required: usize,
+    limit: usize,
+) -> Result<(), OwnedCompileError> {
+    if required > limit {
+        Err(OwnedCompileError::Limit {
+            kind,
+            required,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn copy_string(value: &str, what: &'static str) -> Result<String, OwnedCompileError> {
+    let mut copied = String::new();
+    copied
+        .try_reserve_exact(value.len())
+        .map_err(|_| OwnedCompileError::Allocation {
+            what,
+            requested: value.len(),
+        })?;
+    copied.push_str(value);
+    Ok(copied)
+}
+
+fn copy_bytes(bytes: &[u8], what: &'static str) -> Result<Vec<u8>, OwnedCompileError> {
+    let mut copied = allocate_vec(bytes.len(), what)?;
+    copied.extend_from_slice(bytes);
+    Ok(copied)
+}
+
+fn allocate_vec<T>(capacity: usize, what: &'static str) -> Result<Vec<T>, OwnedCompileError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| OwnedCompileError::Allocation {
+            what,
+            requested: capacity,
+        })?;
+    Ok(values)
+}
+
+fn push_fallible<T>(
+    values: &mut Vec<T>,
+    value: T,
+    what: &'static str,
+) -> Result<(), OwnedCompileError> {
+    if values.len() == values.capacity() {
+        let requested = values.len().saturating_add(1);
+        values
+            .try_reserve(1)
+            .map_err(|_| OwnedCompileError::Allocation { what, requested })?;
+    }
+    values.push(value);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{OwnedCompileError, allocate_vec};
+
+    #[test]
+    fn compiler_allocation_failure_is_structured() {
+        assert!(matches!(
+            allocate_vec::<u8>(usize::MAX, "test entries"),
+            Err(OwnedCompileError::Allocation {
+                what: "test entries",
+                requested: usize::MAX,
+            })
+        ));
+    }
+}
