@@ -115,9 +115,12 @@ has configurable captured-output and live arena-object limits. Crossing the
 object threshold first performs tracing collection with active registers,
 callers, globals, modules, and threads rooted; retained objects then fail with
 a structured limit error. Output growth is preflighted and uses fallible
-reservation. These are partial defenses: VM-wide byte accounting for table
-growth, strings, chunks, and temporary/native results remains required before
-confined execution can claim a hard memory limit.
+reservation. Guest-driven arena, table, closure-upvalue, and thread-root
+capacity growth also uses checked fallible reservation and returns structured
+allocation errors. These are partial defenses: VM-wide byte accounting for
+table growth, strings, chunks, temporary/native results, root queues, and
+host-owned values remains required before confined execution can claim a hard
+memory limit.
 
 ## Package compatibility
 

@@ -61,10 +61,11 @@ impl Default for Vm {
 }
 
 impl Vm {
-    #[must_use]
-    pub fn new(dialect: Dialect) -> Self {
+    /// Creates a VM, returning structured heap-allocation failures from
+    /// built-in initialization.
+    pub fn try_new(dialect: Dialect) -> Result<Self, RuntimeError> {
         let mut heap = Heap::default();
-        let main_thread = heap.allocate_thread(Vec::new());
+        let main_thread = heap.allocate_thread(&[])?;
         let mut threads = HashMap::new();
         threads.insert(main_thread, ThreadState::Running);
         let mut vm = Self {
@@ -89,8 +90,17 @@ impl Vm {
             output_limit: MAX_STRING_BYTES,
             active_roots: Vec::new(),
         };
-        vm.install_base_library();
-        vm
+        vm.install_base_library()?;
+        Ok(vm)
+    }
+
+    /// Creates a VM using the compatibility infallible constructor.
+    ///
+    /// This panics if the fixed built-in heap cannot be initialized. Embedders
+    /// that need structured initialization failures should use [`Self::try_new`].
+    #[must_use]
+    pub fn new(dialect: Dialect) -> Self {
+        Self::try_new(dialect).expect("fixed VM built-ins must fit in memory")
     }
 
     #[must_use]
@@ -434,8 +444,11 @@ impl Vm {
                         usize::from(upvalue_count) + 1,
                         &frame.gc_roots(&self.heap)?,
                     )?;
-                    let closure = self.heap.allocate_closure(chunk.clone(), child, Vec::new());
-                    let mut upvalues = Vec::with_capacity(upvalue_count as usize);
+                    let closure = self.heap.allocate_closure(
+                        chunk.clone(),
+                        child,
+                        usize::from(upvalue_count),
+                    )?;
                     for capture_index in 0..upvalue_count {
                         let capture = frame.instruction()?;
                         if capture.opcode() != Opcode::Capture {
@@ -448,9 +461,11 @@ impl Vm {
                         frame.pc = capture.pc() + 1;
                         let upvalue = match capture.a() {
                             0 if capture.b() == instruction.a() => {
-                                self.heap.allocate_upvalue(Value::Closure(closure))
+                                self.heap.allocate_upvalue(Value::Closure(closure))?
                             }
-                            0 => self.heap.allocate_upvalue(frame.get(capture.b())?.clone()),
+                            0 => self
+                                .heap
+                                .allocate_upvalue(frame.get(capture.b())?.clone())?,
                             1 => frame.capture_ref(&mut self.heap, capture.b())?,
                             2 => frame.upvalue(&self.heap, capture.b())?,
                             kind => {
@@ -460,9 +475,8 @@ impl Vm {
                                 });
                             }
                         };
-                        upvalues.push(upvalue);
+                        self.heap.closure_push_upvalue(closure, upvalue)?;
                     }
-                    self.heap.closure_set_upvalues(closure, upvalues)?;
                     frame.set(instruction.a(), Value::Closure(closure))?;
                 }
                 Opcode::Capture => {
@@ -658,7 +672,7 @@ impl Vm {
                         });
                     }
                     self.ensure_heap_objects(1, &frame.gc_roots(&self.heap)?)?;
-                    let table = self.heap.allocate_table(array_capacity, hash_capacity);
+                    let table = self.heap.allocate_table(array_capacity, hash_capacity)?;
                     frame.set(instruction.a(), Value::Table(table))?;
                 }
                 Opcode::DupTable => {
@@ -699,7 +713,7 @@ impl Vm {
                         }
                     };
                     self.ensure_heap_objects(1, &frame.gc_roots(&self.heap)?)?;
-                    let table = self.heap.allocate_table(0, entries.len());
+                    let table = self.heap.allocate_table(0, entries.len())?;
                     for (key, value) in entries {
                         let key = materialize_constant(&chunk, prototype, key)?;
                         self.heap.table_set(table, key, value)?;
@@ -1607,7 +1621,7 @@ impl Vm {
         Ok((left == right).then_some(left))
     }
 
-    fn install_base_library(&mut self) {
+    fn install_base_library(&mut self) -> Result<(), RuntimeError> {
         let require = self.register_function(|vm, arguments| {
             let name = arguments.first().ok_or(RuntimeError::Argument {
                 function: "require",
@@ -1996,14 +2010,12 @@ impl Vm {
             };
             Ok(vec![Value::String(Arc::from(result))])
         });
-        let string = self.heap.allocate_table(0, 1);
-        self.heap
-            .table_set(
-                string,
-                Value::String(Arc::from(&b"sub"[..])),
-                Value::NativeFunction(string_sub),
-            )
-            .expect("valid built-in table key");
+        let string = self.heap.allocate_table(0, 1)?;
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"sub"[..])),
+            Value::NativeFunction(string_sub),
+        )?;
         let string_len = self.register_function(|_, arguments| {
             let string = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.len",
@@ -2013,13 +2025,11 @@ impl Vm {
                 string_bytes(string, "string.len")?.len() as i64,
             )])
         });
-        self.heap
-            .table_set(
-                string,
-                Value::String(Arc::from(&b"len"[..])),
-                Value::NativeFunction(string_len),
-            )
-            .expect("valid built-in table key");
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"len"[..])),
+            Value::NativeFunction(string_len),
+        )?;
         let string_byte = self.register_function(|_, arguments| {
             let string = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.byte",
@@ -2046,13 +2056,11 @@ impl Vm {
                 .map(|value| Value::Integer(i64::from(*value)))
                 .collect())
         });
-        self.heap
-            .table_set(
-                string,
-                Value::String(Arc::from(&b"byte"[..])),
-                Value::NativeFunction(string_byte),
-            )
-            .expect("valid built-in table key");
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"byte"[..])),
+            Value::NativeFunction(string_byte),
+        )?;
         let string_reverse = self.register_function(|_, arguments| {
             let string = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.reverse",
@@ -2062,13 +2070,11 @@ impl Vm {
             result.reverse();
             Ok(vec![Value::String(Arc::from(result))])
         });
-        self.heap
-            .table_set(
-                string,
-                Value::String(Arc::from(&b"reverse"[..])),
-                Value::NativeFunction(string_reverse),
-            )
-            .expect("valid built-in table key");
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"reverse"[..])),
+            Value::NativeFunction(string_reverse),
+        )?;
         let string_char = self.register_function(|_, arguments| {
             let mut result = Vec::with_capacity(arguments.len());
             for argument in arguments {
@@ -2085,13 +2091,11 @@ impl Vm {
             }
             Ok(vec![Value::String(Arc::from(result))])
         });
-        self.heap
-            .table_set(
-                string,
-                Value::String(Arc::from(&b"char"[..])),
-                Value::NativeFunction(string_char),
-            )
-            .expect("valid built-in table key");
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"char"[..])),
+            Value::NativeFunction(string_char),
+        )?;
         let string_rep = self.register_function(|vm, arguments| {
             let value = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.rep",
@@ -2138,13 +2142,11 @@ impl Vm {
             }
             Ok(vec![Value::String(Arc::from(result))])
         });
-        self.heap
-            .table_set(
-                string,
-                Value::String(Arc::from(&b"rep"[..])),
-                Value::NativeFunction(string_rep),
-            )
-            .expect("valid built-in table key");
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"rep"[..])),
+            Value::NativeFunction(string_rep),
+        )?;
         let string_lower = self.register_function(|_, arguments| {
             let value = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.lower",
@@ -2154,13 +2156,11 @@ impl Vm {
             result.make_ascii_lowercase();
             Ok(vec![Value::String(Arc::from(result))])
         });
-        self.heap
-            .table_set(
-                string,
-                Value::String(Arc::from(&b"lower"[..])),
-                Value::NativeFunction(string_lower),
-            )
-            .expect("valid built-in table key");
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"lower"[..])),
+            Value::NativeFunction(string_lower),
+        )?;
         let string_upper = self.register_function(|_, arguments| {
             let value = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.upper",
@@ -2170,21 +2170,20 @@ impl Vm {
             result.make_ascii_uppercase();
             Ok(vec![Value::String(Arc::from(result))])
         });
-        self.heap
-            .table_set(
-                string,
-                Value::String(Arc::from(&b"upper"[..])),
-                Value::NativeFunction(string_upper),
-            )
-            .expect("valid built-in table key");
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"upper"[..])),
+            Value::NativeFunction(string_upper),
+        )?;
         self.set_global(&b"string"[..], Value::Table(string));
 
-        self.install_table_library();
-        self.install_math_library();
-        self.install_coroutine_library();
+        self.install_table_library()?;
+        self.install_math_library()?;
+        self.install_coroutine_library()?;
+        Ok(())
     }
 
-    fn install_coroutine_library(&mut self) {
+    fn install_coroutine_library(&mut self) -> Result<(), RuntimeError> {
         let create = self.register_function(|vm, arguments| {
             let function = arguments.first().cloned().ok_or(RuntimeError::Argument {
                 function: "coroutine.create",
@@ -2201,7 +2200,7 @@ impl Vm {
                 });
             }
             vm.ensure_heap_objects(1, &[])?;
-            let thread = vm.heap.allocate_thread(vec![function.clone()]);
+            let thread = vm.heap.allocate_thread(std::slice::from_ref(&function))?;
             vm.threads.insert(thread, ThreadState::New(function));
             Ok(vec![Value::Thread(thread)])
         });
@@ -2236,7 +2235,7 @@ impl Vm {
                 });
             }
             vm.ensure_heap_objects(1, &[])?;
-            let thread = vm.heap.allocate_thread(vec![function.clone()]);
+            let thread = vm.heap.allocate_thread(std::slice::from_ref(&function))?;
             vm.threads.insert(thread, ThreadState::New(function));
             Ok(vec![Value::CoroutineFunction(thread)])
         });
@@ -2277,14 +2276,14 @@ impl Vm {
                 }
                 ThreadState::New(_) | ThreadState::Suspended(_) => {
                     vm.threads.insert(thread, ThreadState::Dead(None));
-                    vm.heap.thread_set_roots(thread, Vec::new())?;
+                    vm.heap.thread_set_roots(thread, &[])?;
                     vec![Value::Boolean(true)]
                 }
             };
             Ok(result)
         });
 
-        let table = self.heap.allocate_table(0, 8);
+        let table = self.heap.allocate_table(0, 8)?;
         for (name, function) in [
             (&b"create"[..], create),
             (&b"status"[..], status),
@@ -2295,15 +2294,14 @@ impl Vm {
             (&b"isyieldable"[..], isyieldable),
             (&b"close"[..], close),
         ] {
-            self.heap
-                .table_set(
-                    table,
-                    Value::String(Arc::from(name)),
-                    Value::NativeFunction(function),
-                )
-                .expect("valid built-in table key");
+            self.heap.table_set(
+                table,
+                Value::String(Arc::from(name)),
+                Value::NativeFunction(function),
+            )?;
         }
         self.set_global(&b"coroutine"[..], Value::Table(table));
+        Ok(())
     }
 
     fn resume_thread(
@@ -2333,7 +2331,7 @@ impl Vm {
         let mut thread_roots = roots;
         thread_roots.push(Value::Thread(thread));
         thread_roots.extend_from_slice(arguments.get(1..).unwrap_or_default());
-        self.heap.thread_set_roots(thread, thread_roots.clone())?;
+        self.heap.thread_set_roots(thread, &thread_roots)?;
         let previous_thread = self.running_thread.replace(thread);
         let result = match resumable {
             Resumable::New(function) => self.call_value(
@@ -2369,7 +2367,7 @@ impl Vm {
         Ok(match result {
             Ok(values) => {
                 self.threads.insert(thread, ThreadState::Dead(None));
-                self.heap.thread_set_roots(thread, Vec::new())?;
+                self.heap.thread_set_roots(thread, &[])?;
                 let mut resumed = Vec::with_capacity(values.len() + 1);
                 resumed.push(Value::Boolean(true));
                 resumed.extend(values);
@@ -2387,7 +2385,7 @@ impl Vm {
                 let error_value = runtime_error_value(error);
                 self.threads
                     .insert(thread, ThreadState::Dead(Some(error_value.clone())));
-                self.heap.thread_set_roots(thread, Vec::new())?;
+                self.heap.thread_set_roots(thread, &[])?;
                 vec![Value::Boolean(false), error_value]
             }
         })
@@ -2501,13 +2499,13 @@ impl Vm {
             None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
         };
         let roots = continuation_roots(&continuation.frame, &continuation.callers, &self.heap)?;
-        self.heap.thread_set_roots(thread, roots)?;
+        self.heap.thread_set_roots(thread, &roots)?;
         self.threads
             .insert(thread, ThreadState::Suspended(continuation));
         Ok(())
     }
 
-    fn install_table_library(&mut self) {
+    fn install_table_library(&mut self) -> Result<(), RuntimeError> {
         let insert = self.register_function(|vm, arguments| {
             let table = arguments.first().ok_or(RuntimeError::Argument {
                 function: "table.insert",
@@ -2623,7 +2621,7 @@ impl Vm {
         });
         let pack = self.register_function(|vm, arguments| {
             vm.ensure_heap_objects(1, &[])?;
-            let table = vm.heap.allocate_table(arguments.len(), 1);
+            let table = vm.heap.allocate_table(arguments.len(), 1)?;
             for (index, value) in arguments.iter().enumerate() {
                 vm.heap
                     .table_set(table, Value::Integer((index + 1) as i64), value.clone())?;
@@ -2671,7 +2669,7 @@ impl Vm {
             Ok(values)
         });
 
-        let table = self.heap.allocate_table(0, 5);
+        let table = self.heap.allocate_table(0, 5)?;
         for (name, function) in [
             (&b"insert"[..], insert),
             (&b"remove"[..], remove),
@@ -2679,18 +2677,17 @@ impl Vm {
             (&b"pack"[..], pack),
             (&b"unpack"[..], unpack),
         ] {
-            self.heap
-                .table_set(
-                    table,
-                    Value::String(Arc::from(name)),
-                    Value::NativeFunction(function),
-                )
-                .expect("valid built-in table key");
+            self.heap.table_set(
+                table,
+                Value::String(Arc::from(name)),
+                Value::NativeFunction(function),
+            )?;
         }
         self.set_global(&b"table"[..], Value::Table(table));
+        Ok(())
     }
 
-    fn install_math_library(&mut self) {
+    fn install_math_library(&mut self) -> Result<(), RuntimeError> {
         let abs = self.register_function(|_, arguments| {
             let value = number_argument(arguments, 0, "math.abs")?;
             Ok(vec![Value::Number(value.abs())])
@@ -2787,7 +2784,7 @@ impl Vm {
             Ok(vec![Value::Number(result)])
         });
 
-        let table = self.heap.allocate_table(0, 15);
+        let table = self.heap.allocate_table(0, 15)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -2806,10 +2803,10 @@ impl Vm {
             (&b"huge"[..], Value::Number(f64::INFINITY)),
         ] {
             self.heap
-                .table_set(table, Value::String(Arc::from(name)), value)
-                .expect("valid built-in table key");
+                .table_set(table, Value::String(Arc::from(name)), value)?;
         }
         self.set_global(&b"math"[..], Value::Table(table));
+        Ok(())
     }
 }
 
@@ -3187,7 +3184,7 @@ impl Frame {
         if let Some(upvalue) = self.open_upvalues.get(&register) {
             return Ok(*upvalue);
         }
-        let upvalue = heap.allocate_upvalue(self.get(register)?.clone());
+        let upvalue = heap.allocate_upvalue(self.get(register)?.clone())?;
         self.open_upvalues.insert(register, upvalue);
         Ok(upvalue)
     }
@@ -4030,7 +4027,7 @@ mod tests {
     fn global_values_remain_gc_roots() {
         let mut vm = Vm::default();
         let string = table_id(vm.global(b"string").unwrap()).unwrap();
-        let garbage = vm.heap.allocate_table(0, 0);
+        let garbage = vm.heap.allocate_table(0, 0).unwrap();
         let stats = vm.collect(std::iter::empty::<&Value>());
         assert_eq!(stats.collected, 1);
         assert_eq!(stats.before, stats.retained + stats.collected);
@@ -4043,5 +4040,14 @@ mod tests {
             vm.heap.table_get(garbage, &Value::Integer(1)),
             Err(HeapError::StaleTable(garbage))
         );
+    }
+
+    #[test]
+    fn fallible_constructor_installs_builtin_heap_state() {
+        let vm = Vm::try_new(Dialect::Blu).unwrap();
+        assert!(matches!(vm.global(b"string"), Some(Value::Table(_))));
+        assert!(matches!(vm.global(b"table"), Some(Value::Table(_))));
+        assert!(matches!(vm.global(b"coroutine"), Some(Value::Table(_))));
+        assert!(matches!(vm.global(b"math"), Some(Value::Table(_))));
     }
 }

@@ -1,8 +1,9 @@
-use crate::Value;
+use crate::{MemoryError, Value, checked_hash_bytes, checked_vector_bytes};
 use blu_bytecode::Chunk;
 use core::fmt;
 use std::{
     collections::{HashMap, VecDeque},
+    hash::Hash,
     sync::Arc,
 };
 
@@ -51,6 +52,7 @@ pub struct CollectionStats {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HeapError {
+    Memory(MemoryError),
     StaleTable(TableId),
     StaleClosure(ClosureId),
     StaleUpvalue(UpvalueId),
@@ -63,6 +65,7 @@ pub enum HeapError {
 impl fmt::Display for HeapError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::Memory(error) => error.fmt(f),
             Self::StaleTable(value) => write!(f, "stale or invalid table handle {value:?}"),
             Self::StaleClosure(value) => write!(f, "stale or invalid closure handle {value:?}"),
             Self::StaleUpvalue(value) => write!(f, "stale or invalid upvalue handle {value:?}"),
@@ -74,7 +77,20 @@ impl fmt::Display for HeapError {
     }
 }
 
-impl std::error::Error for HeapError {}
+impl From<MemoryError> for HeapError {
+    fn from(error: MemoryError) -> Self {
+        Self::Memory(error)
+    }
+}
+
+impl std::error::Error for HeapError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Memory(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Default)]
 pub struct Heap {
@@ -84,57 +100,71 @@ pub struct Heap {
 }
 
 impl Heap {
-    #[must_use]
-    pub fn allocate_table(&mut self, array_capacity: usize, hash_capacity: usize) -> TableId {
+    pub fn allocate_table(
+        &mut self,
+        array_capacity: usize,
+        hash_capacity: usize,
+    ) -> Result<TableId, HeapError> {
+        let mut array = Vec::new();
+        try_reserve_vec_exact(&mut array, array_capacity)?;
+        let mut hash = HashMap::new();
+        try_reserve_hash(&mut hash, hash_capacity)?;
         let id = self.allocate(Object::Table(Table {
-            array: Vec::with_capacity(array_capacity),
-            hash: HashMap::with_capacity(hash_capacity),
+            array,
+            hash,
             metatable: None,
-        }));
-        TableId {
+        }))?;
+        Ok(TableId {
             index: id.index,
             generation: id.generation,
-        }
+        })
     }
 
-    pub(crate) fn allocate_upvalue(&mut self, value: Value) -> UpvalueId {
-        let id = self.allocate(Object::Upvalue(value));
-        UpvalueId {
+    pub(crate) fn allocate_upvalue(&mut self, value: Value) -> Result<UpvalueId, HeapError> {
+        let id = self.allocate(Object::Upvalue(value))?;
+        Ok(UpvalueId {
             index: id.index,
             generation: id.generation,
-        }
+        })
     }
 
     pub(crate) fn allocate_closure(
         &mut self,
         chunk: Arc<Chunk>,
         prototype: usize,
-        upvalues: Vec<UpvalueId>,
-    ) -> ClosureId {
+        upvalue_capacity: usize,
+    ) -> Result<ClosureId, HeapError> {
+        let mut upvalues = Vec::new();
+        try_reserve_vec_exact(&mut upvalues, upvalue_capacity)?;
         let id = self.allocate(Object::Closure(Closure {
             chunk,
             prototype,
             upvalues,
-        }));
-        ClosureId {
+        }))?;
+        Ok(ClosureId {
             index: id.index,
             generation: id.generation,
-        }
+        })
     }
 
-    pub(crate) fn allocate_thread(&mut self, roots: Vec<Value>) -> ThreadId {
-        let id = self.allocate(Object::Thread(Thread { roots }));
-        ThreadId {
+    pub(crate) fn allocate_thread(&mut self, roots: &[Value]) -> Result<ThreadId, HeapError> {
+        let roots = try_clone_slice(roots)?;
+        let id = self.allocate(Object::Thread(Thread { roots }))?;
+        Ok(ThreadId {
             index: id.index,
             generation: id.generation,
-        }
+        })
     }
 
     pub(crate) fn thread_set_roots(
         &mut self,
         thread: ThreadId,
-        roots: Vec<Value>,
+        roots: &[Value],
     ) -> Result<(), HeapError> {
+        self.object(thread.into())
+            .filter(|object| matches!(object, Object::Thread(_)))
+            .ok_or(HeapError::StaleThread(thread))?;
+        let roots = try_clone_slice(roots)?;
         match self.object_mut(thread.into()) {
             Some(Object::Thread(value)) => {
                 value.roots = roots;
@@ -161,8 +191,7 @@ impl Heap {
 
     pub fn table_set(&mut self, table: TableId, key: Value, value: Value) -> Result<(), HeapError> {
         let key = Key::from_value(&key)?;
-        self.table_mut(table)?.set(key, value);
-        Ok(())
+        self.table_mut(table)?.set(key, value)
     }
 
     pub fn table_length(&self, table: TableId) -> Result<usize, HeapError> {
@@ -223,18 +252,20 @@ impl Heap {
         Ok((
             closure.chunk.clone(),
             closure.prototype,
-            closure.upvalues.clone(),
+            try_clone_slice(&closure.upvalues)?,
         ))
     }
 
-    pub(crate) fn closure_set_upvalues(
+    pub(crate) fn closure_push_upvalue(
         &mut self,
         closure: ClosureId,
-        upvalues: Vec<UpvalueId>,
+        upvalue: UpvalueId,
     ) -> Result<(), HeapError> {
+        self.closure(closure)?;
         match self.object_mut(closure.into()) {
             Some(Object::Closure(value)) => {
-                value.upvalues = upvalues;
+                try_reserve_vec(&mut value.upvalues, 1)?;
+                value.upvalues.push(upvalue);
                 Ok(())
             }
             _ => Err(HeapError::StaleClosure(closure)),
@@ -324,27 +355,29 @@ impl Heap {
         }
     }
 
-    fn allocate(&mut self, object: Object) -> ObjectId {
-        self.live += 1;
+    fn allocate(&mut self, object: Object) -> Result<ObjectId, HeapError> {
         if let Some(index) = self.free.pop() {
             let slot = &mut self.slots[index as usize];
             debug_assert!(slot.object.is_none());
             slot.object = Some(object);
-            ObjectId {
+            self.live += 1;
+            Ok(ObjectId {
                 index,
                 generation: slot.generation,
-            }
+            })
         } else {
-            let index = self.slots.len() as u32;
+            let index = u32::try_from(self.slots.len()).map_err(|_| MemoryError::SizeOverflow)?;
+            try_reserve_vec_exact(&mut self.slots, 1)?;
             self.slots.push(Slot {
                 generation: 0,
                 marked: false,
                 object: Some(object),
             });
-            ObjectId {
+            self.live += 1;
+            Ok(ObjectId {
                 index,
                 generation: 0,
-            }
+            })
         }
     }
 
@@ -439,24 +472,36 @@ impl Table {
         self.hash.get(key)
     }
 
-    fn set(&mut self, key: Key, value: Value) {
+    fn set(&mut self, key: Key, value: Value) -> Result<(), HeapError> {
         if let Some(index) = key.array_index() {
             if index <= self.array.len() {
                 self.array[index - 1] = value;
                 self.trim_array();
-                return;
+                return Ok(());
             }
-            if index == self.array.len() + 1 && !matches!(value, Value::Nil) {
+            let next_array_index = self
+                .array
+                .len()
+                .checked_add(1)
+                .ok_or(MemoryError::SizeOverflow)?;
+            if index == next_array_index && !matches!(value, Value::Nil) {
+                let promoted = self.contiguous_hash_values_after(index)?;
+                let additional = promoted.checked_add(1).ok_or(MemoryError::SizeOverflow)?;
+                try_reserve_vec(&mut self.array, additional)?;
                 self.array.push(value);
-                self.promote_contiguous();
-                return;
+                self.promote_contiguous(promoted);
+                return Ok(());
             }
         }
         if matches!(value, Value::Nil) {
             self.hash.remove(&key);
         } else {
+            if !self.hash.contains_key(&key) {
+                try_reserve_hash(&mut self.hash, 1)?;
+            }
             self.hash.insert(key, value);
         }
+        Ok(())
     }
 
     fn length(&self) -> usize {
@@ -476,15 +521,74 @@ impl Table {
         }
     }
 
-    fn promote_contiguous(&mut self) {
-        loop {
+    fn promote_contiguous(&mut self, count: usize) {
+        for _ in 0..count {
             let key = Key::Integer((self.array.len() + 1) as i64);
             let Some(value) = self.hash.remove(&key) else {
-                break;
+                return;
             };
             self.array.push(value);
         }
     }
+
+    fn contiguous_hash_values_after(&self, index: usize) -> Result<usize, HeapError> {
+        let mut next = index.checked_add(1).ok_or(MemoryError::SizeOverflow)?;
+        let mut count = 0usize;
+        loop {
+            let key = i64::try_from(next).map_err(|_| MemoryError::SizeOverflow)?;
+            if !self.hash.contains_key(&Key::Integer(key)) {
+                return Ok(count);
+            }
+            count = count.checked_add(1).ok_or(MemoryError::SizeOverflow)?;
+            next = next.checked_add(1).ok_or(MemoryError::SizeOverflow)?;
+        }
+    }
+}
+
+fn try_clone_slice<T: Clone>(values: &[T]) -> Result<Vec<T>, HeapError> {
+    let mut cloned = Vec::new();
+    try_reserve_vec_exact(&mut cloned, values.len())?;
+    cloned.extend_from_slice(values);
+    Ok(cloned)
+}
+
+fn try_reserve_vec<T>(values: &mut Vec<T>, additional: usize) -> Result<(), HeapError> {
+    let required = values
+        .len()
+        .checked_add(additional)
+        .ok_or(MemoryError::SizeOverflow)?;
+    let requested = checked_vector_bytes::<T>(required)?;
+    values
+        .try_reserve(additional)
+        .map_err(|_| MemoryError::AllocationFailed { requested })?;
+    Ok(())
+}
+
+fn try_reserve_vec_exact<T>(values: &mut Vec<T>, additional: usize) -> Result<(), HeapError> {
+    let required = values
+        .len()
+        .checked_add(additional)
+        .ok_or(MemoryError::SizeOverflow)?;
+    let requested = checked_vector_bytes::<T>(required)?;
+    values
+        .try_reserve_exact(additional)
+        .map_err(|_| MemoryError::AllocationFailed { requested })?;
+    Ok(())
+}
+
+fn try_reserve_hash<K: Eq + Hash, V>(
+    values: &mut HashMap<K, V>,
+    additional: usize,
+) -> Result<(), HeapError> {
+    let required = values
+        .len()
+        .checked_add(additional)
+        .ok_or(MemoryError::SizeOverflow)?;
+    let requested = checked_hash_bytes::<K, V>(required)?;
+    values
+        .try_reserve(additional)
+        .map_err(|_| MemoryError::AllocationFailed { requested })?;
+    Ok(())
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -578,7 +682,7 @@ mod tests {
     #[test]
     fn tables_split_dense_integer_keys_and_hash_keys() {
         let mut heap = Heap::default();
-        let table = heap.allocate_table(0, 0);
+        let table = heap.allocate_table(0, 0).unwrap();
         heap.table_set(table, Value::Integer(2), Value::Number(2.0))
             .unwrap();
         heap.table_set(table, Value::Integer(1), Value::Number(1.0))
@@ -599,15 +703,16 @@ mod tests {
     #[test]
     fn tracing_collection_handles_cycles_and_closure_graphs() {
         let mut heap = Heap::default();
-        let retained = heap.allocate_table(0, 0);
-        let child = heap.allocate_table(0, 0);
-        let garbage = heap.allocate_table(0, 0);
+        let retained = heap.allocate_table(0, 0).unwrap();
+        let child = heap.allocate_table(0, 0).unwrap();
+        let garbage = heap.allocate_table(0, 0).unwrap();
         heap.table_set(retained, Value::Integer(1), Value::Table(child))
             .unwrap();
         heap.table_set(child, Value::Integer(1), Value::Table(retained))
             .unwrap();
-        let upvalue = heap.allocate_upvalue(Value::Table(retained));
-        let closure = heap.allocate_closure(empty_chunk(), 0, vec![upvalue]);
+        let upvalue = heap.allocate_upvalue(Value::Table(retained)).unwrap();
+        let closure = heap.allocate_closure(empty_chunk(), 0, 1).unwrap();
+        heap.closure_push_upvalue(closure, upvalue).unwrap();
 
         let root = Value::Closure(closure);
         assert_eq!(
@@ -635,8 +740,8 @@ mod tests {
     #[test]
     fn metatables_are_traced_and_support_iteration() {
         let mut heap = Heap::default();
-        let table = heap.allocate_table(0, 0);
-        let metatable = heap.allocate_table(0, 1);
+        let table = heap.allocate_table(0, 0).unwrap();
+        let metatable = heap.allocate_table(0, 1).unwrap();
         heap.table_set(
             metatable,
             Value::String(Arc::from(&b"answer"[..])),
@@ -666,8 +771,8 @@ mod tests {
     #[test]
     fn thread_roots_trace_suspended_values() {
         let mut heap = Heap::default();
-        let retained = heap.allocate_table(0, 0);
-        let thread = heap.allocate_thread(vec![Value::Table(retained)]);
+        let retained = heap.allocate_table(0, 0).unwrap();
+        let thread = heap.allocate_thread(&[Value::Table(retained)]).unwrap();
         assert_eq!(
             heap.collect([&Value::Thread(thread)]),
             CollectionStats {
@@ -676,7 +781,7 @@ mod tests {
                 collected: 0,
             }
         );
-        heap.thread_set_roots(thread, Vec::new()).unwrap();
+        heap.thread_set_roots(thread, &[]).unwrap();
         assert_eq!(
             heap.collect([&Value::Thread(thread)]),
             CollectionStats {
@@ -688,6 +793,62 @@ mod tests {
         assert_eq!(
             heap.table_get(retained, &Value::Integer(1)),
             Err(HeapError::StaleTable(retained))
+        );
+    }
+
+    #[test]
+    fn oversized_initial_capacities_fail_without_consuming_an_arena_slot() {
+        let mut heap = Heap::default();
+        assert_eq!(
+            heap.allocate_table(usize::MAX, 0),
+            Err(HeapError::Memory(MemoryError::SizeOverflow))
+        );
+        assert_eq!(
+            heap.allocate_table(0, usize::MAX),
+            Err(HeapError::Memory(MemoryError::SizeOverflow))
+        );
+        assert_eq!(
+            heap.allocate_closure(empty_chunk(), 0, usize::MAX),
+            Err(HeapError::Memory(MemoryError::SizeOverflow))
+        );
+        assert_eq!(heap.live_objects(), 0);
+
+        let table = heap.allocate_table(0, 0).unwrap();
+        assert_eq!(format!("{table:?}"), "Table(0:0)");
+    }
+
+    #[test]
+    fn dense_insertion_reserves_and_promotes_the_full_contiguous_run() {
+        let mut heap = Heap::default();
+        let table = heap.allocate_table(0, 0).unwrap();
+        heap.table_set(table, Value::Integer(3), Value::Integer(30))
+            .unwrap();
+        heap.table_set(table, Value::Integer(2), Value::Integer(20))
+            .unwrap();
+        heap.table_set(table, Value::Integer(1), Value::Integer(10))
+            .unwrap();
+
+        let table = heap.table(table).unwrap();
+        assert_eq!(
+            table.array,
+            [Value::Integer(10), Value::Integer(20), Value::Integer(30)]
+        );
+        assert!(table.array.capacity() >= 3);
+        assert!(table.hash.is_empty());
+    }
+
+    #[test]
+    fn fallible_allocation_preserves_generation_on_slot_reuse() {
+        let mut heap = Heap::default();
+        let old = heap.allocate_table(0, 0).unwrap();
+        heap.collect(std::iter::empty());
+        let replacement = heap.allocate_table(0, 0).unwrap();
+
+        assert_eq!(format!("{old:?}"), "Table(0:0)");
+        assert_eq!(format!("{replacement:?}"), "Table(0:1)");
+        assert_eq!(
+            heap.table_get(old, &Value::Integer(1)),
+            Err(HeapError::StaleTable(old))
         );
     }
 }
