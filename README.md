@@ -41,10 +41,11 @@ claim of complete Luau, Lua, or Blu compatibility.
 
 The first Blu-owned frontend substrate is also present: `blu-syntax` performs
 bounded byte-oriented lexing and parses the initial local/assignment-list/return arithmetic
-slice, including nil, boolean, and escape-free quoted byte-string literals
+slice, including nil, boolean, and quoted byte-string literals with the common
+Lua/Luau escaped delimiters, backslash, and single-letter control escapes
 plus semicolon separators, grouping parentheses, and profile-neutral `+`/`-`/`*`, into a spanned arena AST with explicit profile
-reconciliation. String escapes fail explicitly until their profile-specific
-rules are implemented. Unary `not` follows common Lua truthiness and produces
+reconciliation. Numeric, hex, Unicode, `\z`, and line-continuation escapes fail
+explicitly until their profile-specific rules are implemented. Unary `not` follows common Lua truthiness and produces
 a boolean under every profile.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into
 canonical BluV1 artifacts without native linkage or fallback; the same

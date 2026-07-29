@@ -188,9 +188,9 @@ fn unary_not_is_a_profile_neutral_keyword() {
 }
 
 #[test]
-fn escape_free_quoted_strings_are_profile_neutral_byte_tokens() {
+fn quoted_strings_and_common_escapes_are_profile_neutral_byte_tokens() {
     for profile in SemanticProfile::ALL {
-        let source = source(b"return 'blu', \"lua\"".to_vec());
+        let source = source(br#"return 'blu', "lua", 'a\'b', "a\"b", "\\\a\b\f\n\r\t\v""#.to_vec());
         let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
         assert!(!lexed.has_errors(), "{profile}");
         let strings: Vec<_> = lexed
@@ -199,13 +199,22 @@ fn escape_free_quoted_strings_are_profile_neutral_byte_tokens() {
             .filter(|token| token.kind() == TokenKind::StringLiteral)
             .map(|token| source.slice(token.span()).unwrap())
             .collect();
-        assert_eq!(strings, [b"'blu'".as_slice(), b"\"lua\"".as_slice()]);
+        assert_eq!(
+            strings,
+            [
+                b"'blu'".as_slice(),
+                b"\"lua\"".as_slice(),
+                br#"'a\'b'"#.as_slice(),
+                br#""a\"b""#.as_slice(),
+                br#""\\\a\b\f\n\r\t\v""#.as_slice(),
+            ]
+        );
     }
 }
 
 #[test]
-fn string_escapes_and_unterminated_strings_fail_explicitly() {
-    let escaped = source(br#"return "a\nb""#.to_vec());
+fn profile_sensitive_escapes_and_unterminated_strings_fail_explicitly() {
+    let escaped = source(br#"return "a\x41b""#.to_vec());
     let escaped = lex(&escaped, SemanticProfile::Lua54, LexerLimits::default()).unwrap();
     assert_eq!(escaped.diagnostics()[0].code().as_str(), "BLU-LEX-0007");
     assert_eq!(escaped.diagnostics()[0].found(), Some(b"\\".as_slice()));

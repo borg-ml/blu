@@ -771,6 +771,34 @@ fn string_literal_payload_limits_fail_before_constant_insertion() {
             limit: 4,
         })
     ));
+
+    let source = make_source(br#"return "\n""#.to_vec());
+    let mut limits = OwnedCompileLimits::default();
+    limits.artifact.max_constant_bytes = 1;
+    let compiled = OwnedCompiler::new(limits)
+        .compile(&source, SemanticProfile::Lua54, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        compiled.artifact().main().constants,
+        [Constant::String(vec![b'\n'])]
+    );
+}
+
+#[test]
+fn common_string_escapes_decode_to_bytes_for_every_profile() {
+    let source = make_source(br#"return "\\\'\"\a\b\f\n\r\t\v""#.to_vec());
+    let expected = b"\\'\"\x07\x08\x0c\n\r\t\x0b".to_vec();
+
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            compiled.artifact().main().constants,
+            [Constant::String(expected.clone())],
+            "{profile}"
+        );
+    }
 }
 
 #[test]

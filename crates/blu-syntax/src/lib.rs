@@ -359,6 +359,18 @@ pub fn lex(
                     && !matches!(bytes[offset], b'\r' | b'\n')
                 {
                     if bytes[offset] == b'\\' {
+                        let Some(escaped) = bytes.get(offset + 1).copied() else {
+                            unsupported_escape.get_or_insert(offset);
+                            offset += 1;
+                            continue;
+                        };
+                        if matches!(
+                            escaped,
+                            b'\\' | b'\'' | b'"' | b'a' | b'b' | b'f' | b'n' | b'r' | b't' | b'v'
+                        ) {
+                            offset += 2;
+                            continue;
+                        }
                         unsupported_escape.get_or_insert(offset);
                     }
                     offset += 1;
@@ -383,7 +395,7 @@ pub fn lex(
                         "BLU-LEX-0007",
                         explicit_profile,
                         span,
-                        "string escapes are not implemented for this profile",
+                        "unsupported string escape for this profile",
                         limits.diagnostic_limits,
                     )?
                     .try_with_found(&bytes[escape..escape + 1])?

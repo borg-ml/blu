@@ -351,6 +351,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let escaped_string = SourceFile::new(
+            SourceId::new(9),
+            "escaped-string.blu",
+            br#"return "\\\'\"\a\b\f\n\r\t\v""#.to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -487,6 +494,17 @@ mod tests {
                     },
                 ]),
                 "assignment list swap under {profile}"
+            );
+            let compiled = OwnedCompiler::default()
+                .compile(&escaped_string, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![Value::String(Arc::from(
+                    &b"\\'\"\x07\x08\x0c\n\r\t\x0b"[..]
+                ))]),
+                "string escapes under {profile}"
             );
         }
     }

@@ -876,14 +876,15 @@ impl<'a> Lowerer<'a> {
                 message: "string-literal AST delimiters do not match",
             });
         }
+        let decoded_len = decoded_string_len(value)?;
         check_limit(
             OwnedCompileLimit::StringLiteralBytes,
-            value.len(),
+            decoded_len,
             self.limits.artifact.max_constant_bytes,
         )?;
         let total =
             self.constant_bytes
-                .checked_add(value.len())
+                .checked_add(decoded_len)
                 .ok_or(OwnedCompileError::Limit {
                     kind: OwnedCompileLimit::TotalConstantBytes,
                     required: usize::MAX,
@@ -894,9 +895,32 @@ impl<'a> Lowerer<'a> {
             total,
             self.limits.artifact.max_total_constant_bytes,
         )?;
-        let value = copy_bytes(value, "string literal bytes")?;
+        let mut decoded = allocate_vec(decoded_len, "string literal bytes")?;
+        let mut offset = 0;
+        while offset < value.len() {
+            let byte = value[offset];
+            if byte == b'\\' {
+                let escaped =
+                    *value
+                        .get(offset + 1)
+                        .ok_or(OwnedCompileError::InternalInvariant {
+                            message: "validated string literal ends in a backslash",
+                        })?;
+                push_fallible(
+                    &mut decoded,
+                    decode_string_escape(escaped).ok_or(OwnedCompileError::InternalInvariant {
+                        message: "validated string literal contains an unsupported escape",
+                    })?,
+                    "string literal bytes",
+                )?;
+                offset += 2;
+            } else {
+                push_fallible(&mut decoded, byte, "string literal bytes")?;
+                offset += 1;
+            }
+        }
         self.constant_bytes = total;
-        Ok(Constant::String(value))
+        Ok(Constant::String(decoded))
     }
 
     fn source_diagnostic(
@@ -1015,6 +1039,50 @@ fn copy_bytes(bytes: &[u8], what: &'static str) -> Result<Vec<u8>, OwnedCompileE
     let mut copied = allocate_vec(bytes.len(), what)?;
     copied.extend_from_slice(bytes);
     Ok(copied)
+}
+
+fn decode_string_escape(escaped: u8) -> Option<u8> {
+    Some(match escaped {
+        b'\\' => b'\\',
+        b'\'' => b'\'',
+        b'"' => b'"',
+        b'a' => 0x07,
+        b'b' => 0x08,
+        b'f' => 0x0c,
+        b'n' => b'\n',
+        b'r' => b'\r',
+        b't' => b'\t',
+        b'v' => 0x0b,
+        _ => return None,
+    })
+}
+
+fn decoded_string_len(value: &[u8]) -> Result<usize, OwnedCompileError> {
+    let mut decoded_len = 0_usize;
+    let mut offset = 0;
+    while offset < value.len() {
+        if value[offset] == b'\\' {
+            let escaped = *value
+                .get(offset + 1)
+                .ok_or(OwnedCompileError::InternalInvariant {
+                    message: "validated string literal ends in a backslash",
+                })?;
+            if decode_string_escape(escaped).is_none() {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "validated string literal contains an unsupported escape",
+                });
+            }
+            offset += 2;
+        } else {
+            offset += 1;
+        }
+        decoded_len = decoded_len
+            .checked_add(1)
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "decoded string literal length overflowed",
+            })?;
+    }
+    Ok(decoded_len)
 }
 
 fn allocate_vec<T>(capacity: usize, what: &'static str) -> Result<Vec<T>, OwnedCompileError> {

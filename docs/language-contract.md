@@ -49,9 +49,11 @@ bounded byte lexer and small parser/AST slice for the first owned-frontend
 program. It includes byte-zero dialect directives, stable raw-byte spans,
 retained trivia, the documented `//` profile gate, `local name = expression`,
 bare or expression-list `return`, nil/boolean/decimal-integer/identifier expressions,
-escape-free single- and double-quoted byte strings, and `+`/`-`/`*`/`//` precedence
-plus grouping parentheses and unary `not`. String escapes are rejected until their
-profile-specific rules are implemented. Parsing retains the explicit profile and rejects
+single- and double-quoted byte strings with the common Lua/Luau escaped delimiters,
+backslash, and `\a`/`\b`/`\f`/`\n`/`\r`/`\t`/`\v`, and `+`/`-`/`*`/`//`
+precedence plus grouping parentheses and unary `not`. Numeric, hex, Unicode, `\z`,
+and line-continuation escapes are rejected until their profile-specific rules are
+implemented. Parsing retains the explicit profile and rejects
 diagnostics without exposing a partial AST. Resolution, lowering, emission,
 and execution are separate explicit stages; the public engine never silently
 selects this frontend as a fallback. Parser-owned arenas, lists, and diagnostic counts are bounded
