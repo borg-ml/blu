@@ -87,6 +87,7 @@ pub enum ExpressionKind {
     Nil,
     Boolean(bool),
     DecimalInteger,
+    StringLiteral,
     Identifier(Identifier),
     Group(ExpressionId),
     Binary(BinaryExpression),

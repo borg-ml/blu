@@ -297,7 +297,8 @@ mod tests {
         let source = SourceFile::new(
             SourceId::new(1),
             "answer.blu",
-            b"local empty = nil\nlocal yes = true\nreturn empty, yes, false, (40 + 2)".to_vec(),
+            b"local empty = nil\nlocal yes = true\nreturn empty, yes, false, 'blu', (40 + 2)"
+                .to_vec(),
             SourceLimits::default(),
         )
         .unwrap();
@@ -323,6 +324,7 @@ mod tests {
                     Value::Nil,
                     Value::Boolean(true),
                     Value::Boolean(false),
+                    Value::String(Arc::from(&b"blu"[..])),
                     Value::Number(42.0),
                 ]),
                 "{profile}"

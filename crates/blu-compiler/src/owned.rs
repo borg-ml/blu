@@ -73,6 +73,8 @@ pub enum OwnedCompileLimit {
     Instructions,
     ReturnValues,
     IntegerLiteralBytes,
+    StringLiteralBytes,
+    TotalConstantBytes,
     SourceNameBytes,
     DebugNameBytes,
     TotalDebugBytes,
@@ -87,6 +89,8 @@ impl fmt::Display for OwnedCompileLimit {
             Self::Instructions => formatter.write_str("instructions"),
             Self::ReturnValues => formatter.write_str("return values"),
             Self::IntegerLiteralBytes => formatter.write_str("integer literal bytes"),
+            Self::StringLiteralBytes => formatter.write_str("string literal bytes"),
+            Self::TotalConstantBytes => formatter.write_str("total constant bytes"),
             Self::SourceNameBytes => formatter.write_str("source identity name bytes"),
             Self::DebugNameBytes => formatter.write_str("local debug name bytes"),
             Self::TotalDebugBytes => formatter.write_str("total local debug name bytes"),
@@ -360,6 +364,7 @@ struct Lowerer<'a> {
     bindings: Vec<Binding>,
     register_count: usize,
     constants: Vec<Constant>,
+    constant_bytes: usize,
     code: Vec<Instruction>,
     source_map: Vec<ByteSpan>,
 }
@@ -379,6 +384,7 @@ impl<'a> Lowerer<'a> {
             bindings: allocate_vec(capacity.min(limits.max_bindings), "local bindings")?,
             register_count: 0,
             constants: allocate_vec(capacity.min(limits.max_constants), "constants")?,
+            constant_bytes: 0,
             code: allocate_vec(capacity.min(limits.max_instructions), "instructions")?,
             source_map: allocate_vec(capacity.min(limits.max_instructions), "source map")?,
         })
@@ -579,6 +585,10 @@ impl<'a> Lowerer<'a> {
                 )?;
                 Ok(destination)
             }
+            ExpressionKind::StringLiteral => {
+                let constant = self.string_constant(expression.span())?;
+                self.lower_constant(constant, expression.span())
+            }
             ExpressionKind::Identifier(identifier) => self.resolve(identifier.span()),
             ExpressionKind::Group(inner) => self.lower_expression(inner),
             ExpressionKind::Binary(binary) => match binary.operator() {
@@ -694,6 +704,46 @@ impl<'a> Lowerer<'a> {
                 message: "validated decimal-integer text failed numeric parsing",
             })?;
         Ok(Constant::Number(number))
+    }
+
+    fn string_constant(&mut self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
+        let bytes = self.source.slice(span)?;
+        let Some((&quote, rest)) = bytes.split_first() else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "string-literal AST is empty",
+            });
+        };
+        let Some((&closing, value)) = rest.split_last() else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "string-literal AST has no closing quote",
+            });
+        };
+        if !matches!(quote, b'\'' | b'"') || closing != quote {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "string-literal AST delimiters do not match",
+            });
+        }
+        check_limit(
+            OwnedCompileLimit::StringLiteralBytes,
+            value.len(),
+            self.limits.artifact.max_constant_bytes,
+        )?;
+        let total =
+            self.constant_bytes
+                .checked_add(value.len())
+                .ok_or(OwnedCompileError::Limit {
+                    kind: OwnedCompileLimit::TotalConstantBytes,
+                    required: usize::MAX,
+                    limit: self.limits.artifact.max_total_constant_bytes,
+                })?;
+        check_limit(
+            OwnedCompileLimit::TotalConstantBytes,
+            total,
+            self.limits.artifact.max_total_constant_bytes,
+        )?;
+        let value = copy_bytes(value, "string literal bytes")?;
+        self.constant_bytes = total;
+        Ok(Constant::String(value))
     }
 
     fn source_diagnostic(

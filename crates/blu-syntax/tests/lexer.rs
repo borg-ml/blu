@@ -119,6 +119,37 @@ fn nil_and_boolean_literals_are_profile_neutral_keywords() {
 }
 
 #[test]
+fn escape_free_quoted_strings_are_profile_neutral_byte_tokens() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return 'blu', \"lua\"".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        let strings: Vec<_> = lexed
+            .tokens()
+            .iter()
+            .filter(|token| token.kind() == TokenKind::StringLiteral)
+            .map(|token| source.slice(token.span()).unwrap())
+            .collect();
+        assert_eq!(strings, [b"'blu'".as_slice(), b"\"lua\"".as_slice()]);
+    }
+}
+
+#[test]
+fn string_escapes_and_unterminated_strings_fail_explicitly() {
+    let escaped = source(br#"return "a\nb""#.to_vec());
+    let escaped = lex(&escaped, SemanticProfile::Lua54, LexerLimits::default()).unwrap();
+    assert_eq!(escaped.diagnostics()[0].code().as_str(), "BLU-LEX-0007");
+    assert_eq!(escaped.diagnostics()[0].found(), Some(b"\\".as_slice()));
+
+    let unterminated = source(b"return 'blu".to_vec());
+    let unterminated = lex(&unterminated, SemanticProfile::Luau, LexerLimits::default()).unwrap();
+    assert_eq!(
+        unterminated.diagnostics()[0].code().as_str(),
+        "BLU-LEX-0008"
+    );
+}
+
+#[test]
 fn conflicting_directive_is_reported_on_its_value() {
     let source = source(b"--!dialect lua54\r\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

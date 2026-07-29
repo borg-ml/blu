@@ -232,7 +232,8 @@ impl ParseOutcome {
 /// Parses the currently supported grammar under an explicit profile.
 ///
 /// The grammar is limited to `local name = expression`, a final
-/// `return expression (, expression)*`, nil, booleans, decimal-integer and identifier
+/// `return expression (, expression)*`, nil, booleans, escape-free quoted byte
+/// strings, decimal-integer and identifier
 /// expressions, grouping parentheses, and left-associative `+` and `//`
 /// (`//` binds more tightly).
 /// Trivia remains available through [`Parsed::tokens`] or
@@ -450,7 +451,14 @@ impl<'a> Parser<'a> {
             self.report_current_or_eof(
                 "BLU-PARSE-0004",
                 "expected an expression",
-                &["nil", "boolean", "decimal integer", "identifier", "("],
+                &[
+                    "nil",
+                    "boolean",
+                    "quoted string",
+                    "decimal integer",
+                    "identifier",
+                    "(",
+                ],
             )?;
             return Ok(None);
         };
@@ -459,6 +467,7 @@ impl<'a> Parser<'a> {
             TokenKind::True => ExpressionKind::Boolean(true),
             TokenKind::False => ExpressionKind::Boolean(false),
             TokenKind::DecimalInteger => ExpressionKind::DecimalInteger,
+            TokenKind::StringLiteral => ExpressionKind::StringLiteral,
             TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
             TokenKind::LeftParenthesis => {
                 self.bump();
@@ -489,7 +498,14 @@ impl<'a> Parser<'a> {
                 self.report_current(
                     "BLU-PARSE-0004",
                     "expected an expression",
-                    &["nil", "boolean", "decimal integer", "identifier", "("],
+                    &[
+                        "nil",
+                        "boolean",
+                        "quoted string",
+                        "decimal integer",
+                        "identifier",
+                        "(",
+                    ],
                 )?;
                 return Ok(None);
             }

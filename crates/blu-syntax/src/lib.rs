@@ -133,6 +133,7 @@ pub enum TokenKind {
     False,
     Identifier,
     DecimalInteger,
+    StringLiteral,
     Equal,
     Comma,
     Plus,
@@ -332,6 +333,47 @@ pub fn lex(
             b'+' => {
                 offset += 1;
                 TokenKind::Plus
+            }
+            quote @ (b'\'' | b'"') => {
+                offset += 1;
+                let mut unsupported_escape = None;
+                while offset < bytes.len()
+                    && bytes[offset] != quote
+                    && !matches!(bytes[offset], b'\r' | b'\n')
+                {
+                    if bytes[offset] == b'\\' {
+                        unsupported_escape.get_or_insert(offset);
+                    }
+                    offset += 1;
+                }
+                if offset < bytes.len() && bytes[offset] == quote {
+                    offset += 1;
+                } else {
+                    let span = source.span(start, offset)?;
+                    let diagnostic = diagnostic(
+                        "BLU-LEX-0008",
+                        explicit_profile,
+                        span,
+                        "unterminated quoted string",
+                        limits.diagnostic_limits,
+                    )?
+                    .try_with_found(&bytes[start..offset])?;
+                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                }
+                if let Some(escape) = unsupported_escape {
+                    let span = source.span(escape, escape + 1)?;
+                    let diagnostic = diagnostic(
+                        "BLU-LEX-0007",
+                        explicit_profile,
+                        span,
+                        "string escapes are not implemented for this profile",
+                        limits.diagnostic_limits,
+                    )?
+                    .try_with_found(&bytes[escape..escape + 1])?
+                    .try_with_note_parts(&["selected profile: ", explicit_profile.as_str()])?;
+                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                }
+                TokenKind::StringLiteral
             }
             b'(' => {
                 offset += 1;

@@ -517,6 +517,33 @@ fn source_and_debug_name_limits_are_checked_before_owned_copies() {
 }
 
 #[test]
+fn string_literal_payload_limits_fail_before_constant_insertion() {
+    let source = make_source(b"return 'blu'".to_vec());
+    let mut limits = OwnedCompileLimits::default();
+    limits.artifact.max_constant_bytes = 2;
+    assert!(matches!(
+        OwnedCompiler::new(limits).compile(&source, SemanticProfile::Blu, compiler_identity(),),
+        Err(OwnedCompileError::Limit {
+            kind: OwnedCompileLimit::StringLiteralBytes,
+            required: 3,
+            limit: 2,
+        })
+    ));
+
+    let source = make_source(b"return 'abc', 'de'".to_vec());
+    let mut limits = OwnedCompileLimits::default();
+    limits.artifact.max_total_constant_bytes = 4;
+    assert!(matches!(
+        OwnedCompiler::new(limits).compile(&source, SemanticProfile::Luau, compiler_identity(),),
+        Err(OwnedCompileError::Limit {
+            kind: OwnedCompileLimit::TotalConstantBytes,
+            required: 5,
+            limit: 4,
+        })
+    ));
+}
+
+#[test]
 fn artifact_register_limit_is_separate_from_bootstrap_translation_limit() {
     use core::fmt::Write;
 
