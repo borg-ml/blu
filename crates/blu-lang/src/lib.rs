@@ -356,7 +356,7 @@ mod tests {
             engine.execute(b"return require('answer')(2)"),
             Ok(vec![Value::Number(42.0)])
         );
-        engine.vm_mut().collect(std::iter::empty());
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
         assert_eq!(
             engine.execute(b"return require('answer')(3)"),
             Ok(vec![Value::Number(43.0)])
@@ -487,7 +487,7 @@ mod tests {
     fn suspended_explicit_frames_remain_gc_roots() {
         let mut engine = Engine::default();
         let collect = engine.vm_mut().register_function(|vm, _| {
-            vm.collect(std::iter::empty());
+            vm.collect(std::iter::empty())?;
             Ok(Vec::new())
         });
         engine
@@ -547,7 +547,7 @@ mod tests {
             ),
             Ok(Vec::new())
         );
-        engine.vm_mut().collect(std::iter::empty());
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
         assert_eq!(
             engine.execute(b"return coroutine.resume(saved_thread)"),
             Ok(vec![Value::Boolean(true), Value::Number(42.0)])
@@ -814,7 +814,7 @@ mod tests {
             ),
             Ok(vec![Value::Number(5.0)])
         );
-        engine.vm_mut().collect(std::iter::empty());
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
         assert_eq!(
             engine.execute(b"return wrapped(9)"),
             Ok(vec![Value::Number(10.0)])

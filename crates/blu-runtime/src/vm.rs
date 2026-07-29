@@ -1,5 +1,8 @@
 use crate::heap::UpvalueId;
-use crate::{ClosureId, Dialect, Heap, HeapError, NativeFunctionId, TableId, ThreadId, Value};
+use crate::{
+    ClosureId, Dialect, Heap, HeapError, MemoryConfig, MemoryUsage, NativeFunctionId, TableId,
+    ThreadId, Value,
+};
 use blu_bytecode::{
     Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype, ValidatedChunk,
     ValidationError,
@@ -64,7 +67,19 @@ impl Vm {
     /// Creates a VM, returning structured heap-allocation failures from
     /// built-in initialization.
     pub fn try_new(dialect: Dialect) -> Result<Self, RuntimeError> {
-        let mut heap = Heap::default();
+        Self::try_new_with_memory(dialect, MemoryConfig::default())
+    }
+
+    /// Creates a VM with deterministic accounting for heap-owned storage.
+    ///
+    /// Strings, chunks, VM frames, native-owned values, and GC work queues are
+    /// not included in this stage's reported usage. Logical charged capacities
+    /// are conservative but are not an exact process RSS measurement.
+    pub fn try_new_with_memory(
+        dialect: Dialect,
+        memory: MemoryConfig,
+    ) -> Result<Self, RuntimeError> {
+        let mut heap = Heap::try_new(memory)?;
         let main_thread = heap.allocate_thread(&[])?;
         let mut threads = HashMap::new();
         threads.insert(main_thread, ThreadState::Running);
@@ -133,6 +148,11 @@ impl Vm {
     }
 
     #[must_use]
+    pub const fn memory_usage(&self) -> MemoryUsage {
+        self.heap.memory_usage()
+    }
+
+    #[must_use]
     pub const fn dialect(&self) -> Dialect {
         self.dialect
     }
@@ -173,16 +193,16 @@ impl Vm {
     pub fn collect<'a>(
         &mut self,
         roots: impl IntoIterator<Item = &'a Value>,
-    ) -> crate::CollectionStats {
+    ) -> Result<crate::CollectionStats, RuntimeError> {
         let mut all_roots: Vec<Value> = self.globals.values().cloned().collect();
         all_roots.push(Value::Thread(self.main_thread));
         all_roots.extend(self.module_cache.values().cloned());
         all_roots.extend(self.active_roots.iter().flatten().cloned());
         all_roots.extend(roots.into_iter().cloned());
-        let stats = self.heap.collect(&all_roots);
+        let stats = self.heap.collect(&all_roots)?;
         self.threads
             .retain(|thread, _| self.heap.contains_thread(*thread));
-        stats
+        Ok(stats)
     }
 
     fn ensure_heap_objects(
@@ -194,7 +214,7 @@ impl Vm {
         if required <= self.heap_object_limit {
             return Ok(());
         }
-        self.collect(roots);
+        self.collect(roots)?;
         let required = self.heap.live_objects().saturating_add(additional);
         if required <= self.heap_object_limit {
             Ok(())
@@ -3970,7 +3990,7 @@ mod tests {
         );
         let mut vm = Vm::default();
         let id = vm.register_function(|vm, _| {
-            vm.collect(std::iter::empty::<&Value>());
+            vm.collect(std::iter::empty::<&Value>())?;
             Ok(Vec::new())
         });
         vm.set_global(&b"collect"[..], Value::NativeFunction(id));
@@ -4028,7 +4048,7 @@ mod tests {
         let mut vm = Vm::default();
         let string = table_id(vm.global(b"string").unwrap()).unwrap();
         let garbage = vm.heap.allocate_table(0, 0).unwrap();
-        let stats = vm.collect(std::iter::empty::<&Value>());
+        let stats = vm.collect(std::iter::empty::<&Value>()).unwrap();
         assert_eq!(stats.collected, 1);
         assert_eq!(stats.before, stats.retained + stats.collected);
         assert!(
@@ -4049,5 +4069,27 @@ mod tests {
         assert!(matches!(vm.global(b"table"), Some(Value::Table(_))));
         assert!(matches!(vm.global(b"coroutine"), Some(Value::Table(_))));
         assert!(matches!(vm.global(b"math"), Some(Value::Table(_))));
+    }
+
+    #[test]
+    fn configured_constructor_reports_heap_memory_limit_structurally() {
+        let error = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                hard_limit_bytes: Some(0),
+                gc_start_bytes: 0,
+                gc_growth_percent: 50,
+                max_single_allocation_bytes: usize::MAX,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            RuntimeError::Heap(HeapError::Memory(crate::MemoryError::LimitExceeded {
+                used: 0,
+                limit: 0,
+                ..
+            }))
+        ));
     }
 }

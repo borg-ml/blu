@@ -136,7 +136,7 @@ const fn checked_align_up(value: usize, alignment: usize) -> Option<usize> {
 }
 
 /// Tracks deterministic, conservatively charged memory usage.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct MemoryAccount {
     config: MemoryConfig,
     current_bytes: usize,
@@ -260,6 +260,25 @@ impl MemoryReservation<'_> {
     pub fn commit(mut self) {
         self.committed = true;
     }
+
+    /// Commits this reservation while releasing an allocation it replaces.
+    pub fn commit_replacing(mut self, replaced_bytes: usize) -> Result<(), MemoryError> {
+        let used_before_reservation = self.account.current_bytes.checked_sub(self.bytes).ok_or(
+            MemoryError::AccountingUnderflow {
+                released: self.bytes,
+                used: self.account.current_bytes,
+            },
+        )?;
+        if replaced_bytes > used_before_reservation {
+            return Err(MemoryError::AccountingUnderflow {
+                released: replaced_bytes,
+                used: used_before_reservation,
+            });
+        }
+        self.account.current_bytes -= replaced_bytes;
+        self.committed = true;
+        Ok(())
+    }
 }
 
 impl Drop for MemoryReservation<'_> {
@@ -333,6 +352,26 @@ mod tests {
         assert_eq!(account.usage().current_bytes, 32);
         account.release(32).unwrap();
         assert_eq!(account.usage().current_bytes, 0);
+    }
+
+    #[test]
+    fn replacement_commit_atomically_swaps_charges() {
+        let mut account = MemoryAccount::default();
+        account.reserve(40).unwrap().commit();
+        account.reserve(64).unwrap().commit_replacing(40).unwrap();
+        assert_eq!(account.usage().current_bytes, 64);
+        assert_eq!(account.usage().peak_bytes, 104);
+
+        let error = account.reserve(8).unwrap().commit_replacing(65);
+        assert_eq!(
+            error,
+            Err(MemoryError::AccountingUnderflow {
+                released: 65,
+                used: 64,
+            })
+        );
+        assert_eq!(account.usage().current_bytes, 64);
+        assert_eq!(account.usage().peak_bytes, 104);
     }
 
     #[test]

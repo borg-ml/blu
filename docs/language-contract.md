@@ -117,10 +117,15 @@ callers, globals, modules, and threads rooted; retained objects then fail with
 a structured limit error. Output growth is preflighted and uses fallible
 reservation. Guest-driven arena, table, closure-upvalue, and thread-root
 capacity growth also uses checked fallible reservation and returns structured
-allocation errors. These are partial defenses: VM-wide byte accounting for
-table growth, strings, chunks, temporary/native results, root queues, and
-host-owned values remains required before confined execution can claim a hard
-memory limit.
+allocation errors. The runtime now exposes deterministic logical byte
+accounting and an optional limit for arena slots plus live table buffers,
+closure-upvalue buffers, and thread-root buffers. Collection releases live
+object-buffer charges while retaining reusable arena-slot charges. This is
+still a partial accounting boundary: strings, chunks, VM stacks, the arena
+free list, collection work queues, temporary/native results, and host-owned
+values are not included, and the byte threshold does not yet trigger
+collection automatically. Confined execution therefore cannot claim a hard
+process-wide memory limit.
 
 ## Package compatibility
 
