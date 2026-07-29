@@ -899,6 +899,21 @@ impl Vm {
                     )?;
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::Modulo {
+                    destination,
+                    left,
+                    right,
+                } => {
+                    let left = blu_register(&registers, left)?;
+                    let right = blu_register(&registers, right)?;
+                    let value = if let (Value::Integer(left), Value::Integer(right)) = (left, right)
+                    {
+                        Value::Integer(integer_floor_mod(*left, *right)?)
+                    } else {
+                        arithmetic(Opcode::Mod, left, right)?
+                    };
+                    set_blu_register(&mut registers, destination, value)?;
+                }
                 BluInstruction::Move {
                     destination,
                     source,
@@ -4708,6 +4723,11 @@ fn integer_floor_div(left: i64, right: i64) -> Result<i64, RuntimeError> {
     })
 }
 
+fn integer_floor_mod(left: i64, right: i64) -> Result<i64, RuntimeError> {
+    let quotient = integer_floor_div(left, right)?;
+    Ok(left.wrapping_sub(quotient.wrapping_mul(right)))
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeError {
     Validation(ValidationError),
@@ -5397,6 +5417,48 @@ mod tests {
                 "{profile}"
             );
         }
+    }
+
+    #[test]
+    fn direct_blu_v1_integer_modulo_uses_floor_semantics_and_rejects_zero() {
+        let modulo_program = |left, right| {
+            validated_blu_program(
+                SemanticProfile::Lua54,
+                vec![BluConstant::Integer(left), BluConstant::Integer(right)],
+                vec![
+                    BluInstruction::LoadConstant {
+                        destination: 0,
+                        constant: 0,
+                    },
+                    BluInstruction::LoadConstant {
+                        destination: 1,
+                        constant: 1,
+                    },
+                    BluInstruction::Modulo {
+                        destination: 2,
+                        left: 0,
+                        right: 1,
+                    },
+                    BluInstruction::Return { first: 2, count: 1 },
+                ],
+                FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS,
+                3,
+            )
+        };
+
+        let mut vm = Vm::new(Dialect::Blu);
+        assert_eq!(
+            vm.execute_blu_v1(modulo_program(-7, 3), BluLimits::default()),
+            Ok(vec![Value::Integer(2)])
+        );
+        assert_eq!(
+            vm.execute_blu_v1(modulo_program(7, -3), BluLimits::default()),
+            Ok(vec![Value::Integer(-2)])
+        );
+        assert_eq!(
+            vm.execute_blu_v1(modulo_program(7, 0), BluLimits::default()),
+            Err(RuntimeError::DivideByZero)
+        );
     }
 
     #[test]

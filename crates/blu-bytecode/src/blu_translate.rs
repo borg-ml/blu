@@ -257,6 +257,16 @@ fn translate_instruction(
             register(prototype, left)?,
             register(prototype, right)?,
         )),
+        BluInstruction::Modulo {
+            destination,
+            left,
+            right,
+        } => Ok(abc(
+            Opcode::Mod,
+            register(prototype, destination)?,
+            register(prototype, left)?,
+            register(prototype, right)?,
+        )),
         BluInstruction::Move {
             destination,
             source,
