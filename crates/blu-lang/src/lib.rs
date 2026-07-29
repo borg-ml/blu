@@ -1164,6 +1164,8 @@ return value"#
                         packed.n,
                         math.deg(math.pi),
                         math.log(8, 2),
+                        math.fmod(-7, 3),
+                        math.fmod(7, -3),
                         table.unpack(packed, 1, 3)
                 "#
             ),
@@ -1175,6 +1177,8 @@ return value"#
                 Value::Integer(3),
                 Value::Number(180.0),
                 Value::Number(3.0),
+                Value::Number(-1.0),
+                Value::Number(1.0),
                 Value::Number(4.0),
                 Value::Nil,
                 Value::Number(6.0),
@@ -1184,6 +1188,13 @@ return value"#
             Engine::for_dialect(Dialect::Luau).execute(b"return string.rep('ab', 3, '-')"),
             Ok(vec![Value::String(Arc::from(&b"ababab"[..]))])
         );
+        assert!(matches!(
+            Engine::default().execute(b"return math.fmod('x', 2)"),
+            Err(ExecuteError::Runtime(RuntimeError::Type {
+                operation: "math.fmod",
+                ..
+            }))
+        ));
     }
 
     #[test]

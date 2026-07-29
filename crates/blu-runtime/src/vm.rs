@@ -3932,6 +3932,11 @@ impl Vm {
                 number_argument(arguments, 0, "math.deg")?.to_degrees(),
             )])
         });
+        let fmod = self.register_function(|_, arguments| {
+            let dividend = number_argument(arguments, 0, "math.fmod")?;
+            let divisor = number_argument(arguments, 1, "math.fmod")?;
+            Ok(vec![Value::Number(dividend % divisor)])
+        });
         let min = self.register_function(|_, arguments| {
             let mut values = arguments.iter();
             let first = values.next().ok_or(RuntimeError::Argument {
@@ -3975,7 +3980,7 @@ impl Vm {
             Ok(vec![Value::Number(result)])
         });
 
-        let table = self.heap.allocate_table(0, 15)?;
+        let table = self.heap.allocate_table(0, 16)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -3988,6 +3993,7 @@ impl Vm {
             (&b"tan"[..], Value::NativeFunction(tan)),
             (&b"rad"[..], Value::NativeFunction(rad)),
             (&b"deg"[..], Value::NativeFunction(deg)),
+            (&b"fmod"[..], Value::NativeFunction(fmod)),
             (&b"min"[..], Value::NativeFunction(min)),
             (&b"max"[..], Value::NativeFunction(max)),
             (&b"pi"[..], Value::Number(core::f64::consts::PI)),

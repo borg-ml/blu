@@ -23,6 +23,8 @@ and table operations, numeric and generic loops, closures and mutable upvalues,
 variadic and multiple-return calls, globals and imports, Rust native functions,
 protected calls, `pairs`/`ipairs`/`next`, string method dispatch, core
 metamethods, an initial standard library, and host-configured cached `require`.
+The math slice includes shared truncating `math.fmod`; unlike floor-based `%`,
+its remainder preserves the dividend's sign.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
 remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,

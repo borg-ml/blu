@@ -259,6 +259,10 @@ Blu plugin is active.
 
 ## Resource limits
 
+The initial shared math library includes `math.fmod`. It requires two numeric
+arguments and uses truncating remainder semantics, so the result follows the
+dividend's sign and is intentionally distinct from the language `%` operator.
+
 Serialized bytecode and mutable embedding inputs are checked again at the
 execution boundary. Loaders, compiler artifacts, and portable packages also
 expose an opaque `ValidatedChunk` whose safe API permits immutable inspection
