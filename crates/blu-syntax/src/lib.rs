@@ -1,10 +1,21 @@
 #![forbid(unsafe_code)]
-//! Byte-oriented lexical analysis for the first Blu-owned frontend slice.
+//! Byte-oriented syntax analysis for the first Blu-owned frontend slice.
 //!
-//! This crate does not parse or compile source. It retains whitespace and
-//! comments, reconciles an optional initial dialect directive with an explicit
-//! semantic profile, and recognizes only the tokens represented by
-//! [`TokenKind`]. All source inspection is performed on bytes.
+//! The lexer retains whitespace and comments, reconciles an optional initial
+//! dialect directive with an explicit semantic profile, and recognizes only
+//! the tokens represented by [`TokenKind`]. The bounded parser accepts only
+//! the small grammar documented by [`parse`]. This crate does not resolve,
+//! lower, compile, or execute source. All source inspection is performed on
+//! bytes.
+
+mod ast;
+mod parser;
+
+pub use ast::{
+    Ast, BinaryExpression, BinaryOperator, Expression, ExpressionId, ExpressionKind, Identifier,
+    LocalStatement, ReturnStatement, Statement,
+};
+pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticCode, Label, Phase, SemanticProfile, Severity, SourceFile,
@@ -109,6 +120,7 @@ pub enum TokenKind {
     Identifier,
     DecimalInteger,
     Equal,
+    Comma,
     Plus,
     FloorDivide,
     Unknown,
@@ -162,7 +174,7 @@ impl DialectDirective {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub struct Lexed {
     profile: SemanticProfile,
     directive: Option<DialectDirective>,
@@ -293,6 +305,10 @@ pub fn lex(
             b'=' => {
                 offset += 1;
                 TokenKind::Equal
+            }
+            b',' => {
+                offset += 1;
+                TokenKind::Comma
             }
             b'+' => {
                 offset += 1;

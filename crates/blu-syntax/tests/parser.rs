@@ -1,0 +1,277 @@
+use blu_core::{Phase, SemanticProfile, SourceFile, SourceId, SourceLimits};
+use blu_syntax::{
+    BinaryOperator, ExpressionId, ExpressionKind, ParseError, ParseLimit, ParseLimits,
+    ParseOutcome, Statement, TokenKind, parse,
+};
+
+fn source(bytes: impl Into<Vec<u8>>) -> SourceFile {
+    SourceFile::new(
+        SourceId::new(29),
+        "parser-test.lua",
+        bytes,
+        SourceLimits::default(),
+    )
+    .unwrap()
+}
+
+fn accepted(
+    source: &SourceFile,
+    profile: SemanticProfile,
+    limits: ParseLimits,
+) -> blu_syntax::Parsed {
+    match parse(source, profile, limits).unwrap() {
+        ParseOutcome::Accepted(parsed) => parsed,
+        ParseOutcome::Rejected(rejected) => {
+            panic!("unexpected rejection: {:?}", rejected.diagnostics())
+        }
+    }
+}
+
+fn binary(parsed: &blu_syntax::Parsed, id: ExpressionId) -> blu_syntax::BinaryExpression {
+    match parsed.ast().expression(id).unwrap().kind() {
+        ExpressionKind::Binary(binary) => binary,
+        other => panic!("expected binary expression, found {other:?}"),
+    }
+}
+
+#[test]
+fn vertical_slice_preserves_profile_spans_and_trivia_for_all_profiles() {
+    for profile in SemanticProfile::ALL {
+        let bytes = format!(
+            "--!dialect {}\n-- retained\nlocal answer = 40\nreturn answer + 2",
+            profile.as_str()
+        );
+        let source = source(bytes.into_bytes());
+        let parsed = accepted(&source, profile, ParseLimits::default());
+
+        assert_eq!(parsed.profile(), profile);
+        assert_eq!(parsed.ast().profile(), profile);
+        assert_eq!(parsed.directive().unwrap().profile(), profile);
+        assert_eq!(parsed.ast().statements().len(), 2);
+        assert!(parsed.tokens().iter().any(|token| {
+            token.kind() == TokenKind::Comment
+                && source.slice(token.span()).unwrap() == b"-- retained"
+        }));
+
+        let Statement::Local(local) = &parsed.ast().statements()[0] else {
+            panic!("expected local statement");
+        };
+        assert_eq!(source.slice(local.name().span()).unwrap(), b"answer");
+        assert_eq!(
+            source
+                .slice(parsed.ast().expression(local.value()).unwrap().span())
+                .unwrap(),
+            b"40"
+        );
+        let Statement::Return(return_statement) = &parsed.ast().statements()[1] else {
+            panic!("expected return statement");
+        };
+        assert_eq!(return_statement.values().len(), 1);
+        assert_eq!(
+            source.slice(return_statement.span()).unwrap(),
+            b"return answer + 2"
+        );
+    }
+}
+
+#[test]
+fn floor_divide_binds_tighter_than_add_and_both_are_left_associative() {
+    let source = source(b"return a + b // c // d + e".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Lua54, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+
+    let root = binary(&parsed, statement.values()[0]);
+    assert_eq!(root.operator(), BinaryOperator::Add);
+    assert_eq!(
+        source
+            .slice(parsed.ast().expression(root.right()).unwrap().span())
+            .unwrap(),
+        b"e"
+    );
+    let first_add = binary(&parsed, root.left());
+    assert_eq!(first_add.operator(), BinaryOperator::Add);
+    assert_eq!(
+        source
+            .slice(parsed.ast().expression(first_add.left()).unwrap().span())
+            .unwrap(),
+        b"a"
+    );
+    let second_divide = binary(&parsed, first_add.right());
+    assert_eq!(second_divide.operator(), BinaryOperator::FloorDivide);
+    assert_eq!(source.slice(second_divide.operator_span()).unwrap(), b"//");
+    let first_divide = binary(&parsed, second_divide.left());
+    assert_eq!(first_divide.operator(), BinaryOperator::FloorDivide);
+    assert_eq!(
+        source
+            .slice(parsed.ast().expression(first_divide.left()).unwrap().span())
+            .unwrap(),
+        b"b"
+    );
+    assert_eq!(
+        source
+            .slice(
+                parsed
+                    .ast()
+                    .expression(first_divide.right())
+                    .unwrap()
+                    .span()
+            )
+            .unwrap(),
+        b"c"
+    );
+}
+
+#[test]
+fn return_expression_lists_are_spanned_and_comma_separated() {
+    let source = source(b"return 1, value + 2, 9 // 4".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Lua53, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+
+    assert_eq!(statement.values().len(), 3);
+    assert_eq!(
+        source.slice(statement.span()).unwrap(),
+        b"return 1, value + 2, 9 // 4"
+    );
+    assert_eq!(
+        parsed
+            .tokens()
+            .iter()
+            .filter(|token| token.kind() == TokenKind::Comma)
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn malformed_input_is_a_structural_rejection_with_stable_diagnostics() {
+    let source = source(b"local = 1\nreturn value +".to_vec());
+    let outcome = parse(&source, SemanticProfile::Blu, ParseLimits::default()).unwrap();
+    assert!(outcome.accepted().is_none());
+    let rejected = outcome.rejected().unwrap();
+
+    assert_eq!(rejected.profile(), SemanticProfile::Blu);
+    assert_eq!(rejected.diagnostics().len(), 2);
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0002");
+    assert_eq!(rejected.diagnostics()[0].phase(), Phase::Parse);
+    assert_eq!(rejected.diagnostics()[0].expected(), ["identifier"]);
+    assert_eq!(
+        source
+            .slice(rejected.diagnostics()[0].primary().span())
+            .unwrap(),
+        b"="
+    );
+    assert_eq!(rejected.diagnostics()[1].code().as_str(), "BLU-PARSE-0004");
+    assert!(rejected.diagnostics()[1].primary().span().is_empty());
+    assert_eq!(
+        rejected.diagnostics()[1]
+            .primary()
+            .span()
+            .start()
+            .as_usize(),
+        source.len()
+    );
+}
+
+#[test]
+fn empty_trivia_only_and_truncated_inputs_do_not_panic() {
+    for bytes in [b"".as_slice(), b" \n-- retained".as_slice()] {
+        let source = source(bytes.to_vec());
+        let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+
+        assert!(parsed.ast().statements().is_empty());
+        assert!(parsed.ast().expressions().is_empty());
+        assert!(parsed.ast().span().is_empty());
+    }
+
+    let source = source(b"return".to_vec());
+    let outcome = parse(&source, SemanticProfile::Blu, ParseLimits::default()).unwrap();
+    let rejected = outcome.rejected().unwrap();
+    assert_eq!(rejected.diagnostics().len(), 1);
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0004");
+    assert!(rejected.diagnostics()[0].primary().span().is_empty());
+    assert_eq!(
+        rejected.diagnostics()[0]
+            .primary()
+            .span()
+            .start()
+            .as_usize(),
+        source.len()
+    );
+}
+
+#[test]
+fn ast_depth_and_diagnostic_limits_are_structured() {
+    let valid_source = source(b"return 1 + 2 + 3".to_vec());
+    assert_eq!(
+        parse(
+            &valid_source,
+            SemanticProfile::Blu,
+            ParseLimits {
+                max_ast_nodes: 3,
+                ..ParseLimits::default()
+            },
+        ),
+        Err(ParseError::Limit {
+            kind: ParseLimit::AstNodes,
+            required: 4,
+            limit: 3,
+        })
+    );
+    assert_eq!(
+        parse(
+            &valid_source,
+            SemanticProfile::Blu,
+            ParseLimits {
+                max_expression_depth: 2,
+                ..ParseLimits::default()
+            },
+        ),
+        Err(ParseError::Limit {
+            kind: ParseLimit::ExpressionDepth,
+            required: 3,
+            limit: 2,
+        })
+    );
+
+    let malformed = source(b"1 2".to_vec());
+    assert_eq!(
+        parse(
+            &malformed,
+            SemanticProfile::Blu,
+            ParseLimits {
+                max_diagnostics: 1,
+                ..ParseLimits::default()
+            },
+        ),
+        Err(ParseError::Limit {
+            kind: ParseLimit::Diagnostics,
+            required: 2,
+            limit: 1,
+        })
+    );
+}
+
+#[test]
+fn lua51_and_lua52_floor_divide_rejection_is_inherited_from_lexing() {
+    for profile in [SemanticProfile::Lua51, SemanticProfile::Lua52] {
+        let source = source(b"return 7 // 2".to_vec());
+        let outcome = parse(&source, profile, ParseLimits::default()).unwrap();
+        let rejected = outcome.rejected().unwrap();
+
+        assert!(rejected.lexed().has_errors(), "{profile}");
+        assert_eq!(rejected.diagnostics().len(), 1, "{profile}");
+        assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-LEX-0002");
+        assert_eq!(rejected.diagnostics()[0].phase(), Phase::Lex);
+        assert_eq!(rejected.diagnostics()[0].profile(), profile);
+        assert_eq!(
+            source
+                .slice(rejected.diagnostics()[0].primary().span())
+                .unwrap(),
+            b"//"
+        );
+    }
+}
