@@ -1,0 +1,21 @@
+[workspace]
+members = [
+    "crates/blu-bytecode",
+    "crates/blu-conformance",
+    "crates/blu-lang",
+    "crates/blu-runtime",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/borg-ml/blu"
+authors = ["Borg contributors"]
+
+[workspace.dependencies]
+blu-bytecode = { version = "0.1.0", path = "crates/blu-bytecode" }
+blu-runtime = { version = "0.1.0", path = "crates/blu-runtime" }
+tempfile = "3.23"

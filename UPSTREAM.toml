@@ -1,0 +1,34 @@
+repository = "https://github.com/luau-lang/luau.git"
+revision = "f8ca77acdcb50241e3da21af663f8ef97b4b5ce4"
+bytecode_min = 3
+bytecode_max = 12
+bytecode_target = 9
+typeinfo_min = 1
+typeinfo_max = 3
+typeinfo_target = 3
+
+[[lua]]
+dialect = "lua51"
+version = "5.1.5"
+source = "https://www.lua.org/ftp/lua-5.1.5.tar.gz"
+
+[[lua]]
+dialect = "lua52"
+version = "5.2.4"
+source = "https://www.lua.org/ftp/lua-5.2.4.tar.gz"
+
+[[lua]]
+dialect = "lua53"
+version = "5.3.6"
+source = "https://www.lua.org/ftp/lua-5.3.6.tar.gz"
+
+[[lua]]
+dialect = "lua54"
+version = "5.4.8"
+source = "https://www.lua.org/ftp/lua-5.4.8.tar.gz"
+
+[[lua]]
+dialect = "lua55"
+version = "5.5.0"
+source = "https://www.lua.org/ftp/lua-5.5.0.tar.gz"
+
