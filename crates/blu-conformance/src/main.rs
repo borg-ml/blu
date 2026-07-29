@@ -32,6 +32,32 @@ end
 print(sum(values))
 print(string.sub("blu", 2, 3))
 "#;
+const SCALAR_CASES: [(&str, &str); 12] = [
+    ("addition", "1 + 2"),
+    ("precedence", "(9 - 4) * 3"),
+    ("division", "7 / 2"),
+    ("floor division", "-7 // 3"),
+    ("modulo", "17 % 5"),
+    ("power", "2 ^ 8"),
+    ("string", "\"blu\""),
+    ("string length", "#(\"borg\")"),
+    ("not", "not false"),
+    ("and", "true and 4"),
+    ("or", "false or 9"),
+    ("comparison", "3 < 4"),
+];
+const TABLE_SOURCE: &str = r#"
+local values = {}
+values[1] = 3
+values.answer = 4
+return values[1] + values.answer
+"#;
+const TABLE_REFERENCE_SOURCE: &str = r#"
+local values = {}
+values[1] = 3
+values.answer = 4
+print(type(values[1] + values.answer) .. ":" .. tostring(values[1] + values.answer))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -56,41 +82,16 @@ fn run() -> Result<(), String> {
     verify_executable(&compiler)?;
 
     let temporary = tempfile::tempdir().map_err(|error| error.to_string())?;
-    let return_source = temporary.path().join("return.luau");
-    fs::write(&return_source, "return 6 * 7\n").map_err(|error| error.to_string())?;
-    let bytecode = Command::new(&compiler)
-        .arg("--binary")
-        .arg(&return_source)
-        .output()
-        .map_err(|error| format!("failed to execute {}: {error}", compiler.display()))?;
-    ensure_success(&compiler, &bytecode)?;
-    let chunk = load(&bytecode.stdout, LoadLimits::default())
-        .map_err(|error| format!("Blu rejected upstream bytecode: {error}"))?;
-    let blu_result = Vm::default()
-        .execute(&chunk)
-        .map_err(|error| format!("Blu failed upstream bytecode: {error}"))?;
-    if blu_result != [Value::Number(42.0)] {
-        return Err(format!("Blu returned {blu_result:?}, expected Number(42)"));
-    }
-
-    let print_source = temporary.path().join("print.luau");
-    fs::write(&print_source, "print(6 * 7)\n").map_err(|error| error.to_string())?;
-    let reference = Command::new(&args.upstream)
-        .arg(&print_source)
-        .output()
-        .map_err(|error| {
-            format!(
-                "failed to execute reference {}: {error}",
-                args.upstream.display()
-            )
-        })?;
-    ensure_success(&args.upstream, &reference)?;
-    if String::from_utf8_lossy(&reference.stdout).trim() != "42" {
-        return Err(format!(
-            "reference returned unexpected output {:?}",
-            String::from_utf8_lossy(&reference.stdout)
-        ));
-    }
+    let (scalar_count, bytecode_version) =
+        verify_scalar_cases(&compiler, &args.upstream, temporary.path())?;
+    verify_program_case(
+        "table identity and split storage",
+        TABLE_SOURCE,
+        TABLE_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
 
     let portable_source = temporary.path().join("portable.lua");
     fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
@@ -108,10 +109,137 @@ fn run() -> Result<(), String> {
     }
 
     println!("pinned Luau revision: {PINNED_REVISION}");
-    println!("bytecode version: {}", chunk.version);
-    println!("scalar differential smoke: pass (42)");
+    println!("bytecode version: {bytecode_version}");
+    println!("scalar differential corpus: pass ({scalar_count} cases)");
+    println!("heap differential corpus: pass (table identity and access)");
     println!("portable reference matrix: pass (Luau, Lua 5.1-5.5)");
     Ok(())
+}
+
+fn verify_program_case(
+    name: &str,
+    source: &str,
+    reference_source: &str,
+    compiler: &Path,
+    upstream: &Path,
+    temporary: &Path,
+) -> Result<(), String> {
+    let source_path = temporary.join("program.luau");
+    fs::write(&source_path, source).map_err(|error| error.to_string())?;
+    let bytecode = Command::new(compiler)
+        .arg("--binary")
+        .arg(&source_path)
+        .output()
+        .map_err(|error| format!("failed to execute {}: {error}", compiler.display()))?;
+    ensure_success(compiler, &bytecode)?;
+    let chunk = load(&bytecode.stdout, LoadLimits::default())
+        .map_err(|error| format!("Blu rejected program case {name:?}: {error}"))?;
+    let result = Vm::default()
+        .execute(&chunk)
+        .map_err(|error| format!("Blu failed program case {name:?}: {error}"))?;
+    if result.len() != 1 {
+        return Err(format!(
+            "Blu returned {} values for program case {name:?}, expected one",
+            result.len()
+        ));
+    }
+    let result = canonical_value(&result[0])?;
+
+    let reference_path = temporary.join("program-reference.luau");
+    fs::write(&reference_path, reference_source).map_err(|error| error.to_string())?;
+    let reference = Command::new(upstream)
+        .arg(&reference_path)
+        .output()
+        .map_err(|error| {
+            format!(
+                "failed to execute reference {}: {error}",
+                upstream.display()
+            )
+        })?;
+    ensure_success(upstream, &reference)?;
+    let reference = String::from_utf8_lossy(&reference.stdout);
+    if result != reference.trim() {
+        return Err(format!(
+            "program case {name:?} differs: Blu={result:?}, Luau={:?}",
+            reference.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_scalar_cases(
+    compiler: &Path,
+    upstream: &Path,
+    temporary: &Path,
+) -> Result<(usize, u8), String> {
+    let mut bytecode_version = None;
+    for (index, (name, expression)) in SCALAR_CASES.iter().enumerate() {
+        let return_source = temporary.join(format!("scalar-{index}.luau"));
+        fs::write(&return_source, format!("return {expression}\n"))
+            .map_err(|error| error.to_string())?;
+        let bytecode = Command::new(compiler)
+            .arg("--binary")
+            .arg(&return_source)
+            .output()
+            .map_err(|error| format!("failed to execute {}: {error}", compiler.display()))?;
+        ensure_success(compiler, &bytecode)?;
+        let chunk = load(&bytecode.stdout, LoadLimits::default())
+            .map_err(|error| format!("Blu rejected scalar case {name:?}: {error}"))?;
+        bytecode_version.get_or_insert(chunk.version);
+        let blu_result = Vm::default()
+            .execute(&chunk)
+            .map_err(|error| format!("Blu failed scalar case {name:?}: {error}"))?;
+        if blu_result.len() != 1 {
+            return Err(format!(
+                "Blu returned {} values for scalar case {name:?}, expected one",
+                blu_result.len()
+            ));
+        }
+        let blu_result = canonical_value(&blu_result[0])?;
+
+        let print_source = temporary.join(format!("scalar-reference-{index}.luau"));
+        fs::write(
+            &print_source,
+            format!("local value = {expression}\nprint(type(value) .. \":\" .. tostring(value))\n"),
+        )
+        .map_err(|error| error.to_string())?;
+        let reference = Command::new(upstream)
+            .arg(&print_source)
+            .output()
+            .map_err(|error| {
+                format!(
+                    "failed to execute reference {}: {error}",
+                    upstream.display()
+                )
+            })?;
+        ensure_success(upstream, &reference)?;
+        let reference = String::from_utf8_lossy(&reference.stdout);
+        if blu_result != reference.trim() {
+            return Err(format!(
+                "scalar case {name:?} differs: Blu={blu_result:?}, Luau={:?}",
+                reference.trim()
+            ));
+        }
+    }
+    Ok((
+        SCALAR_CASES.len(),
+        bytecode_version.ok_or("scalar corpus is empty")?,
+    ))
+}
+
+fn canonical_value(value: &Value) -> Result<String, String> {
+    match value {
+        Value::Nil => Ok("nil:nil".into()),
+        Value::Boolean(value) => Ok(format!("boolean:{value}")),
+        Value::Number(value) => Ok(format!("number:{value}")),
+        Value::Integer(value) => Ok(format!("number:{value}")),
+        Value::String(value) => std::str::from_utf8(value)
+            .map(|value| format!("string:{value}"))
+            .map_err(|error| format!("Blu returned a non-UTF-8 scalar string: {error}")),
+        _ => Err(format!(
+            "Blu returned an unsupported differential value {value:?}"
+        )),
+    }
 }
 
 fn executable_name(base: &str) -> String {

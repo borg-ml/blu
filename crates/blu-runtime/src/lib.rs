@@ -7,9 +7,11 @@
 pub use blu_bytecode as bytecode;
 
 mod dialect;
+mod heap;
 mod value;
 mod vm;
 
 pub use dialect::Dialect;
+pub use heap::{CollectionStats, Heap, HeapError, TableId};
 pub use value::Value;
 pub use vm::{RuntimeError, Vm};

@@ -1,3 +1,4 @@
+use crate::TableId;
 use core::fmt;
 use std::sync::Arc;
 
@@ -9,6 +10,7 @@ pub enum Value {
     Number(f64),
     Integer(i64),
     String(Arc<[u8]>),
+    Table(TableId),
 }
 
 impl Value {
@@ -24,6 +26,7 @@ impl Value {
             Self::Boolean(_) => "boolean",
             Self::Number(_) | Self::Integer(_) => "number",
             Self::String(_) => "string",
+            Self::Table(_) => "table",
         }
     }
 
@@ -47,6 +50,7 @@ impl fmt::Debug for Value {
                 .debug_tuple("String")
                 .field(&String::from_utf8_lossy(value))
                 .finish(),
+            Self::Table(value) => value.fmt(f),
         }
     }
 }
@@ -61,6 +65,7 @@ impl PartialEq for Value {
             (Self::Number(left), Self::Integer(right))
             | (Self::Integer(right), Self::Number(left)) => *left == *right as f64,
             (Self::String(left), Self::String(right)) => left == right,
+            (Self::Table(left), Self::Table(right)) => left == right,
             _ => false,
         }
     }

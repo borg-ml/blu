@@ -1,4 +1,4 @@
-use crate::{Dialect, Value};
+use crate::{Dialect, Heap, HeapError, TableId, Value};
 use blu_bytecode::{Chunk, Constant, Instruction, Opcode, Prototype};
 use core::fmt;
 use std::sync::Arc;
@@ -7,6 +7,7 @@ use std::sync::Arc;
 pub struct Vm {
     dialect: Dialect,
     instruction_limit: u64,
+    heap: Heap,
 }
 
 impl Default for Vm {
@@ -14,16 +15,18 @@ impl Default for Vm {
         Self {
             dialect: Dialect::Luau,
             instruction_limit: 10_000_000,
+            heap: Heap::default(),
         }
     }
 }
 
 impl Vm {
     #[must_use]
-    pub const fn new(dialect: Dialect) -> Self {
+    pub fn new(dialect: Dialect) -> Self {
         Self {
             dialect,
             instruction_limit: 10_000_000,
+            heap: Heap::default(),
         }
     }
 
@@ -33,7 +36,19 @@ impl Vm {
         self
     }
 
-    pub fn execute(&self, chunk: &Chunk) -> Result<Vec<Value>, RuntimeError> {
+    #[must_use]
+    pub const fn heap(&self) -> &Heap {
+        &self.heap
+    }
+
+    pub fn collect<'a>(
+        &mut self,
+        roots: impl IntoIterator<Item = &'a Value>,
+    ) -> crate::CollectionStats {
+        self.heap.collect(roots)
+    }
+
+    pub fn execute(&mut self, chunk: &Chunk) -> Result<Vec<Value>, RuntimeError> {
         if self.dialect != Dialect::Luau {
             return Err(RuntimeError::DialectNotImplemented(self.dialect));
         }
@@ -171,9 +186,10 @@ impl Vm {
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::Length => {
-                    let value = frame.get(instruction.b())?;
+                    let value = frame.get(instruction.b())?.clone();
                     let length = match value {
                         Value::String(value) => value.len(),
+                        Value::Table(table) => self.heap.table_length(table)?,
                         other => {
                             return Err(RuntimeError::Type {
                                 operation: "length",
@@ -183,6 +199,87 @@ impl Vm {
                         }
                     };
                     frame.set(instruction.a(), Value::Number(length as f64))?;
+                }
+                Opcode::NewTable => {
+                    let array_capacity = instruction.aux().ok_or(RuntimeError::MissingAux {
+                        pc: instruction.pc(),
+                        opcode: instruction.opcode(),
+                    })? as usize;
+                    let hash_capacity = if instruction.b() == 0 {
+                        0
+                    } else {
+                        1usize
+                            .checked_shl(u32::from(instruction.b() - 1))
+                            .unwrap_or(usize::MAX)
+                    };
+                    let table = self
+                        .heap
+                        .allocate_table(array_capacity, hash_capacity.min(1 << 20));
+                    frame.set(instruction.a(), Value::Table(table))?;
+                }
+                Opcode::GetTable => {
+                    let table = table_id(frame.get(instruction.b())?)?;
+                    let key = frame.get(instruction.c())?.clone();
+                    let value = self.heap.table_get(table, &key)?;
+                    frame.set(instruction.a(), value)?;
+                }
+                Opcode::SetTable => {
+                    let value = frame.get(instruction.a())?.clone();
+                    let table = table_id(frame.get(instruction.b())?)?;
+                    let key = frame.get(instruction.c())?.clone();
+                    self.heap.table_set(table, key, value)?;
+                }
+                Opcode::GetTableKs | Opcode::GetUdataKs => {
+                    let table = table_id(frame.get(instruction.b())?)?;
+                    let index = table_string_constant(instruction)?;
+                    let key = frame.constant_u32(index)?;
+                    let value = self.heap.table_get(table, &key)?;
+                    frame.set(instruction.a(), value)?;
+                }
+                Opcode::SetTableKs | Opcode::SetUdataKs => {
+                    let value = frame.get(instruction.a())?.clone();
+                    let table = table_id(frame.get(instruction.b())?)?;
+                    let index = table_string_constant(instruction)?;
+                    let key = frame.constant_u32(index)?;
+                    self.heap.table_set(table, key, value)?;
+                }
+                Opcode::GetTableN => {
+                    let table = table_id(frame.get(instruction.b())?)?;
+                    let key = Value::Integer(i64::from(instruction.c()) + 1);
+                    let value = self.heap.table_get(table, &key)?;
+                    frame.set(instruction.a(), value)?;
+                }
+                Opcode::SetTableN => {
+                    let value = frame.get(instruction.a())?.clone();
+                    let table = table_id(frame.get(instruction.b())?)?;
+                    let key = Value::Integer(i64::from(instruction.c()) + 1);
+                    self.heap.table_set(table, key, value)?;
+                }
+                Opcode::SetList => {
+                    let table = table_id(frame.get(instruction.a())?)?;
+                    let start = instruction.aux().ok_or(RuntimeError::MissingAux {
+                        pc: instruction.pc(),
+                        opcode: instruction.opcode(),
+                    })? as usize;
+                    let source = usize::from(instruction.b());
+                    let count = if instruction.c() == 0 {
+                        frame.top.saturating_sub(source)
+                    } else {
+                        usize::from(instruction.c() - 1)
+                    };
+                    for offset in 0..count {
+                        let register =
+                            u8::try_from(source + offset).map_err(|_| RuntimeError::Register {
+                                register: source + offset,
+                                count: frame.registers.len(),
+                            })?;
+                        let value = frame.get(register)?.clone();
+                        self.heap.table_set(
+                            table,
+                            Value::Integer((start + offset) as i64),
+                            value,
+                        )?;
+                    }
                 }
                 Opcode::Jump | Opcode::JumpBack | Opcode::JumpX => {
                     frame.jump(instruction)?;
@@ -368,6 +465,34 @@ fn materialize_constants(chunk: &Chunk, prototype: &Prototype) -> Result<Vec<Val
         .collect()
 }
 
+fn table_id(value: &Value) -> Result<TableId, RuntimeError> {
+    match value {
+        Value::Table(table) => Ok(*table),
+        other => Err(RuntimeError::Type {
+            operation: "table access",
+            expected: "table",
+            actual: other.type_name(),
+        }),
+    }
+}
+
+fn table_string_constant(instruction: Instruction) -> Result<u32, RuntimeError> {
+    let aux = instruction.aux().ok_or(RuntimeError::MissingAux {
+        pc: instruction.pc(),
+        opcode: instruction.opcode(),
+    })?;
+    Ok(
+        if matches!(
+            instruction.opcode(),
+            Opcode::GetUdataKs | Opcode::SetUdataKs
+        ) {
+            aux & 0xffff
+        } else {
+            aux
+        },
+    )
+}
+
 fn arithmetic(opcode: Opcode, left: &Value, right: &Value) -> Result<Value, RuntimeError> {
     if let (Value::Integer(left), Value::Integer(right)) = (left, right) {
         return match opcode {
@@ -492,6 +617,7 @@ pub enum RuntimeError {
         expected: &'static str,
         actual: &'static str,
     },
+    Heap(HeapError),
     DivideByZero,
     Breakpoint {
         pc: usize,
@@ -543,6 +669,7 @@ impl fmt::Display for RuntimeError {
                 expected,
                 actual,
             } => write!(f, "{operation} expected {expected}, received {actual}"),
+            Self::Heap(error) => error.fmt(f),
             Self::DivideByZero => f.write_str("integer divide by zero"),
             Self::Breakpoint { pc } => write!(f, "breakpoint at word {pc}"),
             Self::InstructionLimit { limit } => {
@@ -552,7 +679,20 @@ impl fmt::Display for RuntimeError {
     }
 }
 
-impl std::error::Error for RuntimeError {}
+impl From<HeapError> for RuntimeError {
+    fn from(error: HeapError) -> Self {
+        Self::Heap(error)
+    }
+}
+
+impl std::error::Error for RuntimeError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Heap(error) => Some(error),
+            _ => None,
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {
