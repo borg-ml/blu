@@ -142,6 +142,7 @@ pub enum TokenKind {
     Plus,
     Minus,
     Star,
+    Slash,
     FloorDivide,
     LeftParenthesis,
     RightParenthesis,
@@ -326,6 +327,10 @@ pub fn lex(
                     push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                 }
                 TokenKind::FloorDivide
+            }
+            b'/' => {
+                offset += 1;
+                TokenKind::Slash
             }
             b'=' => {
                 offset += 1;

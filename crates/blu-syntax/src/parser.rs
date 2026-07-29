@@ -825,6 +825,7 @@ fn binary_operator(kind: TokenKind) -> Option<(BinaryOperator, u8)> {
         TokenKind::Plus => Some((BinaryOperator::Add, 1)),
         TokenKind::Minus => Some((BinaryOperator::Subtract, 1)),
         TokenKind::Star => Some((BinaryOperator::Multiply, 2)),
+        TokenKind::Slash => Some((BinaryOperator::Divide, 2)),
         TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 2)),
         _ => None,
     }

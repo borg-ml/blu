@@ -248,6 +248,11 @@ pub enum Instruction {
         left: u16,
         right: u16,
     },
+    Divide {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
     FloorDivide {
         destination: u16,
         left: u16,
@@ -281,6 +286,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::Add { .. }
             | Instruction::Subtract { .. }
             | Instruction::Multiply { .. }
+            | Instruction::Divide { .. }
             | Instruction::FloorDivide { .. }
             | Instruction::Return { .. } => true,
         },
@@ -292,6 +298,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::Add { .. }
                 | Instruction::Subtract { .. }
                 | Instruction::Multiply { .. }
+                | Instruction::Divide { .. }
                 | Instruction::Return { .. }
         ),
         _ => false,
@@ -1132,6 +1139,11 @@ fn validate_prototype(
                 left,
                 right,
             }
+            | Instruction::Divide {
+                destination,
+                left,
+                right,
+            }
             | Instruction::FloorDivide {
                 destination,
                 left,
@@ -1407,6 +1419,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::Add { .. }
                     | Instruction::Subtract { .. }
                     | Instruction::Multiply { .. }
+                    | Instruction::Divide { .. }
                     | Instruction::FloorDivide { .. } => 7,
                     Instruction::Move { .. }
                     | Instruction::Not { .. }
@@ -1534,6 +1547,16 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 right,
             } => {
                 out.push(7);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::Divide {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(8);
                 put_u16(out, *destination);
                 put_u16(out, *left);
                 put_u16(out, *right);
@@ -2158,6 +2181,11 @@ fn read_prototype(
                 right: reader.u16()?,
             },
             7 => Instruction::Multiply {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
+            },
+            8 => Instruction::Divide {
                 destination: reader.u16()?,
                 left: reader.u16()?,
                 right: reader.u16()?,

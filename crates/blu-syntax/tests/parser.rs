@@ -307,6 +307,26 @@ fn multiplication_binds_above_addition_and_is_left_associative() {
 }
 
 #[test]
+fn division_shares_multiplication_precedence_and_is_left_associative() {
+    let source = source(b"return a + b * c / d * e".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    let root = binary(&parsed, statement.values()[0]);
+    assert_eq!(root.operator(), BinaryOperator::Add);
+    let last_multiply = binary(&parsed, root.right());
+    assert_eq!(last_multiply.operator(), BinaryOperator::Multiply);
+    let divide = binary(&parsed, last_multiply.left());
+    assert_eq!(divide.operator(), BinaryOperator::Divide);
+    assert_eq!(
+        binary(&parsed, divide.left()).operator(),
+        BinaryOperator::Multiply
+    );
+    assert_eq!(source.slice(divide.operator_span()).unwrap(), b"/");
+}
+
+#[test]
 fn grouping_parentheses_override_precedence_and_retain_their_span() {
     let source = source(b"return (a + b) // c".to_vec());
     let parsed = accepted(&source, SemanticProfile::Lua54, ParseLimits::default());

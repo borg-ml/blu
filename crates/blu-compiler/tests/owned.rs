@@ -612,6 +612,25 @@ fn shared_baseline_artifacts_round_trip_for_all_seven_profiles() {
 }
 
 #[test]
+fn ordinary_division_lowers_for_every_profile() {
+    let source = make_source(b"return 21 / 2, 20 / 5".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Divide { .. })),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn decimal_constants_follow_each_profile_numeric_policy() {
     let number_source = make_source(b"return 9007199254740993, 18446744073709551616".to_vec());
     for profile in [

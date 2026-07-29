@@ -759,6 +759,20 @@ impl<'a> Lowerer<'a> {
                     )?;
                     Ok(destination)
                 }
+                BinaryOperator::Divide => {
+                    let left = self.lower_expression(binary.left())?;
+                    let right = self.lower_expression(binary.right())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::Divide {
+                            destination,
+                            left,
+                            right,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
+                }
                 BinaryOperator::FloorDivide => {
                     if self.profile == SemanticProfile::Blu {
                         return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
