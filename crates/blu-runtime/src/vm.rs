@@ -333,7 +333,13 @@ impl Vm {
                 | Opcode::IDiv => {
                     let left = frame.get(instruction.b())?.clone();
                     let right = frame.get(instruction.c())?.clone();
-                    let value = arithmetic(instruction.opcode(), &left, &right)?;
+                    let value = self.arithmetic_value(
+                        instruction.opcode(),
+                        left,
+                        right,
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::AddK
@@ -345,13 +351,25 @@ impl Vm {
                 | Opcode::IDivK => {
                     let left = frame.get(instruction.b())?.clone();
                     let right = frame.constant_u32(u32::from(instruction.c()))?;
-                    let value = arithmetic(instruction.opcode(), &left, &right)?;
+                    let value = self.arithmetic_value(
+                        instruction.opcode(),
+                        left,
+                        right,
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::SubRk | Opcode::DivRk => {
                     let left = frame.constant_u32(u32::from(instruction.b()))?;
                     let right = frame.get(instruction.c())?.clone();
-                    let value = arithmetic(instruction.opcode(), &left, &right)?;
+                    let value = self.arithmetic_value(
+                        instruction.opcode(),
+                        left,
+                        right,
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::And | Opcode::Or => {
@@ -392,20 +410,51 @@ impl Vm {
                         Value::Integer(value) => Value::Integer(value.wrapping_neg()),
                         Value::Number(value) => Value::Number(-value),
                         other => {
-                            return Err(RuntimeError::Type {
-                                operation: "unary minus",
-                                expected: "number",
-                                actual: other.type_name(),
-                            });
+                            let actual = other.type_name();
+                            let function =
+                                self.metamethod(&other, "__unm")?
+                                    .ok_or(RuntimeError::Type {
+                                        operation: "unary minus",
+                                        expected: "number or __unm metamethod",
+                                        actual,
+                                    })?;
+                            let argument = other.clone();
+                            let result = self.call_value(
+                                chunk,
+                                function,
+                                &[argument],
+                                remaining,
+                                depth,
+                                frame.gc_roots(&self.heap)?,
+                            )?;
+                            frame.refresh_open_upvalues(&self.heap)?;
+                            result.into_iter().next().unwrap_or(Value::Nil)
                         }
                     };
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::Length => {
                     let value = frame.get(instruction.b())?.clone();
-                    let length = match value {
-                        Value::String(value) => value.len(),
-                        Value::Table(table) => self.heap.table_length(table)?,
+                    let result = match value {
+                        Value::String(value) => Value::Number(value.len() as f64),
+                        Value::Table(table) => {
+                            if let Some(function) =
+                                self.metamethod(&Value::Table(table), "__len")?
+                            {
+                                let result = self.call_value(
+                                    chunk,
+                                    function,
+                                    &[Value::Table(table)],
+                                    remaining,
+                                    depth,
+                                    frame.gc_roots(&self.heap)?,
+                                )?;
+                                frame.refresh_open_upvalues(&self.heap)?;
+                                result.into_iter().next().unwrap_or(Value::Nil)
+                            } else {
+                                Value::Number(self.heap.table_length(table)? as f64)
+                            }
+                        }
                         other => {
                             return Err(RuntimeError::Type {
                                 operation: "length",
@@ -414,7 +463,7 @@ impl Vm {
                             });
                         }
                     };
-                    frame.set(instruction.a(), Value::Number(length as f64))?;
+                    frame.set(instruction.a(), result)?;
                 }
                 Opcode::NewTable => {
                     let array_capacity = instruction.aux().ok_or(RuntimeError::MissingAux {
@@ -480,40 +529,76 @@ impl Vm {
                 Opcode::GetTable => {
                     let table = frame.get(instruction.b())?.clone();
                     let key = frame.get(instruction.c())?.clone();
-                    let value = self.index_value(&table, &key, "table access")?;
+                    let value = self.index_value(
+                        table,
+                        key,
+                        "table access",
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::SetTable => {
                     let value = frame.get(instruction.a())?.clone();
-                    let table = table_id(frame.get(instruction.b())?)?;
+                    let table = frame.get(instruction.b())?.clone();
                     let key = frame.get(instruction.c())?.clone();
-                    self.heap.table_set(table, key, value)?;
+                    self.set_index(
+                        table,
+                        key,
+                        value,
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                 }
                 Opcode::GetTableKs | Opcode::GetUdataKs => {
                     let table = frame.get(instruction.b())?.clone();
                     let index = table_string_constant(instruction)?;
                     let key = frame.constant_u32(index)?;
-                    let value = self.index_value(&table, &key, "table access")?;
+                    let value = self.index_value(
+                        table,
+                        key,
+                        "table access",
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::SetTableKs | Opcode::SetUdataKs => {
                     let value = frame.get(instruction.a())?.clone();
-                    let table = table_id(frame.get(instruction.b())?)?;
+                    let table = frame.get(instruction.b())?.clone();
                     let index = table_string_constant(instruction)?;
                     let key = frame.constant_u32(index)?;
-                    self.heap.table_set(table, key, value)?;
+                    self.set_index(
+                        table,
+                        key,
+                        value,
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                 }
                 Opcode::GetTableN => {
                     let table = frame.get(instruction.b())?.clone();
                     let key = Value::Integer(i64::from(instruction.c()) + 1);
-                    let value = self.index_value(&table, &key, "table access")?;
+                    let value = self.index_value(
+                        table,
+                        key,
+                        "table access",
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::SetTableN => {
                     let value = frame.get(instruction.a())?.clone();
-                    let table = table_id(frame.get(instruction.b())?)?;
+                    let table = frame.get(instruction.b())?.clone();
                     let key = Value::Integer(i64::from(instruction.c()) + 1);
-                    self.heap.table_set(table, key, value)?;
+                    self.set_index(
+                        table,
+                        key,
+                        value,
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                 }
                 Opcode::SetList => {
                     let table = table_id(frame.get(instruction.a())?)?;
@@ -544,7 +629,13 @@ impl Vm {
                 Opcode::NameCall => {
                     let receiver = frame.get(instruction.b())?.clone();
                     let key = frame.constant_u32(table_string_constant(instruction)?)?;
-                    let method = self.index_value(&receiver, &key, "method lookup")?;
+                    let method = self.index_value(
+                        receiver.clone(),
+                        key,
+                        "method lookup",
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )?;
+                    frame.refresh_open_upvalues(&self.heap)?;
                     let receiver_register =
                         instruction
                             .a()
@@ -698,11 +789,17 @@ impl Vm {
                             register: right_register as usize,
                             count: frame.registers.len(),
                         })?;
-                    let left = frame.get(instruction.a())?;
-                    let right = frame.get(right_register)?;
-                    if compare(instruction.opcode(), left, right)? {
+                    let left = frame.get(instruction.a())?.clone();
+                    let right = frame.get(right_register)?.clone();
+                    if self.compare_value(
+                        instruction.opcode(),
+                        left,
+                        right,
+                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                    )? {
                         frame.jump(instruction)?;
                     }
+                    frame.refresh_open_upvalues(&self.heap)?;
                 }
                 Opcode::JumpXEqKNil | Opcode::JumpXEqKB | Opcode::JumpXEqKN | Opcode::JumpXEqKS => {
                     let left = frame.get(instruction.a())?;
@@ -725,26 +822,17 @@ impl Vm {
                     }
                 }
                 Opcode::Concat => {
-                    let mut bytes = Vec::new();
-                    for register in instruction.b()..=instruction.c() {
-                        match frame.get(register)? {
-                            Value::String(value) => bytes.extend_from_slice(value),
-                            Value::Integer(value) => {
-                                bytes.extend_from_slice(value.to_string().as_bytes());
-                            }
-                            Value::Number(value) => {
-                                bytes.extend_from_slice(value.to_string().as_bytes());
-                            }
-                            other => {
-                                return Err(RuntimeError::Type {
-                                    operation: "concatenation",
-                                    expected: "string or number",
-                                    actual: other.type_name(),
-                                });
-                            }
-                        }
+                    let mut result = frame.get(instruction.c())?.clone();
+                    for register in (instruction.b()..instruction.c()).rev() {
+                        let left = frame.get(register)?.clone();
+                        result = self.concat_value(
+                            left,
+                            result,
+                            CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        )?;
+                        frame.refresh_open_upvalues(&self.heap)?;
                     }
-                    frame.set(instruction.a(), Value::String(Arc::from(bytes)))?;
+                    frame.set(instruction.a(), result)?;
                 }
                 Opcode::Call | Opcode::CallFb => {
                     let function = frame.get(instruction.a())?.clone();
@@ -830,6 +918,26 @@ impl Vm {
                 self.active_roots.pop();
                 result
             }
+            Value::Table(table) => {
+                let function =
+                    self.metamethod(&Value::Table(table), "__call")?
+                        .ok_or(RuntimeError::Type {
+                            operation: "call",
+                            expected: "function or __call metamethod",
+                            actual: "table",
+                        })?;
+                let mut metamethod_arguments = Vec::with_capacity(arguments.len() + 1);
+                metamethod_arguments.push(Value::Table(table));
+                metamethod_arguments.extend_from_slice(arguments);
+                self.call_value(
+                    chunk,
+                    function,
+                    &metamethod_arguments,
+                    remaining,
+                    depth,
+                    roots,
+                )
+            }
             other => Err(RuntimeError::Type {
                 operation: "call",
                 expected: "function",
@@ -839,12 +947,13 @@ impl Vm {
     }
 
     fn index_value(
-        &self,
-        value: &Value,
-        key: &Value,
+        &mut self,
+        value: Value,
+        key: Value,
         operation: &'static str,
+        context: CallContext<'_>,
     ) -> Result<Value, RuntimeError> {
-        let mut table = match value {
+        let mut table = match &value {
             Value::Table(table) => *table,
             Value::String(_) => {
                 table_id(self.globals.get(&b"string"[..]).ok_or(RuntimeError::Type {
@@ -862,7 +971,7 @@ impl Vm {
             }
         };
         for _ in 0..100 {
-            let result = self.heap.table_get(table, key)?;
+            let result = self.heap.table_get(table, &key)?;
             if !matches!(result, Value::Nil) {
                 return Ok(result);
             }
@@ -875,6 +984,20 @@ impl Vm {
             match index {
                 Value::Nil => return Ok(Value::Nil),
                 Value::Table(next) => table = next,
+                function @ (Value::Closure(_) | Value::NativeFunction(_)) => {
+                    return Ok(self
+                        .call_value(
+                            context.chunk,
+                            function,
+                            &[Value::Table(table), key],
+                            context.remaining,
+                            context.depth,
+                            context.roots,
+                        )?
+                        .into_iter()
+                        .next()
+                        .unwrap_or(Value::Nil));
+                }
                 other => {
                     return Err(RuntimeError::UnsupportedMetamethod {
                         name: "__index",
@@ -884,6 +1007,269 @@ impl Vm {
             }
         }
         Err(RuntimeError::MetatableLoop)
+    }
+
+    fn set_index(
+        &mut self,
+        value: Value,
+        key: Value,
+        assigned: Value,
+        context: CallContext<'_>,
+    ) -> Result<(), RuntimeError> {
+        let mut table = table_id(&value)?;
+        for _ in 0..100 {
+            let existing = self.heap.table_get(table, &key)?;
+            if !matches!(existing, Value::Nil) {
+                self.heap.table_set(table, key, assigned)?;
+                return Ok(());
+            }
+            let Some(metatable) = self.heap.table_metatable(table)? else {
+                self.heap.table_set(table, key, assigned)?;
+                return Ok(());
+            };
+            let newindex = self
+                .heap
+                .table_get(metatable, &Value::String(Arc::from(&b"__newindex"[..])))?;
+            match newindex {
+                Value::Nil => {
+                    self.heap.table_set(table, key, assigned)?;
+                    return Ok(());
+                }
+                Value::Table(next) => table = next,
+                function @ (Value::Closure(_) | Value::NativeFunction(_)) => {
+                    self.call_value(
+                        context.chunk,
+                        function,
+                        &[Value::Table(table), key, assigned],
+                        context.remaining,
+                        context.depth,
+                        context.roots,
+                    )?;
+                    return Ok(());
+                }
+                other => {
+                    return Err(RuntimeError::UnsupportedMetamethod {
+                        name: "__newindex",
+                        actual: other.type_name(),
+                    });
+                }
+            }
+        }
+        Err(RuntimeError::MetatableLoop)
+    }
+
+    fn arithmetic_value(
+        &mut self,
+        opcode: Opcode,
+        left: Value,
+        right: Value,
+        context: CallContext<'_>,
+    ) -> Result<Value, RuntimeError> {
+        if left.as_number().is_some() && right.as_number().is_some() {
+            return arithmetic(opcode, &left, &right);
+        }
+        let name = match opcode {
+            Opcode::Add | Opcode::AddK => "__add",
+            Opcode::Sub | Opcode::SubK | Opcode::SubRk => "__sub",
+            Opcode::Mul | Opcode::MulK => "__mul",
+            Opcode::Div | Opcode::DivK | Opcode::DivRk => "__div",
+            Opcode::Mod | Opcode::ModK => "__mod",
+            Opcode::Pow | Opcode::PowK => "__pow",
+            Opcode::IDiv | Opcode::IDivK => "__idiv",
+            _ => return Err(RuntimeError::UnsupportedArithmetic(opcode)),
+        };
+        let function = self
+            .metamethod(&left, name)?
+            .or(self.metamethod(&right, name)?)
+            .ok_or(RuntimeError::Type {
+                operation: "arithmetic",
+                expected: "number or arithmetic metamethod",
+                actual: left.type_name(),
+            })?;
+        Ok(self
+            .call_value(
+                context.chunk,
+                function,
+                &[left, right],
+                context.remaining,
+                context.depth,
+                context.roots,
+            )?
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Nil))
+    }
+
+    fn concat_value(
+        &mut self,
+        left: Value,
+        right: Value,
+        context: CallContext<'_>,
+    ) -> Result<Value, RuntimeError> {
+        if let (Some(left), Some(right)) = (concat_bytes(&left), concat_bytes(&right)) {
+            let mut result = Vec::with_capacity(left.len() + right.len());
+            result.extend_from_slice(&left);
+            result.extend_from_slice(&right);
+            return Ok(Value::String(Arc::from(result)));
+        }
+        let function = self
+            .metamethod(&left, "__concat")?
+            .or(self.metamethod(&right, "__concat")?)
+            .ok_or(RuntimeError::Type {
+                operation: "concatenation",
+                expected: "string, number, or __concat metamethod",
+                actual: left.type_name(),
+            })?;
+        Ok(self
+            .call_value(
+                context.chunk,
+                function,
+                &[left, right],
+                context.remaining,
+                context.depth,
+                context.roots,
+            )?
+            .into_iter()
+            .next()
+            .unwrap_or(Value::Nil))
+    }
+
+    fn metamethod(&self, value: &Value, name: &'static str) -> Result<Option<Value>, RuntimeError> {
+        let Value::Table(table) = value else {
+            return Ok(None);
+        };
+        let Some(metatable) = self.heap.table_metatable(*table)? else {
+            return Ok(None);
+        };
+        let value = self
+            .heap
+            .table_get(metatable, &Value::String(Arc::from(name.as_bytes())))?;
+        if matches!(value, Value::Nil) {
+            Ok(None)
+        } else if matches!(value, Value::Closure(_) | Value::NativeFunction(_)) {
+            Ok(Some(value))
+        } else {
+            Err(RuntimeError::UnsupportedMetamethod {
+                name,
+                actual: value.type_name(),
+            })
+        }
+    }
+
+    fn compare_value(
+        &mut self,
+        opcode: Opcode,
+        left: Value,
+        right: Value,
+        context: CallContext<'_>,
+    ) -> Result<bool, RuntimeError> {
+        let negate = matches!(
+            opcode,
+            Opcode::JumpIfNotEq | Opcode::JumpIfNotLe | Opcode::JumpIfNotLt
+        );
+        let base = match opcode {
+            Opcode::JumpIfEq | Opcode::JumpIfNotEq => {
+                if left == right {
+                    true
+                } else if matches!((&left, &right), (Value::Table(_), Value::Table(_))) {
+                    match self.shared_metamethod(&left, &right, "__eq")? {
+                        Some(function) => self
+                            .call_value(
+                                context.chunk,
+                                function,
+                                &[left, right],
+                                context.remaining,
+                                context.depth,
+                                context.roots,
+                            )?
+                            .first()
+                            .is_some_and(Value::is_truthy),
+                        None => false,
+                    }
+                } else {
+                    false
+                }
+            }
+            Opcode::JumpIfLt | Opcode::JumpIfNotLt => {
+                if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
+                    left < right
+                } else if let (Value::String(left), Value::String(right)) = (&left, &right) {
+                    left < right
+                } else {
+                    let function = self.shared_metamethod(&left, &right, "__lt")?.ok_or(
+                        RuntimeError::Type {
+                            operation: "comparison",
+                            expected: "matching values or __lt metamethods",
+                            actual: left.type_name(),
+                        },
+                    )?;
+                    self.call_value(
+                        context.chunk,
+                        function,
+                        &[left, right],
+                        context.remaining,
+                        context.depth,
+                        context.roots,
+                    )?
+                    .first()
+                    .is_some_and(Value::is_truthy)
+                }
+            }
+            Opcode::JumpIfLe | Opcode::JumpIfNotLe => {
+                if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
+                    left <= right
+                } else if let (Value::String(left), Value::String(right)) = (&left, &right) {
+                    left <= right
+                } else if let Some(function) = self.shared_metamethod(&left, &right, "__le")? {
+                    self.call_value(
+                        context.chunk,
+                        function,
+                        &[left, right],
+                        context.remaining,
+                        context.depth,
+                        context.roots,
+                    )?
+                    .first()
+                    .is_some_and(Value::is_truthy)
+                } else {
+                    let function = self.shared_metamethod(&right, &left, "__lt")?.ok_or(
+                        RuntimeError::Type {
+                            operation: "comparison",
+                            expected: "matching values or __le/__lt metamethods",
+                            actual: left.type_name(),
+                        },
+                    )?;
+                    !self
+                        .call_value(
+                            context.chunk,
+                            function,
+                            &[right, left],
+                            context.remaining,
+                            context.depth,
+                            context.roots,
+                        )?
+                        .first()
+                        .is_some_and(Value::is_truthy)
+                }
+            }
+            _ => return Err(RuntimeError::UnsupportedComparison(opcode)),
+        };
+        Ok(base != negate)
+    }
+
+    fn shared_metamethod(
+        &self,
+        left: &Value,
+        right: &Value,
+        name: &'static str,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Some(left) = self.metamethod(left, name)? else {
+            return Ok(None);
+        };
+        let Some(right) = self.metamethod(right, name)? else {
+            return Ok(None);
+        };
+        Ok((left == right).then_some(left))
     }
 
     fn install_base_library(&mut self) {
@@ -1015,6 +1401,72 @@ impl Vm {
         });
         self.set_global(&b"setmetatable"[..], Value::NativeFunction(setmetatable));
 
+        let rawget = self.register_function(|vm, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "rawget",
+                index: 1,
+            })?;
+            let table = table_id(table)?;
+            let key = arguments.get(1).ok_or(RuntimeError::Argument {
+                function: "rawget",
+                index: 2,
+            })?;
+            Ok(vec![vm.heap.table_get(table, key)?])
+        });
+        self.set_global(&b"rawget"[..], Value::NativeFunction(rawget));
+
+        let rawset = self.register_function(|vm, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "rawset",
+                index: 1,
+            })?;
+            let table = table_id(value)?;
+            let key = arguments.get(1).ok_or(RuntimeError::Argument {
+                function: "rawset",
+                index: 2,
+            })?;
+            let assigned = arguments.get(2).ok_or(RuntimeError::Argument {
+                function: "rawset",
+                index: 3,
+            })?;
+            vm.heap.table_set(table, key.clone(), assigned.clone())?;
+            Ok(vec![value.clone()])
+        });
+        self.set_global(&b"rawset"[..], Value::NativeFunction(rawset));
+
+        let rawequal = self.register_function(|_, arguments| {
+            let left = arguments.first().ok_or(RuntimeError::Argument {
+                function: "rawequal",
+                index: 1,
+            })?;
+            let right = arguments.get(1).ok_or(RuntimeError::Argument {
+                function: "rawequal",
+                index: 2,
+            })?;
+            Ok(vec![Value::Boolean(left == right)])
+        });
+        self.set_global(&b"rawequal"[..], Value::NativeFunction(rawequal));
+
+        let rawlen = self.register_function(|vm, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "rawlen",
+                index: 1,
+            })?;
+            let length = match value {
+                Value::String(value) => value.len(),
+                Value::Table(table) => vm.heap.table_length(*table)?,
+                other => {
+                    return Err(RuntimeError::Type {
+                        operation: "rawlen",
+                        expected: "string or table",
+                        actual: other.type_name(),
+                    });
+                }
+            };
+            Ok(vec![Value::Number(length as f64)])
+        });
+        self.set_global(&b"rawlen"[..], Value::NativeFunction(rawlen));
+
         let print = self.register_function(|vm, arguments| {
             for (index, value) in arguments.iter().enumerate() {
                 if index != 0 {
@@ -1103,6 +1555,15 @@ fn relative_index(index: i64, length: usize) -> i64 {
     }
 }
 
+fn concat_bytes(value: &Value) -> Option<Vec<u8>> {
+    match value {
+        Value::String(value) => Some(value.to_vec()),
+        Value::Integer(value) => Some(value.to_string().into_bytes()),
+        Value::Number(value) => Some(value.to_string().into_bytes()),
+        _ => None,
+    }
+}
+
 fn append_value(output: &mut Vec<u8>, value: &Value) {
     match value {
         Value::Nil => output.extend_from_slice(b"nil"),
@@ -1128,6 +1589,24 @@ impl fmt::Debug for Vm {
             .field("native_function_count", &self.native_functions.len())
             .field("active_frame_count", &self.active_roots.len())
             .finish_non_exhaustive()
+    }
+}
+
+struct CallContext<'a> {
+    chunk: &'a Chunk,
+    remaining: &'a mut u64,
+    depth: usize,
+    roots: Vec<Value>,
+}
+
+impl<'a> CallContext<'a> {
+    fn new(chunk: &'a Chunk, remaining: &'a mut u64, depth: usize, roots: Vec<Value>) -> Self {
+        Self {
+            chunk,
+            remaining,
+            depth,
+            roots,
+        }
     }
 }
 
@@ -1503,34 +1982,6 @@ fn integer_floor_div(left: i64, right: i64) -> Result<i64, RuntimeError> {
     } else {
         quotient
     })
-}
-
-fn compare(opcode: Opcode, left: &Value, right: &Value) -> Result<bool, RuntimeError> {
-    let equal = left == right;
-    match opcode {
-        Opcode::JumpIfEq => Ok(equal),
-        Opcode::JumpIfNotEq => Ok(!equal),
-        Opcode::JumpIfLe | Opcode::JumpIfLt | Opcode::JumpIfNotLe | Opcode::JumpIfNotLt => {
-            let left_number = left.as_number().ok_or(RuntimeError::Type {
-                operation: "comparison",
-                expected: "number",
-                actual: left.type_name(),
-            })?;
-            let right_number = right.as_number().ok_or(RuntimeError::Type {
-                operation: "comparison",
-                expected: "number",
-                actual: right.type_name(),
-            })?;
-            Ok(match opcode {
-                Opcode::JumpIfLe => left_number <= right_number,
-                Opcode::JumpIfLt => left_number < right_number,
-                Opcode::JumpIfNotLe => left_number > right_number,
-                Opcode::JumpIfNotLt => left_number >= right_number,
-                _ => unreachable!(),
-            })
-        }
-        _ => Err(RuntimeError::UnsupportedComparison(opcode)),
-    }
 }
 
 #[derive(Clone, Debug, PartialEq)]

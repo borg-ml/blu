@@ -249,6 +249,145 @@ local object = setmetatable({}, { __index = prototype })
 local result = object.answer
 print(type(result) .. ":" .. tostring(result))
 "#;
+const CALLABLE_INDEX_SOURCE: &str = r#"
+local object = setmetatable({ base = 5 }, {
+    __index = function(self, key)
+        return self.base + #key
+    end,
+})
+return object.abc
+"#;
+const CALLABLE_INDEX_REFERENCE_SOURCE: &str = r#"
+local object = setmetatable({ base = 5 }, {
+    __index = function(self, key)
+        return self.base + #key
+    end,
+})
+local result = object.abc
+print(type(result) .. ":" .. tostring(result))
+"#;
+const NEWINDEX_SOURCE: &str = r#"
+local function_target = {}
+local function_object = setmetatable({}, {
+    __newindex = function(self, key, value)
+        function_target[key] = value * 2
+    end,
+})
+function_object.answer = 9
+
+local table_target = {}
+local table_object = setmetatable({}, { __newindex = table_target })
+table_object.extra = 4
+return function_target.answer + table_target.extra
+"#;
+const NEWINDEX_REFERENCE_SOURCE: &str = r#"
+local function_target = {}
+local function_object = setmetatable({}, {
+    __newindex = function(self, key, value)
+        function_target[key] = value * 2
+    end,
+})
+function_object.answer = 9
+
+local table_target = {}
+local table_object = setmetatable({}, { __newindex = table_target })
+table_object.extra = 4
+local result = function_target.answer + table_target.extra
+print(type(result) .. ":" .. tostring(result))
+"#;
+const ARITHMETIC_METAMETHOD_SOURCE: &str = r#"
+local value = setmetatable({}, {
+    __add = function(left, right) return 11 end,
+    __mul = function(left, right) return 12 end,
+    __idiv = function(left, right) return 13 end,
+})
+return (value + 3) + (3 * value) + (value // 2)
+"#;
+const ARITHMETIC_METAMETHOD_REFERENCE_SOURCE: &str = r#"
+local value = setmetatable({}, {
+    __add = function(left, right) return 11 end,
+    __mul = function(left, right) return 12 end,
+    __idiv = function(left, right) return 13 end,
+})
+local result = (value + 3) + (3 * value) + (value // 2)
+print(type(result) .. ":" .. tostring(result))
+"#;
+const UNARY_METAMETHOD_SOURCE: &str = r#"
+local value = setmetatable({}, {
+    __unm = function(self) return 20 end,
+    __len = function(self) return 3 end,
+})
+return (-value) + #value
+"#;
+const UNARY_METAMETHOD_REFERENCE_SOURCE: &str = r#"
+local value = setmetatable({}, {
+    __unm = function(self) return 20 end,
+    __len = function(self) return 3 end,
+})
+local result = (-value) + #value
+print(type(result) .. ":" .. tostring(result))
+"#;
+const COMPARISON_METAMETHOD_SOURCE: &str = r#"
+local metatable = {
+    __eq = function(left, right) return true end,
+    __lt = function(left, right) return left.rank < right.rank end,
+}
+local left = setmetatable({ rank = 1 }, metatable)
+local right = setmetatable({ rank = 2 }, metatable)
+return left == right and left < right and left <= right and not (right < left)
+"#;
+const COMPARISON_METAMETHOD_REFERENCE_SOURCE: &str = r#"
+local metatable = {
+    __eq = function(left, right) return true end,
+    __lt = function(left, right) return left.rank < right.rank end,
+}
+local left = setmetatable({ rank = 1 }, metatable)
+local right = setmetatable({ rank = 2 }, metatable)
+local result = left == right and left < right and left <= right and not (right < left)
+print(type(result) .. ":" .. tostring(result))
+"#;
+const CALL_AND_CONCAT_METAMETHOD_SOURCE: &str = r#"
+local callable = setmetatable({ factor = 3 }, {
+    __call = function(self, value) return self.factor * value end,
+})
+local metatable = {
+    __concat = function(left, right) return left.text .. right.text end,
+}
+local left = setmetatable({ text = "bl" }, metatable)
+local right = setmetatable({ text = "u" }, metatable)
+return callable(4) + #(left .. right)
+"#;
+const CALL_AND_CONCAT_METAMETHOD_REFERENCE_SOURCE: &str = r#"
+local callable = setmetatable({ factor = 3 }, {
+    __call = function(self, value) return self.factor * value end,
+})
+local metatable = {
+    __concat = function(left, right) return left.text .. right.text end,
+}
+local left = setmetatable({ text = "bl" }, metatable)
+local right = setmetatable({ text = "u" }, metatable)
+local result = callable(4) + #(left .. right)
+print(type(result) .. ":" .. tostring(result))
+"#;
+const RAW_BASE_SOURCE: &str = r#"
+local object = setmetatable({}, {
+    __index = function() return 99 end,
+    __newindex = function() error("must not run") end,
+    __len = function() return 99 end,
+})
+rawset(object, "answer", 3)
+return rawget(object, "answer") + rawlen(object) + (rawequal(object, object) and 1 or 0)
+"#;
+const RAW_BASE_REFERENCE_SOURCE: &str = r#"
+local object = setmetatable({}, {
+    __index = function() return 99 end,
+    __newindex = function() error("must not run") end,
+    __len = function() return 99 end,
+})
+rawset(object, "answer", 3)
+local result = rawget(object, "answer") + rawlen(object) + (rawequal(object, object) and 1 or 0)
+print(type(result) .. ":" .. tostring(result))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -387,6 +526,62 @@ fn run() -> Result<(), String> {
         &args.upstream,
         temporary.path(),
     )?;
+    verify_program_case(
+        "callable index metamethod",
+        CALLABLE_INDEX_SOURCE,
+        CALLABLE_INDEX_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "table and callable newindex metamethods",
+        NEWINDEX_SOURCE,
+        NEWINDEX_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "arithmetic metamethods",
+        ARITHMETIC_METAMETHOD_SOURCE,
+        ARITHMETIC_METAMETHOD_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "unary and length metamethods",
+        UNARY_METAMETHOD_SOURCE,
+        UNARY_METAMETHOD_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "comparison metamethods",
+        COMPARISON_METAMETHOD_SOURCE,
+        COMPARISON_METAMETHOD_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "call and concatenation metamethods",
+        CALL_AND_CONCAT_METAMETHOD_SOURCE,
+        CALL_AND_CONCAT_METAMETHOD_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "raw base operations",
+        RAW_BASE_SOURCE,
+        RAW_BASE_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
 
     let portable_source = temporary.path().join("portable.lua");
     fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
@@ -426,7 +621,7 @@ fn run() -> Result<(), String> {
     println!("bytecode version: {bytecode_version}");
     println!("scalar differential corpus: pass ({scalar_count} cases)");
     println!(
-        "program differential corpus: pass (tables, loops, iteration, methods, closures, captures, varargs, multret)"
+        "program differential corpus: pass (tables, loops, iteration, methods, metamethods, closures, captures, varargs, multret)"
     );
     println!("portable reference matrix: pass (Luau, Lua 5.1-5.5)");
     Ok(())
