@@ -94,6 +94,14 @@ fn run() -> Result<(), String> {
 
     let portable_source = temporary.path().join("portable.lua");
     fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
+    let portable_bytecode = Command::new(&compiler)
+        .arg("--binary")
+        .arg(&portable_source)
+        .output()
+        .map_err(|error| format!("failed to execute {}: {error}", compiler.display()))?;
+    ensure_success(&compiler, &portable_bytecode)?;
+    load(&portable_bytecode.stdout, LoadLimits::default())
+        .map_err(|error| format!("Blu rejected portable upstream bytecode: {error}"))?;
     verify_portable_reference("Luau", &args.upstream, &portable_source)?;
     for (name, executable) in &lua_references {
         verify_portable_reference(name, executable, &portable_source)?;

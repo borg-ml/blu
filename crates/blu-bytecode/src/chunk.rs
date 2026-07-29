@@ -4,7 +4,7 @@
 
 use crate::{
     BYTECODE_VERSION_MAX, BYTECODE_VERSION_MIN, DecodeError, Instruction, TYPEINFO_VERSION_MAX,
-    TYPEINFO_VERSION_MIN, decode,
+    TYPEINFO_VERSION_MIN, ValidationError, decode, validate,
 };
 use core::fmt;
 
@@ -160,6 +160,7 @@ pub enum ChunkError {
         prototype: usize,
         source: DecodeError,
     },
+    Validation(ValidationError),
 }
 
 impl fmt::Display for ChunkError {
@@ -215,6 +216,7 @@ impl fmt::Display for ChunkError {
             Self::Instruction { prototype, source } => {
                 write!(f, "prototype {prototype}: {source}")
             }
+            Self::Validation(source) => source.fmt(f),
         }
     }
 }
@@ -223,6 +225,7 @@ impl std::error::Error for ChunkError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Instruction { source, .. } => Some(source),
+            Self::Validation(source) => Some(source),
             _ => None,
         }
     }
@@ -330,14 +333,16 @@ pub fn load(bytes: &[u8], limits: LoadLimits) -> Result<Chunk, ChunkError> {
         });
     }
 
-    Ok(Chunk {
+    let chunk = Chunk {
         version,
         typeinfo_version,
         strings,
         userdata_types,
         prototypes,
         main,
-    })
+    };
+    validate(&chunk).map_err(ChunkError::Validation)?;
+    Ok(chunk)
 }
 
 fn load_prototype(

@@ -5,15 +5,19 @@
 //! the repository's `UPSTREAM.toml`.
 
 mod chunk;
+mod disassemble;
 mod instruction;
 mod opcode;
+mod validate;
 
 pub use chunk::{
     Chunk, ChunkError, Constant, DebugInfo, DebugLocal, FeedbackSlot, LineInfo, LoadLimits,
     Prototype, load,
 };
+pub use disassemble::disassemble;
 pub use instruction::{DecodeError, Instruction, InstructionIter, decode};
 pub use opcode::Opcode;
+pub use validate::{ValidationError, validate};
 
 pub const BYTECODE_VERSION_MIN: u8 = 3;
 pub const BYTECODE_VERSION_MAX: u8 = 12;
