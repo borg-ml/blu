@@ -485,7 +485,10 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_local(&mut self, statement: LocalStatement) -> Result<(), OwnedCompileError> {
-        let register = self.lower_expression(statement.value())?;
+        let register = match statement.value() {
+            Some(value) => self.lower_expression(value)?,
+            None => self.lower_constant(Constant::Nil, statement.span())?,
+        };
         let limit = self
             .limits
             .max_bindings

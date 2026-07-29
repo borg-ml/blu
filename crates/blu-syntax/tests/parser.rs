@@ -69,7 +69,13 @@ fn vertical_slice_preserves_profile_spans_and_trivia_for_all_profiles() {
         assert_eq!(source.slice(local.name().span()).unwrap(), b"answer");
         assert_eq!(
             source
-                .slice(parsed.ast().expression(local.value()).unwrap().span())
+                .slice(
+                    parsed
+                        .ast()
+                        .expression(local.value().unwrap())
+                        .unwrap()
+                        .span(),
+                )
                 .unwrap(),
             b"40"
         );
@@ -81,6 +87,20 @@ fn vertical_slice_preserves_profile_spans_and_trivia_for_all_profiles() {
             source.slice(return_statement.span()).unwrap(),
             b"return answer + 2"
         );
+    }
+}
+
+#[test]
+fn local_without_initializer_has_no_value_and_ends_at_its_name() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"local missing\nreturn missing".to_vec());
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::Local(local) = parsed.ast().statements()[0] else {
+            panic!("expected local statement");
+        };
+        assert_eq!(source.slice(local.span()).unwrap(), b"local missing");
+        assert_eq!(source.slice(local.name().span()).unwrap(), b"missing");
+        assert_eq!(local.value(), None);
     }
 }
 

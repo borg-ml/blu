@@ -195,6 +195,33 @@ fn local_resolution_is_sequential_and_shadow_aware() {
 }
 
 #[test]
+fn uninitialized_local_lowers_to_nil_for_every_profile() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(b"local missing\nreturn missing".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(compiled.artifact().main().constants, [Constant::Nil]);
+        assert_eq!(
+            compiled.artifact().main().code,
+            [
+                Instruction::LoadConstant {
+                    destination: 0,
+                    constant: 0,
+                },
+                Instruction::Return { first: 0, count: 1 },
+            ]
+        );
+        assert_eq!(
+            Vm::new(Dialect::Blu)
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Nil]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn floor_division_lowers_only_for_assigned_profiles_and_bootstrap_translation_rejects_it() {
     for profile in [
         SemanticProfile::Luau,

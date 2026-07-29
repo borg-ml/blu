@@ -315,6 +315,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let nil_local = SourceFile::new(
+            SourceId::new(4),
+            "nil-local.blu",
+            b"local missing\nreturn missing".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -365,6 +372,15 @@ mod tests {
                     .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
                 Ok(Vec::new()),
                 "implicit return under {profile}"
+            );
+            let compiled = OwnedCompiler::default()
+                .compile(&nil_local, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![Value::Nil]),
+                "uninitialized local under {profile}"
             );
         }
     }

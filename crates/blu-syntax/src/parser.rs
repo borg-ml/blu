@@ -364,18 +364,20 @@ impl<'a> Parser<'a> {
             None
         };
 
-        let has_equal = if self.at(TokenKind::Equal) {
+        if self.at(TokenKind::Equal) {
             self.bump();
-            true
-        } else {
-            self.report_current_or_eof("BLU-PARSE-0003", "expected `=` after local name", &["="])?;
-            false
-        };
-        let value = self.parse_expression(0)?;
-
-        if let (Some(name), true, Some(value)) = (name, has_equal, value) {
-            let span = keyword.span().merge(self.expression(value.id)?.span())?;
-            self.push_statement(Statement::Local(LocalStatement::new(name, value.id, span)))?;
+            let value = self.parse_expression(0)?;
+            if let (Some(name), Some(value)) = (name, value) {
+                let span = keyword.span().merge(self.expression(value.id)?.span())?;
+                self.push_statement(Statement::Local(LocalStatement::new(
+                    name,
+                    Some(value.id),
+                    span,
+                )))?;
+            }
+        } else if let Some(name) = name {
+            let span = keyword.span().merge(name.span())?;
+            self.push_statement(Statement::Local(LocalStatement::new(name, None, span)))?;
         }
         Ok(())
     }

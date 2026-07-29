@@ -67,7 +67,8 @@ The separate `blu_compiler::owned::OwnedCompiler`, also re-exported through
 locals (with explicit shadowing), decimal integer
 literals, truthiness-based boolean `not`, numeric `+`/`-`/`*`, profile-gated `//`, and
 an optional final bare or expression-list `return`. Falling off the chunk emits
-an EOF-spanned zero-result return. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
+an EOF-spanned zero-result return. A local declaration without `= expression`
+is initialized to `nil`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
 BluV1 Integer constants and use normal IEEE-754 parsing above that; Lua 5.1,
 Lua 5.2, and Luau always use the latter Number policy. Blu currently uses the
 Number policy for its bootstrap path, which is not a final Blu

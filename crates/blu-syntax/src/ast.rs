@@ -162,12 +162,12 @@ impl Expression {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LocalStatement {
     name: Identifier,
-    value: ExpressionId,
+    value: Option<ExpressionId>,
     span: ByteSpan,
 }
 
 impl LocalStatement {
-    pub(crate) const fn new(name: Identifier, value: ExpressionId, span: ByteSpan) -> Self {
+    pub(crate) const fn new(name: Identifier, value: Option<ExpressionId>, span: ByteSpan) -> Self {
         Self { name, value, span }
     }
 
@@ -177,7 +177,7 @@ impl LocalStatement {
     }
 
     #[must_use]
-    pub const fn value(self) -> ExpressionId {
+    pub const fn value(self) -> Option<ExpressionId> {
         self.value
     }
 
