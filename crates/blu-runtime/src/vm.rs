@@ -2393,7 +2393,7 @@ impl Vm {
         right: Value,
         context: CallContext<'_>,
     ) -> Result<Value, RuntimeError> {
-        if let (Some(left), Some(right)) = (concat_bytes(&left), concat_bytes(&right)) {
+        if let (Some(left), Some(right)) = (try_concat_bytes(&left)?, try_concat_bytes(&right)?) {
             let required =
                 left.len()
                     .checked_add(right.len())
@@ -3639,7 +3639,7 @@ impl Vm {
             })?;
             let table = table_id(table)?;
             let separator = match arguments.get(1) {
-                Some(value) => concat_bytes(value).ok_or(RuntimeError::Type {
+                Some(value) => try_concat_bytes(value)?.ok_or(RuntimeError::Type {
                     operation: "table.concat",
                     expected: "string or number",
                     actual: value.type_name(),
@@ -3993,12 +3993,16 @@ fn relative_index(index: i64, length: usize) -> i64 {
     }
 }
 
-fn concat_bytes(value: &Value) -> Option<Cow<'_, [u8]>> {
+fn try_concat_bytes(value: &Value) -> Result<Option<Cow<'_, [u8]>>, RuntimeError> {
     match value {
-        Value::String(value) => Some(Cow::Borrowed(value)),
-        Value::Integer(value) => Some(Cow::Owned(value.to_string().into_bytes())),
-        Value::Number(value) => Some(Cow::Owned(value.to_string().into_bytes())),
-        _ => None,
+        Value::String(value) => Ok(Some(Cow::Borrowed(value))),
+        Value::Integer(_) | Value::Number(_) => {
+            let mut rendered =
+                try_vec_with_capacity(rendered_value_len(value), "numeric string coercion")?;
+            append_value(&mut rendered, value);
+            Ok(Some(Cow::Owned(rendered)))
+        }
+        _ => Ok(None),
     }
 }
 
@@ -5934,6 +5938,18 @@ mod tests {
                 i64::MIN.to_string().into_bytes()
             ))])
         );
+
+        let mut remaining = 1;
+        assert_eq!(
+            vm.concat_value(
+                Value::Integer(i64::MIN),
+                Value::Number(2.5),
+                CallContext::new(&mut remaining, 0, GcRoots::default()),
+            ),
+            Ok(Value::String(Arc::from(
+                [i64::MIN.to_string().as_bytes(), b"2.5"].concat(),
+            )))
+        );
     }
 
     #[test]
@@ -5967,6 +5983,20 @@ mod tests {
                     b"2.5",
                 ]
                 .concat(),
+            ))])
+        );
+        assert_eq!(
+            concat(
+                &mut vm,
+                &[
+                    Value::Table(table),
+                    Value::Integer(-7),
+                    Value::Integer(1),
+                    Value::Integer(2),
+                ],
+            ),
+            Ok(vec![Value::String(Arc::from(
+                [b"a\0".as_slice(), b"-7", i64::MIN.to_string().as_bytes()].concat(),
             ))])
         );
 
