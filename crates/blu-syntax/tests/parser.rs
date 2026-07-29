@@ -154,6 +154,26 @@ fn subtraction_shares_addition_precedence_and_is_left_associative() {
 }
 
 #[test]
+fn multiplication_binds_above_addition_and_is_left_associative() {
+    let source = source(b"return a + b * c * d + e".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    let root = binary(&parsed, statement.values()[0]);
+    assert_eq!(root.operator(), BinaryOperator::Add);
+    let first_add = binary(&parsed, root.left());
+    assert_eq!(first_add.operator(), BinaryOperator::Add);
+    let second_multiply = binary(&parsed, first_add.right());
+    assert_eq!(second_multiply.operator(), BinaryOperator::Multiply);
+    assert_eq!(
+        binary(&parsed, second_multiply.left()).operator(),
+        BinaryOperator::Multiply
+    );
+    assert_eq!(source.slice(second_multiply.operator_span()).unwrap(), b"*");
+}
+
+#[test]
 fn grouping_parentheses_override_precedence_and_retain_their_span() {
     let source = source(b"return (a + b) // c".to_vec());
     let parsed = accepted(&source, SemanticProfile::Lua54, ParseLimits::default());

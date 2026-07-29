@@ -860,6 +860,18 @@ impl Vm {
                     )?;
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::Multiply {
+                    destination,
+                    left,
+                    right,
+                } => {
+                    let value = arithmetic(
+                        Opcode::Mul,
+                        blu_register(&registers, left)?,
+                        blu_register(&registers, right)?,
+                    )?;
+                    set_blu_register(&mut registers, destination, value)?;
+                }
                 BluInstruction::Move {
                     destination,
                     source,

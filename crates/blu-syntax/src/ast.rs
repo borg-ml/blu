@@ -36,6 +36,7 @@ impl Identifier {
 pub enum BinaryOperator {
     Add,
     Subtract,
+    Multiply,
     FloorDivide,
 }
 

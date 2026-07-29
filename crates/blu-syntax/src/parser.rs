@@ -685,6 +685,7 @@ fn binary_operator(kind: TokenKind) -> Option<(BinaryOperator, u8)> {
     match kind {
         TokenKind::Plus => Some((BinaryOperator::Add, 1)),
         TokenKind::Minus => Some((BinaryOperator::Subtract, 1)),
+        TokenKind::Star => Some((BinaryOperator::Multiply, 2)),
         TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 2)),
         _ => None,
     }

@@ -273,6 +273,11 @@ fn baseline_instruction_legality_is_explicit_for_every_profile() {
             left: 0,
             right: 0,
         },
+        Instruction::Multiply {
+            destination: 0,
+            left: 0,
+            right: 0,
+        },
         Instruction::Return { first: 0, count: 1 },
     ];
 
@@ -330,6 +335,50 @@ fn subtraction_is_canonical_profile_neutral_and_bootstrap_translatable() {
     assert_eq!(
         translated.prototypes[0].instructions[2].opcode(),
         Opcode::Sub
+    );
+}
+
+#[test]
+fn multiplication_is_canonical_profile_neutral_and_bootstrap_translatable() {
+    let limits = BluLimits::default();
+    for profile in SemanticProfile::ALL {
+        let mut artifact = baseline_fixture(profile);
+        artifact.prototypes[0].code[2] = Instruction::Multiply {
+            destination: 2,
+            left: 0,
+            right: 1,
+        };
+        let validated = ValidatedArtifact::new(artifact, limits).unwrap();
+        let bytes = encode(&validated, limits).unwrap();
+        let (_, first_instruction) = first_constant_and_instruction_offsets(&bytes);
+        assert_eq!(bytes[first_instruction + 14], 7, "{profile}");
+        assert_eq!(
+            decode_validated(&bytes, limits).unwrap().main().code[2],
+            Instruction::Multiply {
+                destination: 2,
+                left: 0,
+                right: 1,
+            }
+        );
+    }
+
+    let mut artifact = baseline_fixture(SemanticProfile::Blu);
+    artifact.prototypes[0].code[2] = Instruction::Multiply {
+        destination: 2,
+        left: 0,
+        right: 1,
+    };
+    let translated = translate_baseline_to_luau(
+        ValidatedArtifact::new(artifact, limits).unwrap(),
+        SemanticProfile::Blu,
+        limits,
+    )
+    .unwrap()
+    .into_validated_chunk()
+    .into_chunk();
+    assert_eq!(
+        translated.prototypes[0].instructions[2].opcode(),
+        Opcode::Mul
     );
 }
 

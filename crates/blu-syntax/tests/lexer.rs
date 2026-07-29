@@ -117,6 +117,25 @@ fn binary_minus_is_a_profile_neutral_token() {
 }
 
 #[test]
+fn multiplication_is_a_profile_neutral_token() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return 6 * 7".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::Return,
+                TokenKind::DecimalInteger,
+                TokenKind::Star,
+                TokenKind::DecimalInteger,
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn nil_and_boolean_literals_are_profile_neutral_keywords() {
     for profile in SemanticProfile::ALL {
         let source = source(b"return nil, true, false".to_vec());
