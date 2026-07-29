@@ -1,8 +1,9 @@
 use crate::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
-    DialectDirective, Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement,
-    LexError, Lexed, LexerLimits, LocalListStatement, LocalStatement, ReturnStatement, Statement,
-    Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
+    BreakStatement, DialectDirective, Expression, ExpressionId, ExpressionKind, Identifier,
+    IfClause, IfStatement, LexError, Lexed, LexerLimits, LocalListStatement, LocalStatement,
+    ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement,
+    lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -284,6 +285,7 @@ struct Parser<'a> {
     statements: Vec<Statement>,
     statement_count: usize,
     block_depth: usize,
+    loop_depth: usize,
     expressions: Vec<Expression>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -304,6 +306,7 @@ impl<'a> Parser<'a> {
             statements: allocate_vec(ast_capacity, "AST statements")?,
             statement_count: 0,
             block_depth: 0,
+            loop_depth: 0,
             expressions: allocate_vec(ast_capacity, "AST expressions")?,
             diagnostics: allocate_vec(diagnostic_capacity, "parser diagnostics")?,
         })
@@ -341,6 +344,46 @@ impl<'a> Parser<'a> {
                 TokenKind::Identifier => self.parse_assignment()?,
                 TokenKind::If => self.parse_if()?,
                 TokenKind::While => self.parse_while()?,
+                TokenKind::Break => {
+                    let Some(keyword) = self.bump() else {
+                        return Err(ParseError::InternalInvariant {
+                            message: "break check succeeded without a current token",
+                        });
+                    };
+                    if self.loop_depth == 0 {
+                        let diagnostic = parser_diagnostic(
+                            "BLU-PARSE-0022",
+                            self.lexed.profile(),
+                            keyword.span(),
+                            "`break` is only valid inside a loop",
+                            &["loop body"],
+                            Some(self.source.slice(keyword.span())?),
+                            self.limits.lexer.diagnostic_limits,
+                        )?;
+                        self.push_diagnostic(diagnostic)?;
+                    } else {
+                        self.push_statement(Statement::Break(BreakStatement::new(keyword.span())))?;
+                    }
+                    while self.at(TokenKind::Semicolon) {
+                        self.bump();
+                    }
+                    if self
+                        .current()
+                        .is_some_and(|token| !terminators.contains(&token.kind()))
+                    {
+                        self.report_current(
+                            "BLU-PARSE-0023",
+                            "unexpected token after break statement",
+                            &["end of block"],
+                        )?;
+                        while self
+                            .current()
+                            .is_some_and(|token| !terminators.contains(&token.kind()))
+                        {
+                            self.bump();
+                        }
+                    }
+                }
                 TokenKind::Return => {
                     self.parse_return()?;
                     while self.at(TokenKind::Semicolon) {
@@ -367,7 +410,7 @@ impl<'a> Parser<'a> {
                     self.report_current(
                         "BLU-PARSE-0001",
                         "expected a supported statement",
-                        &["local", "assignment", "if", "while", "return"],
+                        &["local", "assignment", "if", "while", "break", "return"],
                     )?;
                     self.bump();
                 }
@@ -467,7 +510,10 @@ impl<'a> Parser<'a> {
             return Ok(());
         }
         self.bump();
-        let body = self.parse_nested_block(&[TokenKind::End])?;
+        self.loop_depth += 1;
+        let parsed_body = self.parse_nested_block(&[TokenKind::End]);
+        self.loop_depth -= 1;
+        let body = parsed_body?;
         if !self.at(TokenKind::End) {
             self.report_current_or_eof(
                 "BLU-PARSE-0021",

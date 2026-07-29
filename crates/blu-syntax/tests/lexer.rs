@@ -778,6 +778,19 @@ fn while_loop_keywords_are_shared_across_profiles() {
 }
 
 #[test]
+fn break_is_a_shared_loop_keyword() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"while true do break end".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert!(
+            significant_kinds(&lexed).contains(&TokenKind::Break),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn malformed_decimal_exponents_are_structured() {
     let source = source(b"return 1e+".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua54, LexerLimits::default()).unwrap();

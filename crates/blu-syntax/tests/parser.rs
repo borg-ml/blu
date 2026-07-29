@@ -389,6 +389,27 @@ fn while_loops_own_nested_blocks() {
 }
 
 #[test]
+fn break_is_scoped_to_loop_bodies_and_terminates_its_block() {
+    let source_file = source(b"while true do if ready then break end end".to_vec());
+    let parsed = accepted(&source_file, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::While(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected while statement");
+    };
+    let Statement::If(statement) = &statement.body().statements()[0] else {
+        panic!("expected nested if statement");
+    };
+    assert!(matches!(
+        statement.clauses()[0].body().statements()[0],
+        Statement::Break(_)
+    ));
+
+    let outside = source(b"break".to_vec());
+    let outcome = parse(&outside, SemanticProfile::Blu, ParseLimits::default()).unwrap();
+    let rejected = outcome.rejected().unwrap();
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0022");
+}
+
+#[test]
 fn multiplication_binds_above_addition_and_is_left_associative() {
     let source = source(b"return a + b * c * d + e".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());

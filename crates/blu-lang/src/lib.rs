@@ -481,6 +481,14 @@ return value"#
             SourceLimits::default(),
         )
         .unwrap();
+        let nested_break = SourceFile::new(
+            SourceId::new(25),
+            "nested-break.blu",
+            b"local outer = 0\nlocal hits = 0\nwhile outer < 3 do\nouter = outer + 1\nlocal inner = 0\nwhile true do\ninner = inner + 1\nhits = hits + 1\nif inner == 2 then break end\nend\nif outer == 2 then break end\nend\nreturn outer, hits"
+                .to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -490,6 +498,23 @@ return value"#
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&nested_break, profile, compiler.clone())
+                .unwrap();
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                vec![Value::Integer(2), Value::Integer(4)]
+            } else {
+                vec![Value::Number(2.0), Value::Number(4.0)]
+            };
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(expected),
+                "{profile}"
+            );
             let compiled = OwnedCompiler::default()
                 .compile(&while_loop, profile, compiler.clone())
                 .unwrap();

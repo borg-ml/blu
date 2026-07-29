@@ -13,7 +13,7 @@ mod parser;
 
 pub use ast::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
-    Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement,
+    BreakStatement, Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement,
     LocalListStatement, LocalStatement, ReturnStatement, Statement, UnaryExpression, UnaryOperator,
     WhileStatement,
 };
@@ -140,6 +140,7 @@ pub enum TokenKind {
     End,
     While,
     Do,
+    Break,
     Nil,
     True,
     False,
@@ -834,6 +835,7 @@ pub fn lex(
                     b"end" => TokenKind::End,
                     b"while" => TokenKind::While,
                     b"do" => TokenKind::Do,
+                    b"break" => TokenKind::Break,
                     b"nil" => TokenKind::Nil,
                     b"true" => TokenKind::True,
                     b"false" => TokenKind::False,

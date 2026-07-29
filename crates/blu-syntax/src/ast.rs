@@ -431,6 +431,22 @@ impl WhileStatement {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct BreakStatement {
+    span: ByteSpan,
+}
+
+impl BreakStatement {
+    pub(crate) const fn new(span: ByteSpan) -> Self {
+        Self { span }
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Statement {
     Local(LocalStatement),
@@ -439,6 +455,7 @@ pub enum Statement {
     AssignmentList(AssignmentListStatement),
     If(IfStatement),
     While(WhileStatement),
+    Break(BreakStatement),
     Return(ReturnStatement),
 }
 
@@ -452,6 +469,7 @@ impl Statement {
             Self::AssignmentList(statement) => statement.span(),
             Self::If(statement) => statement.span(),
             Self::While(statement) => statement.span(),
+            Self::Break(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
         }
     }

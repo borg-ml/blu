@@ -920,6 +920,32 @@ fn while_loops_execute_with_scoped_locals_and_instruction_limits() {
 }
 
 #[test]
+fn break_exits_only_the_innermost_owned_loop() {
+    let source = make_source(
+        b"local outer = 0\nlocal hits = 0\nwhile outer < 3 do\nouter = outer + 1\nlocal inner = 0\nwhile true do\ninner = inner + 1\nhits = hits + 1\nif inner == 2 then break end\nend\nif outer == 2 then break end\nend\nreturn outer, hits"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            vec![Value::Integer(2), Value::Integer(4)]
+        } else {
+            vec![Value::Number(2.0), Value::Number(4.0)]
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(expected),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {

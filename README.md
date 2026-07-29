@@ -97,6 +97,8 @@ path-terminating returns.
 Block-scoped `while` loops add separately feature-gated backward branches;
 validation records the target's definite-initialization state, and runtime
 execution remains subject to the VM instruction limit.
+Shared `break` statements are structurally restricted to loop bodies and patch
+only the innermost loop's exit, including through nested conditional blocks.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

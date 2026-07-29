@@ -370,6 +370,7 @@ struct Lowerer<'a> {
     limits: OwnedCompileLimits,
     bindings: Vec<Binding>,
     closed_bindings: Vec<Binding>,
+    loop_breaks: Vec<Vec<usize>>,
     register_count: usize,
     constants: Vec<Constant>,
     constant_bytes: usize,
@@ -394,6 +395,7 @@ impl<'a> Lowerer<'a> {
                 capacity.min(limits.max_bindings),
                 "closed local bindings",
             )?,
+            loop_breaks: allocate_vec(8, "loop control stack")?,
             register_count: 0,
             constants: allocate_vec(capacity.min(limits.max_constants), "constants")?,
             constant_bytes: 0,
@@ -542,6 +544,10 @@ impl<'a> Lowerer<'a> {
                     self.lower_while(statement)?;
                     false
                 }
+                Statement::Break(statement) => {
+                    self.lower_break(statement.span())?;
+                    true
+                }
                 Statement::Return(return_statement) => {
                     self.lower_return(return_statement)?;
                     true
@@ -611,7 +617,19 @@ impl<'a> Lowerer<'a> {
             statement.span(),
         )?;
         let scope = self.bindings.len();
-        let terminated = self.lower_statements(statement.body().statements())?;
+        push_fallible(
+            &mut self.loop_breaks,
+            allocate_vec(2, "loop break branches")?,
+            "loop control stack",
+        )?;
+        let lowered = self.lower_statements(statement.body().statements());
+        let breaks = self
+            .loop_breaks
+            .pop()
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "loop control stack became empty during lowering",
+            })?;
+        let terminated = lowered?;
         self.close_scope(scope)?;
         if !terminated {
             let target =
@@ -620,7 +638,28 @@ impl<'a> Lowerer<'a> {
                 })?;
             self.emit(Instruction::Jump { target }, statement.span())?;
         }
-        self.patch_forward_branch(exit, self.code.len())
+        let end = self.code.len();
+        self.patch_forward_branch(exit, end)?;
+        for branch in breaks {
+            self.patch_forward_branch(branch, end)?;
+        }
+        Ok(())
+    }
+
+    fn lower_break(&mut self, span: ByteSpan) -> Result<(), OwnedCompileError> {
+        if self.loop_breaks.is_empty() {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "parser exposed break outside a loop",
+            });
+        }
+        let branch = self.code.len();
+        self.emit(Instruction::Jump { target: 0 }, span)?;
+        let Some(breaks) = self.loop_breaks.last_mut() else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "loop control stack became empty during break lowering",
+            });
+        };
+        push_fallible(breaks, branch, "loop break branches")
     }
 
     fn close_scope(&mut self, start: usize) -> Result<(), OwnedCompileError> {
