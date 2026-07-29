@@ -18,11 +18,15 @@ pinned upstream Luau revision. Lua 5.1–5.5 source profiles, standard libraries
 and versioned C API bridges follow behind the same differential conformance
 gates.
 
-The interpreter currently covers scalar and table operations, numeric and
-generic loops, closures and mutable upvalues, variadic and multiple-return
-calls, globals and imports, Rust native functions, `pairs`/`ipairs`/`next`,
-string method dispatch, and initial table metatables. This is meaningful
-execution coverage, not yet a claim of complete Luau, Lua, or Blu compatibility.
+The current Luau-backed Blu path compiles source in-process and covers scalar
+and table operations, numeric and generic loops, closures and mutable upvalues,
+variadic and multiple-return calls, globals and imports, Rust native functions,
+protected calls, `pairs`/`ipairs`/`next`, string method dispatch, core
+metamethods, an initial standard library, and host-configured cached `require`.
+The default engine selects `blu`; `--!dialect` directives are checked against
+the configured engine. Lua 5.1–5.5 profiles are declared but still fail
+explicitly as unimplemented. This is meaningful execution coverage, not yet a
+claim of complete Luau, Lua, or Blu compatibility.
 
 ## Repository layout
 

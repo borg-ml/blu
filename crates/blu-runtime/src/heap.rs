@@ -1,4 +1,5 @@
 use crate::Value;
+use blu_bytecode::Chunk;
 use core::fmt;
 use std::{
     collections::{HashMap, VecDeque},
@@ -103,10 +104,12 @@ impl Heap {
 
     pub(crate) fn allocate_closure(
         &mut self,
+        chunk: Arc<Chunk>,
         prototype: usize,
         upvalues: Vec<UpvalueId>,
     ) -> ClosureId {
         let id = self.allocate(Object::Closure(Closure {
+            chunk,
             prototype,
             upvalues,
         }));
@@ -186,9 +189,13 @@ impl Heap {
     pub(crate) fn closure_parts(
         &self,
         closure: ClosureId,
-    ) -> Result<(usize, Vec<UpvalueId>), HeapError> {
+    ) -> Result<(Arc<Chunk>, usize, Vec<UpvalueId>), HeapError> {
         let closure = self.closure(closure)?;
-        Ok((closure.prototype, closure.upvalues.clone()))
+        Ok((
+            closure.chunk.clone(),
+            closure.prototype,
+            closure.upvalues.clone(),
+        ))
     }
 
     pub(crate) fn upvalue_get(&self, upvalue: UpvalueId) -> Result<Value, HeapError> {
@@ -354,6 +361,7 @@ enum Object {
 
 #[derive(Clone, Debug)]
 struct Closure {
+    chunk: Arc<Chunk>,
     prototype: usize,
     upvalues: Vec<UpvalueId>,
 }
@@ -492,6 +500,17 @@ impl Key {
 mod tests {
     use super::*;
 
+    fn empty_chunk() -> Arc<Chunk> {
+        Arc::new(Chunk {
+            version: 12,
+            typeinfo_version: 3,
+            strings: Vec::new(),
+            userdata_types: Vec::new(),
+            prototypes: Vec::new(),
+            main: 0,
+        })
+    }
+
     #[test]
     fn tables_split_dense_integer_keys_and_hash_keys() {
         let mut heap = Heap::default();
@@ -524,7 +543,7 @@ mod tests {
         heap.table_set(child, Value::Integer(1), Value::Table(retained))
             .unwrap();
         let upvalue = heap.allocate_upvalue(Value::Table(retained));
-        let closure = heap.allocate_closure(0, vec![upvalue]);
+        let closure = heap.allocate_closure(empty_chunk(), 0, vec![upvalue]);
 
         let root = Value::Closure(closure);
         assert_eq!(

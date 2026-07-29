@@ -40,6 +40,12 @@ an initial source directive such as `--!dialect lua54`. `auto` may be offered
 by import tooling, but imported packages must be locked to the resolved
 dialect.
 
+Current implementation status: the public engine defaults to `blu`, accepts
+`blu` and `luau` source through the pinned Luau compiler, and rejects a source
+directive that conflicts with the configured engine. The Lua 5.1–5.5 profiles
+remain explicit, structured `not implemented` errors until their own frontends
+and semantic profiles exist.
+
 ## Semantic profiles
 
 Parsing different syntaxes into one instruction set is insufficient. Function
@@ -93,6 +99,11 @@ Host-specific packages still require their host. A Neovim plugin needs the
 Neovim API, an OpenResty package needs the `ngx` API, and a Roblox package needs
 Roblox datatypes/services. Blu may provide adapters, but language compatibility
 does not fabricate those environments.
+
+The initial embedding surface exposes a host-configured `require` loader with a
+per-VM cache, circular-load detection, and GC-rooted module results. Filesystem
+resolution, manifests, authority checks, LuaRocks resolution, and native module
+loading are not yet implemented.
 
 ## Native modules
 

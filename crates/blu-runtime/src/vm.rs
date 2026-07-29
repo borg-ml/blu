@@ -2,12 +2,16 @@ use crate::heap::UpvalueId;
 use crate::{ClosureId, Dialect, Heap, HeapError, NativeFunctionId, TableId, Value};
 use blu_bytecode::{Chunk, Constant, Instruction, Opcode, Prototype};
 use core::fmt;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 const MAX_DYNAMIC_REGISTERS: usize = 1_000_000;
 
 type NativeFunction =
     Arc<dyn Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync>;
+type ModuleLoader = Arc<dyn Fn(&mut Vm, &[u8]) -> Result<Value, RuntimeError> + Send + Sync>;
 
 #[derive(Clone)]
 pub struct Vm {
@@ -19,13 +23,16 @@ pub struct Vm {
     native_functions: Vec<NativeFunction>,
     protected_call: Option<NativeFunctionId>,
     error_handler_call: Option<NativeFunctionId>,
+    module_loader: Option<ModuleLoader>,
+    module_cache: HashMap<Arc<[u8]>, Value>,
+    loading_modules: HashSet<Arc<[u8]>>,
     output: Vec<u8>,
     active_roots: Vec<Vec<Value>>,
 }
 
 impl Default for Vm {
     fn default() -> Self {
-        Self::new(Dialect::Luau)
+        Self::new(Dialect::Blu)
     }
 }
 
@@ -41,6 +48,9 @@ impl Vm {
             native_functions: Vec::new(),
             protected_call: None,
             error_handler_call: None,
+            module_loader: None,
+            module_cache: HashMap::new(),
+            loading_modules: HashSet::new(),
             output: Vec::new(),
             active_roots: Vec::new(),
         };
@@ -65,6 +75,11 @@ impl Vm {
         &self.heap
     }
 
+    #[must_use]
+    pub const fn dialect(&self) -> Dialect {
+        self.dialect
+    }
+
     pub fn register_function(
         &mut self,
         function: impl Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync + 'static,
@@ -76,6 +91,17 @@ impl Vm {
 
     pub fn set_global(&mut self, name: impl Into<Arc<[u8]>>, value: Value) {
         self.globals.insert(name.into(), value);
+    }
+
+    pub fn set_module_loader(
+        &mut self,
+        loader: impl Fn(&mut Vm, &[u8]) -> Result<Value, RuntimeError> + Send + Sync + 'static,
+    ) {
+        self.module_loader = Some(Arc::new(loader));
+    }
+
+    pub fn clear_module_cache(&mut self) {
+        self.module_cache.clear();
     }
 
     #[must_use]
@@ -92,22 +118,28 @@ impl Vm {
         roots: impl IntoIterator<Item = &'a Value>,
     ) -> crate::CollectionStats {
         let mut all_roots: Vec<Value> = self.globals.values().cloned().collect();
+        all_roots.extend(self.module_cache.values().cloned());
         all_roots.extend(self.active_roots.iter().flatten().cloned());
         all_roots.extend(roots.into_iter().cloned());
         self.heap.collect(&all_roots)
     }
 
     pub fn execute(&mut self, chunk: &Chunk) -> Result<Vec<Value>, RuntimeError> {
-        if self.dialect != Dialect::Luau {
+        self.execute_owned(chunk.clone())
+    }
+
+    pub fn execute_owned(&mut self, chunk: Chunk) -> Result<Vec<Value>, RuntimeError> {
+        if !matches!(self.dialect, Dialect::Blu | Dialect::Luau) {
             return Err(RuntimeError::DialectNotImplemented(self.dialect));
         }
+        let chunk = Arc::new(chunk);
         let mut remaining = self.instruction_limit;
-        self.execute_frame(chunk, chunk.main, None, &[], &mut remaining, 0)
+        self.execute_frame(&chunk, chunk.main, None, &[], &mut remaining, 0)
     }
 
     fn execute_frame(
         &mut self,
-        chunk: &Chunk,
+        chunk: &Arc<Chunk>,
         prototype_index: usize,
         closure: Option<ClosureId>,
         arguments: &[Value],
@@ -298,7 +330,7 @@ impl Vm {
                         };
                         upvalues.push(upvalue);
                     }
-                    let closure = self.heap.allocate_closure(child, upvalues);
+                    let closure = self.heap.allocate_closure(chunk.clone(), child, upvalues);
                     frame.set(instruction.a(), Value::Closure(closure))?;
                 }
                 Opcode::Capture => {
@@ -341,7 +373,7 @@ impl Vm {
                         instruction.opcode(),
                         left,
                         right,
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
@@ -359,7 +391,7 @@ impl Vm {
                         instruction.opcode(),
                         left,
                         right,
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
@@ -371,7 +403,7 @@ impl Vm {
                         instruction.opcode(),
                         left,
                         right,
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
@@ -424,7 +456,6 @@ impl Vm {
                                     })?;
                             let argument = other.clone();
                             let result = self.call_value(
-                                chunk,
                                 function,
                                 &[argument],
                                 remaining,
@@ -446,7 +477,6 @@ impl Vm {
                                 self.metamethod(&Value::Table(table), "__len")?
                             {
                                 let result = self.call_value(
-                                    chunk,
                                     function,
                                     &[Value::Table(table)],
                                     remaining,
@@ -537,7 +567,7 @@ impl Vm {
                         table,
                         key,
                         "table access",
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
@@ -550,7 +580,7 @@ impl Vm {
                         table,
                         key,
                         value,
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                 }
@@ -562,7 +592,7 @@ impl Vm {
                         table,
                         key,
                         "table access",
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
@@ -576,7 +606,7 @@ impl Vm {
                         table,
                         key,
                         value,
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                 }
@@ -587,7 +617,7 @@ impl Vm {
                         table,
                         key,
                         "table access",
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
@@ -600,7 +630,7 @@ impl Vm {
                         table,
                         key,
                         value,
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                 }
@@ -637,7 +667,7 @@ impl Vm {
                         receiver.clone(),
                         key,
                         "method lookup",
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )?;
                     frame.refresh_open_upvalues(&self.heap)?;
                     let receiver_register =
@@ -742,7 +772,6 @@ impl Vm {
                     )
                     .expect("u8 fits usize");
                     let results = self.call_value(
-                        chunk,
                         function,
                         &arguments,
                         remaining,
@@ -799,7 +828,7 @@ impl Vm {
                         instruction.opcode(),
                         left,
                         right,
-                        CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                     )? {
                         frame.jump(instruction)?;
                     }
@@ -832,7 +861,7 @@ impl Vm {
                         result = self.concat_value(
                             left,
                             result,
-                            CallContext::new(chunk, remaining, depth, frame.gc_roots(&self.heap)?),
+                            CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
                         )?;
                         frame.refresh_open_upvalues(&self.heap)?;
                     }
@@ -848,7 +877,6 @@ impl Vm {
                     };
                     let arguments = frame.register_slice(start, count)?.to_vec();
                     let results = self.call_value(
-                        chunk,
                         function,
                         &arguments,
                         remaining,
@@ -889,7 +917,6 @@ impl Vm {
 
     fn call_value(
         &mut self,
-        chunk: &Chunk,
         function: Value,
         arguments: &[Value],
         remaining: &mut u64,
@@ -898,10 +925,10 @@ impl Vm {
     ) -> Result<Vec<Value>, RuntimeError> {
         match function {
             Value::Closure(closure) => {
-                let (child, _) = self.heap.closure_parts(closure)?;
+                let (closure_chunk, child, _) = self.heap.closure_parts(closure)?;
                 self.active_roots.push(roots);
                 let result = self.execute_frame(
-                    chunk,
+                    &closure_chunk,
                     child,
                     Some(closure),
                     arguments,
@@ -918,7 +945,6 @@ impl Vm {
                         index: 1,
                     })?;
                     let result = self.call_value(
-                        chunk,
                         target,
                         arguments.get(1..).unwrap_or_default(),
                         remaining,
@@ -951,7 +977,6 @@ impl Vm {
                         index: 2,
                     })?;
                     let result = self.call_value(
-                        chunk,
                         target,
                         arguments.get(2..).unwrap_or_default(),
                         remaining,
@@ -967,7 +992,6 @@ impl Vm {
                         }
                         Err(error) => {
                             let handled = self.call_value(
-                                chunk,
                                 handler,
                                 &[runtime_error_value(error)],
                                 remaining,
@@ -1007,14 +1031,7 @@ impl Vm {
                 let mut metamethod_arguments = Vec::with_capacity(arguments.len() + 1);
                 metamethod_arguments.push(Value::Table(table));
                 metamethod_arguments.extend_from_slice(arguments);
-                self.call_value(
-                    chunk,
-                    function,
-                    &metamethod_arguments,
-                    remaining,
-                    depth,
-                    roots,
-                )
+                self.call_value(function, &metamethod_arguments, remaining, depth, roots)
             }
             other => Err(RuntimeError::Type {
                 operation: "call",
@@ -1065,7 +1082,6 @@ impl Vm {
                 function @ (Value::Closure(_) | Value::NativeFunction(_)) => {
                     return Ok(self
                         .call_value(
-                            context.chunk,
                             function,
                             &[Value::Table(table), key],
                             context.remaining,
@@ -1116,7 +1132,6 @@ impl Vm {
                 Value::Table(next) => table = next,
                 function @ (Value::Closure(_) | Value::NativeFunction(_)) => {
                     self.call_value(
-                        context.chunk,
                         function,
                         &[Value::Table(table), key, assigned],
                         context.remaining,
@@ -1166,7 +1181,6 @@ impl Vm {
             })?;
         Ok(self
             .call_value(
-                context.chunk,
                 function,
                 &[left, right],
                 context.remaining,
@@ -1200,7 +1214,6 @@ impl Vm {
             })?;
         Ok(self
             .call_value(
-                context.chunk,
                 function,
                 &[left, right],
                 context.remaining,
@@ -1253,7 +1266,6 @@ impl Vm {
                     match self.shared_metamethod(&left, &right, "__eq")? {
                         Some(function) => self
                             .call_value(
-                                context.chunk,
                                 function,
                                 &[left, right],
                                 context.remaining,
@@ -1282,7 +1294,6 @@ impl Vm {
                         },
                     )?;
                     self.call_value(
-                        context.chunk,
                         function,
                         &[left, right],
                         context.remaining,
@@ -1300,7 +1311,6 @@ impl Vm {
                     left <= right
                 } else if let Some(function) = self.shared_metamethod(&left, &right, "__le")? {
                     self.call_value(
-                        context.chunk,
                         function,
                         &[left, right],
                         context.remaining,
@@ -1319,7 +1329,6 @@ impl Vm {
                     )?;
                     !self
                         .call_value(
-                            context.chunk,
                             function,
                             &[right, left],
                             context.remaining,
@@ -1351,6 +1360,29 @@ impl Vm {
     }
 
     fn install_base_library(&mut self) {
+        let require = self.register_function(|vm, arguments| {
+            let name = arguments.first().ok_or(RuntimeError::Argument {
+                function: "require",
+                index: 1,
+            })?;
+            let name = Arc::<[u8]>::from(string_bytes(name, "require")?);
+            if let Some(value) = vm.module_cache.get(&name) {
+                return Ok(vec![value.clone()]);
+            }
+            if !vm.loading_modules.insert(name.clone()) {
+                return Err(RuntimeError::CircularModule(name));
+            }
+            let result = match vm.module_loader.clone() {
+                Some(loader) => loader(vm, &name),
+                None => Err(RuntimeError::ModuleLoaderMissing),
+            };
+            vm.loading_modules.remove(&name);
+            let value = result?;
+            vm.module_cache.insert(name, value.clone());
+            Ok(vec![value])
+        });
+        self.set_global(&b"require"[..], Value::NativeFunction(require));
+
         let next = self.register_function(|vm, arguments| {
             let table = arguments.first().ok_or(RuntimeError::Argument {
                 function: "next",
@@ -1454,18 +1486,15 @@ impl Vm {
             let value = value.trim();
             let parsed = if base == 10 {
                 value.parse::<f64>().ok()
+            } else if let Some(digits) = value.strip_prefix('-') {
+                u64::from_str_radix(digits, base)
+                    .ok()
+                    .map(|value| -(value as f64))
             } else {
-                let (negative, digits) = value
-                    .strip_prefix('-')
-                    .map_or((false, value), |digits| (true, digits));
-                let digits = digits.strip_prefix('+').unwrap_or(digits);
-                u64::from_str_radix(digits, base).ok().map(|value| {
-                    if negative {
-                        -(value as f64)
-                    } else {
-                        value as f64
-                    }
-                })
+                let digits = value.strip_prefix('+').unwrap_or(value);
+                u64::from_str_radix(digits, base)
+                    .ok()
+                    .map(|value| value as f64)
             };
             Ok(vec![parsed.map_or(Value::Nil, Value::Number)])
         });
@@ -2086,22 +2115,22 @@ impl fmt::Debug for Vm {
             .field("native_function_count", &self.native_functions.len())
             .field("protected_call", &self.protected_call)
             .field("error_handler_call", &self.error_handler_call)
+            .field("has_module_loader", &self.module_loader.is_some())
+            .field("module_cache", &self.module_cache)
             .field("active_frame_count", &self.active_roots.len())
             .finish_non_exhaustive()
     }
 }
 
 struct CallContext<'a> {
-    chunk: &'a Chunk,
     remaining: &'a mut u64,
     depth: usize,
     roots: Vec<Value>,
 }
 
 impl<'a> CallContext<'a> {
-    fn new(chunk: &'a Chunk, remaining: &'a mut u64, depth: usize, roots: Vec<Value>) -> Self {
+    fn new(remaining: &'a mut u64, depth: usize, roots: Vec<Value>) -> Self {
         Self {
-            chunk,
             remaining,
             depth,
             roots,
@@ -2241,7 +2270,7 @@ impl<'a> Frame<'a> {
 
     fn upvalue(&self, heap: &Heap, index: u8) -> Result<UpvalueId, RuntimeError> {
         let closure = self.closure.ok_or(RuntimeError::MissingClosure)?;
-        let (_, upvalues) = heap.closure_parts(closure)?;
+        let (_, _, upvalues) = heap.closure_parts(closure)?;
         upvalues
             .get(index as usize)
             .copied()
@@ -2577,6 +2606,8 @@ pub enum RuntimeError {
         length: usize,
     },
     ConversionBase(u32),
+    ModuleLoaderMissing,
+    CircularModule(Arc<[u8]>),
 }
 
 impl fmt::Display for RuntimeError {
@@ -2679,6 +2710,12 @@ impl fmt::Display for RuntimeError {
             Self::ConversionBase(base) => {
                 write!(f, "tonumber base {base} is outside the range 2..=36")
             }
+            Self::ModuleLoaderMissing => f.write_str("require has no configured module loader"),
+            Self::CircularModule(name) => write!(
+                f,
+                "circular require while loading {:?}",
+                String::from_utf8_lossy(name)
+            ),
         }
     }
 }
