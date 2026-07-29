@@ -42,7 +42,8 @@ pub enum BytecodeFormat {
 pub struct FeatureBits(u64);
 
 impl FeatureBits {
-    /// Straight-line constant loads, register moves, numeric addition, and return.
+    /// Straight-line constant loads, register moves, boolean `not`, numeric
+    /// addition, and return.
     pub const BASELINE: Self = Self(1);
     /// Lossless `i64` constant storage, without implying integer execution.
     ///
@@ -228,6 +229,10 @@ pub enum Instruction {
         destination: u16,
         source: u16,
     },
+    Not {
+        destination: u16,
+        source: u16,
+    },
     Add {
         destination: u16,
         left: u16,
@@ -262,6 +267,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
         | SemanticProfile::Lua55 => match instruction {
             Instruction::LoadConstant { .. }
             | Instruction::Move { .. }
+            | Instruction::Not { .. }
             | Instruction::Add { .. }
             | Instruction::FloorDivide { .. }
             | Instruction::Return { .. } => true,
@@ -270,6 +276,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             instruction,
             Instruction::LoadConstant { .. }
                 | Instruction::Move { .. }
+                | Instruction::Not { .. }
                 | Instruction::Add { .. }
                 | Instruction::Return { .. }
         ),
@@ -1088,6 +1095,14 @@ fn validate_prototype(
                 check_read(index, pc, source, &initialized)?;
                 initialized[destination as usize] = true;
             }
+            Instruction::Not {
+                destination,
+                source,
+            } => {
+                check_register(index, pc, destination, registers)?;
+                check_read(index, pc, source, &initialized)?;
+                initialized[destination as usize] = true;
+            }
             Instruction::Add {
                 destination,
                 left,
@@ -1367,7 +1382,9 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     Instruction::LoadConstant { .. }
                     | Instruction::Add { .. }
                     | Instruction::FloorDivide { .. } => 7,
-                    Instruction::Move { .. } | Instruction::Return { .. } => 5,
+                    Instruction::Move { .. }
+                    | Instruction::Not { .. }
+                    | Instruction::Return { .. } => 5,
                 },
             )?;
         }
@@ -1480,6 +1497,14 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 source,
             } => {
                 out.push(4);
+                put_u16(out, *destination);
+                put_u16(out, *source);
+            }
+            Instruction::Not {
+                destination,
+                source,
+            } => {
+                out.push(5);
                 put_u16(out, *destination);
                 put_u16(out, *source);
             }
@@ -2074,6 +2099,10 @@ fn read_prototype(
                 right: reader.u16()?,
             },
             4 => Instruction::Move {
+                destination: reader.u16()?,
+                source: reader.u16()?,
+            },
+            5 => Instruction::Not {
                 destination: reader.u16()?,
                 source: reader.u16()?,
             },

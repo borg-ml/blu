@@ -119,6 +119,20 @@ fn nil_and_boolean_literals_are_profile_neutral_keywords() {
 }
 
 #[test]
+fn unary_not_is_a_profile_neutral_keyword() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return not false".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [TokenKind::Return, TokenKind::Not, TokenKind::False],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn escape_free_quoted_strings_are_profile_neutral_byte_tokens() {
     for profile in SemanticProfile::ALL {
         let source = source(b"return 'blu', \"lua\"".to_vec());

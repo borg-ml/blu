@@ -855,6 +855,13 @@ impl Vm {
                     let value = blu_register(&registers, source)?.clone();
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::Not {
+                    destination,
+                    source,
+                } => {
+                    let value = Value::Boolean(!blu_register(&registers, source)?.is_truthy());
+                    set_blu_register(&mut registers, destination, value)?;
+                }
                 BluInstruction::FloorDivide {
                     destination,
                     left,

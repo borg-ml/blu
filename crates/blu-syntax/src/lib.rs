@@ -13,7 +13,7 @@ mod parser;
 
 pub use ast::{
     Ast, BinaryExpression, BinaryOperator, Expression, ExpressionId, ExpressionKind, Identifier,
-    LocalStatement, ReturnStatement, Statement,
+    LocalStatement, ReturnStatement, Statement, UnaryExpression, UnaryOperator,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
@@ -128,6 +128,7 @@ pub enum TokenKind {
     DialectDirective,
     Local,
     Return,
+    Not,
     Nil,
     True,
     False,
@@ -398,6 +399,7 @@ pub fn lex(
                 match &bytes[start..offset] {
                     b"local" => TokenKind::Local,
                     b"return" => TokenKind::Return,
+                    b"not" => TokenKind::Not,
                     b"nil" => TokenKind::Nil,
                     b"true" => TokenKind::True,
                     b"false" => TokenKind::False,

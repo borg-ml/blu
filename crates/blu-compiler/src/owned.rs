@@ -29,7 +29,7 @@ use blu_core::{
 };
 use blu_syntax::{
     Ast, BinaryOperator, Expression, ExpressionId, ExpressionKind, LocalStatement, ParseError,
-    ParseLimits, ParseOutcome, Rejected, ReturnStatement, Statement, parse,
+    ParseLimits, ParseOutcome, Rejected, ReturnStatement, Statement, UnaryOperator, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -591,6 +591,20 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionKind::Identifier(identifier) => self.resolve(identifier.span()),
             ExpressionKind::Group(inner) => self.lower_expression(inner),
+            ExpressionKind::Unary(unary) => match unary.operator() {
+                UnaryOperator::Not => {
+                    let source = self.lower_expression(unary.operand())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::Not {
+                            destination,
+                            source,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
+                }
+            },
             ExpressionKind::Binary(binary) => match binary.operator() {
                 BinaryOperator::Add => {
                     let left = self.lower_expression(binary.left())?;

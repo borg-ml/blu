@@ -4,7 +4,7 @@ use blu_core::{
 };
 use blu_syntax::{
     BinaryOperator, ExpressionId, ExpressionKind, ParseError, ParseLimit, ParseLimits,
-    ParseOutcome, Statement, TokenKind, parse,
+    ParseOutcome, Statement, TokenKind, UnaryOperator, parse,
 };
 
 fn source(bytes: impl Into<Vec<u8>>) -> SourceFile {
@@ -34,6 +34,13 @@ fn binary(parsed: &blu_syntax::Parsed, id: ExpressionId) -> blu_syntax::BinaryEx
     match parsed.ast().expression(id).unwrap().kind() {
         ExpressionKind::Binary(binary) => binary,
         other => panic!("expected binary expression, found {other:?}"),
+    }
+}
+
+fn unary(parsed: &blu_syntax::Parsed, id: ExpressionId) -> blu_syntax::UnaryExpression {
+    match parsed.ast().expression(id).unwrap().kind() {
+        ExpressionKind::Unary(unary) => unary,
+        other => panic!("expected unary expression, found {other:?}"),
     }
 }
 
@@ -141,6 +148,27 @@ fn grouping_parentheses_override_precedence_and_retain_their_span() {
     };
     assert_eq!(source.slice(group.span()).unwrap(), b"(a + b)");
     assert_eq!(binary(&parsed, inner).operator(), BinaryOperator::Add);
+}
+
+#[test]
+fn unary_not_binds_tighter_than_binary_operators_and_associates_right() {
+    let source = source(b"return not not false + 1".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    let add = binary(&parsed, statement.values()[0]);
+    let outer = unary(&parsed, add.left());
+    assert_eq!(outer.operator(), UnaryOperator::Not);
+    assert_eq!(source.slice(outer.operator_span()).unwrap(), b"not");
+    let inner = unary(&parsed, outer.operand());
+    assert_eq!(inner.operator(), UnaryOperator::Not);
+    assert_eq!(
+        source
+            .slice(parsed.ast().expression(inner.operand()).unwrap().span())
+            .unwrap(),
+        b"false"
+    );
 }
 
 #[test]

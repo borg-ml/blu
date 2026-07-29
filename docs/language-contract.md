@@ -50,7 +50,7 @@ program. It includes byte-zero dialect directives, stable raw-byte spans,
 retained trivia, the documented `//` profile gate, `local name = expression`,
 expression-list `return`, nil/boolean/decimal-integer/identifier expressions,
 escape-free single- and double-quoted byte strings, and `+`/`//` precedence
-plus grouping parentheses. String escapes are rejected until their
+plus grouping parentheses and unary `not`. String escapes are rejected until their
 profile-specific rules are implemented. Parsing retains the explicit profile and rejects
 diagnostics without exposing a partial AST. Resolution, lowering, emission,
 and execution are separate explicit stages; the public engine never silently
@@ -65,7 +65,7 @@ that every process or host allocation is VM-accounted.
 The separate `blu_compiler::owned::OwnedCompiler`, also re-exported through
 `blu_lang::frontend`, compiles exactly this AST slice: declaration-ordered
 locals (with explicit shadowing), decimal integer
-literals, numeric `+`, profile-gated `//`, and a final expression-list
+literals, truthiness-based boolean `not`, numeric `+`, profile-gated `//`, and a final expression-list
 `return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
 BluV1 Integer constants and use normal IEEE-754 parsing above that; Lua 5.1,
 Lua 5.2, and Luau always use the latter Number policy. Blu currently uses the

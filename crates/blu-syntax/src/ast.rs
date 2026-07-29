@@ -39,6 +39,47 @@ pub enum BinaryOperator {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum UnaryOperator {
+    Not,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct UnaryExpression {
+    operator: UnaryOperator,
+    operator_span: ByteSpan,
+    operand: ExpressionId,
+}
+
+impl UnaryExpression {
+    pub(crate) const fn new(
+        operator: UnaryOperator,
+        operator_span: ByteSpan,
+        operand: ExpressionId,
+    ) -> Self {
+        Self {
+            operator,
+            operator_span,
+            operand,
+        }
+    }
+
+    #[must_use]
+    pub const fn operator(self) -> UnaryOperator {
+        self.operator
+    }
+
+    #[must_use]
+    pub const fn operator_span(self) -> ByteSpan {
+        self.operator_span
+    }
+
+    #[must_use]
+    pub const fn operand(self) -> ExpressionId {
+        self.operand
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BinaryExpression {
     left: ExpressionId,
     operator: BinaryOperator,
@@ -90,6 +131,7 @@ pub enum ExpressionKind {
     StringLiteral,
     Identifier(Identifier),
     Group(ExpressionId),
+    Unary(UnaryExpression),
     Binary(BinaryExpression),
 }
 

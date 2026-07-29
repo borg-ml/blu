@@ -1,7 +1,7 @@
 use crate::{
     Ast, BinaryExpression, BinaryOperator, DialectDirective, Expression, ExpressionId,
     ExpressionKind, Identifier, LexError, Lexed, LexerLimits, LocalStatement, ReturnStatement,
-    Statement, Token, TokenKind, lex,
+    Statement, Token, TokenKind, UnaryExpression, UnaryOperator, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -410,7 +410,7 @@ impl<'a> Parser<'a> {
         &mut self,
         minimum_precedence: u8,
     ) -> Result<Option<BuiltExpression>, ParseError> {
-        let Some(mut left) = self.parse_primary()? else {
+        let Some(mut left) = self.parse_prefix()? else {
             return Ok(None);
         };
 
@@ -446,6 +446,32 @@ impl<'a> Parser<'a> {
         Ok(Some(left))
     }
 
+    fn parse_prefix(&mut self) -> Result<Option<BuiltExpression>, ParseError> {
+        let Some(operator) = self
+            .current()
+            .filter(|token| token.kind() == TokenKind::Not)
+        else {
+            return self.parse_primary();
+        };
+        self.bump();
+        let Some(operand) = self.parse_expression(3)? else {
+            return Ok(None);
+        };
+        let span = operator.span().merge(self.expression(operand.id)?.span())?;
+        self.push_expression(
+            Expression::new(
+                ExpressionKind::Unary(UnaryExpression::new(
+                    UnaryOperator::Not,
+                    operator.span(),
+                    operand.id,
+                )),
+                span,
+            ),
+            operand.depth.saturating_add(1),
+        )
+        .map(Some)
+    }
+
     fn parse_primary(&mut self) -> Result<Option<BuiltExpression>, ParseError> {
         let Some(token) = self.current() else {
             self.report_current_or_eof(
@@ -457,6 +483,7 @@ impl<'a> Parser<'a> {
                     "quoted string",
                     "decimal integer",
                     "identifier",
+                    "not",
                     "(",
                 ],
             )?;
@@ -504,6 +531,7 @@ impl<'a> Parser<'a> {
                         "quoted string",
                         "decimal integer",
                         "identifier",
+                        "not",
                         "(",
                     ],
                 )?;
