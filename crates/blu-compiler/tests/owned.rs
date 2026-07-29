@@ -973,6 +973,57 @@ fn continue_restarts_only_blu_and_luau_owned_loops() {
 }
 
 #[test]
+fn repeat_until_executes_once_scopes_locals_and_tests_after_continue() {
+    let source = make_source(
+        b"local count = 0\nlocal total = 0\nrepeat\ncount = count + 1\nlocal current = count\nif count < 3 then continue end\ntotal = total + current\nuntil count == 4\nreturn count, total"
+            .to_vec(),
+    );
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .expect("compilation should succeed");
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Number(4.0), Value::Number(7.0)])
+        );
+    }
+
+    for profile in [
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        assert!(matches!(
+            OwnedCompiler::default().compile(&source, profile, compiler_identity()),
+            Err(OwnedCompileError::Syntax(_))
+        ));
+    }
+
+    let once =
+        make_source(b"local count = 0\nrepeat count = count + 1 until true\nreturn count".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&once, profile, compiler_identity())
+            .expect("profile-neutral repeat should compile");
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Value::Integer(1)
+        } else {
+            Value::Number(1.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {

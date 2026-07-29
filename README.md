@@ -89,8 +89,7 @@ The owned path also directly executes profile-neutral `==`, `~=`, `<`, `<=`,
 `>`, and `>=`; ordered comparisons accept only compatible numbers or byte
 strings, while equality between unlike scalar types is false.
 Operand-returning `and` and `or` use validated forward branches and preserve
-short-circuit evaluation in every profile. Backward canonical branches remain
-unsupported until loop control-flow validation is assigned.
+short-circuit evaluation in every profile.
 Structured `if`/`elseif`/`else` blocks execute through the same validated
 forward control flow, retain branch-local lexical scope, and support
 path-terminating returns.
@@ -101,6 +100,9 @@ Shared `break` statements are structurally restricted to loop bodies and patch
 only the innermost loop's exit, including through nested conditional blocks.
 `continue` is an explicit Blu/Luau extension that restarts the innermost loop;
 Lua 5.1–5.5 profiles reject it during lexing.
+Profile-neutral `repeat`/`until` loops execute their body at least once and
+retain body locals through the trailing condition. In Blu and Luau, `continue`
+in a repeat loop transfers to that trailing condition.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

@@ -389,6 +389,34 @@ fn while_loops_own_nested_blocks() {
 }
 
 #[test]
+fn repeat_loops_own_a_body_and_trailing_condition() {
+    for profile in SemanticProfile::ALL {
+        let source_file = source(b"repeat local value = 1 until value == 1".to_vec());
+        let parsed = accepted(&source_file, profile, ParseLimits::default());
+        let Statement::Repeat(statement) = &parsed.ast().statements()[0] else {
+            panic!("expected repeat statement");
+        };
+        assert_eq!(statement.body().statements().len(), 1);
+        assert!(matches!(
+            parsed
+                .ast()
+                .expression(statement.condition())
+                .expect("condition should exist")
+                .kind(),
+            ExpressionKind::Binary(_)
+        ));
+    }
+
+    let missing_until = source(b"repeat local value = 1".to_vec());
+    let outcome = parse(&missing_until, SemanticProfile::Blu, ParseLimits::default())
+        .expect("parsing should complete");
+    let rejected = outcome
+        .rejected()
+        .expect("missing until should be rejected");
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0024");
+}
+
+#[test]
 fn break_is_scoped_to_loop_bodies_and_terminates_its_block() {
     let source_file = source(b"while true do if ready then break end end".to_vec());
     let parsed = accepted(&source_file, SemanticProfile::Blu, ParseLimits::default());

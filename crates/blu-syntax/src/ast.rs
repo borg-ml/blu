@@ -431,6 +431,38 @@ impl WhileStatement {
     }
 }
 
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct RepeatStatement {
+    body: Block,
+    condition: ExpressionId,
+    span: ByteSpan,
+}
+
+impl RepeatStatement {
+    pub(crate) const fn new(body: Block, condition: ExpressionId, span: ByteSpan) -> Self {
+        Self {
+            body,
+            condition,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn body(&self) -> &Block {
+        &self.body
+    }
+
+    #[must_use]
+    pub const fn condition(&self) -> ExpressionId {
+        self.condition
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct BreakStatement {
     span: ByteSpan,
@@ -471,6 +503,7 @@ pub enum Statement {
     AssignmentList(AssignmentListStatement),
     If(IfStatement),
     While(WhileStatement),
+    Repeat(RepeatStatement),
     Break(BreakStatement),
     Continue(ContinueStatement),
     Return(ReturnStatement),
@@ -486,6 +519,7 @@ impl Statement {
             Self::AssignmentList(statement) => statement.span(),
             Self::If(statement) => statement.span(),
             Self::While(statement) => statement.span(),
+            Self::Repeat(statement) => statement.span(),
             Self::Break(statement) => statement.span(),
             Self::Continue(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
@@ -524,6 +558,7 @@ impl Block {
                         .saturating_add(statement.else_body().map_or(0, |block| block.node_count()))
                 }
                 Statement::While(statement) => statement.body().node_count(),
+                Statement::Repeat(statement) => statement.body().node_count(),
                 _ => 0,
             };
             count.saturating_add(1).saturating_add(nested)

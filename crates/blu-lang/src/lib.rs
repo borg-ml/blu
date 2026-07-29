@@ -497,6 +497,14 @@ return value"#
             SourceLimits::default(),
         )
         .unwrap();
+        let repeat_loop = SourceFile::new(
+            SourceId::new(27),
+            "repeat-loop.blu",
+            b"local count = 0\nrepeat\ncount = count + 1\nlocal current = count\nuntil current == 3\nreturn count"
+                .to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -506,6 +514,23 @@ return value"#
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&repeat_loop, profile, compiler.clone())
+                .unwrap();
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(3)
+            } else {
+                Value::Number(3.0)
+            };
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![expected]),
+                "{profile}"
+            );
             let compiled =
                 OwnedCompiler::default().compile(&continue_loop, profile, compiler.clone());
             if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {

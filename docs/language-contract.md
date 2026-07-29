@@ -170,8 +170,12 @@ conditionals target the innermost active loop exit without escaping outer
 loops or lexical scopes.
 `continue` is assigned to Blu and Luau only. It is rejected lexically for Lua
 5.1–5.5 rather than being treated as an identifier or silently accepted.
-Within a loop it terminates the current block path and emits a validated
-back-edge to the innermost loop condition.
+Within a loop it terminates the current block path and transfers to the
+innermost loop condition.
+`repeat`/`until` is shared by every profile. Its body executes before its
+condition, and body-local bindings remain in scope through that condition.
+For Blu and Luau, `continue` inside `repeat` transfers to the trailing
+condition; it does not skip the condition by restarting the body.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

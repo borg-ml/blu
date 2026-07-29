@@ -2,8 +2,8 @@ use crate::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
     BreakStatement, ContinueStatement, DialectDirective, Expression, ExpressionId, ExpressionKind,
     Identifier, IfClause, IfStatement, LexError, Lexed, LexerLimits, LocalListStatement,
-    LocalStatement, ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator,
-    WhileStatement, lex,
+    LocalStatement, RepeatStatement, ReturnStatement, Statement, Token, TokenKind, UnaryExpression,
+    UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -344,6 +344,7 @@ impl<'a> Parser<'a> {
                 TokenKind::Identifier => self.parse_assignment()?,
                 TokenKind::If => self.parse_if()?,
                 TokenKind::While => self.parse_while()?,
+                TokenKind::Repeat => self.parse_repeat()?,
                 TokenKind::Break | TokenKind::Continue => {
                     let Some(keyword) = self.bump() else {
                         return Err(ParseError::InternalInvariant {
@@ -419,6 +420,7 @@ impl<'a> Parser<'a> {
                             "assignment",
                             "if",
                             "while",
+                            "repeat",
                             "break",
                             "continue",
                             "return",
@@ -543,6 +545,42 @@ impl<'a> Parser<'a> {
             condition.id,
             body,
             keyword.span().merge(end.span())?,
+        )))
+    }
+
+    fn parse_repeat(&mut self) -> Result<(), ParseError> {
+        let Some(keyword) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "repeat parser entered without a current token",
+            });
+        };
+        self.loop_depth += 1;
+        let parsed_body = self.parse_nested_block(&[TokenKind::Until]);
+        self.loop_depth -= 1;
+        let body = parsed_body?;
+        if !self.at(TokenKind::Until) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0024",
+                "expected `until` to close repeat statement",
+                &["until"],
+            )?;
+            return Ok(());
+        }
+        self.bump();
+        let Some(condition) = self.parse_expression(0)? else {
+            return Ok(());
+        };
+        let condition_span = self
+            .expressions
+            .get(condition.id.as_usize())
+            .ok_or(ParseError::InternalInvariant {
+                message: "repeat condition expression is missing",
+            })?
+            .span();
+        self.push_statement(Statement::Repeat(RepeatStatement::new(
+            body,
+            condition.id,
+            keyword.span().merge(condition_span)?,
         )))
     }
 

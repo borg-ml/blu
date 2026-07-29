@@ -778,6 +778,20 @@ fn while_loop_keywords_are_shared_across_profiles() {
 }
 
 #[test]
+fn repeat_loop_keywords_are_shared_across_profiles() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"repeat ready = true until ready".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).expect("lexing should complete");
+        assert!(!lexed.has_errors(), "{profile}");
+        let kinds = significant_kinds(&lexed)
+            .into_iter()
+            .filter(|kind| matches!(kind, TokenKind::Repeat | TokenKind::Until))
+            .collect::<Vec<_>>();
+        assert_eq!(kinds, [TokenKind::Repeat, TokenKind::Until]);
+    }
+}
+
+#[test]
 fn break_is_a_shared_loop_keyword() {
     for profile in SemanticProfile::ALL {
         let source = source(b"while true do break end".to_vec());
