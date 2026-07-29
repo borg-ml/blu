@@ -860,6 +860,95 @@ mod tests {
     }
 
     #[test]
+    fn generic_for_steps_resume_without_restarting_and_trace_pending_values() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            engine.execute(
+                br#"
+                    local calls = 0
+                    local state = { retained = 40 }
+                    local function iterator(current_state, control)
+                        calls += 1
+                        if control >= 2 then
+                            return nil
+                        end
+                        local resumed = coroutine.yield("step" .. calls)
+                        return control + 1, current_state.retained + resumed
+                    end
+                    saved_thread = coroutine.create(function()
+                        local total = 0
+                        for key, value in iterator, state, 0 do
+                            total += key + value
+                        end
+                        return calls, total
+                    end)
+                    return coroutine.resume(saved_thread)
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"step1"[..])),
+            ])
+        );
+        engine.vm_mut().collect(std::iter::empty()).unwrap();
+        assert_eq!(
+            engine.execute(
+                br#"
+                    local second_ok, second = coroutine.resume(saved_thread, 1)
+                    local third_ok, count, total = coroutine.resume(saved_thread, 2)
+                    return second_ok, second, third_ok, count, total,
+                        coroutine.status(saved_thread)
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"step2"[..])),
+                Value::Boolean(true),
+                Value::Number(3.0),
+                Value::Number(86.0),
+                Value::String(Arc::from(&b"dead"[..])),
+            ]),
+        );
+    }
+
+    #[test]
+    fn generic_for_errors_after_resume_reach_the_protected_boundary() {
+        assert_eq!(
+            Engine::default().execute(
+                br#"
+                    local calls = 0
+                    local function iterator()
+                        calls += 1
+                        coroutine.yield("iteration pause")
+                        error("iteration boom")
+                    end
+                    local thread = coroutine.create(function()
+                        local ok, message = pcall(function()
+                            for _ in iterator do
+                            end
+                        end)
+                        return ok, message, calls
+                    end)
+                    local first_ok, pause = coroutine.resume(thread)
+                    local second_ok, protected_ok, message, count =
+                        coroutine.resume(thread)
+                    return first_ok, pause, second_ok, protected_ok,
+                        message, count, coroutine.status(thread)
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"iteration pause"[..])),
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"iteration boom"[..])),
+                Value::Number(1.0),
+                Value::String(Arc::from(&b"dead"[..])),
+            ])
+        );
+    }
+
+    #[test]
     fn protected_calls_can_yield_and_resume_successfully() {
         assert_eq!(
             Engine::default().execute(

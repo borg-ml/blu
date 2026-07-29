@@ -9,10 +9,24 @@ pub struct ValidationError {
     pub prototype: usize,
     pub pc: Option<usize>,
     pub message: String,
+    pub allocation: Option<ValidationAllocation>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ValidationAllocation {
+    pub what: &'static str,
+    pub requested: usize,
 }
 
 impl fmt::Display for ValidationError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(allocation) = self.allocation {
+            return write!(
+                f,
+                "prototype {}: failed to allocate {} entries for {}",
+                self.prototype, allocation.requested, allocation.what
+            );
+        }
         if let Some(pc) = self.pc {
             write!(
                 f,
@@ -45,6 +59,7 @@ fn validate_chunk_structure(chunk: &Chunk) -> Result<(), ValidationError> {
         prototype,
         pc: None,
         message,
+        allocation: None,
     };
     if chunk.main >= chunk.prototypes.len() {
         return Err(error(
@@ -171,6 +186,7 @@ fn check_constant(
             prototype,
             pc: None,
             message: format!("{what} constant {index} exceeds constant count {count}"),
+            allocation: None,
         })
     }
 }
@@ -201,12 +217,17 @@ impl Validator<'_> {
                 ),
             );
         }
-        let mut starts = vec![false; self.prototype.code.len()];
+        let mut starts = self.bool_scratch("instruction-start map")?;
         for instruction in &self.prototype.instructions {
             starts[instruction.pc()] = true;
         }
 
         let mut open_captures = Vec::new();
+        open_captures
+            .try_reserve_exact(self.prototype.instructions.len())
+            .map_err(|_| {
+                self.allocation_error("open-capture stack", self.prototype.instructions.len())
+            })?;
         for (index, instruction) in self.prototype.instructions.iter().copied().enumerate() {
             self.validate_instruction(index, instruction, &starts, &mut open_captures)?;
         }
@@ -223,7 +244,7 @@ impl Validator<'_> {
     fn validate_variadic(&self) -> Result<(), ValidationError> {
         use Opcode::*;
 
-        let mut targets = vec![false; self.prototype.code.len()];
+        let mut targets = self.bool_scratch("variadic jump-target map")?;
         for instruction in &self.prototype.instructions {
             if !instruction.opcode().is_fast_call()
                 && let Some(target) = instruction.jump_target()
@@ -910,9 +931,43 @@ impl Validator<'_> {
             prototype: self.prototype_index,
             pc,
             message,
+            allocation: None,
         }
     }
 
+    fn allocation_error(&self, what: &'static str, requested: usize) -> ValidationError {
+        ValidationError {
+            prototype: self.prototype_index,
+            pc: None,
+            message: String::new(),
+            allocation: Some(ValidationAllocation { what, requested }),
+        }
+    }
+
+    fn bool_scratch(&self, what: &'static str) -> Result<Vec<bool>, ValidationError> {
+        try_bool_scratch(self.prototype_index, self.prototype.code.len(), what)
+    }
+}
+
+fn try_bool_scratch(
+    prototype: usize,
+    requested: usize,
+    what: &'static str,
+) -> Result<Vec<bool>, ValidationError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(requested)
+        .map_err(|_| ValidationError {
+            prototype,
+            pc: None,
+            message: String::new(),
+            allocation: Some(ValidationAllocation { what, requested }),
+        })?;
+    values.resize(requested, false);
+    Ok(values)
+}
+
+impl Validator<'_> {
     fn error<T>(&self, pc: Option<usize>, message: String) -> Result<T, ValidationError> {
         Err(self.make_error(pc, message))
     }
@@ -938,6 +993,22 @@ fn constant_kind(constant: &Constant) -> &'static str {
 mod tests {
     use super::*;
     use crate::{DebugInfo, LineInfo};
+
+    #[test]
+    fn validation_scratch_capacity_failure_is_structured() {
+        assert_eq!(
+            try_bool_scratch(7, usize::MAX, "test scratch"),
+            Err(ValidationError {
+                prototype: 7,
+                pc: None,
+                message: String::new(),
+                allocation: Some(ValidationAllocation {
+                    what: "test scratch",
+                    requested: usize::MAX,
+                }),
+            })
+        );
+    }
 
     fn prototype(code: Vec<u32>, max_stack_size: u8) -> Prototype {
         let instructions = crate::decode(&code).unwrap();

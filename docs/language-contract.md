@@ -44,11 +44,27 @@ Current implementation status: the public engine defaults to `blu`, accepts
 `blu` and `luau` source through the pinned Luau compiler, and rejects a source
 directive that conflicts with the configured engine. The Lua 5.1–5.5 profiles
 remain explicit, structured `not implemented` errors until their own frontends
-and runtime semantics exist. The separate `blu-syntax` crate now implements
-the bounded byte lexer for the first owned-frontend slice, including
-byte-zero dialect directives, stable raw-byte spans, retained trivia, and the
-documented `//` profile gate. It does not yet parse, lower, emit, or execute
-source, and the public engine does not silently select it as a compiler.
+and runtime semantics exist. The separate `blu-syntax` crate now implements a
+bounded byte lexer and small parser/AST slice for the first owned-frontend
+program. It includes byte-zero dialect directives, stable raw-byte spans,
+retained trivia, the documented `//` profile gate, `local name = expression`,
+expression-list `return`, and decimal-integer/identifier expressions with `+`
+and `//` precedence. Parsing retains the explicit profile and rejects
+diagnostics without exposing a partial AST. It does not resolve, lower, emit,
+compile, or execute source, and the public engine does not silently select it
+as a compiler. Parser-owned arenas, lists, copied found-bytes, and diagnostic
+counts are bounded and reserve fallibly; construction of diagnostic strings
+and expected-token lists still inherits infallible allocation from
+`blu-core` and remains an explicit hardening gap.
+
+The BluV1 baseline artifact can be translated only for an explicitly matching
+`blu` or `luau` profile. Translation revalidates the artifact under caller
+supplied execution limits, rejects nested/upvalue structure and Luau field
+widths it cannot preserve, and returns a profile-tagged chunk.
+`Vm::execute_translated` consumes that chunk and checks the configured dialect;
+the retained tag is also checked if low-level code extracts the
+`ValidatedChunk`. This is a bootstrap path for the three baseline instructions,
+not the owned resolver, lowerer, or full Blu backend.
 
 Ordinary bytecode calls currently run on an owned, bounded VM frame stack.
 Suspended callers and their registers are traced as GC roots. Generational
@@ -126,10 +142,19 @@ accounting and an optional limit for arena slots plus live table buffers,
 closure-upvalue buffers, and thread-root buffers. Collection releases live
 object-buffer charges while retaining reusable arena-slot charges. This is
 still a partial accounting boundary: strings, chunks, VM stacks, the arena
-free list, collection work queues, temporary/native results, and host-owned
-values are not included. Accounted guest heap growth triggers collection at
-the configured byte threshold before reserving more storage. Active and saved
-frames trace both their values and every live open-upvalue cell.
+free list, collection work queues, temporary results, and host-owned values are
+not included. Dynamic VM-register growth is nevertheless capped and uses
+fallible reservation before changing a frame. Results returned from a native
+callback are count-bounded (1,000,000 by default, configurable with
+`Vm::with_native_result_limit`) and rejected before caller-frame writes, but
+allocations performed inside host callback code remain the embedder's
+responsibility. Built-in concatenation and the string transformation,
+repetition, character, byte-expansion, and `table.unpack` result buffers use
+checked fallible reservation; concatenation also enforces the 64 MiB
+string-result limit.
+Accounted guest heap growth triggers collection at the configured byte
+threshold before reserving more storage. Active and saved frames trace both
+their values and every live open-upvalue cell.
 
 Heap handles returned by `Vm::execute*` (and therefore `Engine::execute*`) stay
 rooted across later calls. Each returned table, closure, or thread occurrence

@@ -7,6 +7,7 @@
 //! the repository's `UPSTREAM.toml`.
 
 pub mod blu;
+mod blu_translate;
 mod chunk;
 mod disassemble;
 mod instruction;
@@ -20,7 +21,7 @@ pub use chunk::{
 pub use disassemble::disassemble;
 pub use instruction::{DecodeError, Instruction, InstructionIter, decode};
 pub use opcode::Opcode;
-pub use validate::{ValidationError, validate};
+pub use validate::{ValidationAllocation, ValidationError, validate};
 
 pub const BYTECODE_VERSION_MIN: u8 = 3;
 pub const BYTECODE_VERSION_MAX: u8 = 12;

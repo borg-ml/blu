@@ -40,16 +40,19 @@ explicitly as unimplemented. This is meaningful execution coverage, not yet a
 claim of complete Luau, Lua, or Blu compatibility.
 
 The first Blu-owned frontend substrate is also present: `blu-syntax` performs
-bounded byte-oriented lexing for the initial vertical slice, with explicit
-profile reconciliation and stable byte spans. It is not yet connected to a
-parser or compiler, so public source execution still uses the pinned Luau
-compatibility compiler.
+bounded byte-oriented lexing and parses the initial local/return arithmetic
+slice into a spanned arena AST with explicit profile reconciliation. It is not
+yet connected to resolution or code generation, so public source execution
+still uses the pinned Luau compatibility compiler. Hand-built BluV1 baseline
+artifacts can be revalidated under execution limits, translated into a
+profile-tagged bootstrap chunk, and consumed by the VM without discarding the
+authorized Blu/Luau profile.
 
 ## Repository layout
 
 - `blu-lang`: public facade crate for embedding Blu.
 - `blu-core`: dependency-free semantic profiles, source identities, byte spans, and diagnostics.
-- `blu-syntax`: bounded byte-oriented lexer for the Blu-owned frontend.
+- `blu-syntax`: bounded byte lexer and initial parser/AST for the Blu-owned frontend.
 - `blu-compiler`: isolated in-process Luau source compiler adapter.
 - `blu-bytecode`: bounded BluV1 artifacts plus versioned Luau decoding and loading.
 - `blu-package`: bounded canonical package envelopes and artifact validation.

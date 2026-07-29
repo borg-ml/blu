@@ -5,10 +5,12 @@ use crate::{
 };
 use blu_bytecode::{
     Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype, ValidatedChunk,
-    ValidationError,
+    ValidationError, blu::TranslatedChunk,
 };
+use blu_core::SemanticProfile;
 use core::fmt;
 use std::{
+    borrow::Cow,
     collections::{HashMap, HashSet},
     sync::Arc,
 };
@@ -16,6 +18,7 @@ use std::{
 const MAX_DYNAMIC_REGISTERS: usize = 1_000_000;
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
 const DEFAULT_HOST_VALUE_LIMIT: usize = 4096;
+const DEFAULT_NATIVE_RESULT_LIMIT: usize = MAX_DYNAMIC_REGISTERS;
 
 type NativeFunction =
     Arc<dyn Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync>;
@@ -109,6 +112,7 @@ pub struct Vm {
     host_roots: HashMap<HostRoot, usize>,
     host_root_count: usize,
     host_value_limit: usize,
+    native_result_limit: usize,
 }
 
 impl Default for Vm {
@@ -161,6 +165,7 @@ impl Vm {
             host_roots: HashMap::new(),
             host_root_count: 0,
             host_value_limit: DEFAULT_HOST_VALUE_LIMIT,
+            native_result_limit: DEFAULT_NATIVE_RESULT_LIMIT,
         };
         vm.install_base_library()?;
         Ok(vm)
@@ -209,6 +214,16 @@ impl Vm {
     #[must_use]
     pub fn with_host_value_limit(mut self, limit: usize) -> Self {
         self.host_value_limit = limit;
+        self
+    }
+
+    /// Sets the maximum number of values accepted from one native callback.
+    ///
+    /// The default matches the dynamic-register limit. Oversized results are
+    /// rejected before any caller frame is modified.
+    #[must_use]
+    pub fn with_native_result_limit(mut self, limit: usize) -> Self {
+        self.native_result_limit = limit;
         self
     }
 
@@ -339,6 +354,12 @@ impl Vm {
     #[must_use]
     pub const fn host_value_limit(&self) -> usize {
         self.host_value_limit
+    }
+
+    /// Returns the configured maximum result count for one native callback.
+    #[must_use]
+    pub const fn native_result_limit(&self) -> usize {
+        self.native_result_limit
     }
 
     pub fn collect<'a>(
@@ -538,12 +559,45 @@ impl Vm {
         self.execute_validated_owned(chunk.clone())
     }
 
+    /// Executes a BluV1 baseline translation without discarding its profile.
+    ///
+    /// The translated chunk is consumed, so this path does not deep-clone the
+    /// artifact. The VM dialect must match the profile authorized during
+    /// translation.
+    pub fn execute_translated(
+        &mut self,
+        translated: TranslatedChunk,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let expected = match self.dialect {
+            Dialect::Blu => SemanticProfile::Blu,
+            Dialect::Luau => SemanticProfile::Luau,
+            dialect => return Err(RuntimeError::DialectNotImplemented(dialect)),
+        };
+        if translated.profile() != expected {
+            return Err(RuntimeError::SemanticProfileMismatch {
+                configured: self.dialect,
+                artifact: translated.profile(),
+            });
+        }
+        self.execute_validated_owned(translated.into_validated_chunk())
+    }
+
     pub fn execute_validated_owned(
         &mut self,
         chunk: ValidatedChunk,
     ) -> Result<Vec<Value>, RuntimeError> {
-        if !matches!(self.dialect, Dialect::Blu | Dialect::Luau) {
-            return Err(RuntimeError::DialectNotImplemented(self.dialect));
+        let expected = match self.dialect {
+            Dialect::Blu => SemanticProfile::Blu,
+            Dialect::Luau => SemanticProfile::Luau,
+            dialect => return Err(RuntimeError::DialectNotImplemented(dialect)),
+        };
+        if let Some(artifact) = chunk.semantic_profile()
+            && artifact != expected
+        {
+            return Err(RuntimeError::SemanticProfileMismatch {
+                configured: self.dialect,
+                artifact,
+            });
         }
         let chunk = Arc::new(chunk.into_chunk());
         let mut remaining = self.instruction_limit;
@@ -1282,10 +1336,11 @@ impl Vm {
                         register: usize::from(base) + 2,
                         count: frame.registers.len(),
                     })?;
-                    let arguments = vec![
-                        frame.get(state_register)?.clone(),
-                        frame.get(index_register)?.clone(),
-                    ];
+                    let state = frame.get(state_register)?.clone();
+                    let control = frame.get(index_register)?.clone();
+                    let mut arguments = try_vec_with_capacity(2, "generic-for arguments")?;
+                    arguments.push(state.clone());
+                    arguments.push(control.clone());
                     let variable_count = usize::try_from(
                         instruction.aux().ok_or(RuntimeError::MissingAux {
                             pc: instruction.pc(),
@@ -1293,6 +1348,38 @@ impl Vm {
                         })? & 0xff,
                     )
                     .expect("u8 fits usize");
+                    if let Value::Closure(closure) = function {
+                        let (child_chunk, child, _) = self.heap.closure_parts(closure)?;
+                        if depth + 1 > self.call_limit {
+                            return Err(RuntimeError::CallLimit {
+                                limit: self.call_limit,
+                            });
+                        }
+                        let child_prototype = child_chunk
+                            .prototypes
+                            .get(child)
+                            .ok_or(RuntimeError::InvalidPrototype(child))?;
+                        let constants = materialize_constants(&child_chunk, child_prototype)?;
+                        let child_frame =
+                            Frame::new(child_chunk, child, constants, Some(closure), &arguments)?;
+                        let caller = Caller {
+                            frame,
+                            register: base,
+                            encoded_count: 0,
+                            return_mode: ReturnMode::Operation(PendingOperation::GenericForStep {
+                                function: Value::Closure(closure),
+                                state,
+                                control,
+                                base,
+                                variable_count,
+                                instruction,
+                            }),
+                        };
+                        self.active_roots.push(caller.gc_roots(&self.heap)?);
+                        callers.push(caller);
+                        frame = child_frame;
+                        continue;
+                    }
                     let results = self.call_value(
                         function,
                         &arguments,
@@ -1489,10 +1576,7 @@ impl Vm {
                     let results = frame.registers[start..end].to_vec();
                     if let Some(caller) = callers.pop() {
                         self.active_roots.pop();
-                        frame = caller.frame;
-                        frame.refresh_open_upvalues(&self.heap)?;
-                        let results = caller.return_mode.success_results(results);
-                        frame.write_results(caller.register, caller.encoded_count, results)?;
+                        frame = caller.complete_success(&self.heap, results)?;
                         continue;
                     }
                     return Ok(results);
@@ -1635,7 +1719,14 @@ impl Vm {
                 self.active_roots.push(roots);
                 let result = function(self, arguments);
                 self.active_roots.pop();
-                result
+                let values = result?;
+                if values.len() > self.native_result_limit {
+                    return Err(RuntimeError::NativeResultLimit {
+                        required: values.len(),
+                        limit: self.native_result_limit,
+                    });
+                }
+                Ok(values)
             }
             Value::Table(table) => {
                 let function =
@@ -1820,7 +1911,20 @@ impl Vm {
         context: CallContext<'_>,
     ) -> Result<Value, RuntimeError> {
         if let (Some(left), Some(right)) = (concat_bytes(&left), concat_bytes(&right)) {
-            let mut result = Vec::with_capacity(left.len() + right.len());
+            let required =
+                left.len()
+                    .checked_add(right.len())
+                    .ok_or(RuntimeError::StringLimit {
+                        required: usize::MAX,
+                        limit: MAX_STRING_BYTES,
+                    })?;
+            if required > MAX_STRING_BYTES {
+                return Err(RuntimeError::StringLimit {
+                    required,
+                    limit: MAX_STRING_BYTES,
+                });
+            }
+            let mut result = try_vec_with_capacity(required, "concatenated string")?;
             result.extend_from_slice(&left);
             result.extend_from_slice(&right);
             return Ok(Value::String(Arc::from(result)));
@@ -2393,7 +2497,7 @@ impl Vm {
             Value::String(Arc::from(&b"len"[..])),
             Value::NativeFunction(string_len),
         )?;
-        let string_byte = self.register_function(|_, arguments| {
+        let string_byte = self.register_function(|vm, arguments| {
             let string = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.byte",
                 index: 1,
@@ -2414,10 +2518,16 @@ impl Vm {
             if start > end {
                 return Ok(Vec::new());
             }
-            Ok(string[(start - 1) as usize..end as usize]
-                .iter()
-                .map(|value| Value::Integer(i64::from(*value)))
-                .collect())
+            let bytes = &string[(start - 1) as usize..end as usize];
+            if bytes.len() > vm.native_result_limit {
+                return Err(RuntimeError::NativeResultLimit {
+                    required: bytes.len(),
+                    limit: vm.native_result_limit,
+                });
+            }
+            let mut values = try_vec_with_capacity(bytes.len(), "string.byte results")?;
+            values.extend(bytes.iter().map(|value| Value::Integer(i64::from(*value))));
+            Ok(values)
         });
         self.heap.table_set(
             string,
@@ -2429,7 +2539,8 @@ impl Vm {
                 function: "string.reverse",
                 index: 1,
             })?;
-            let mut result = string_bytes(string, "string.reverse")?.to_vec();
+            let mut result =
+                try_clone_bytes(string_bytes(string, "string.reverse")?, "reversed string")?;
             result.reverse();
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -2439,7 +2550,7 @@ impl Vm {
             Value::NativeFunction(string_reverse),
         )?;
         let string_char = self.register_function(|_, arguments| {
-            let mut result = Vec::with_capacity(arguments.len());
+            let mut result = try_vec_with_capacity(arguments.len(), "string.char result")?;
             for argument in arguments {
                 let index = result.len();
                 let value = argument.as_number().ok_or(RuntimeError::Type {
@@ -2496,7 +2607,7 @@ impl Vm {
                     limit: MAX_STRING_BYTES,
                 });
             }
-            let mut result = Vec::with_capacity(required);
+            let mut result = try_vec_with_capacity(required, "repeated string")?;
             for index in 0..count {
                 if index != 0 {
                     result.extend_from_slice(separator);
@@ -2515,7 +2626,8 @@ impl Vm {
                 function: "string.lower",
                 index: 1,
             })?;
-            let mut result = string_bytes(value, "string.lower")?.to_vec();
+            let mut result =
+                try_clone_bytes(string_bytes(value, "string.lower")?, "lowercase string")?;
             result.make_ascii_lowercase();
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -2529,7 +2641,8 @@ impl Vm {
                 function: "string.upper",
                 index: 1,
             })?;
-            let mut result = string_bytes(value, "string.upper")?.to_vec();
+            let mut result =
+                try_clone_bytes(string_bytes(value, "string.upper")?, "uppercase string")?;
             result.make_ascii_uppercase();
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -2720,7 +2833,7 @@ impl Vm {
                         arguments.get(1..).unwrap_or_default().to_vec(),
                     )?;
                     for caller in &continuation.callers {
-                        self.active_roots.push(caller.frame.gc_roots(&self.heap)?);
+                        self.active_roots.push(caller.gc_roots(&self.heap)?);
                     }
                     self.run_resumed_frames(
                         continuation.frame,
@@ -2818,7 +2931,9 @@ impl Vm {
                                 }
                             }
                         }
-                        ReturnMode::Direct | ReturnMode::ErrorHandlerResult => {
+                        ReturnMode::Direct
+                        | ReturnMode::ErrorHandlerResult
+                        | ReturnMode::Operation(_) => {
                             unreachable!("only protected callers catch errors")
                         }
                     };
@@ -2964,7 +3079,7 @@ impl Vm {
                     expected: "string or number",
                     actual: value.type_name(),
                 })?,
-                None => Vec::new(),
+                None => Cow::Borrowed(&[] as &[u8]),
             };
             let start = arguments
                 .get(2)
@@ -3040,7 +3155,7 @@ impl Vm {
                     limit: MAX_DYNAMIC_REGISTERS,
                 });
             }
-            let mut values = Vec::with_capacity(count);
+            let mut values = try_vec_with_capacity(count, "table.unpack results")?;
             for index in start..=end {
                 values.push(vm.heap.table_get(table, &Value::Integer(index))?);
             }
@@ -3267,13 +3382,27 @@ fn relative_index(index: i64, length: usize) -> i64 {
     }
 }
 
-fn concat_bytes(value: &Value) -> Option<Vec<u8>> {
+fn concat_bytes(value: &Value) -> Option<Cow<'_, [u8]>> {
     match value {
-        Value::String(value) => Some(value.to_vec()),
-        Value::Integer(value) => Some(value.to_string().into_bytes()),
-        Value::Number(value) => Some(value.to_string().into_bytes()),
+        Value::String(value) => Some(Cow::Borrowed(value)),
+        Value::Integer(value) => Some(Cow::Owned(value.to_string().into_bytes())),
+        Value::Number(value) => Some(Cow::Owned(value.to_string().into_bytes())),
         _ => None,
     }
+}
+
+fn try_vec_with_capacity<T>(capacity: usize, what: &'static str) -> Result<Vec<T>, RuntimeError> {
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(capacity)
+        .map_err(|_| RuntimeError::Allocation { what })?;
+    Ok(values)
+}
+
+fn try_clone_bytes(bytes: &[u8], what: &'static str) -> Result<Vec<u8>, RuntimeError> {
+    let mut result = try_vec_with_capacity(bytes.len(), what)?;
+    result.extend_from_slice(bytes);
+    Ok(result)
 }
 
 fn runtime_error_value(error: RuntimeError) -> Value {
@@ -3335,6 +3464,7 @@ impl fmt::Debug for Vm {
             .field("active_frame_count", &self.active_roots.len())
             .field("retained_value_count", &self.host_root_count)
             .field("host_value_limit", &self.host_value_limit)
+            .field("native_result_limit", &self.native_result_limit)
             .finish_non_exhaustive()
     }
 }
@@ -3372,12 +3502,42 @@ struct Caller {
     return_mode: ReturnMode,
 }
 
+impl Caller {
+    fn gc_roots(&self, heap: &Heap) -> Result<GcRoots, RuntimeError> {
+        let mut roots = self.frame.gc_roots(heap)?;
+        if let ReturnMode::Operation(operation) = &self.return_mode {
+            roots
+                .values
+                .try_reserve_exact(3)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "pending operation GC roots",
+                })?;
+            roots.values.extend(operation.values().into_iter().cloned());
+        }
+        Ok(roots)
+    }
+
+    fn complete_success(mut self, heap: &Heap, results: Vec<Value>) -> Result<Frame, RuntimeError> {
+        self.frame.refresh_open_upvalues(heap)?;
+        match self.return_mode {
+            ReturnMode::Operation(operation) => operation.complete(&mut self.frame, results)?,
+            return_mode => {
+                let results = return_mode.success_results(results);
+                self.frame
+                    .write_results(self.register, self.encoded_count, results)?;
+            }
+        }
+        Ok(self.frame)
+    }
+}
+
 #[derive(Clone, Debug)]
 enum ReturnMode {
     Direct,
     Protected,
     ErrorHandler(Value),
     ErrorHandlerResult,
+    Operation(PendingOperation),
 }
 
 impl ReturnMode {
@@ -3398,7 +3558,63 @@ impl ReturnMode {
                 Value::Boolean(false),
                 results.into_iter().next().unwrap_or(Value::Nil),
             ],
+            Self::Operation(_) => unreachable!("operations complete through Caller"),
         }
+    }
+}
+
+#[derive(Clone, Debug)]
+enum PendingOperation {
+    GenericForStep {
+        function: Value,
+        state: Value,
+        control: Value,
+        base: u8,
+        variable_count: usize,
+        instruction: Instruction,
+    },
+}
+
+impl PendingOperation {
+    fn values(&self) -> [&Value; 3] {
+        match self {
+            Self::GenericForStep {
+                function,
+                state,
+                control,
+                ..
+            } => [function, state, control],
+        }
+    }
+
+    fn complete(self, frame: &mut Frame, results: Vec<Value>) -> Result<(), RuntimeError> {
+        match self {
+            Self::GenericForStep {
+                base,
+                variable_count,
+                instruction,
+                ..
+            } => {
+                for offset in 0..variable_count {
+                    let register = usize::from(base) + 3 + offset;
+                    let register = u8::try_from(register).map_err(|_| RuntimeError::Register {
+                        register,
+                        count: frame.registers.len(),
+                    })?;
+                    frame.set(register, results.get(offset).cloned().unwrap_or(Value::Nil))?;
+                }
+                let index_register = base.checked_add(2).ok_or(RuntimeError::Register {
+                    register: usize::from(base) + 2,
+                    count: frame.registers.len(),
+                })?;
+                let first = results.first().cloned().unwrap_or(Value::Nil);
+                frame.set(index_register, first.clone())?;
+                if !matches!(first, Value::Nil) {
+                    frame.jump(instruction)?;
+                }
+            }
+        }
+        Ok(())
     }
 }
 
@@ -3543,6 +3759,9 @@ impl Frame {
             });
         }
         if required > self.registers.len() {
+            self.registers
+                .try_reserve_exact(required - self.registers.len())
+                .map_err(|_| RuntimeError::Allocation { what: "VM stack" })?;
             self.registers.resize(required, Value::Nil);
         }
         Ok(())
@@ -3667,7 +3886,7 @@ fn continuation_roots(
 ) -> Result<GcRoots, RuntimeError> {
     let mut roots = frame.gc_roots(heap)?;
     for caller in callers {
-        roots.extend(caller.frame.gc_roots(heap)?);
+        roots.extend(caller.gc_roots(heap)?);
     }
     Ok(roots)
 }
@@ -3814,6 +4033,10 @@ pub enum RuntimeError {
         what: &'static str,
     },
     DialectNotImplemented(Dialect),
+    SemanticProfileMismatch {
+        configured: Dialect,
+        artifact: SemanticProfile,
+    },
     InvalidMainPrototype(usize),
     InvalidPrototype(usize),
     InvalidProgramCounter {
@@ -3899,6 +4122,10 @@ pub enum RuntimeError {
         required: usize,
         limit: usize,
     },
+    NativeResultLimit {
+        required: usize,
+        limit: usize,
+    },
     MetatableProtected,
     MetatableLoop,
     UnsupportedMetamethod {
@@ -3944,6 +4171,13 @@ impl fmt::Display for RuntimeError {
             Self::DialectNotImplemented(dialect) => {
                 write!(f, "{dialect:?} execution is not implemented")
             }
+            Self::SemanticProfileMismatch {
+                configured,
+                artifact,
+            } => write!(
+                f,
+                "translated {artifact} artifact cannot execute in {configured:?} mode"
+            ),
             Self::InvalidMainPrototype(index) => write!(f, "invalid main prototype {index}"),
             Self::InvalidPrototype(index) => write!(f, "invalid prototype {index}"),
             Self::InvalidProgramCounter { pc, code_words } => {
@@ -4026,6 +4260,12 @@ impl fmt::Display for RuntimeError {
                     "retained host values require {required} entries, limit is {limit}"
                 )
             }
+            Self::NativeResultLimit { required, limit } => {
+                write!(
+                    f,
+                    "native callback returned {required} values, limit is {limit}"
+                )
+            }
             Self::MetatableProtected => f.write_str("cannot change a protected metatable"),
             Self::MetatableLoop => f.write_str("metatable lookup chain is too long"),
             Self::UnsupportedMetamethod { name, actual } => {
@@ -4104,7 +4344,18 @@ impl std::error::Error for RuntimeError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use blu_bytecode::{LoadLimits, load};
+    use blu_bytecode::{
+        LoadLimits,
+        blu::{
+            Artifact as BluArtifact, BluLimits, BytecodeFormat, Constant as BluConstant,
+            FeatureBits, Instruction as BluInstruction, Prototype as BluPrototype, SourceRecord,
+            TranslatedChunk, ValidatedArtifact, translate_baseline_to_luau,
+        },
+        load,
+    };
+    use blu_core::{
+        ByteSpan, CompilerId, CompilerIdentity, IdentityLimits, SourceId, SourceIdentity,
+    };
 
     const RETURN_THREE_V12: &[u8] = &[
         0x0c, 0x03, 0x00, 0x00, 0x01, 0x23, 0x01, 0x00, 0x00, 0x01, 0x0a, 0x00, 0x03, 0x41, 0x00,
@@ -4139,6 +4390,66 @@ mod tests {
         chunk
     }
 
+    fn translated_baseline(profile: SemanticProfile) -> TranslatedChunk {
+        let identity_limits = IdentityLimits::default();
+        let source = SourceId::new(1);
+        let source_span = ByteSpan::from_usize(source, 0, 0).unwrap();
+        let artifact = BluArtifact {
+            format: BytecodeFormat::BluV1,
+            compiler: CompilerIdentity::new(
+                CompilerId::new([7; 16]),
+                "blu-test",
+                "1",
+                None,
+                identity_limits,
+            )
+            .unwrap(),
+            sources: vec![SourceRecord {
+                identity: SourceIdentity::new(source, "baseline.blu", identity_limits).unwrap(),
+                byte_len: 1,
+                digest: [0; 32],
+            }],
+            prototypes: vec![BluPrototype {
+                profile,
+                source,
+                register_count: 3,
+                parameter_count: 0,
+                is_vararg: false,
+                required_features: FeatureBits::BASELINE,
+                constants: vec![BluConstant::Number(40.0), BluConstant::Number(2.0)],
+                upvalues: Vec::new(),
+                children: Vec::new(),
+                code: vec![
+                    BluInstruction::LoadConstant {
+                        destination: 0,
+                        constant: 0,
+                    },
+                    BluInstruction::LoadConstant {
+                        destination: 1,
+                        constant: 1,
+                    },
+                    BluInstruction::Add {
+                        destination: 2,
+                        left: 0,
+                        right: 1,
+                    },
+                    BluInstruction::Return { first: 2, count: 1 },
+                ],
+                source_map: vec![source_span; 4],
+                locals: Vec::new(),
+                upvalue_debug: Vec::new(),
+            }],
+            main: 0,
+        };
+        let limits = BluLimits::default();
+        translate_baseline_to_luau(
+            ValidatedArtifact::new(artifact, limits).unwrap(),
+            profile,
+            limits,
+        )
+        .unwrap()
+    }
+
     fn native(vm: &Vm, table: &[u8], name: &[u8]) -> NativeFunction {
         let table = table_id(vm.global(table).unwrap()).unwrap();
         let value = vm
@@ -4156,6 +4467,33 @@ mod tests {
         let chunk = load(RETURN_THREE_V12, LoadLimits::default()).unwrap();
         let result = Vm::default().execute(&chunk).unwrap();
         assert_eq!(result, vec![Value::Number(3.0)]);
+    }
+
+    #[test]
+    fn translated_blu_v1_executes_only_under_its_authorized_profile() {
+        assert_eq!(
+            Vm::new(Dialect::Blu).execute_translated(translated_baseline(SemanticProfile::Blu)),
+            Ok(vec![Value::Number(42.0)])
+        );
+        assert_eq!(
+            Vm::new(Dialect::Luau).execute_translated(translated_baseline(SemanticProfile::Luau)),
+            Ok(vec![Value::Number(42.0)])
+        );
+        assert_eq!(
+            Vm::new(Dialect::Luau).execute_translated(translated_baseline(SemanticProfile::Blu)),
+            Err(RuntimeError::SemanticProfileMismatch {
+                configured: Dialect::Luau,
+                artifact: SemanticProfile::Blu,
+            })
+        );
+        let extracted = translated_baseline(SemanticProfile::Blu).into_validated_chunk();
+        assert_eq!(
+            Vm::new(Dialect::Luau).execute_validated_owned(extracted),
+            Err(RuntimeError::SemanticProfileMismatch {
+                configured: Dialect::Luau,
+                artifact: SemanticProfile::Blu,
+            })
+        );
     }
 
     #[test]
@@ -4281,6 +4619,78 @@ mod tests {
             vm.execute(&chunk),
             Err(RuntimeError::Validation(error)) if error.message.contains("constant 99")
         ));
+    }
+
+    #[test]
+    fn native_result_limit_rejects_results_before_frame_writes() {
+        let code = vec![
+            abc(Opcode::GetGlobal, 0, 0, 0),
+            0,
+            abc(Opcode::Call, 0, 1, 2),
+            abc(Opcode::Return, 0, 2, 0),
+        ];
+        let chunk = test_chunk(&[b"native"], vec![Constant::String(0)], code, 1);
+        let mut vm = Vm::default().with_native_result_limit(1);
+        assert_eq!(vm.native_result_limit(), 1);
+        let id = vm.register_function(|_, _| Ok(vec![Value::Integer(41), Value::Integer(42)]));
+        vm.set_global(&b"native"[..], Value::NativeFunction(id));
+
+        assert_eq!(
+            vm.execute(&chunk),
+            Err(RuntimeError::NativeResultLimit {
+                required: 2,
+                limit: 1,
+            })
+        );
+        assert_eq!(vm.retained_value_count(), 0);
+
+        let mut builtin_vm = Vm::default().with_native_result_limit(1);
+        let string_byte = native(&builtin_vm, b"string", b"byte");
+        assert_eq!(
+            string_byte(
+                &mut builtin_vm,
+                &[
+                    Value::String(Arc::from(&b"ab"[..])),
+                    Value::Integer(1),
+                    Value::Integer(2),
+                ],
+            ),
+            Err(RuntimeError::NativeResultLimit {
+                required: 2,
+                limit: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn dynamic_stack_limit_is_atomic_and_legal_growth_succeeds() {
+        let chunk = Arc::new(test_chunk(&[], Vec::new(), vec![Opcode::Return as u32], 1));
+        let mut frame = Frame::new(chunk, 0, Vec::new(), None, &[]).unwrap();
+        let before = frame.registers.clone();
+
+        assert_eq!(
+            frame.ensure_dynamic(MAX_DYNAMIC_REGISTERS + 1),
+            Err(RuntimeError::StackLimit {
+                required: MAX_DYNAMIC_REGISTERS + 1,
+                limit: MAX_DYNAMIC_REGISTERS,
+            })
+        );
+        assert_eq!(frame.registers, before);
+        assert_eq!(frame.top, 0);
+
+        frame.ensure_dynamic(3).unwrap();
+        assert_eq!(frame.registers, vec![Value::Nil; 3]);
+        assert_eq!(frame.top, 0);
+    }
+
+    #[test]
+    fn guest_vector_capacity_overflow_is_structured() {
+        assert_eq!(
+            try_vec_with_capacity::<Value>(usize::MAX, "test values").unwrap_err(),
+            RuntimeError::Allocation {
+                what: "test values",
+            }
+        );
     }
 
     #[test]

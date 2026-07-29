@@ -2,7 +2,9 @@
 //!
 //! This module intentionally implements only the baseline needed to carry the
 //! first compiler slice. Its validated type proves this module's structural
-//! policy only; it does not make a Blu artifact executable.
+//! policy only. The separate baseline translator revalidates under an
+//! execution policy and produces a profile-tagged bootstrap chunk; validation
+//! alone is not execution authorization.
 
 use blu_core::{
     ByteOffset, ByteSpan, CompilerId, CompilerIdentity, IdentityLimits, SemanticProfile, SourceId,
@@ -10,6 +12,8 @@ use blu_core::{
 };
 use core::{fmt, ops::BitOr};
 use std::collections::HashMap;
+
+pub use crate::blu_translate::{TranslatedChunk, TranslationError, translate_baseline_to_luau};
 
 /// Bytes which cannot be confused with a serialized Luau chunk.
 pub const MAGIC: [u8; 4] = *b"BLU\0";
@@ -291,6 +295,11 @@ impl ValidatedArtifact {
     #[must_use]
     pub const fn validation_policy(&self) -> BluLimits {
         self.policy
+    }
+
+    #[must_use]
+    pub fn into_artifact(self) -> Artifact {
+        self.artifact
     }
 
     #[must_use]

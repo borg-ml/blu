@@ -6,6 +6,7 @@ use crate::{
     BYTECODE_VERSION_MAX, BYTECODE_VERSION_MIN, DecodeError, Instruction, TYPEINFO_VERSION_MAX,
     TYPEINFO_VERSION_MIN, ValidationError, decode, validate,
 };
+use blu_core::SemanticProfile;
 use core::fmt;
 use core::ops::Deref;
 
@@ -48,22 +49,44 @@ pub struct Chunk {
 }
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct ValidatedChunk(Chunk);
+pub struct ValidatedChunk {
+    chunk: Chunk,
+    semantic_profile: Option<SemanticProfile>,
+}
 
 impl ValidatedChunk {
     pub fn new(chunk: Chunk) -> Result<Self, ValidationError> {
         validate(&chunk)?;
-        Ok(Self(chunk))
+        Ok(Self {
+            chunk,
+            semantic_profile: None,
+        })
+    }
+
+    pub(crate) fn new_profiled(
+        chunk: Chunk,
+        semantic_profile: SemanticProfile,
+    ) -> Result<Self, ValidationError> {
+        validate(&chunk)?;
+        Ok(Self {
+            chunk,
+            semantic_profile: Some(semantic_profile),
+        })
     }
 
     #[must_use]
     pub const fn as_chunk(&self) -> &Chunk {
-        &self.0
+        &self.chunk
+    }
+
+    #[must_use]
+    pub const fn semantic_profile(&self) -> Option<SemanticProfile> {
+        self.semantic_profile
     }
 
     #[must_use]
     pub fn into_chunk(self) -> Chunk {
-        self.0
+        self.chunk
     }
 }
 
@@ -375,7 +398,7 @@ pub fn load(bytes: &[u8], limits: LoadLimits) -> Result<Chunk, ChunkError> {
 }
 
 pub fn load_validated(bytes: &[u8], limits: LoadLimits) -> Result<ValidatedChunk, ChunkError> {
-    load(bytes, limits).map(ValidatedChunk)
+    load(bytes, limits).and_then(|chunk| ValidatedChunk::new(chunk).map_err(ChunkError::Validation))
 }
 
 fn load_prototype(

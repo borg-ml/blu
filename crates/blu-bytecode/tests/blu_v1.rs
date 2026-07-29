@@ -1,9 +1,10 @@
 use blu_bytecode::blu::{
     Artifact, BLU_V1_VERSION, BluLimits, BytecodeFormat, Constant, DecodeError, FeatureBits,
-    Instruction, LocalDebug, MAGIC, Prototype, SourceRecord, Upvalue, UpvalueDebug,
-    ValidatedArtifact, ValidationError, decode, decode_validated, encode, instruction_is_legal,
+    Instruction, LocalDebug, MAGIC, Prototype, SourceRecord, TranslationError, Upvalue,
+    UpvalueDebug, ValidatedArtifact, ValidationError, decode, decode_validated, encode,
+    instruction_is_legal, translate_baseline_to_luau,
 };
-use blu_bytecode::{ChunkError, LoadLimits, load};
+use blu_bytecode::{ChunkError, LoadLimits, Opcode, load};
 use blu_core::{
     ByteSpan, CompilerId, CompilerIdentity, IdentityLimits, SemanticProfile, SourceId,
     SourceIdentity,
@@ -160,6 +161,14 @@ fn fixture() -> Artifact {
     }
 }
 
+fn baseline_fixture(profile: SemanticProfile) -> Artifact {
+    let mut artifact = fixture();
+    artifact.prototypes.truncate(1);
+    artifact.prototypes[0].profile = profile;
+    artifact.prototypes[0].children.clear();
+    artifact
+}
+
 #[test]
 fn canonical_round_trip_preserves_profiles_and_metadata() {
     let limits = BluLimits::default();
@@ -275,6 +284,119 @@ fn blu_v1_is_not_accepted_as_a_luau_chunk() {
     assert!(matches!(
         load(&bytes, LoadLimits::default()),
         Err(ChunkError::UnsupportedVersion(version)) if version == MAGIC[0]
+    ));
+}
+
+#[test]
+fn baseline_translation_is_explicit_validated_and_profile_preserving() {
+    let limits = BluLimits::default();
+    let artifact = ValidatedArtifact::new(baseline_fixture(SemanticProfile::Blu), limits).unwrap();
+    let translated =
+        translate_baseline_to_luau(artifact, SemanticProfile::Blu, BluLimits::default()).unwrap();
+    assert_eq!(translated.profile(), SemanticProfile::Blu);
+    let chunk = translated.into_validated_chunk();
+    assert_eq!(chunk.semantic_profile(), Some(SemanticProfile::Blu));
+    let main = &chunk.prototypes[chunk.main];
+
+    assert_eq!(main.max_stack_size, 3);
+    assert_eq!(main.instructions.len(), 4);
+    assert_eq!(main.instructions[0].opcode(), Opcode::LoadK);
+    assert_eq!(main.instructions[1].opcode(), Opcode::LoadK);
+    assert_eq!(main.instructions[2].opcode(), Opcode::Add);
+    assert_eq!(main.instructions[3].opcode(), Opcode::Return);
+    assert_eq!(main.instructions[3].b(), 2);
+}
+
+#[test]
+fn baseline_translation_rejects_profile_loss_and_unrepresentable_structure() {
+    let limits = BluLimits::default();
+    let strict = ValidatedArtifact::new(baseline_fixture(SemanticProfile::Blu), limits).unwrap();
+    let execution_limits = BluLimits {
+        max_code_per_prototype: 3,
+        ..limits
+    };
+    assert!(matches!(
+        translate_baseline_to_luau(strict, SemanticProfile::Blu, execution_limits),
+        Err(TranslationError::ExecutionValidation(
+            ValidationError::Limit {
+                what: "instruction count",
+                actual: 4,
+                limit: 3,
+            }
+        ))
+    ));
+
+    let blu = ValidatedArtifact::new(baseline_fixture(SemanticProfile::Blu), limits).unwrap();
+    assert!(matches!(
+        translate_baseline_to_luau(blu, SemanticProfile::Luau, limits),
+        Err(TranslationError::ProfileMismatch {
+            prototype: 0,
+            artifact: SemanticProfile::Blu,
+            execution: SemanticProfile::Luau,
+        })
+    ));
+
+    let lua54 = ValidatedArtifact::new(baseline_fixture(SemanticProfile::Lua54), limits).unwrap();
+    assert_eq!(
+        translate_baseline_to_luau(lua54, SemanticProfile::Lua54, limits),
+        Err(TranslationError::UnsupportedExecutionProfile(
+            SemanticProfile::Lua54
+        ))
+    );
+
+    let mut nested = fixture();
+    for prototype in &mut nested.prototypes {
+        prototype.profile = SemanticProfile::Blu;
+    }
+    let nested = ValidatedArtifact::new(nested, limits).unwrap();
+    assert_eq!(
+        translate_baseline_to_luau(nested, SemanticProfile::Blu, limits),
+        Err(TranslationError::UnsupportedStructure {
+            prototype: 0,
+            what: "child prototypes",
+        })
+    );
+}
+
+#[test]
+fn baseline_translation_checks_narrow_luau_fields() {
+    let limits = BluLimits::default();
+    let mut registers = baseline_fixture(SemanticProfile::Blu);
+    registers.prototypes[0].register_count = 256;
+    let registers = ValidatedArtifact::new(registers, limits).unwrap();
+    assert!(matches!(
+        translate_baseline_to_luau(registers, SemanticProfile::Blu, limits),
+        Err(TranslationError::TooLarge {
+            prototype: Some(0),
+            what: "register count",
+            actual: 256,
+            limit: 255,
+        })
+    ));
+
+    let mut returns = baseline_fixture(SemanticProfile::Blu);
+    returns.prototypes[0].register_count = 255;
+    returns.prototypes[0].code = (0..255)
+        .map(|destination| Instruction::LoadConstant {
+            destination,
+            constant: 0,
+        })
+        .collect();
+    returns.prototypes[0].code.push(Instruction::Return {
+        first: 0,
+        count: 255,
+    });
+    let span = returns.prototypes[0].source_map[0];
+    returns.prototypes[0].source_map = vec![span; 256];
+    let returns = ValidatedArtifact::new(returns, limits).unwrap();
+    assert!(matches!(
+        translate_baseline_to_luau(returns, SemanticProfile::Blu, limits),
+        Err(TranslationError::TooLarge {
+            prototype: Some(0),
+            what: "fixed return count",
+            actual: 255,
+            limit: 254,
+        })
     ));
 }
 

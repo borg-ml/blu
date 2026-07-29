@@ -71,6 +71,7 @@ name = "blu-runtime"
 version = "0.1.0"
 dependencies = [
  "blu-bytecode",
+ "blu-core",
 ]
 
 [[package]]

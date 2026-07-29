@@ -96,6 +96,7 @@ impl Instruction {
 pub enum DecodeError {
     InvalidOpcode { pc: usize, opcode: u8 },
     MissingAux { pc: usize, opcode: Opcode },
+    Allocation { requested: usize },
 }
 
 impl fmt::Display for DecodeError {
@@ -106,6 +107,12 @@ impl fmt::Display for DecodeError {
             }
             Self::MissingAux { pc, opcode } => {
                 write!(f, "missing auxiliary word for {opcode} at word {pc}")
+            }
+            Self::Allocation { requested } => {
+                write!(
+                    f,
+                    "failed to allocate space for {requested} decoded instructions"
+                )
             }
         }
     }
@@ -161,7 +168,16 @@ impl Iterator for InstructionIter<'_> {
 }
 
 pub fn decode(words: &[u32]) -> Result<Vec<Instruction>, DecodeError> {
-    InstructionIter::new(words).collect()
+    let mut instructions = Vec::new();
+    instructions
+        .try_reserve_exact(words.len())
+        .map_err(|_| DecodeError::Allocation {
+            requested: words.len(),
+        })?;
+    for instruction in InstructionIter::new(words) {
+        instructions.push(instruction?);
+    }
+    Ok(instructions)
 }
 
 #[cfg(test)]

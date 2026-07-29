@@ -11,3 +11,4 @@ authors.workspace = true
 
 [dependencies]
 blu-bytecode.workspace = true
+blu-core.workspace = true

@@ -471,6 +471,57 @@ local result = math.abs(-3) + math.floor(2.9) + math.ceil(2.1) + math.sqrt(16)
     + (math.pi > 3 and 1 or 0) + (math.huge > 1e300 and 1 or 0)
 print(type(result) .. ":" .. tostring(result))
 "#;
+const GENERIC_FOR_COROUTINE_SOURCE: &str = r#"
+local calls = 0
+local function iterator(state, control)
+    calls += 1
+    if control >= 2 then
+        return nil
+    end
+    local resumed = coroutine.yield("step" .. calls)
+    return control + 1, state + resumed
+end
+local thread = coroutine.create(function()
+    local total = 0
+    for key, value in iterator, 40, 0 do
+        total += key + value
+    end
+    return calls, total
+end)
+local first_ok, first = coroutine.resume(thread)
+local second_ok, second = coroutine.resume(thread, 1)
+local third_ok, count, total = coroutine.resume(thread, 2)
+return first_ok and first == "step1"
+    and second_ok and second == "step2"
+    and third_ok and count == 3 and total == 86
+    and coroutine.status(thread) == "dead"
+"#;
+const GENERIC_FOR_COROUTINE_REFERENCE_SOURCE: &str = r#"
+local calls = 0
+local function iterator(state, control)
+    calls += 1
+    if control >= 2 then
+        return nil
+    end
+    local resumed = coroutine.yield("step" .. calls)
+    return control + 1, state + resumed
+end
+local thread = coroutine.create(function()
+    local total = 0
+    for key, value in iterator, 40, 0 do
+        total += key + value
+    end
+    return calls, total
+end)
+local first_ok, first = coroutine.resume(thread)
+local second_ok, second = coroutine.resume(thread, 1)
+local third_ok, count, total = coroutine.resume(thread, 2)
+local result = first_ok and first == "step1"
+    and second_ok and second == "step2"
+    and third_ok and count == 3 and total == 86
+    and coroutine.status(thread) == "dead"
+print(type(result) .. ":" .. tostring(result))
+"#;
 const ERROR_HANDLER_CALL_SOURCE: &str = r#"
 local ok, value = xpcall(function(input)
     return input * 2
@@ -644,6 +695,14 @@ fn run() -> Result<(), String> {
         "table identity and split storage",
         TABLE_SOURCE,
         TABLE_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "yielding generic-for iterator",
+        GENERIC_FOR_COROUTINE_SOURCE,
+        GENERIC_FOR_COROUTINE_REFERENCE_SOURCE,
         &compiler,
         &args.upstream,
         temporary.path(),
