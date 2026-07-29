@@ -109,3 +109,7 @@ intended for:
 
 Application adapters such as a future `blu-borg` crate belong outside the core
 runtime and use the same embedding API available to third-party applications.
+
+## License
+
+Blu is free and open-source software, available under the [MIT License](LICENSE).
