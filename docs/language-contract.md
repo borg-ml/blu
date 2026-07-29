@@ -50,9 +50,9 @@ program. It includes byte-zero dialect directives, stable raw-byte spans,
 retained trivia, the documented `//` profile gate, `local name = expression`,
 expression-list `return`, and decimal-integer/identifier expressions with `+`
 and `//` precedence. Parsing retains the explicit profile and rejects
-diagnostics without exposing a partial AST. It does not resolve, lower, emit,
-compile, or execute source, and the public engine does not silently select it
-as a compiler. Parser-owned arenas, lists, and diagnostic counts are bounded
+diagnostics without exposing a partial AST. Resolution, lowering, emission,
+and execution are separate explicit stages; the public engine never silently
+selects this frontend as a fallback. Parser-owned arenas, lists, and diagnostic counts are bounded
 and reserve fallibly. `blu-core::DiagnosticLimits` separately bounds each
 diagnostic's label text, secondary labels, expected items, raw found bytes,
 notes, and help; the lexer and parser construct these values through fallible
@@ -86,8 +86,7 @@ The BluV1 baseline artifact can be translated only for an explicitly matching
 `blu` or `luau` profile. Translation revalidates the artifact under caller
 supplied execution limits, rejects nested/upvalue structure and Luau field
 widths it cannot preserve, and returns a profile-tagged chunk. It explicitly
-rejects BluV1 floor division rather than substituting a Luau opcode because
-the direct profile-aware BluV1 runtime semantics are not implemented.
+rejects BluV1 floor division rather than substituting a Luau opcode.
 `Vm::execute_translated` consumes that chunk and derives the root frame's
 semantic profile from the retained artifact tag; the configured VM dialect is
 only the fallback for ordinary unprofiled chunks. Frames retain that profile
@@ -97,6 +96,17 @@ path. Mixed-profile BluV1 calls remain explicitly unsupported because the
 translator rejects nested prototypes and upvalues rather than collapsing a
 child profile into its parent. This is a bootstrap path for the baseline
 instructions, not the owned resolver, lowerer, or full Blu backend.
+
+`Vm::execute_blu_v1`, exposed for owned compilations as
+`Engine::execute_owned_compilation`, is the direct profile-aware path. It
+consumes and revalidates the artifact under caller-supplied limits and executes
+the single-prototype baseline slice for all seven profiles without translation.
+It also executes floor division where the dialect matrix assigns it: Luau
+numbers and Lua 5.3--5.5 integers or numbers. Integer constants remain a
+lossless storage feature, so the executor rejects them explicitly for profiles
+whose integer execution semantics are not assigned. Nested prototypes,
+upvalues, and the rest of the language remain explicit unsupported structure,
+not an implicit compatibility claim.
 
 Ordinary bytecode calls currently run on an owned, bounded VM frame stack.
 Suspended callers and their registers are traced as GC roots. Generational

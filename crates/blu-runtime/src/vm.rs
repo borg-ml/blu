@@ -5,7 +5,11 @@ use crate::{
 };
 use blu_bytecode::{
     Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype, ValidatedChunk,
-    ValidationError, blu::TranslatedChunk,
+    ValidationError,
+    blu::{
+        BluLimits, Constant as BluConstant, Instruction as BluInstruction, TranslatedChunk,
+        ValidatedArtifact as ValidatedBluArtifact, ValidationError as BluValidationError,
+    },
 };
 use blu_core::SemanticProfile;
 use core::fmt;
@@ -624,6 +628,156 @@ impl Vm {
         translated: TranslatedChunk,
     ) -> Result<Vec<Value>, RuntimeError> {
         self.execute_validated_owned(translated.into_validated_chunk())
+    }
+
+    /// Executes the currently supported validated BluV1 instruction slice
+    /// directly, without translating it to Luau bytecode.
+    ///
+    /// The artifact is consumed and revalidated under `execution_limits`.
+    /// Unsupported structure and profile-sensitive constants fail explicitly.
+    pub fn execute_blu_v1(
+        &mut self,
+        artifact: ValidatedBluArtifact,
+        execution_limits: BluLimits,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let artifact = ValidatedBluArtifact::new(artifact.into_artifact(), execution_limits)
+            .map_err(RuntimeError::BluValidation)?
+            .into_artifact();
+        if artifact.prototypes.len() != 1 {
+            return Err(RuntimeError::UnsupportedBluV1Structure {
+                what: "multiple prototypes",
+            });
+        }
+        let main = usize::try_from(artifact.main)
+            .map_err(|_| RuntimeError::InvalidMainPrototype(usize::MAX))?;
+        let prototype = artifact
+            .prototypes
+            .get(main)
+            .ok_or(RuntimeError::InvalidMainPrototype(main))?;
+        if !prototype.children.is_empty() {
+            return Err(RuntimeError::UnsupportedBluV1Structure {
+                what: "child prototypes",
+            });
+        }
+        if !prototype.upvalues.is_empty() {
+            return Err(RuntimeError::UnsupportedBluV1Structure { what: "upvalues" });
+        }
+
+        let previous_profile = self.active_profile.replace(prototype.profile);
+        let result = self.run_blu_v1_prototype(prototype);
+        self.active_profile = previous_profile;
+        match result {
+            Ok(values) => {
+                self.retain_host_occurrences(&values)?;
+                Ok(values)
+            }
+            Err(error) => {
+                self.retain_error_occurrences(&error)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn run_blu_v1_prototype(
+        &mut self,
+        prototype: &blu_bytecode::blu::Prototype,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let mut constants =
+            try_vec_with_capacity(prototype.constants.len(), "BluV1 runtime constants")?;
+        for (index, constant) in prototype.constants.iter().enumerate() {
+            constants.push(match constant {
+                BluConstant::Nil => Value::Nil,
+                BluConstant::Boolean(value) => Value::Boolean(*value),
+                BluConstant::Number(value) => Value::Number(*value),
+                BluConstant::Integer(value)
+                    if matches!(
+                        prototype.profile,
+                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) =>
+                {
+                    Value::Integer(*value)
+                }
+                BluConstant::Integer(_) => {
+                    return Err(RuntimeError::UnsupportedBluV1Constant {
+                        profile: prototype.profile,
+                        constant: index,
+                        kind: "integer",
+                    });
+                }
+                BluConstant::String(value) => Value::String(Arc::from(value.as_slice())),
+            });
+        }
+        let register_count = usize::from(prototype.register_count);
+        let mut registers = try_vec_with_capacity(register_count, "BluV1 runtime registers")?;
+        registers.resize(register_count, Value::Nil);
+        let mut remaining = self.instruction_limit;
+        let mut pc = 0usize;
+        while let Some(instruction) = prototype.code.get(pc).copied() {
+            if remaining == 0 {
+                return Err(RuntimeError::InstructionLimit {
+                    limit: self.instruction_limit,
+                });
+            }
+            remaining -= 1;
+            match instruction {
+                BluInstruction::LoadConstant {
+                    destination,
+                    constant,
+                } => {
+                    let value = constants.get(constant as usize).cloned().ok_or(
+                        RuntimeError::Constant {
+                            constant: constant as usize,
+                            count: constants.len(),
+                        },
+                    )?;
+                    set_blu_register(&mut registers, destination, value)?;
+                }
+                BluInstruction::Add {
+                    destination,
+                    left,
+                    right,
+                } => {
+                    let value = arithmetic(
+                        Opcode::Add,
+                        blu_register(&registers, left)?,
+                        blu_register(&registers, right)?,
+                    )?;
+                    set_blu_register(&mut registers, destination, value)?;
+                }
+                BluInstruction::FloorDivide {
+                    destination,
+                    left,
+                    right,
+                } => {
+                    let value = arithmetic(
+                        Opcode::IDiv,
+                        blu_register(&registers, left)?,
+                        blu_register(&registers, right)?,
+                    )?;
+                    set_blu_register(&mut registers, destination, value)?;
+                }
+                BluInstruction::Return { first, count } => {
+                    let start = usize::from(first);
+                    let end =
+                        start
+                            .checked_add(usize::from(count))
+                            .ok_or(RuntimeError::Register {
+                                register: usize::MAX,
+                                count: registers.len(),
+                            })?;
+                    let values = registers.get(start..end).ok_or(RuntimeError::Register {
+                        register: end.saturating_sub(1),
+                        count: registers.len(),
+                    })?;
+                    return try_clone_values(values, "BluV1 return values");
+                }
+            }
+            pc += 1;
+        }
+        Err(RuntimeError::InvalidProgramCounter {
+            pc,
+            code_words: prototype.code.len(),
+        })
     }
 
     pub fn execute_validated_owned(
@@ -4254,6 +4408,31 @@ fn table_string_constant(instruction: Instruction) -> Result<u32, RuntimeError> 
     )
 }
 
+fn blu_register(registers: &[Value], register: u16) -> Result<&Value, RuntimeError> {
+    registers
+        .get(usize::from(register))
+        .ok_or(RuntimeError::Register {
+            register: usize::from(register),
+            count: registers.len(),
+        })
+}
+
+fn set_blu_register(
+    registers: &mut [Value],
+    register: u16,
+    value: Value,
+) -> Result<(), RuntimeError> {
+    let count = registers.len();
+    let slot = registers
+        .get_mut(usize::from(register))
+        .ok_or(RuntimeError::Register {
+            register: usize::from(register),
+            count,
+        })?;
+    *slot = value;
+    Ok(())
+}
+
 fn arithmetic(opcode: Opcode, left: &Value, right: &Value) -> Result<Value, RuntimeError> {
     if let (Value::Integer(left), Value::Integer(right)) = (left, right) {
         return match opcode {
@@ -4311,11 +4490,20 @@ fn integer_floor_div(left: i64, right: i64) -> Result<i64, RuntimeError> {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RuntimeError {
     Validation(ValidationError),
+    BluValidation(BluValidationError),
     Allocation {
         what: &'static str,
     },
     DialectNotImplemented(Dialect),
     SemanticProfileNotImplemented(SemanticProfile),
+    UnsupportedBluV1Structure {
+        what: &'static str,
+    },
+    UnsupportedBluV1Constant {
+        profile: SemanticProfile,
+        constant: usize,
+        kind: &'static str,
+    },
     SemanticProfileMismatch {
         configured: Dialect,
         artifact: SemanticProfile,
@@ -4450,6 +4638,7 @@ impl fmt::Display for RuntimeError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Validation(error) => write!(f, "bytecode validation failed: {error}"),
+            Self::BluValidation(error) => write!(f, "BluV1 validation failed: {error}"),
             Self::Allocation { what } => write!(f, "{what} allocation failed"),
             Self::DialectNotImplemented(dialect) => {
                 write!(f, "{dialect:?} execution is not implemented")
@@ -4457,6 +4646,17 @@ impl fmt::Display for RuntimeError {
             Self::SemanticProfileNotImplemented(profile) => {
                 write!(f, "{profile} execution is not implemented")
             }
+            Self::UnsupportedBluV1Structure { what } => {
+                write!(f, "BluV1 execution does not support {what}")
+            }
+            Self::UnsupportedBluV1Constant {
+                profile,
+                constant,
+                kind,
+            } => write!(
+                f,
+                "BluV1 {profile} constant {constant} uses unsupported {kind} semantics"
+            ),
             Self::SemanticProfileMismatch {
                 configured,
                 artifact,
@@ -4621,6 +4821,7 @@ impl std::error::Error for RuntimeError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             Self::Validation(error) => Some(error),
+            Self::BluValidation(error) => Some(error),
             Self::Heap(error) => Some(error),
             _ => None,
         }
@@ -4676,10 +4877,17 @@ mod tests {
         chunk
     }
 
-    fn translated_baseline(profile: SemanticProfile) -> TranslatedChunk {
+    fn validated_blu_program(
+        profile: SemanticProfile,
+        constants: Vec<BluConstant>,
+        code: Vec<BluInstruction>,
+        required_features: FeatureBits,
+        register_count: u16,
+    ) -> ValidatedArtifact {
         let identity_limits = IdentityLimits::default();
         let source = SourceId::new(1);
         let source_span = ByteSpan::from_usize(source, 0, 0).unwrap();
+        let source_map = vec![source_span; code.len()];
         let artifact = BluArtifact {
             format: BytecodeFormat::BluV1,
             compiler: CompilerIdentity::new(
@@ -4698,42 +4906,47 @@ mod tests {
             prototypes: vec![BluPrototype {
                 profile,
                 source,
-                register_count: 3,
+                register_count,
                 parameter_count: 0,
                 is_vararg: false,
-                required_features: FeatureBits::BASELINE,
-                constants: vec![BluConstant::Number(40.0), BluConstant::Number(2.0)],
+                required_features,
+                constants,
                 upvalues: Vec::new(),
                 children: Vec::new(),
-                code: vec![
-                    BluInstruction::LoadConstant {
-                        destination: 0,
-                        constant: 0,
-                    },
-                    BluInstruction::LoadConstant {
-                        destination: 1,
-                        constant: 1,
-                    },
-                    BluInstruction::Add {
-                        destination: 2,
-                        left: 0,
-                        right: 1,
-                    },
-                    BluInstruction::Return { first: 2, count: 1 },
-                ],
-                source_map: vec![source_span; 4],
+                code,
+                source_map,
                 locals: Vec::new(),
                 upvalue_debug: Vec::new(),
             }],
             main: 0,
         };
-        let limits = BluLimits::default();
-        translate_baseline_to_luau(
-            ValidatedArtifact::new(artifact, limits).unwrap(),
+        ValidatedArtifact::new(artifact, BluLimits::default()).unwrap()
+    }
+
+    fn translated_baseline(profile: SemanticProfile) -> TranslatedChunk {
+        let artifact = validated_blu_program(
             profile,
-            limits,
-        )
-        .unwrap()
+            vec![BluConstant::Number(40.0), BluConstant::Number(2.0)],
+            vec![
+                BluInstruction::LoadConstant {
+                    destination: 0,
+                    constant: 0,
+                },
+                BluInstruction::LoadConstant {
+                    destination: 1,
+                    constant: 1,
+                },
+                BluInstruction::Add {
+                    destination: 2,
+                    left: 0,
+                    right: 1,
+                },
+                BluInstruction::Return { first: 2, count: 1 },
+            ],
+            FeatureBits::BASELINE,
+            3,
+        );
+        translate_baseline_to_luau(artifact, profile, BluLimits::default()).unwrap()
     }
 
     fn native(vm: &Vm, table: &[u8], name: &[u8]) -> NativeFunction {
@@ -4774,6 +4987,147 @@ mod tests {
             Vm::new(Dialect::Luau).execute_validated_owned(extracted),
             Ok(vec![Value::Number(42.0)])
         );
+    }
+
+    #[test]
+    fn direct_blu_v1_baseline_executes_under_every_semantic_profile() {
+        for profile in SemanticProfile::ALL {
+            let artifact = validated_blu_program(
+                profile,
+                vec![BluConstant::Number(40.0), BluConstant::Number(2.0)],
+                vec![
+                    BluInstruction::LoadConstant {
+                        destination: 0,
+                        constant: 0,
+                    },
+                    BluInstruction::LoadConstant {
+                        destination: 1,
+                        constant: 1,
+                    },
+                    BluInstruction::Add {
+                        destination: 2,
+                        left: 0,
+                        right: 1,
+                    },
+                    BluInstruction::Return { first: 2, count: 1 },
+                ],
+                FeatureBits::BASELINE,
+                3,
+            );
+            assert_eq!(
+                Vm::new(Dialect::Blu).execute_blu_v1(artifact, BluLimits::default()),
+                Ok(vec![Value::Number(42.0)]),
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_blu_v1_floor_division_obeys_authorized_profile_semantics() {
+        let floor_program = |profile, constants| {
+            validated_blu_program(
+                profile,
+                constants,
+                vec![
+                    BluInstruction::LoadConstant {
+                        destination: 0,
+                        constant: 0,
+                    },
+                    BluInstruction::LoadConstant {
+                        destination: 1,
+                        constant: 1,
+                    },
+                    BluInstruction::FloorDivide {
+                        destination: 2,
+                        left: 0,
+                        right: 1,
+                    },
+                    BluInstruction::Return { first: 2, count: 1 },
+                ],
+                FeatureBits::BASELINE
+                    | FeatureBits::INTEGER_CONSTANTS
+                    | FeatureBits::FLOOR_DIVISION,
+                3,
+            )
+        };
+
+        assert_eq!(
+            Vm::new(Dialect::Blu).execute_blu_v1(
+                floor_program(
+                    SemanticProfile::Luau,
+                    vec![BluConstant::Number(-7.0), BluConstant::Number(3.0)]
+                ),
+                BluLimits::default()
+            ),
+            Ok(vec![Value::Number(-3.0)])
+        );
+        for profile in [
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            assert_eq!(
+                Vm::new(Dialect::Blu).execute_blu_v1(
+                    floor_program(
+                        profile,
+                        vec![BluConstant::Integer(-7), BluConstant::Integer(3)]
+                    ),
+                    BluLimits::default()
+                ),
+                Ok(vec![Value::Integer(-3)]),
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn direct_blu_v1_rejects_integer_semantics_not_assigned_to_profile() {
+        let artifact = validated_blu_program(
+            SemanticProfile::Luau,
+            vec![BluConstant::Integer(1)],
+            vec![
+                BluInstruction::LoadConstant {
+                    destination: 0,
+                    constant: 0,
+                },
+                BluInstruction::Return { first: 0, count: 1 },
+            ],
+            FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS,
+            1,
+        );
+        assert_eq!(
+            Vm::new(Dialect::Blu).execute_blu_v1(artifact, BluLimits::default()),
+            Err(RuntimeError::UnsupportedBluV1Constant {
+                profile: SemanticProfile::Luau,
+                constant: 0,
+                kind: "integer",
+            })
+        );
+    }
+
+    #[test]
+    fn direct_blu_v1_revalidates_under_execution_limits() {
+        let artifact = validated_blu_program(
+            SemanticProfile::Blu,
+            vec![BluConstant::Number(1.0)],
+            vec![
+                BluInstruction::LoadConstant {
+                    destination: 0,
+                    constant: 0,
+                },
+                BluInstruction::Return { first: 0, count: 1 },
+            ],
+            FeatureBits::BASELINE,
+            1,
+        );
+        let limits = BluLimits {
+            max_registers_per_prototype: 0,
+            ..BluLimits::default()
+        };
+        assert!(matches!(
+            Vm::new(Dialect::Blu).execute_blu_v1(artifact, limits),
+            Err(RuntimeError::BluValidation(_))
+        ));
     }
 
     #[test]

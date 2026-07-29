@@ -80,6 +80,20 @@ impl Engine {
             .map_err(ExecuteError::Runtime)
     }
 
+    /// Executes a Blu-owned compilation directly as BluV1.
+    ///
+    /// The runtime consumes and revalidates the artifact under the caller's
+    /// execution limits. This path never invokes or falls back to the legacy
+    /// Luau compiler.
+    pub fn execute_owned_compilation(
+        &mut self,
+        compilation: frontend::OwnedCompilation,
+        execution_limits: bytecode::blu::BluLimits,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        self.vm
+            .execute_blu_v1(compilation.into_validated_artifact(), execution_limits)
+    }
+
     pub fn execute_package(
         &mut self,
         package: Package,
@@ -274,7 +288,7 @@ mod tests {
     };
 
     #[test]
-    fn owned_frontend_is_available_through_the_public_facade() {
+    fn owned_frontend_compiles_and_executes_every_baseline_profile() {
         use frontend::{
             CompilerId, CompilerIdentity, IdentityLimits, OwnedCompiler, SemanticProfile,
             SourceFile, SourceId, SourceLimits,
@@ -295,16 +309,20 @@ mod tests {
             IdentityLimits::default(),
         )
         .unwrap();
-        let compiled = OwnedCompiler::default()
-            .compile(&source, SemanticProfile::Blu, compiler)
-            .unwrap();
-
-        let artifact = compiled.artifact().artifact();
-        assert_eq!(
-            artifact.prototypes[artifact.main as usize].profile,
-            SemanticProfile::Blu
-        );
-        assert!(!compiled.bytes().is_empty());
+        for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler.clone())
+                .unwrap();
+            let artifact = compiled.artifact().artifact();
+            assert_eq!(artifact.prototypes[artifact.main as usize].profile, profile);
+            assert!(!compiled.bytes().is_empty());
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![Value::Number(42.0)]),
+                "{profile}"
+            );
+        }
     }
 
     #[test]

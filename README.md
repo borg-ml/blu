@@ -45,13 +45,14 @@ slice into a spanned arena AST with explicit profile reconciliation.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into
 canonical BluV1 artifacts without native linkage or fallback; the same
 explicit-profile API is available from the public facade as
-`blu_lang::frontend`. Public `blu-lang` source execution still explicitly
-enables the pinned Luau compatibility compiler while the owned execution path
-is incomplete. BluV1 represents floor division for Luau and Lua 5.3–5.5
-directly; Blu lowering rejects it until Blu numeric/metamethod semantics are
-assigned, and the bootstrap translator rejects it until the profile-aware
-BluV1 executor exists. Translatable baseline artifacts are revalidated
-under execution limits and retain their authorized Blu/Luau frame profile.
+`blu_lang::frontend`. `Engine::execute_owned_compilation` directly executes
+the single-prototype baseline slice for every declared profile without the
+Luau compiler or bytecode translator. It revalidates the consumed artifact
+under caller-supplied execution limits. BluV1 floor division executes with
+Luau number semantics and Lua 5.3–5.5 integer/number semantics; Blu lowering
+still rejects it until Blu numeric and metamethod semantics are assigned.
+The older `Engine::execute` source path continues to use the pinned Luau
+compatibility compiler while the owned grammar and executor are expanded.
 
 ## Repository layout
 

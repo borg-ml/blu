@@ -195,7 +195,7 @@ fn local_resolution_is_sequential_and_shadow_aware() {
 }
 
 #[test]
-fn floor_division_lowers_only_for_syntax_profiles_and_stays_non_executable() {
+fn floor_division_lowers_only_for_assigned_profiles_and_bootstrap_translation_rejects_it() {
     for profile in [
         SemanticProfile::Luau,
         SemanticProfile::Lua53,
