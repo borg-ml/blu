@@ -15,6 +15,9 @@ upstream:
     @cmake -S "{{upstream_dir}}" -B "{{upstream_build}}" -DCMAKE_BUILD_TYPE=Release -DLUAU_BUILD_TESTS=OFF
     @cmake --build "{{upstream_build}}" --target Luau.Repl.CLI Luau.Compile.CLI --parallel
 
+lua-upstream:
+    ./scripts/build-lua-references.sh
+
 test:
     cargo test --workspace
 
@@ -23,5 +26,8 @@ check:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo test --workspace
 
-conformance: upstream
-    cargo run -p blu-conformance -- --upstream "{{upstream_build}}/luau" --source "{{upstream_dir}}"
+conformance: upstream lua-upstream
+    cargo run -p blu-conformance -- \
+        --upstream "{{upstream_build}}/luau" \
+        --source "{{upstream_dir}}" \
+        --lua-source ".upstream/lua"

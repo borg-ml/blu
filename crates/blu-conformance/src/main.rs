@@ -9,6 +9,29 @@ use std::{
 };
 
 const PINNED_REVISION: &str = "f8ca77acdcb50241e3da21af663f8ef97b4b5ce4";
+const LUA_REFERENCES: [(&str, &str); 5] = [
+    ("5.1.5", "Lua 5.1"),
+    ("5.2.4", "Lua 5.2"),
+    ("5.3.6", "Lua 5.3"),
+    ("5.4.8", "Lua 5.4"),
+    ("5.5.0", "Lua 5.5"),
+];
+const PORTABLE_EXPECTED: &str = "14\nlu";
+const PORTABLE_SOURCE: &str = r#"
+local values = { 3, 1, 4 }
+values[2] = values[1] + values[3]
+
+local function sum(items)
+    local total = 0
+    for index = 1, #items do
+        total = total + items[index]
+    end
+    return total
+end
+
+print(sum(values))
+print(string.sub("blu", 2, 3))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -24,6 +47,7 @@ fn run() -> Result<(), String> {
     let args = Args::parse(env::args_os().skip(1))?;
     verify_checkout(&args.source)?;
     verify_executable(&args.upstream)?;
+    let lua_references = verify_lua_references(&args.lua_source)?;
     let compiler = args
         .upstream
         .parent()
@@ -68,9 +92,17 @@ fn run() -> Result<(), String> {
         ));
     }
 
+    let portable_source = temporary.path().join("portable.lua");
+    fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
+    verify_portable_reference("Luau", &args.upstream, &portable_source)?;
+    for (name, executable) in &lua_references {
+        verify_portable_reference(name, executable, &portable_source)?;
+    }
+
     println!("pinned Luau revision: {PINNED_REVISION}");
     println!("bytecode version: {}", chunk.version);
     println!("scalar differential smoke: pass (42)");
+    println!("portable reference matrix: pass (Luau, Lua 5.1-5.5)");
     Ok(())
 }
 
@@ -107,6 +139,48 @@ fn verify_executable(path: &Path) -> Result<(), String> {
     ensure_success(path, &output)
 }
 
+fn verify_lua_references(source: &Path) -> Result<Vec<(String, PathBuf)>, String> {
+    LUA_REFERENCES
+        .iter()
+        .map(|(version, expected_name)| {
+            let executable = source
+                .join(format!("lua-{version}"))
+                .join("src")
+                .join(executable_name("lua"));
+            let output = Command::new(&executable)
+                .args(["-e", "print(_VERSION)"])
+                .output()
+                .map_err(|error| format!("failed to execute {}: {error}", executable.display()))?;
+            ensure_success(&executable, &output)?;
+            let actual_name = String::from_utf8_lossy(&output.stdout);
+            if actual_name.trim() != *expected_name {
+                return Err(format!(
+                    "{} identifies as {:?}, expected {expected_name:?}",
+                    executable.display(),
+                    actual_name.trim()
+                ));
+            }
+            Ok((expected_name.to_string(), executable))
+        })
+        .collect()
+}
+
+fn verify_portable_reference(name: &str, executable: &Path, source: &Path) -> Result<(), String> {
+    let output = Command::new(executable)
+        .arg(source)
+        .output()
+        .map_err(|error| format!("failed to execute {name} reference: {error}"))?;
+    ensure_success(executable, &output)?;
+    let actual = String::from_utf8_lossy(&output.stdout);
+    if actual.trim() != PORTABLE_EXPECTED {
+        return Err(format!(
+            "{name} returned {:?} for the portable reference, expected {PORTABLE_EXPECTED:?}",
+            actual.trim()
+        ));
+    }
+    Ok(())
+}
+
 fn ensure_success(path: &Path, output: &std::process::Output) -> Result<(), String> {
     if output.status.success() {
         Ok(())
@@ -124,12 +198,14 @@ fn ensure_success(path: &Path, output: &std::process::Output) -> Result<(), Stri
 struct Args {
     upstream: PathBuf,
     source: PathBuf,
+    lua_source: PathBuf,
 }
 
 impl Args {
     fn parse(args: impl Iterator<Item = std::ffi::OsString>) -> Result<Self, String> {
         let mut upstream = None;
         let mut source = None;
+        let mut lua_source = None;
         let mut args = args;
         while let Some(argument) = args.next() {
             match argument.to_str() {
@@ -139,9 +215,13 @@ impl Args {
                 Some("--source") => {
                     source = Some(args.next().ok_or("--source requires a path")?.into());
                 }
+                Some("--lua-source") => {
+                    lua_source = Some(args.next().ok_or("--lua-source requires a path")?.into());
+                }
                 _ => {
                     return Err(format!(
-                        "usage: blu-conformance --upstream <luau> --source <luau-checkout>; \
+                        "usage: blu-conformance --upstream <luau> --source <luau-checkout> \
+                         --lua-source <lua-checkouts>; \
                          unexpected argument {}",
                         argument.to_string_lossy()
                     ));
@@ -151,6 +231,7 @@ impl Args {
         Ok(Self {
             upstream: upstream.ok_or("missing --upstream")?,
             source: source.ok_or("missing --source")?,
+            lua_source: lua_source.ok_or("missing --lua-source")?,
         })
     }
 }
@@ -162,16 +243,24 @@ mod tests {
     #[test]
     fn parses_explicit_reference_runtime_and_source() {
         let args = Args::parse(
-            ["--upstream", "/tmp/build/luau", "--source", "/tmp/source"]
-                .into_iter()
-                .map(std::ffi::OsString::from),
+            [
+                "--upstream",
+                "/tmp/build/luau",
+                "--source",
+                "/tmp/source",
+                "--lua-source",
+                "/tmp/lua",
+            ]
+            .into_iter()
+            .map(std::ffi::OsString::from),
         )
         .unwrap();
         assert_eq!(
             args,
             Args {
                 upstream: "/tmp/build/luau".into(),
-                source: "/tmp/source".into()
+                source: "/tmp/source".into(),
+                lua_source: "/tmp/lua".into(),
             }
         );
         assert!(Args::parse(std::iter::empty()).is_err());
