@@ -1,7 +1,8 @@
 use crate::{
     AssignmentStatement, Ast, BinaryExpression, BinaryOperator, DialectDirective, Expression,
-    ExpressionId, ExpressionKind, Identifier, LexError, Lexed, LexerLimits, LocalStatement,
-    ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator, lex,
+    ExpressionId, ExpressionKind, Identifier, LexError, Lexed, LexerLimits, LocalListStatement,
+    LocalStatement, ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator,
+    lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -371,20 +372,75 @@ impl<'a> Parser<'a> {
             None
         };
 
+        let mut names = allocate_vec(1, "local name list")?;
+        if let Some(name) = name {
+            names.push(name);
+        }
+        while self.at(TokenKind::Comma) {
+            self.bump();
+            if !self.at(TokenKind::Identifier) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0002",
+                    "expected a local name",
+                    &["identifier"],
+                )?;
+                break;
+            }
+            let Some(identifier) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "identifier check succeeded without a current token",
+                });
+            };
+            push_fallible(
+                &mut names,
+                Identifier::new(identifier.span()),
+                "local name list",
+            )?;
+        }
+
+        let mut values = allocate_vec(1, "local value list")?;
         if self.at(TokenKind::Equal) {
             self.bump();
-            let value = self.parse_expression(0)?;
-            if let (Some(name), Some(value)) = (name, value) {
-                let span = keyword.span().merge(self.expression(value.id)?.span())?;
-                self.push_statement(Statement::Local(LocalStatement::new(
-                    name,
-                    Some(value.id),
-                    span,
-                )))?;
+            if let Some(value) = self.parse_expression(0)? {
+                values.push(value.id);
+                while self.at(TokenKind::Comma) {
+                    self.bump();
+                    let Some(value) = self.parse_expression(0)? else {
+                        break;
+                    };
+                    push_fallible(&mut values, value.id, "local value list")?;
+                }
             }
-        } else if let Some(name) = name {
-            let span = keyword.span().merge(name.span())?;
-            self.push_statement(Statement::Local(LocalStatement::new(name, None, span)))?;
+        }
+        if names.is_empty() {
+            return Ok(());
+        }
+        let end = if let Some(value) = values.last() {
+            self.expression(*value)?.span()
+        } else {
+            let Some(name) = names.last() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "non-empty local name list became empty",
+                });
+            };
+            name.span()
+        };
+        let span = keyword.span().merge(end)?;
+        if names.len() == 1 && values.len() <= 1 {
+            let Some(name) = names.first().copied() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "single local name list became empty",
+                });
+            };
+            self.push_statement(Statement::Local(LocalStatement::new(
+                name,
+                values.first().copied(),
+                span,
+            )))?;
+        } else {
+            self.push_statement(Statement::LocalList(LocalListStatement::new(
+                names, values, span,
+            )))?;
         }
         Ok(())
     }

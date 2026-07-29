@@ -220,6 +220,42 @@ impl LocalStatement {
 }
 
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LocalListStatement {
+    names: Vec<Identifier>,
+    values: Vec<ExpressionId>,
+    span: ByteSpan,
+}
+
+impl LocalListStatement {
+    pub(crate) const fn new(
+        names: Vec<Identifier>,
+        values: Vec<ExpressionId>,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            names,
+            values,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub fn names(&self) -> &[Identifier] {
+        &self.names
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[ExpressionId] {
+        &self.values
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct ReturnStatement {
     values: Vec<ExpressionId>,
     span: ByteSpan,
@@ -244,6 +280,7 @@ impl ReturnStatement {
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Statement {
     Local(LocalStatement),
+    LocalList(LocalListStatement),
     Assignment(AssignmentStatement),
     Return(ReturnStatement),
 }
@@ -253,6 +290,7 @@ impl Statement {
     pub const fn span(&self) -> ByteSpan {
         match self {
             Self::Local(statement) => statement.span(),
+            Self::LocalList(statement) => statement.span(),
             Self::Assignment(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
         }

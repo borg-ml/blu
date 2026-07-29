@@ -29,8 +29,8 @@ use blu_core::{
 };
 use blu_syntax::{
     AssignmentStatement, Ast, BinaryOperator, Expression, ExpressionId, ExpressionKind,
-    LocalStatement, ParseError, ParseLimits, ParseOutcome, Rejected, ReturnStatement, Statement,
-    UnaryOperator, parse,
+    LocalListStatement, LocalStatement, ParseError, ParseLimits, ParseOutcome, Rejected,
+    ReturnStatement, Statement, UnaryOperator, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -396,6 +396,7 @@ impl<'a> Lowerer<'a> {
         for (index, statement) in ast.statements().iter().enumerate() {
             match statement {
                 Statement::Local(local) => self.lower_local(*local)?,
+                Statement::LocalList(local) => self.lower_local_list(local)?,
                 Statement::Assignment(assignment) => self.lower_assignment(*assignment)?,
                 Statement::Return(return_statement) => {
                     if index + 1 != ast.statements().len() {
@@ -529,6 +530,54 @@ impl<'a> Lowerer<'a> {
             },
             statement.span(),
         )
+    }
+
+    fn lower_local_list(
+        &mut self,
+        statement: &LocalListStatement,
+    ) -> Result<(), OwnedCompileError> {
+        let required = self.bindings.len().saturating_add(statement.names().len());
+        let limit = self
+            .limits
+            .max_bindings
+            .min(self.limits.artifact.max_debug_entries_per_prototype)
+            .min(self.limits.artifact.max_total_debug_entries);
+        check_limit(OwnedCompileLimit::Bindings, required, limit)?;
+
+        let capacity = statement.names().len().max(statement.values().len());
+        let mut registers = allocate_vec(capacity, "local declaration registers")?;
+        for value in statement.values().iter().copied() {
+            registers.push(self.lower_expression(value)?);
+        }
+        while registers.len() < statement.names().len() {
+            let Some(name) = statement.names().get(registers.len()).copied() else {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "local name/value adjustment index is out of bounds",
+                });
+            };
+            registers.push(self.lower_constant(Constant::Nil, name.span())?);
+        }
+        let start_pc =
+            u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "instruction count passed limits but cannot fit a debug PC",
+            })?;
+        for (name, register) in statement
+            .names()
+            .iter()
+            .copied()
+            .zip(registers.iter().copied())
+        {
+            push_fallible(
+                &mut self.bindings,
+                Binding {
+                    name: name.span(),
+                    register,
+                    start_pc,
+                },
+                "local bindings",
+            )?;
+        }
+        Ok(())
     }
 
     fn lower_return(&mut self, statement: &ReturnStatement) -> Result<(), OwnedCompileError> {

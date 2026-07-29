@@ -336,6 +336,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let local_list = SourceFile::new(
+            SourceId::new(7),
+            "local-list.blu",
+            b"local value = 40\nlocal value, next, missing = value, value + 2\nreturn value, next, missing".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -427,6 +434,31 @@ mod tests {
                     Value::Number(42.0)
                 }]),
                 "semicolon-separated statements under {profile}"
+            );
+            let compiled = OwnedCompiler::default()
+                .compile(&local_list, profile, compiler.clone())
+                .unwrap();
+            let numeric = matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            );
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![
+                    if numeric {
+                        Value::Integer(40)
+                    } else {
+                        Value::Number(40.0)
+                    },
+                    if numeric {
+                        Value::Integer(42)
+                    } else {
+                        Value::Number(42.0)
+                    },
+                    Value::Nil,
+                ]),
+                "local list adjustment under {profile}"
             );
         }
     }

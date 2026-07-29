@@ -105,6 +105,26 @@ fn local_without_initializer_has_no_value_and_ends_at_its_name() {
 }
 
 #[test]
+fn local_name_and_value_lists_preserve_order_and_adjustment_shape() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"local first, second, missing = 40, 2\nreturn first".to_vec());
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::LocalList(local) = &parsed.ast().statements()[0] else {
+            panic!("expected local-list statement");
+        };
+        assert_eq!(local.names().len(), 3);
+        assert_eq!(local.values().len(), 2);
+        assert_eq!(source.slice(local.names()[0].span()).unwrap(), b"first");
+        assert_eq!(source.slice(local.names()[1].span()).unwrap(), b"second");
+        assert_eq!(source.slice(local.names()[2].span()).unwrap(), b"missing");
+        assert_eq!(
+            source.slice(local.span()).unwrap(),
+            b"local first, second, missing = 40, 2"
+        );
+    }
+}
+
+#[test]
 fn identifier_assignment_preserves_target_value_and_full_span() {
     for profile in SemanticProfile::ALL {
         let source = source(b"local answer = 40\nanswer = answer + 2\nreturn answer".to_vec());

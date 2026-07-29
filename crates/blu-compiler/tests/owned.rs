@@ -222,6 +222,55 @@ fn uninitialized_local_lowers_to_nil_for_every_profile() {
 }
 
 #[test]
+fn local_lists_evaluate_before_binding_and_fill_missing_values_with_nil() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(
+            b"local value = 40\nlocal value, next, missing = value, value + 2\nreturn value, next, missing"
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let numeric = matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        );
+        assert_eq!(
+            Vm::new(Dialect::Blu)
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                if numeric {
+                    Value::Integer(40)
+                } else {
+                    Value::Number(40.0)
+                },
+                if numeric {
+                    Value::Integer(42)
+                } else {
+                    Value::Number(42.0)
+                },
+                Value::Nil,
+            ]),
+            "{profile}"
+        );
+    }
+
+    let source = make_source(b"local kept = 1, 2\nreturn kept".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        compiled.artifact().main().constants,
+        [Constant::Number(1.0), Constant::Number(2.0)]
+    );
+    assert_eq!(
+        Vm::new(Dialect::Blu)
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Number(1.0)])
+    );
+}
+
+#[test]
 fn local_assignment_mutates_the_active_shadowed_binding_for_every_profile() {
     for profile in SemanticProfile::ALL {
         let source = make_source(
@@ -438,6 +487,20 @@ fn compiler_limits_fail_before_artifact_creation() {
             kind: OwnedCompileLimit::Instructions,
             required: 1,
             limit: 0,
+        })
+    ));
+
+    let local_list = make_source(b"local first, second".to_vec());
+    let compiler = OwnedCompiler::new(OwnedCompileLimits {
+        max_bindings: 1,
+        ..OwnedCompileLimits::default()
+    });
+    assert!(matches!(
+        compiler.compile(&local_list, SemanticProfile::Blu, compiler_identity()),
+        Err(OwnedCompileError::Limit {
+            kind: OwnedCompileLimit::Bindings,
+            required: 2,
+            limit: 1,
         })
     ));
 }
