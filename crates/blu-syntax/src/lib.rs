@@ -379,6 +379,7 @@ pub fn lex(
                 offset += 1;
                 let mut unsupported_escape = None;
                 let mut malformed_escape = None;
+                let mut malformed_unicode = None;
                 while offset < bytes.len()
                     && bytes[offset] != quote
                     && !matches!(bytes[offset], b'\r' | b'\n')
@@ -447,6 +448,36 @@ pub fn lex(
                             }
                             continue;
                         }
+                        if escaped == b'u' {
+                            let escape = offset;
+                            let mut cursor = offset + 2;
+                            let mut value = 0_u32;
+                            let mut digits = 0_usize;
+                            let mut closed = false;
+                            if bytes.get(cursor) == Some(&b'{') {
+                                cursor += 1;
+                                while bytes.get(cursor).is_some_and(u8::is_ascii_hexdigit) {
+                                    value = value
+                                        .saturating_mul(16)
+                                        .saturating_add(u32::from(hex_value(bytes[cursor])));
+                                    cursor += 1;
+                                    digits += 1;
+                                }
+                                if bytes.get(cursor) == Some(&b'}') {
+                                    cursor += 1;
+                                    closed = true;
+                                }
+                            }
+                            offset = cursor;
+                            let Some(maximum) = unicode_escape_maximum(explicit_profile) else {
+                                unsupported_escape.get_or_insert(escape);
+                                continue;
+                            };
+                            if !closed || digits == 0 || digits > 8 || value > maximum {
+                                malformed_unicode.get_or_insert((escape, offset));
+                            }
+                            continue;
+                        }
                         unsupported_escape.get_or_insert(offset);
                     }
                     offset += 1;
@@ -489,6 +520,19 @@ pub fn lex(
                     )?
                     .try_with_found(&bytes[escape..end])?
                     .try_with_expected("a byte value from 0 through 255")?;
+                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                }
+                if let Some((escape, end)) = malformed_unicode {
+                    let span = source.span(escape, end)?;
+                    let diagnostic = diagnostic(
+                        "BLU-LEX-0018",
+                        explicit_profile,
+                        span,
+                        "malformed Unicode escape for this profile",
+                        limits.diagnostic_limits,
+                    )?
+                    .try_with_found(&bytes[escape..end])?
+                    .try_with_note_parts(&["selected profile: ", explicit_profile.as_str()])?;
                     push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                 }
                 TokenKind::StringLiteral
@@ -1017,6 +1061,24 @@ const fn supports_hex_byte_escape(profile: SemanticProfile) -> bool {
 
 const fn supports_whitespace_escape(profile: SemanticProfile) -> bool {
     supports_hex_byte_escape(profile)
+}
+
+const fn unicode_escape_maximum(profile: SemanticProfile) -> Option<u32> {
+    match profile {
+        SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55 => Some(0x7fff_ffff),
+        SemanticProfile::Luau | SemanticProfile::Lua53 => Some(0x10_ffff),
+        SemanticProfile::Lua51 | SemanticProfile::Lua52 => None,
+        _ => None,
+    }
+}
+
+const fn hex_value(byte: u8) -> u8 {
+    match byte {
+        b'0'..=b'9' => byte - b'0',
+        b'a'..=b'f' => byte - b'a' + 10,
+        b'A'..=b'F' => byte - b'A' + 10,
+        _ => 0,
+    }
 }
 
 fn long_comment_opener(bytes: &[u8], start: usize) -> Option<(usize, usize)> {

@@ -1153,6 +1153,43 @@ fn escaped_physical_line_endings_normalize_to_lf() {
 }
 
 #[test]
+fn unicode_escapes_encode_profile_specific_extended_utf8() {
+    let shared = make_source(br#"return "\u{41}\u{D800}\u{1F41B}""#.to_vec());
+    let shared_bytes = vec![0x41, 0xed, 0xa0, 0x80, 0xf0, 0x9f, 0x90, 0x9b];
+    for profile in SemanticProfile::ALL {
+        let result = OwnedCompiler::default().compile(&shared, profile, compiler_identity());
+        if matches!(profile, SemanticProfile::Lua51 | SemanticProfile::Lua52) {
+            assert!(result.is_err(), "{profile}");
+        } else {
+            assert_eq!(
+                result.unwrap().artifact().main().constants,
+                [Constant::String(shared_bytes.clone())],
+                "{profile}"
+            );
+        }
+    }
+
+    let extended = make_source(br#"return "\u{110000}\u{7fffffff}""#.to_vec());
+    for profile in SemanticProfile::ALL {
+        let result = OwnedCompiler::default().compile(&extended, profile, compiler_identity());
+        if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            assert_eq!(
+                result.unwrap().artifact().main().constants,
+                [Constant::String(vec![
+                    0xf4, 0x90, 0x80, 0x80, 0xfd, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf,
+                ])],
+                "{profile}"
+            );
+        } else {
+            assert!(result.is_err(), "{profile}");
+        }
+    }
+}
+
+#[test]
 fn artifact_register_limit_is_separate_from_bootstrap_translation_limit() {
     use core::fmt::Write;
 

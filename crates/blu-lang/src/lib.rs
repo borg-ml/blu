@@ -407,6 +407,20 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let unicode_escapes = SourceFile::new(
+            SourceId::new(17),
+            "unicode-escapes.blu",
+            br#"return "\u{41}\u{D800}\u{1F41B}""#.to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
+        let extended_unicode_escapes = SourceFile::new(
+            SourceId::new(18),
+            "extended-unicode-escapes.blu",
+            br#"return "\u{110000}\u{7fffffff}""#.to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -416,6 +430,35 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            if !matches!(profile, SemanticProfile::Lua51 | SemanticProfile::Lua52) {
+                let compiled = OwnedCompiler::default()
+                    .compile(&unicode_escapes, profile, compiler.clone())
+                    .unwrap();
+                assert_eq!(
+                    Engine::default()
+                        .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                    Ok(vec![Value::String(Arc::from(
+                        &[0x41, 0xed, 0xa0, 0x80, 0xf0, 0x9f, 0x90, 0x9b][..]
+                    ))]),
+                    "{profile}"
+                );
+            }
+            if matches!(
+                profile,
+                SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                let compiled = OwnedCompiler::default()
+                    .compile(&extended_unicode_escapes, profile, compiler.clone())
+                    .unwrap();
+                assert_eq!(
+                    Engine::default()
+                        .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                    Ok(vec![Value::String(Arc::from(
+                        &[0xf4, 0x90, 0x80, 0x80, 0xfd, 0xbf, 0xbf, 0xbf, 0xbf, 0xbf,][..]
+                    ))]),
+                    "{profile}"
+                );
+            }
             let compiled = OwnedCompiler::default()
                 .compile(&line_continuations, profile, compiler.clone())
                 .unwrap();

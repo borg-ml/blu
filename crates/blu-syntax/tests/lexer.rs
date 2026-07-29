@@ -371,6 +371,43 @@ fn escaped_physical_line_endings_are_shared() {
 }
 
 #[test]
+fn unicode_escapes_follow_profile_bounds() {
+    for profile in SemanticProfile::ALL {
+        let shared = source(br#"return "\u{41}\u{D800}\u{1F41B}""#.to_vec());
+        let lexed = lex(&shared, profile, LexerLimits::default()).unwrap();
+        let supported = !matches!(profile, SemanticProfile::Lua51 | SemanticProfile::Lua52);
+        assert_eq!(lexed.has_errors(), !supported, "{profile}");
+        if !supported {
+            assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0007");
+        }
+
+        let extended = source(br#"return "\u{110000}\u{7fffffff}""#.to_vec());
+        let lexed = lex(&extended, profile, LexerLimits::default()).unwrap();
+        if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            assert!(!lexed.has_errors(), "{profile}");
+        } else if matches!(profile, SemanticProfile::Luau | SemanticProfile::Lua53) {
+            assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0018");
+        } else {
+            assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0007");
+        }
+    }
+
+    for malformed in [
+        br#"return "\u{}""#.as_slice(),
+        br#"return "\u{xyz}""#.as_slice(),
+        br#"return "\u{123456789}""#.as_slice(),
+        br#"return "\u{80000000}""#.as_slice(),
+    ] {
+        let source = source(malformed.to_vec());
+        let lexed = lex(&source, SemanticProfile::Blu, LexerLimits::default()).unwrap();
+        assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0018");
+    }
+}
+
+#[test]
 fn conflicting_directive_is_reported_on_its_value() {
     let source = source(b"--!dialect lua54\r\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

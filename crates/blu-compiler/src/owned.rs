@@ -1166,7 +1166,7 @@ impl<'a> Lowerer<'a> {
                 message: "string-literal AST delimiters do not match",
             });
         }
-        let decoded_len = decoded_string_len(value)?;
+        let decoded_len = decoded_string_len(value, self.profile)?;
         check_limit(
             OwnedCompileLimit::StringLiteralBytes,
             decoded_len,
@@ -1190,11 +1190,11 @@ impl<'a> Lowerer<'a> {
         while offset < value.len() {
             let byte = value[offset];
             if byte == b'\\' {
-                let (decoded_byte, consumed) = decode_string_escape(value, offset)?;
-                if let Some(decoded_byte) = decoded_byte {
-                    push_fallible(&mut decoded, decoded_byte, "string literal bytes")?;
+                let escape = decode_string_escape(value, offset, self.profile)?;
+                for decoded_byte in &escape.bytes[..escape.len] {
+                    push_fallible(&mut decoded, *decoded_byte, "string literal bytes")?;
                 }
-                offset += consumed;
+                offset += escape.consumed;
             } else {
                 push_fallible(&mut decoded, byte, "string literal bytes")?;
                 offset += 1;
@@ -1338,20 +1338,47 @@ fn decode_common_string_escape(escaped: u8) -> Option<u8> {
     })
 }
 
+struct DecodedEscape {
+    bytes: [u8; 6],
+    len: usize,
+    consumed: usize,
+}
+
+impl DecodedEscape {
+    const fn single(byte: u8, consumed: usize) -> Self {
+        let mut bytes = [0; 6];
+        bytes[0] = byte;
+        Self {
+            bytes,
+            len: 1,
+            consumed,
+        }
+    }
+
+    const fn empty(consumed: usize) -> Self {
+        Self {
+            bytes: [0; 6],
+            len: 0,
+            consumed,
+        }
+    }
+}
+
 fn decode_string_escape(
     value: &[u8],
     offset: usize,
-) -> Result<(Option<u8>, usize), OwnedCompileError> {
+    profile: SemanticProfile,
+) -> Result<DecodedEscape, OwnedCompileError> {
     let escaped = *value
         .get(offset + 1)
         .ok_or(OwnedCompileError::InternalInvariant {
             message: "validated string literal ends in a backslash",
         })?;
     if let Some(decoded) = decode_common_string_escape(escaped) {
-        return Ok((Some(decoded), 2));
+        return Ok(DecodedEscape::single(decoded, 2));
     }
     if escaped == b'\n' {
-        return Ok((Some(b'\n'), 2));
+        return Ok(DecodedEscape::single(b'\n', 2));
     }
     if escaped == b'\r' {
         let consumed = if value.get(offset + 2) == Some(&b'\n') {
@@ -1359,7 +1386,7 @@ fn decode_string_escape(
         } else {
             2
         };
-        return Ok((Some(b'\n'), consumed));
+        return Ok(DecodedEscape::single(b'\n', consumed));
     }
     if escaped.is_ascii_digit() {
         let mut cursor = offset + 1;
@@ -1373,7 +1400,7 @@ fn decode_string_escape(
         let decoded = u8::try_from(decoded).map_err(|_| OwnedCompileError::InternalInvariant {
             message: "validated decimal byte escape is out of range",
         })?;
-        return Ok((Some(decoded), cursor - offset));
+        return Ok(DecodedEscape::single(decoded, cursor - offset));
     }
     if escaped == b'x' {
         let high = *value
@@ -1388,18 +1415,96 @@ fn decode_string_escape(
             .ok_or(OwnedCompileError::InternalInvariant {
                 message: "validated hexadecimal byte escape has no low digit",
             })?;
-        return Ok((Some(hex_digit(high) * 16 + hex_digit(low)), 4));
+        return Ok(DecodedEscape::single(
+            hex_digit(high) * 16 + hex_digit(low),
+            4,
+        ));
     }
     if escaped == b'z' {
         let mut cursor = offset + 2;
         while value.get(cursor).is_some_and(u8::is_ascii_whitespace) {
             cursor += 1;
         }
-        return Ok((None, cursor - offset));
+        return Ok(DecodedEscape::empty(cursor - offset));
+    }
+    if escaped == b'u' {
+        let mut cursor = offset + 2;
+        if value.get(cursor) != Some(&b'{') {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "validated Unicode escape has no opening brace",
+            });
+        }
+        cursor += 1;
+        let mut codepoint = 0_u32;
+        let mut digits = 0;
+        while value.get(cursor).is_some_and(u8::is_ascii_hexdigit) {
+            codepoint = codepoint
+                .saturating_mul(16)
+                .saturating_add(u32::from(hex_digit(value[cursor])));
+            cursor += 1;
+            digits += 1;
+        }
+        if digits == 0 || digits > 8 || value.get(cursor) != Some(&b'}') {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "validated Unicode escape is malformed",
+            });
+        }
+        cursor += 1;
+        let maximum = match profile {
+            SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55 => 0x7fff_ffff,
+            SemanticProfile::Luau | SemanticProfile::Lua53 => 0x10_ffff,
+            _ => {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "Unicode escape reached an unsupported profile",
+                });
+            }
+        };
+        if codepoint > maximum {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "validated Unicode escape exceeds the profile maximum",
+            });
+        }
+        let mut decoded = encode_extended_utf8(codepoint);
+        decoded.consumed = cursor - offset;
+        return Ok(decoded);
     }
     Err(OwnedCompileError::InternalInvariant {
         message: "validated string literal contains an unsupported escape",
     })
+}
+
+fn encode_extended_utf8(codepoint: u32) -> DecodedEscape {
+    let len = match codepoint {
+        0..=0x7f => 1,
+        0x80..=0x7ff => 2,
+        0x800..=0xffff => 3,
+        0x1_0000..=0x1f_ffff => 4,
+        0x20_0000..=0x3ff_ffff => 5,
+        _ => 6,
+    };
+    if len == 1 {
+        return DecodedEscape::single(codepoint as u8, 0);
+    }
+    let mut bytes = [0_u8; 6];
+    let mut remaining = codepoint;
+    for index in (1..len).rev() {
+        bytes[index] = 0x80 | (remaining as u8 & 0x3f);
+        remaining >>= 6;
+    }
+    let prefix = match len {
+        2 => 0xc0,
+        3 => 0xe0,
+        4 => 0xf0,
+        5 => 0xf8,
+        6 => 0xfc,
+        _ => 0,
+    };
+    bytes[0] = prefix | remaining as u8;
+    DecodedEscape {
+        bytes,
+        len,
+        consumed: 0,
+    }
 }
 
 fn hex_digit(byte: u8) -> u8 {
@@ -1441,24 +1546,24 @@ fn parse_signed_decimal_exponent(bytes: &[u8]) -> Result<i64, OwnedCompileError>
     })
 }
 
-fn decoded_string_len(value: &[u8]) -> Result<usize, OwnedCompileError> {
+fn decoded_string_len(value: &[u8], profile: SemanticProfile) -> Result<usize, OwnedCompileError> {
     let mut decoded_len = 0_usize;
     let mut offset = 0;
     while offset < value.len() {
-        if value[offset] == b'\\' {
-            let (decoded, consumed) = decode_string_escape(value, offset)?;
-            offset += consumed;
-            if decoded.is_none() {
-                continue;
-            }
+        let added = if value[offset] == b'\\' {
+            let decoded = decode_string_escape(value, offset, profile)?;
+            offset += decoded.consumed;
+            decoded.len
         } else {
             offset += 1;
-        }
-        decoded_len = decoded_len
-            .checked_add(1)
-            .ok_or(OwnedCompileError::InternalInvariant {
-                message: "decoded string literal length overflowed",
-            })?;
+            1
+        };
+        decoded_len =
+            decoded_len
+                .checked_add(added)
+                .ok_or(OwnedCompileError::InternalInvariant {
+                    message: "decoded string literal length overflowed",
+                })?;
     }
     Ok(decoded_len)
 }

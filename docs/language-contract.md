@@ -59,8 +59,8 @@ single- and double-quoted byte strings with common escaped delimiters, backslash
 control escapes, shared decimal byte escapes, `\xXX`, and whitespace-eating `\z` in Blu, Luau, and Lua 5.2–5.5, and
 `+`/`-`/`*`/`/`/`%`/`^`/`//`
 precedence plus grouping parentheses and unary `not`/`-`/`#` for byte strings.
-Unicode escapes are rejected until their profile-specific rules are
-implemented. Parsing retains the explicit profile and rejects
+Unicode escapes use the explicit Luau/Lua 5.3 maximum and Lua 5.4/5.5 extended
+UTF-8 maximum, with Blu selecting the extended byte-string range. Parsing retains the explicit profile and rejects
 diagnostics without exposing a partial AST. Resolution, lowering, emission,
 and execution are separate explicit stages; the public engine never silently
 selects this frontend as a fallback. Parser-owned arenas, lists, and diagnostic counts are bounded
