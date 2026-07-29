@@ -179,7 +179,11 @@ not included. Dynamic VM-register growth is nevertheless capped and uses
 fallible reservation before changing a frame. Initial frame registers,
 constants, varargs, call arguments and results, active/continuation root
 vectors, caller-stack growth, and coroutine/protected-call wrappers likewise
-reserve fallibly before changing logical state. Results returned from a native
+reserve fallibly before changing logical state. Resumed protected-error
+unwinding uses fallible independent frame/caller snapshots, including
+registers, constants, varargs, and open-upvalue indexes. Guest-created
+coroutine-state entries and `require` loading/cache bookkeeping reserve their
+maps before insertion. Results returned from a native
 callback are count-bounded (1,000,000 by default, configurable with
 `Vm::with_native_result_limit`) and rejected before caller-frame writes, but
 allocations performed inside host callback code remain the embedder's
@@ -190,6 +194,10 @@ string-result limit.
 Accounted guest heap growth triggers collection at the configured byte
 threshold before reserving more storage. Active and saved frames trace both
 their values and every live open-upvalue cell.
+
+Global-name storage, the native registry, formatted error strings, allocator
+metadata, and host-created callback values still contain allocations outside
+this fallible logical boundary.
 
 Heap handles returned by `Vm::execute*` (and therefore `Engine::execute*`) stay
 rooted across later calls. Each returned table, closure, or thread occurrence

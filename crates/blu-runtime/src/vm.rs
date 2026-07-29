@@ -958,7 +958,7 @@ impl Vm {
                                         frame.get(capture.b())?.clone(),
                                         &roots,
                                     )?;
-                                    frame.insert_open_upvalue(capture.b(), upvalue);
+                                    frame.insert_open_upvalue(capture.b(), upvalue)?;
                                     upvalue
                                 }
                             },
@@ -2185,15 +2185,26 @@ impl Vm {
             if let Some(value) = vm.module_cache.get(&name) {
                 return Ok(vec![value.clone()]);
             }
-            if !vm.loading_modules.insert(name.clone()) {
+            if vm.loading_modules.contains(&name) {
                 return Err(RuntimeError::CircularModule(name));
             }
+            vm.loading_modules
+                .try_reserve(1)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "loading module set",
+                })?;
+            vm.loading_modules.insert(name.clone());
             let result = match vm.module_loader.clone() {
                 Some(loader) => loader(vm, &name),
                 None => Err(RuntimeError::ModuleLoaderMissing),
             };
             vm.loading_modules.remove(&name);
             let value = result?;
+            vm.module_cache
+                .try_reserve(1)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "module cache",
+                })?;
             vm.module_cache.insert(name, value.clone());
             Ok(vec![value])
         });
@@ -2767,6 +2778,11 @@ impl Vm {
                 });
             }
             let roots = GcRoots::from_values(arguments)?;
+            vm.threads
+                .try_reserve(1)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "coroutine state",
+                })?;
             vm.ensure_heap_objects(1, &roots)?;
             let thread = vm.allocate_thread(std::slice::from_ref(&function), &roots)?;
             vm.threads.insert(thread, ThreadState::New(function));
@@ -2803,6 +2819,11 @@ impl Vm {
                 });
             }
             let roots = GcRoots::from_values(arguments)?;
+            vm.threads
+                .try_reserve(1)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "coroutine state",
+                })?;
             vm.ensure_heap_objects(1, &roots)?;
             let thread = vm.allocate_thread(std::slice::from_ref(&function), &roots)?;
             vm.threads.insert(thread, ThreadState::New(function));
@@ -3010,7 +3031,7 @@ impl Vm {
         depth: usize,
     ) -> Result<Vec<Value>, RuntimeError> {
         loop {
-            let saved_callers = callers.clone();
+            let mut saved_callers = try_clone_callers(&callers)?;
             match self.run_frames(frame, callers, remaining, depth) {
                 Ok(values) => return Ok(values),
                 Err(error @ RuntimeError::CoroutineYield(_)) => return Err(error),
@@ -3021,8 +3042,9 @@ impl Vm {
                     else {
                         return Err(error);
                     };
-                    let mut protected = saved_callers[protected_index].clone();
-                    callers = saved_callers[..protected_index].to_vec();
+                    let mut protected = saved_callers.remove(protected_index);
+                    saved_callers.truncate(protected_index);
+                    callers = saved_callers;
                     let error_value = runtime_error_value(error);
                     let results = match protected.return_mode.clone() {
                         ReturnMode::Protected => {
@@ -3559,6 +3581,14 @@ fn try_clone_values(values: &[Value], what: &'static str) -> Result<Vec<Value>, 
     try_clone_slice(values, what)
 }
 
+fn try_clone_callers(callers: &[Caller]) -> Result<Vec<Caller>, RuntimeError> {
+    let mut cloned = try_vec_with_capacity(callers.len(), "resumed caller stack")?;
+    for caller in callers {
+        cloned.push(caller.try_clone_for_unwind()?);
+    }
+    Ok(cloned)
+}
+
 fn try_clone_slice<T: Clone>(values: &[T], what: &'static str) -> Result<Vec<T>, RuntimeError> {
     let mut cloned = try_vec_with_capacity(values.len(), what)?;
     cloned.extend_from_slice(values);
@@ -3694,6 +3724,15 @@ struct Caller {
 }
 
 impl Caller {
+    fn try_clone_for_unwind(&self) -> Result<Self, RuntimeError> {
+        Ok(Self {
+            frame: self.frame.try_clone_for_unwind()?,
+            register: self.register,
+            encoded_count: self.encoded_count,
+            return_mode: self.return_mode.clone(),
+        })
+    }
+
     fn gc_roots(&self, heap: &Heap) -> Result<GcRoots, RuntimeError> {
         let mut roots = self.frame.gc_roots(heap)?;
         if let ReturnMode::Operation(operation) = &self.return_mode {
@@ -3854,6 +3893,33 @@ impl Frame {
         })
     }
 
+    fn try_clone_for_unwind(&self) -> Result<Self, RuntimeError> {
+        let mut open_upvalues = HashMap::new();
+        open_upvalues
+            .try_reserve(self.open_upvalues.len())
+            .map_err(|_| RuntimeError::Allocation {
+                what: "resumed frame open upvalues",
+            })?;
+        open_upvalues.extend(
+            self.open_upvalues
+                .iter()
+                .map(|(&register, &upvalue)| (register, upvalue)),
+        );
+        Ok(Self {
+            chunk: self.chunk.clone(),
+            prototype_index: self.prototype_index,
+            profile: self.profile,
+            constants: try_clone_values(&self.constants, "resumed frame constants")?,
+            registers: try_clone_values(&self.registers, "resumed frame registers")?,
+            varargs: try_clone_values(&self.varargs, "resumed frame varargs")?,
+            closure: self.closure,
+            open_upvalues,
+            open_upvalues_dirty: self.open_upvalues_dirty,
+            pc: self.pc,
+            top: self.top,
+        })
+    }
+
     fn prototype(&self) -> Result<&Prototype, RuntimeError> {
         self.chunk
             .prototypes
@@ -3983,8 +4049,20 @@ impl Frame {
         self.open_upvalues.get(&register).copied()
     }
 
-    fn insert_open_upvalue(&mut self, register: u8, upvalue: UpvalueId) {
+    fn insert_open_upvalue(
+        &mut self,
+        register: u8,
+        upvalue: UpvalueId,
+    ) -> Result<(), RuntimeError> {
+        if !self.open_upvalues.contains_key(&register) {
+            self.open_upvalues
+                .try_reserve(1)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "frame open upvalues",
+                })?;
+        }
         self.open_upvalues.insert(register, upvalue);
+        Ok(())
     }
 
     fn sync_open_upvalues(&mut self, heap: &mut Heap) -> Result<(), RuntimeError> {
@@ -5108,6 +5186,48 @@ mod tests {
             heap.table_get(garbage, &Value::Integer(1)),
             Err(HeapError::StaleTable(garbage))
         );
+    }
+
+    #[test]
+    fn resumed_caller_snapshots_preserve_state_without_shared_vectors() {
+        let mut heap = Heap::default();
+        let upvalue = heap.allocate_upvalue(Value::Integer(9)).unwrap();
+        let chunk = Arc::new(test_chunk(&[], Vec::new(), vec![Opcode::Return as u32], 2));
+        let mut frame = Frame::new(
+            chunk,
+            0,
+            SemanticProfile::Blu,
+            vec![Value::Integer(3)],
+            None,
+            &[],
+        )
+        .unwrap();
+        frame.registers[0] = Value::Integer(4);
+        frame.varargs.push(Value::Integer(5));
+        frame.insert_open_upvalue(0, upvalue).unwrap();
+        frame.open_upvalues_dirty = true;
+        frame.pc = 7;
+        frame.top = 1;
+        let callers = vec![Caller {
+            frame,
+            register: 1,
+            encoded_count: 2,
+            return_mode: ReturnMode::ErrorHandler(Value::Integer(6)),
+        }];
+
+        let mut cloned = try_clone_callers(&callers).unwrap();
+        assert_eq!(cloned[0].frame.constants, [Value::Integer(3)]);
+        assert_eq!(cloned[0].frame.registers[0], Value::Integer(4));
+        assert_eq!(cloned[0].frame.varargs, [Value::Integer(5)]);
+        assert_eq!(cloned[0].frame.open_upvalue(0), Some(upvalue));
+        assert!(cloned[0].frame.open_upvalues_dirty);
+        assert_eq!(cloned[0].frame.pc, 7);
+        assert_eq!(cloned[0].frame.top, 1);
+        assert_eq!(cloned[0].register, 1);
+        assert_eq!(cloned[0].encoded_count, 2);
+
+        cloned[0].frame.registers[0] = Value::Integer(8);
+        assert_eq!(callers[0].frame.registers[0], Value::Integer(4));
     }
 
     #[test]
