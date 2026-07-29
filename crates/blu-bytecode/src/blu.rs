@@ -238,6 +238,11 @@ pub enum Instruction {
         left: u16,
         right: u16,
     },
+    Subtract {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
     FloorDivide {
         destination: u16,
         left: u16,
@@ -269,6 +274,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::Move { .. }
             | Instruction::Not { .. }
             | Instruction::Add { .. }
+            | Instruction::Subtract { .. }
             | Instruction::FloorDivide { .. }
             | Instruction::Return { .. } => true,
         },
@@ -278,6 +284,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::Move { .. }
                 | Instruction::Not { .. }
                 | Instruction::Add { .. }
+                | Instruction::Subtract { .. }
                 | Instruction::Return { .. }
         ),
         _ => false,
@@ -1108,6 +1115,11 @@ fn validate_prototype(
                 left,
                 right,
             }
+            | Instruction::Subtract {
+                destination,
+                left,
+                right,
+            }
             | Instruction::FloorDivide {
                 destination,
                 left,
@@ -1381,6 +1393,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                 match instruction {
                     Instruction::LoadConstant { .. }
                     | Instruction::Add { .. }
+                    | Instruction::Subtract { .. }
                     | Instruction::FloorDivide { .. } => 7,
                     Instruction::Move { .. }
                     | Instruction::Not { .. }
@@ -1488,6 +1501,16 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 right,
             } => {
                 out.push(1);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::Subtract {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(6);
                 put_u16(out, *destination);
                 put_u16(out, *left);
                 put_u16(out, *right);
@@ -2105,6 +2128,11 @@ fn read_prototype(
             5 => Instruction::Not {
                 destination: reader.u16()?,
                 source: reader.u16()?,
+            },
+            6 => Instruction::Subtract {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

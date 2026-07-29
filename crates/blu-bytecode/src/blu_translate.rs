@@ -227,6 +227,16 @@ fn translate_instruction(
             register(prototype, left)?,
             register(prototype, right)?,
         )),
+        BluInstruction::Subtract {
+            destination,
+            left,
+            right,
+        } => Ok(abc(
+            Opcode::Sub,
+            register(prototype, destination)?,
+            register(prototype, left)?,
+            register(prototype, right)?,
+        )),
         BluInstruction::Move {
             destination,
             source,

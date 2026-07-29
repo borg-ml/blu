@@ -848,6 +848,18 @@ impl Vm {
                     )?;
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::Subtract {
+                    destination,
+                    left,
+                    right,
+                } => {
+                    let value = arithmetic(
+                        Opcode::Sub,
+                        blu_register(&registers, left)?,
+                        blu_register(&registers, right)?,
+                    )?;
+                    set_blu_register(&mut registers, destination, value)?;
+                }
                 BluInstruction::Move {
                     destination,
                     source,
