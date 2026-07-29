@@ -34,6 +34,7 @@ macro_rules! object_id {
 object_id!(TableId, "Table");
 object_id!(ClosureId, "Closure");
 object_id!(UpvalueId, "Upvalue");
+object_id!(ThreadId, "Thread");
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 struct ObjectId {
@@ -53,6 +54,7 @@ pub enum HeapError {
     StaleTable(TableId),
     StaleClosure(ClosureId),
     StaleUpvalue(UpvalueId),
+    StaleThread(ThreadId),
     NilKey,
     NanKey,
     InvalidIterationKey,
@@ -64,6 +66,7 @@ impl fmt::Display for HeapError {
             Self::StaleTable(value) => write!(f, "stale or invalid table handle {value:?}"),
             Self::StaleClosure(value) => write!(f, "stale or invalid closure handle {value:?}"),
             Self::StaleUpvalue(value) => write!(f, "stale or invalid upvalue handle {value:?}"),
+            Self::StaleThread(value) => write!(f, "stale or invalid thread handle {value:?}"),
             Self::NilKey => f.write_str("table index is nil"),
             Self::NanKey => f.write_str("table index is NaN"),
             Self::InvalidIterationKey => f.write_str("invalid key to table iteration"),
@@ -117,6 +120,32 @@ impl Heap {
             index: id.index,
             generation: id.generation,
         }
+    }
+
+    pub(crate) fn allocate_thread(&mut self, roots: Vec<Value>) -> ThreadId {
+        let id = self.allocate(Object::Thread(Thread { roots }));
+        ThreadId {
+            index: id.index,
+            generation: id.generation,
+        }
+    }
+
+    pub(crate) fn thread_set_roots(
+        &mut self,
+        thread: ThreadId,
+        roots: Vec<Value>,
+    ) -> Result<(), HeapError> {
+        match self.object_mut(thread.into()) {
+            Some(Object::Thread(value)) => {
+                value.roots = roots;
+                Ok(())
+            }
+            _ => Err(HeapError::StaleThread(thread)),
+        }
+    }
+
+    pub(crate) fn contains_thread(&self, thread: ThreadId) -> bool {
+        matches!(self.object(thread.into()), Some(Object::Thread(_)))
     }
 
     #[must_use]
@@ -267,6 +296,11 @@ impl Heap {
                     queue.extend(closure.upvalues.iter().copied().map(ObjectId::from));
                 }
                 Object::Upvalue(value) => enqueue_value(value, &mut queue),
+                Object::Thread(thread) => {
+                    for root in &thread.roots {
+                        enqueue_value(root, &mut queue);
+                    }
+                }
             }
         }
 
@@ -354,6 +388,7 @@ fn enqueue_value(value: &Value, queue: &mut VecDeque<ObjectId>) {
     match value {
         Value::Table(value) => queue.push_back((*value).into()),
         Value::Closure(value) => queue.push_back((*value).into()),
+        Value::Thread(value) => queue.push_back((*value).into()),
         Value::NativeFunction(_) => {}
         _ => {}
     }
@@ -371,6 +406,7 @@ enum Object {
     Table(Table),
     Closure(Closure),
     Upvalue(Value),
+    Thread(Thread),
 }
 
 #[derive(Clone, Debug)]
@@ -378,6 +414,11 @@ struct Closure {
     chunk: Arc<Chunk>,
     prototype: usize,
     upvalues: Vec<UpvalueId>,
+}
+
+#[derive(Clone, Debug)]
+struct Thread {
+    roots: Vec<Value>,
 }
 
 #[derive(Clone, Debug)]
@@ -453,6 +494,7 @@ enum Key {
     String(Arc<[u8]>),
     Table(TableId),
     Closure(ClosureId),
+    Thread(ThreadId),
     NativeFunction(crate::NativeFunctionId),
 }
 
@@ -478,6 +520,7 @@ impl Key {
             Value::String(value) => Ok(Self::String(value.clone())),
             Value::Table(value) => Ok(Self::Table(*value)),
             Value::Closure(value) => Ok(Self::Closure(*value)),
+            Value::Thread(value) => Ok(Self::Thread(*value)),
             Value::NativeFunction(value) => Ok(Self::NativeFunction(*value)),
         }
     }
@@ -493,6 +536,7 @@ impl Key {
         match self {
             Self::Table(value) => queue.push_back((*value).into()),
             Self::Closure(value) => queue.push_back((*value).into()),
+            Self::Thread(value) => queue.push_back((*value).into()),
             _ => {}
         }
     }
@@ -505,6 +549,7 @@ impl Key {
             Self::String(value) => Value::String(value.clone()),
             Self::Table(value) => Value::Table(*value),
             Self::Closure(value) => Value::Closure(*value),
+            Self::Thread(value) => Value::Thread(*value),
             Self::NativeFunction(value) => Value::NativeFunction(*value),
         }
     }
@@ -610,6 +655,34 @@ mod tests {
                 Value::String(Arc::from(&b"answer"[..])),
                 Value::Integer(42),
             )))
+        );
+    }
+
+    #[test]
+    fn thread_roots_trace_suspended_values() {
+        let mut heap = Heap::default();
+        let retained = heap.allocate_table(0, 0);
+        let thread = heap.allocate_thread(vec![Value::Table(retained)]);
+        assert_eq!(
+            heap.collect([&Value::Thread(thread)]),
+            CollectionStats {
+                before: 2,
+                retained: 2,
+                collected: 0,
+            }
+        );
+        heap.thread_set_roots(thread, Vec::new()).unwrap();
+        assert_eq!(
+            heap.collect([&Value::Thread(thread)]),
+            CollectionStats {
+                before: 2,
+                retained: 1,
+                collected: 1,
+            }
+        );
+        assert_eq!(
+            heap.table_get(retained, &Value::Integer(1)),
+            Err(HeapError::StaleTable(retained))
         );
     }
 }

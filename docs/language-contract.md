@@ -47,8 +47,11 @@ remain explicit, structured `not implemented` errors until their own frontends
 and semantic profiles exist.
 
 Ordinary bytecode calls currently run on an owned, bounded VM frame stack.
-Suspended callers and their registers are traced as GC roots. Coroutine thread
-objects and resumable yield continuations remain unimplemented.
+Suspended callers and their registers are traced as GC roots. Generational
+thread values support initial `coroutine.create`, `resume`, `yield`, and
+`status` behavior, including nested yields and successful yields through
+`pcall`. `wrap`, main-thread identity, closing threads, and protected error
+unwinding after a resume remain explicit compatibility gaps.
 
 ## Semantic profiles
 

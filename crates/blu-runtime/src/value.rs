@@ -1,4 +1,4 @@
-use crate::{ClosureId, TableId};
+use crate::{ClosureId, TableId, ThreadId};
 use core::fmt;
 use std::sync::Arc;
 
@@ -15,6 +15,7 @@ pub enum Value {
     String(Arc<[u8]>),
     Table(TableId),
     Closure(ClosureId),
+    Thread(ThreadId),
     NativeFunction(NativeFunctionId),
 }
 
@@ -33,6 +34,7 @@ impl Value {
             Self::String(_) => "string",
             Self::Table(_) => "table",
             Self::Closure(_) => "function",
+            Self::Thread(_) => "thread",
             Self::NativeFunction(_) => "function",
         }
     }
@@ -59,6 +61,7 @@ impl fmt::Debug for Value {
                 .finish(),
             Self::Table(value) => value.fmt(f),
             Self::Closure(value) => value.fmt(f),
+            Self::Thread(value) => value.fmt(f),
             Self::NativeFunction(value) => value.fmt(f),
         }
     }
@@ -76,6 +79,7 @@ impl PartialEq for Value {
             (Self::String(left), Self::String(right)) => left == right,
             (Self::Table(left), Self::Table(right)) => left == right,
             (Self::Closure(left), Self::Closure(right)) => left == right,
+            (Self::Thread(left), Self::Thread(right)) => left == right,
             (Self::NativeFunction(left), Self::NativeFunction(right)) => left == right,
             _ => false,
         }

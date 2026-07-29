@@ -505,6 +505,41 @@ local result = tonumber("12.5") + tonumber("ff", 16) + tonumber(3)
     + (typeof(tonumber("invalid")) == "nil" and 1 or 0)
 print(type(result) .. ":" .. tostring(result))
 "#;
+const COROUTINE_SOURCE: &str = r#"
+local thread = coroutine.create(function()
+    local ok, value = pcall(function()
+        local function nested()
+            return coroutine.yield("pause")
+        end
+        return nested() + 1
+    end)
+    return ok, value
+end)
+local first_ok, paused = coroutine.resume(thread)
+local suspended = coroutine.status(thread)
+local second_ok, protected_ok, result = coroutine.resume(thread, 41)
+return first_ok and paused == "pause" and suspended == "suspended"
+    and second_ok and protected_ok and result == 42
+    and coroutine.status(thread) == "dead"
+"#;
+const COROUTINE_REFERENCE_SOURCE: &str = r#"
+local thread = coroutine.create(function()
+    local ok, value = pcall(function()
+        local function nested()
+            return coroutine.yield("pause")
+        end
+        return nested() + 1
+    end)
+    return ok, value
+end)
+local first_ok, paused = coroutine.resume(thread)
+local suspended = coroutine.status(thread)
+local second_ok, protected_ok, result = coroutine.resume(thread, 41)
+local value = first_ok and paused == "pause" and suspended == "suspended"
+    and second_ok and protected_ok and result == 42
+    and coroutine.status(thread) == "dead"
+print(type(value) .. ":" .. tostring(value))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -747,6 +782,14 @@ fn run() -> Result<(), String> {
         &args.upstream,
         temporary.path(),
     )?;
+    verify_program_case(
+        "coroutine yield and protected resume",
+        COROUTINE_SOURCE,
+        COROUTINE_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
 
     let portable_source = temporary.path().join("portable.lua");
     fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
@@ -799,7 +842,7 @@ fn run() -> Result<(), String> {
     println!("bytecode version: {bytecode_version}");
     println!("scalar differential corpus: pass ({scalar_count} cases)");
     println!(
-        "program differential corpus: pass (tables, loops, iteration, methods, metamethods, closures, captures, varargs, multret)"
+        "program differential corpus: pass (tables, loops, iteration, methods, metamethods, closures, captures, varargs, multret, coroutines)"
     );
     println!("portable reference matrix: pass (Luau, Lua 5.1-5.5)");
     Ok(())

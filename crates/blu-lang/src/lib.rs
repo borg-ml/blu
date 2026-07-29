@@ -304,4 +304,105 @@ mod tests {
             Ok(vec![Value::Number(42.0)])
         );
     }
+
+    #[test]
+    fn coroutine_threads_complete_and_report_lifecycle() {
+        assert_eq!(
+            Engine::default().execute(
+                br#"
+                    local thread = coroutine.create(function(left, right)
+                        return left + right, left * right
+                    end)
+                    local before = coroutine.status(thread)
+                    local ok, sum, product = coroutine.resume(thread, 6, 7)
+                    return before, ok, sum, product,
+                        coroutine.status(thread), type(thread)
+                "#
+            ),
+            Ok(vec![
+                Value::String(Arc::from(&b"suspended"[..])),
+                Value::Boolean(true),
+                Value::Number(13.0),
+                Value::Number(42.0),
+                Value::String(Arc::from(&b"dead"[..])),
+                Value::String(Arc::from(&b"thread"[..])),
+            ])
+        );
+    }
+
+    #[test]
+    fn thread_roots_survive_gc_and_nested_yields_resume() {
+        let mut engine = Engine::default();
+        assert_eq!(
+            engine.execute(
+                br#"
+                    local retained = { answer = 42 }
+                    saved_thread = coroutine.create(function()
+                        return retained.answer
+                    end)
+                "#
+            ),
+            Ok(Vec::new())
+        );
+        engine.vm_mut().collect(std::iter::empty());
+        assert_eq!(
+            engine.execute(b"return coroutine.resume(saved_thread)"),
+            Ok(vec![Value::Boolean(true), Value::Number(42.0)])
+        );
+        assert_eq!(
+            engine.execute(
+                br#"
+                    local thread = coroutine.create(function()
+                        local function nested()
+                            return coroutine.yield("pause")
+                        end
+                        return nested() + 1
+                    end)
+                    local first_ok, paused = coroutine.resume(thread)
+                    local suspended = coroutine.status(thread)
+                    local second_ok, result = coroutine.resume(thread, 41)
+                    return first_ok, paused, suspended,
+                        second_ok, result, coroutine.status(thread)
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"pause"[..])),
+                Value::String(Arc::from(&b"suspended"[..])),
+                Value::Boolean(true),
+                Value::Number(42.0),
+                Value::String(Arc::from(&b"dead"[..])),
+            ])
+        );
+    }
+
+    #[test]
+    fn protected_calls_can_yield_and_resume_successfully() {
+        assert_eq!(
+            Engine::default().execute(
+                br#"
+                    local thread = coroutine.create(function()
+                        local ok, value = pcall(function()
+                            local function nested()
+                                return coroutine.yield("pause")
+                            end
+                            return nested() + 1
+                        end)
+                        return ok, value
+                    end)
+                    local first_ok, paused = coroutine.resume(thread)
+                    local second_ok, protected_ok, value =
+                        coroutine.resume(thread, 41)
+                    return first_ok, paused, second_ok, protected_ok, value
+                "#
+            ),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"pause"[..])),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Number(42.0),
+            ])
+        );
+    }
 }

@@ -12,6 +12,6 @@ mod value;
 mod vm;
 
 pub use dialect::Dialect;
-pub use heap::{ClosureId, CollectionStats, Heap, HeapError, TableId};
+pub use heap::{ClosureId, CollectionStats, Heap, HeapError, TableId, ThreadId};
 pub use value::{NativeFunctionId, Value};
 pub use vm::{RuntimeError, Vm};

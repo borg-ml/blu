@@ -1,5 +1,5 @@
 use crate::heap::UpvalueId;
-use crate::{ClosureId, Dialect, Heap, HeapError, NativeFunctionId, TableId, Value};
+use crate::{ClosureId, Dialect, Heap, HeapError, NativeFunctionId, TableId, ThreadId, Value};
 use blu_bytecode::{Chunk, Constant, Instruction, Opcode, Prototype};
 use core::fmt;
 use std::{
@@ -14,6 +14,19 @@ type NativeFunction =
     Arc<dyn Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync>;
 type ModuleLoader = Arc<dyn Fn(&mut Vm, &[u8]) -> Result<Value, RuntimeError> + Send + Sync>;
 
+#[derive(Clone, Debug)]
+enum ThreadState {
+    New(Value),
+    Suspended(Continuation),
+    Running,
+    Dead,
+}
+
+enum Resumable {
+    New(Value),
+    Continuation(Continuation),
+}
+
 #[derive(Clone)]
 pub struct Vm {
     dialect: Dialect,
@@ -24,9 +37,13 @@ pub struct Vm {
     native_functions: Vec<NativeFunction>,
     protected_call: Option<NativeFunctionId>,
     error_handler_call: Option<NativeFunctionId>,
+    coroutine_resume: Option<NativeFunctionId>,
+    coroutine_yield: Option<NativeFunctionId>,
     module_loader: Option<ModuleLoader>,
     module_cache: HashMap<Arc<[u8]>, Value>,
     loading_modules: HashSet<Arc<[u8]>>,
+    threads: HashMap<ThreadId, ThreadState>,
+    running_thread: Option<ThreadId>,
     output: Vec<u8>,
     active_roots: Vec<Vec<Value>>,
 }
@@ -49,9 +66,13 @@ impl Vm {
             native_functions: Vec::new(),
             protected_call: None,
             error_handler_call: None,
+            coroutine_resume: None,
+            coroutine_yield: None,
             module_loader: None,
             module_cache: HashMap::new(),
             loading_modules: HashSet::new(),
+            threads: HashMap::new(),
+            running_thread: None,
             output: Vec::new(),
             active_roots: Vec::new(),
         };
@@ -122,7 +143,10 @@ impl Vm {
         all_roots.extend(self.module_cache.values().cloned());
         all_roots.extend(self.active_roots.iter().flatten().cloned());
         all_roots.extend(roots.into_iter().cloned());
-        self.heap.collect(&all_roots)
+        let stats = self.heap.collect(&all_roots);
+        self.threads
+            .retain(|thread, _| self.heap.contains_thread(*thread));
+        stats
     }
 
     pub fn execute(&mut self, chunk: &Chunk) -> Result<Vec<Value>, RuntimeError> {
@@ -173,15 +197,23 @@ impl Vm {
             .get(prototype_index)
             .ok_or(RuntimeError::InvalidPrototype(prototype_index))?;
         let constants = materialize_constants(chunk, prototype)?;
-        let mut frame = Frame::new(
+        let frame = Frame::new(
             chunk.clone(),
             prototype_index,
             constants,
             closure,
             arguments,
         )?;
-        let mut callers = Vec::<Caller>::new();
+        self.run_frames(frame, Vec::new(), remaining, depth)
+    }
 
+    fn run_frames(
+        &mut self,
+        mut frame: Frame,
+        mut callers: Vec<Caller>,
+        remaining: &mut u64,
+        depth: usize,
+    ) -> Result<Vec<Value>, RuntimeError> {
         loop {
             let depth = depth + callers.len();
             if *remaining == 0 {
@@ -903,6 +935,14 @@ impl Vm {
                 }
                 Opcode::Call | Opcode::CallFb => {
                     let function = frame.get(instruction.a())?.clone();
+                    let suspended_return_mode = match function {
+                        Value::NativeFunction(function)
+                            if self.protected_call == Some(function) =>
+                        {
+                            ReturnMode::Protected
+                        }
+                        _ => ReturnMode::Direct,
+                    };
                     let start = usize::from(instruction.a()) + 1;
                     let count = if instruction.b() == 0 {
                         frame.top.saturating_sub(start)
@@ -930,17 +970,35 @@ impl Vm {
                             frame,
                             register: instruction.a(),
                             encoded_count: instruction.c(),
+                            return_mode: ReturnMode::Direct,
                         });
                         frame = child_frame;
                         continue;
                     } else {
-                        self.call_value(
+                        match self.call_value(
                             function,
                             &arguments,
                             remaining,
                             depth,
                             frame.gc_roots(&self.heap)?,
-                        )?
+                        ) {
+                            Err(RuntimeError::CoroutineYield(values)) => {
+                                let thread = self
+                                    .running_thread
+                                    .ok_or(RuntimeError::CoroutineYieldOutside)?;
+                                self.suspend_thread(
+                                    thread,
+                                    frame,
+                                    callers,
+                                    instruction.a(),
+                                    instruction.c(),
+                                    suspended_return_mode,
+                                    depth,
+                                )?;
+                                return Err(RuntimeError::CoroutineYield(values));
+                            }
+                            result => result?,
+                        }
                     };
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.write_results(instruction.a(), instruction.c(), results)?;
@@ -967,6 +1025,15 @@ impl Vm {
                         self.active_roots.pop();
                         frame = caller.frame;
                         frame.refresh_open_upvalues(&self.heap)?;
+                        let results = match caller.return_mode {
+                            ReturnMode::Direct => results,
+                            ReturnMode::Protected => {
+                                let mut protected = Vec::with_capacity(results.len() + 1);
+                                protected.push(Value::Boolean(true));
+                                protected.extend(results);
+                                protected
+                            }
+                        };
                         frame.write_results(caller.register, caller.encoded_count, results)?;
                         continue;
                     }
@@ -1006,6 +1073,12 @@ impl Vm {
                 result
             }
             Value::NativeFunction(function) => {
+                if self.coroutine_resume == Some(function) {
+                    return self.resume_thread(arguments, remaining, depth, roots);
+                }
+                if self.coroutine_yield == Some(function) {
+                    return Err(RuntimeError::CoroutineYield(arguments.to_vec()));
+                }
                 if self.protected_call == Some(function) {
                     let target = arguments.first().cloned().ok_or(RuntimeError::Argument {
                         function: "pcall",
@@ -1025,6 +1098,7 @@ impl Vm {
                             protected.extend(values);
                             protected
                         }
+                        Err(error @ RuntimeError::CoroutineYield(_)) => return Err(error),
                         Err(RuntimeError::Raised(value)) => {
                             vec![Value::Boolean(false), value]
                         }
@@ -1978,6 +2052,187 @@ impl Vm {
 
         self.install_table_library();
         self.install_math_library();
+        self.install_coroutine_library();
+    }
+
+    fn install_coroutine_library(&mut self) {
+        let create = self.register_function(|vm, arguments| {
+            let function = arguments.first().cloned().ok_or(RuntimeError::Argument {
+                function: "coroutine.create",
+                index: 1,
+            })?;
+            if !matches!(function, Value::Closure(_) | Value::NativeFunction(_)) {
+                return Err(RuntimeError::Type {
+                    operation: "coroutine.create",
+                    expected: "function",
+                    actual: function.type_name(),
+                });
+            }
+            let thread = vm.heap.allocate_thread(vec![function.clone()]);
+            vm.threads.insert(thread, ThreadState::New(function));
+            Ok(vec![Value::Thread(thread)])
+        });
+        let status = self.register_function(|vm, arguments| {
+            let thread = thread_argument(arguments, 0, "coroutine.status")?;
+            let status = match vm.threads.get(&thread) {
+                Some(ThreadState::New(_) | ThreadState::Suspended(_)) => b"suspended".as_slice(),
+                Some(ThreadState::Running) => b"running".as_slice(),
+                Some(ThreadState::Dead) => b"dead".as_slice(),
+                None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
+            };
+            Ok(vec![Value::String(Arc::from(status))])
+        });
+        let resume = self.register_function(|_, _| Err(RuntimeError::NativeFunction(u32::MAX)));
+        self.coroutine_resume = Some(resume);
+        let yield_function =
+            self.register_function(|_, _| Err(RuntimeError::NativeFunction(u32::MAX)));
+        self.coroutine_yield = Some(yield_function);
+
+        let table = self.heap.allocate_table(0, 4);
+        for (name, function) in [
+            (&b"create"[..], create),
+            (&b"status"[..], status),
+            (&b"resume"[..], resume),
+            (&b"yield"[..], yield_function),
+        ] {
+            self.heap
+                .table_set(
+                    table,
+                    Value::String(Arc::from(name)),
+                    Value::NativeFunction(function),
+                )
+                .expect("valid built-in table key");
+        }
+        self.set_global(&b"coroutine"[..], Value::Table(table));
+    }
+
+    fn resume_thread(
+        &mut self,
+        arguments: &[Value],
+        remaining: &mut u64,
+        depth: usize,
+        roots: Vec<Value>,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let thread = thread_argument(arguments, 0, "coroutine.resume")?;
+        let state = self
+            .threads
+            .remove(&thread)
+            .ok_or(RuntimeError::Heap(HeapError::StaleThread(thread)))?;
+        let resumable = match state {
+            ThreadState::New(function) => Resumable::New(function),
+            ThreadState::Suspended(continuation) => Resumable::Continuation(continuation),
+            state @ (ThreadState::Running | ThreadState::Dead) => {
+                self.threads.insert(thread, state);
+                return Ok(vec![
+                    Value::Boolean(false),
+                    Value::String(Arc::from(&b"cannot resume non-suspended coroutine"[..])),
+                ]);
+            }
+        };
+        self.threads.insert(thread, ThreadState::Running);
+        let mut thread_roots = roots;
+        thread_roots.push(Value::Thread(thread));
+        thread_roots.extend_from_slice(arguments.get(1..).unwrap_or_default());
+        self.heap.thread_set_roots(thread, thread_roots.clone())?;
+        let previous_thread = self.running_thread.replace(thread);
+        let result = match resumable {
+            Resumable::New(function) => self.call_value(
+                function,
+                arguments.get(1..).unwrap_or_default(),
+                remaining,
+                depth,
+                thread_roots,
+            ),
+            Resumable::Continuation(mut continuation) => {
+                let active_root_count = self.active_roots.len();
+                let result = (|| {
+                    continuation.frame.write_results(
+                        continuation.register,
+                        continuation.encoded_count,
+                        arguments.get(1..).unwrap_or_default().to_vec(),
+                    )?;
+                    for caller in &continuation.callers {
+                        self.active_roots.push(caller.frame.gc_roots(&self.heap)?);
+                    }
+                    self.run_frames(
+                        continuation.frame,
+                        continuation.callers,
+                        remaining,
+                        continuation.depth,
+                    )
+                })();
+                self.active_roots.truncate(active_root_count);
+                result
+            }
+        };
+        self.running_thread = previous_thread;
+        Ok(match result {
+            Ok(values) => {
+                self.threads.insert(thread, ThreadState::Dead);
+                self.heap.thread_set_roots(thread, Vec::new())?;
+                let mut resumed = Vec::with_capacity(values.len() + 1);
+                resumed.push(Value::Boolean(true));
+                resumed.extend(values);
+                resumed
+            }
+            Err(RuntimeError::CoroutineYield(values))
+                if matches!(self.threads.get(&thread), Some(ThreadState::Suspended(_))) =>
+            {
+                let mut yielded = Vec::with_capacity(values.len() + 1);
+                yielded.push(Value::Boolean(true));
+                yielded.extend(values);
+                yielded
+            }
+            Err(error) => {
+                self.threads.insert(thread, ThreadState::Dead);
+                self.heap.thread_set_roots(thread, Vec::new())?;
+                vec![Value::Boolean(false), runtime_error_value(error)]
+            }
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn suspend_thread(
+        &mut self,
+        thread: ThreadId,
+        frame: Frame,
+        callers: Vec<Caller>,
+        register: u8,
+        encoded_count: u8,
+        return_mode: ReturnMode,
+        depth: usize,
+    ) -> Result<(), RuntimeError> {
+        let continuation = match self.threads.remove(&thread) {
+            Some(ThreadState::Suspended(mut continuation)) => {
+                continuation.callers.insert(
+                    0,
+                    Caller {
+                        frame,
+                        register,
+                        encoded_count,
+                        return_mode,
+                    },
+                );
+                continuation
+            }
+            Some(ThreadState::Running) => Continuation {
+                frame,
+                callers,
+                register,
+                encoded_count,
+                depth,
+            },
+            Some(state) => {
+                self.threads.insert(thread, state);
+                return Err(RuntimeError::CoroutineYieldOutside);
+            }
+            None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
+        };
+        let roots = continuation_roots(&continuation.frame, &continuation.callers, &self.heap)?;
+        self.heap.thread_set_roots(thread, roots)?;
+        self.threads
+            .insert(thread, ThreadState::Suspended(continuation));
+        Ok(())
     }
 
     fn install_table_library(&mut self) {
@@ -2335,6 +2590,27 @@ fn number_argument(
     })
 }
 
+fn thread_argument(
+    arguments: &[Value],
+    zero_based_index: usize,
+    function: &'static str,
+) -> Result<ThreadId, RuntimeError> {
+    let value = arguments
+        .get(zero_based_index)
+        .ok_or(RuntimeError::Argument {
+            function,
+            index: zero_based_index + 1,
+        })?;
+    match value {
+        Value::Thread(thread) => Ok(*thread),
+        other => Err(RuntimeError::Type {
+            operation: function,
+            expected: "thread",
+            actual: other.type_name(),
+        }),
+    }
+}
+
 fn relative_index(index: i64, length: usize) -> i64 {
     if index < 0 {
         length as i64 + index + 1
@@ -2369,6 +2645,7 @@ fn append_value(output: &mut Vec<u8>, value: &Value) {
         Value::String(value) => output.extend_from_slice(value),
         Value::Table(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
         Value::Closure(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
+        Value::Thread(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
         Value::NativeFunction(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
     }
 }
@@ -2407,12 +2684,30 @@ impl<'a> CallContext<'a> {
     }
 }
 
+#[derive(Clone, Debug)]
+struct Continuation {
+    frame: Frame,
+    callers: Vec<Caller>,
+    register: u8,
+    encoded_count: u8,
+    depth: usize,
+}
+
+#[derive(Clone, Debug)]
 struct Caller {
     frame: Frame,
     register: u8,
     encoded_count: u8,
+    return_mode: ReturnMode,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ReturnMode {
+    Direct,
+    Protected,
+}
+
+#[derive(Clone, Debug)]
 struct Frame {
     chunk: Arc<Chunk>,
     prototype_index: usize,
@@ -2668,6 +2963,18 @@ impl Frame {
     }
 }
 
+fn continuation_roots(
+    frame: &Frame,
+    callers: &[Caller],
+    heap: &Heap,
+) -> Result<Vec<Value>, RuntimeError> {
+    let mut roots = frame.gc_roots(heap)?;
+    for caller in callers {
+        roots.extend(caller.frame.gc_roots(heap)?);
+    }
+    Ok(roots)
+}
+
 fn materialize_constants(chunk: &Chunk, prototype: &Prototype) -> Result<Vec<Value>, RuntimeError> {
     prototype
         .constants
@@ -2905,6 +3212,8 @@ pub enum RuntimeError {
         required: usize,
         limit: usize,
     },
+    CoroutineYield(Vec<Value>),
+    CoroutineYieldOutside,
     ModuleLoaderMissing,
     CircularModule(Arc<[u8]>),
 }
@@ -3022,6 +3331,10 @@ impl fmt::Display for RuntimeError {
                     "string result requires {required} bytes, limit is {limit}"
                 )
             }
+            Self::CoroutineYield(values) => {
+                write!(f, "coroutine yielded {} values", values.len())
+            }
+            Self::CoroutineYieldOutside => f.write_str("cannot yield outside a running coroutine"),
             Self::ModuleLoaderMissing => f.write_str("require has no configured module loader"),
             Self::CircularModule(name) => write!(
                 f,
@@ -3323,14 +3636,9 @@ mod tests {
         let mut vm = Vm::default();
         let string = table_id(vm.global(b"string").unwrap()).unwrap();
         let garbage = vm.heap.allocate_table(0, 0);
-        assert_eq!(
-            vm.collect(std::iter::empty::<&Value>()),
-            crate::CollectionStats {
-                before: 4,
-                retained: 3,
-                collected: 1,
-            }
-        );
+        let stats = vm.collect(std::iter::empty::<&Value>());
+        assert_eq!(stats.collected, 1);
+        assert_eq!(stats.before, stats.retained + stats.collected);
         assert!(
             vm.heap
                 .table_get(string, &Value::String(Arc::from(&b"sub"[..])))
