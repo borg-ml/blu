@@ -84,6 +84,7 @@ pub struct BluLimits {
     pub max_children_per_prototype: usize,
     pub max_upvalues_per_prototype: usize,
     pub max_debug_entries_per_prototype: usize,
+    pub max_total_registers: usize,
     pub max_total_constants: usize,
     pub max_total_constant_bytes: usize,
     pub max_total_code: usize,
@@ -113,6 +114,7 @@ impl Default for BluLimits {
             max_children_per_prototype: 100_000,
             max_upvalues_per_prototype: u16::MAX as usize,
             max_debug_entries_per_prototype: 8_000_000,
+            max_total_registers: 8_000_000,
             max_total_constants: 8_000_000,
             max_total_constant_bytes: 32 * 1024 * 1024,
             max_total_code: 8_000_000,
@@ -588,6 +590,7 @@ fn validate_aggregate_limits(
     limits: BluLimits,
 ) -> Result<(), ValidationError> {
     let prototypes = &artifact.prototypes;
+    let mut registers = 0usize;
     let mut constants = 0usize;
     let mut code = 0usize;
     let mut children = 0usize;
@@ -631,6 +634,12 @@ fn validate_aggregate_limits(
         )?;
     }
     for prototype in prototypes {
+        add_validation_total(
+            &mut registers,
+            usize::from(prototype.register_count),
+            "total register count",
+            limits.max_total_registers,
+        )?;
         add_validation_total(
             &mut constants,
             prototype.constants.len(),
@@ -1666,6 +1675,7 @@ fn read_compiler(
 }
 
 struct DecodeBudget {
+    registers: usize,
     constants: usize,
     constant_bytes: usize,
     code: usize,
@@ -1688,6 +1698,7 @@ impl DecodeBudget {
             });
         }
         Ok(Self {
+            registers: 0,
             constants: 0,
             constant_bytes: 0,
             code: 0,
@@ -1792,6 +1803,19 @@ fn read_prototype(
     }
     let source = SourceId::new(reader.u32()?);
     let register_count = reader.u16()?;
+    if usize::from(register_count) > limits.max_registers_per_prototype {
+        return Err(DecodeError::TooLarge {
+            what: "register count",
+            actual: usize::from(register_count),
+            limit: limits.max_registers_per_prototype,
+        });
+    }
+    DecodeBudget::add(
+        &mut budget.registers,
+        usize::from(register_count),
+        "total register count",
+        limits.max_total_registers,
+    )?;
     let parameter_count = reader.u16()?;
     let required_features = FeatureBits::from_bits(reader.u64()?);
 

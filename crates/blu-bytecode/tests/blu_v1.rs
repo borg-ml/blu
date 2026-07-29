@@ -575,7 +575,11 @@ fn validation_enforces_the_total_encoded_size_limit() {
 
 #[test]
 fn validation_enforces_aggregate_work_limits_for_host_built_artifacts() {
-    let cases: [LimitCase; 9] = [
+    let cases: [LimitCase; 10] = [
+        (
+            |limits| limits.max_total_registers = 3,
+            "total register count",
+        ),
         (
             |limits| limits.max_total_constants = 4,
             "total constant count",
@@ -665,6 +669,19 @@ fn decoder_consumes_aggregate_budgets_before_growing_collections() {
         defaults,
     )
     .unwrap();
+
+    let register_limits = BluLimits {
+        max_total_registers: 3,
+        ..defaults
+    };
+    assert!(matches!(
+        decode(&bytes, register_limits),
+        Err(DecodeError::TooLarge {
+            what: "total register count",
+            actual: 4,
+            limit: 3,
+        })
+    ));
 
     let code_limits = BluLimits {
         max_total_code: 4,
