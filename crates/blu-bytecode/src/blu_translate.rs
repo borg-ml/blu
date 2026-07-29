@@ -99,6 +99,7 @@ pub fn translate_baseline_to_luau(
                     | BluInstruction::LessEqual { .. }
                     | BluInstruction::JumpIfTruthy { .. }
                     | BluInstruction::JumpIfFalsy { .. }
+                    | BluInstruction::Jump { .. }
             )
         }) {
             let instruction = if prototype
@@ -358,12 +359,12 @@ fn translate_instruction(
             prototype,
             instruction: "comparisons",
         }),
-        BluInstruction::JumpIfTruthy { .. } | BluInstruction::JumpIfFalsy { .. } => {
-            Err(TranslationError::UnsupportedInstruction {
-                prototype,
-                instruction: "forward branches",
-            })
-        }
+        BluInstruction::JumpIfTruthy { .. }
+        | BluInstruction::JumpIfFalsy { .. }
+        | BluInstruction::Jump { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "forward branches",
+        }),
         BluInstruction::Return { first, count } => {
             let result_field = count
                 .checked_add(1)

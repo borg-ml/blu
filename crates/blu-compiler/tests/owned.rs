@@ -815,6 +815,66 @@ fn logical_operators_short_circuit_and_return_operands_for_every_profile() {
 }
 
 #[test]
+fn conditional_blocks_execute_and_restore_local_scope_for_every_profile() {
+    let source = make_source(
+        br#"local value = "none"
+if false then
+    value = "bad"
+elseif 1 < 2 then
+    local selected = "selected"
+    value = selected
+else
+    value = "else"
+end
+if true then
+    value = value .. "!"
+else
+    value = "bad"
+end
+return value"#
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::Jump { .. })),
+            "{profile}"
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::String(std::sync::Arc::from(&b"selected!"[..]))]),
+            "{profile}"
+        );
+    }
+
+    let returned = make_source(b"if true then return \"then\" else return \"else\" end".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&returned, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::String(std::sync::Arc::from(&b"then"[..]))]),
+            "{profile}"
+        );
+    }
+
+    let escaped = make_source(b"if true then local hidden = 1 end\nreturn hidden".to_vec());
+    assert!(
+        OwnedCompiler::default()
+            .compile(&escaped, SemanticProfile::Blu, compiler_identity())
+            .is_err()
+    );
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {

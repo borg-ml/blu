@@ -332,11 +332,80 @@ impl ReturnStatement {
 }
 
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IfClause {
+    condition: ExpressionId,
+    body: Block,
+    span: ByteSpan,
+}
+
+impl IfClause {
+    pub(crate) const fn new(condition: ExpressionId, body: Block, span: ByteSpan) -> Self {
+        Self {
+            condition,
+            body,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn condition(&self) -> ExpressionId {
+        self.condition
+    }
+
+    #[must_use]
+    pub const fn body(&self) -> &Block {
+        &self.body
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IfStatement {
+    clauses: Vec<IfClause>,
+    else_body: Option<Block>,
+    span: ByteSpan,
+}
+
+impl IfStatement {
+    pub(crate) const fn new(
+        clauses: Vec<IfClause>,
+        else_body: Option<Block>,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            clauses,
+            else_body,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub fn clauses(&self) -> &[IfClause] {
+        &self.clauses
+    }
+
+    #[must_use]
+    pub const fn else_body(&self) -> Option<&Block> {
+        self.else_body.as_ref()
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Statement {
     Local(LocalStatement),
     LocalList(LocalListStatement),
     Assignment(AssignmentStatement),
     AssignmentList(AssignmentListStatement),
+    If(IfStatement),
     Return(ReturnStatement),
 }
 
@@ -348,8 +417,46 @@ impl Statement {
             Self::LocalList(statement) => statement.span(),
             Self::Assignment(statement) => statement.span(),
             Self::AssignmentList(statement) => statement.span(),
+            Self::If(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
         }
+    }
+}
+
+/// An owned lexical statement block.
+///
+/// Blocks are explicit AST nodes so structured statements can own nested
+/// bodies without flattening scope or control-flow boundaries.
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct Block {
+    statements: Vec<Statement>,
+}
+
+impl Block {
+    pub(crate) const fn new(statements: Vec<Statement>) -> Self {
+        Self { statements }
+    }
+
+    #[must_use]
+    pub fn statements(&self) -> &[Statement] {
+        &self.statements
+    }
+
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.statements.iter().fold(0_usize, |count, statement| {
+            let nested = match statement {
+                Statement::If(statement) => {
+                    let clauses = statement.clauses().iter().fold(0_usize, |count, clause| {
+                        count.saturating_add(clause.body().node_count())
+                    });
+                    clauses
+                        .saturating_add(statement.else_body().map_or(0, |block| block.node_count()))
+                }
+                _ => 0,
+            };
+            count.saturating_add(1).saturating_add(nested)
+        })
     }
 }
 
@@ -361,7 +468,7 @@ impl Statement {
 pub struct Ast {
     profile: SemanticProfile,
     span: ByteSpan,
-    statements: Vec<Statement>,
+    block: Block,
     expressions: Vec<Expression>,
 }
 
@@ -375,7 +482,7 @@ impl Ast {
         Self {
             profile,
             span,
-            statements,
+            block: Block::new(statements),
             expressions,
         }
     }
@@ -392,7 +499,12 @@ impl Ast {
 
     #[must_use]
     pub fn statements(&self) -> &[Statement] {
-        &self.statements
+        self.block.statements()
+    }
+
+    #[must_use]
+    pub const fn block(&self) -> &Block {
+        &self.block
     }
 
     #[must_use]
@@ -407,6 +519,8 @@ impl Ast {
 
     #[must_use]
     pub fn node_count(&self) -> usize {
-        self.statements.len().saturating_add(self.expressions.len())
+        self.block
+            .node_count()
+            .saturating_add(self.expressions.len())
     }
 }

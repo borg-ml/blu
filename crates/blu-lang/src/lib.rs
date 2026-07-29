@@ -451,6 +451,28 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let conditionals = SourceFile::new(
+            SourceId::new(23),
+            "conditionals.blu",
+            br#"local value = "none"
+if false then
+    value = "bad"
+elseif 1 < 2 then
+    local selected = "selected"
+    value = selected
+else
+    value = "else"
+end
+if true then
+    value = value .. "!"
+else
+    value = "bad"
+end
+return value"#
+                .to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -460,6 +482,15 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&conditionals, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![Value::String(Arc::from(&b"selected!"[..]))]),
+                "{profile}"
+            );
             let compiled = OwnedCompiler::default()
                 .compile(&logical_operators, profile, compiler.clone())
                 .unwrap();

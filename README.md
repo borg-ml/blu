@@ -91,6 +91,9 @@ strings, while equality between unlike scalar types is false.
 Operand-returning `and` and `or` use validated forward branches and preserve
 short-circuit evaluation in every profile. Backward canonical branches remain
 unsupported until loop control-flow validation is assigned.
+Structured `if`/`elseif`/`else` blocks execute through the same validated
+forward control flow, retain branch-local lexical scope, and support
+path-terminating returns.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

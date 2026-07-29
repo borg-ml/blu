@@ -863,6 +863,16 @@ fn forward_branches_are_feature_gated_and_merge_register_initialization() {
             "{profile}"
         );
 
+        let mut unconditional = forward_branch_fixture(profile);
+        unconditional.prototypes[0].code[2] = Instruction::Jump { target: 3 };
+        let unconditional = ValidatedArtifact::new(unconditional, limits).unwrap();
+        let bytes = encode(&unconditional, limits).unwrap();
+        assert_eq!(
+            decode_validated(&bytes, limits).unwrap().main().code[2],
+            Instruction::Jump { target: 3 },
+            "{profile}"
+        );
+
         let mut missing = forward_branch_fixture(profile);
         missing.prototypes[0].required_features = FeatureBits::BASELINE;
         assert_eq!(

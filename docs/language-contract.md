@@ -153,6 +153,11 @@ The owned compiler uses these branches for operand-returning, short-circuit
 `and` and `or` in every profile. The bootstrap translator rejects them rather
 than mapping unproved control-flow structure to Luau jumps. Backward branches
 remain unsupported until bounded loop CFG validation is implemented.
+An unconditional forward `Jump` completes the structured substrate used by
+owned `if`/`elseif`/`else` statements. Nested blocks own their statement lists,
+branch locals leave resolver scope at the block boundary, and local debug
+ranges end at that boundary. A conditional whose every branch returns does
+not acquire an artificial fallthrough return.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

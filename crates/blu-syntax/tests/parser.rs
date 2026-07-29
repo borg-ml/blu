@@ -358,6 +358,24 @@ fn logical_operators_are_left_associative_below_comparisons() {
 }
 
 #[test]
+fn conditional_blocks_retain_clauses_else_and_nested_statements() {
+    let source =
+        source(b"if a then local x = 1 elseif b then if c then x = 2 end else x = 3 end".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::If(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected if statement");
+    };
+    assert_eq!(statement.clauses().len(), 2);
+    assert_eq!(statement.clauses()[0].body().statements().len(), 1);
+    assert!(matches!(
+        statement.clauses()[1].body().statements()[0],
+        Statement::If(_)
+    ));
+    assert_eq!(statement.else_body().unwrap().statements().len(), 1);
+    assert_eq!(source.slice(statement.span()).unwrap(), source.bytes());
+}
+
+#[test]
 fn multiplication_binds_above_addition_and_is_left_associative() {
     let source = source(b"return a + b * c * d + e".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());

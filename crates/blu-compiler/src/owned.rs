@@ -29,8 +29,8 @@ use blu_core::{
 };
 use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryOperator, Expression, ExpressionId,
-    ExpressionKind, LocalListStatement, LocalStatement, ParseError, ParseLimits, ParseOutcome,
-    Rejected, ReturnStatement, Statement, UnaryOperator, parse,
+    ExpressionKind, IfStatement, LocalListStatement, LocalStatement, ParseError, ParseLimits,
+    ParseOutcome, Rejected, ReturnStatement, Statement, UnaryOperator, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -360,6 +360,7 @@ struct Binding {
     name: ByteSpan,
     register: u16,
     start_pc: u32,
+    end_pc: Option<u32>,
 }
 
 struct Lowerer<'a> {
@@ -368,6 +369,7 @@ struct Lowerer<'a> {
     expressions: &'a [Expression],
     limits: OwnedCompileLimits,
     bindings: Vec<Binding>,
+    closed_bindings: Vec<Binding>,
     register_count: usize,
     constants: Vec<Constant>,
     constant_bytes: usize,
@@ -388,6 +390,10 @@ impl<'a> Lowerer<'a> {
             expressions: ast.expressions(),
             limits,
             bindings: allocate_vec(capacity.min(limits.max_bindings), "local bindings")?,
+            closed_bindings: allocate_vec(
+                capacity.min(limits.max_bindings),
+                "closed local bindings",
+            )?,
             register_count: 0,
             constants: allocate_vec(capacity.min(limits.max_constants), "constants")?,
             constant_bytes: 0,
@@ -397,25 +403,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn run(mut self, ast: &Ast) -> Result<Prototype, OwnedCompileError> {
-        let mut saw_return = false;
-        for (index, statement) in ast.statements().iter().enumerate() {
-            match statement {
-                Statement::Local(local) => self.lower_local(*local)?,
-                Statement::LocalList(local) => self.lower_local_list(local)?,
-                Statement::Assignment(assignment) => self.lower_assignment(*assignment)?,
-                Statement::AssignmentList(assignment) => self.lower_assignment_list(assignment)?,
-                Statement::Return(return_statement) => {
-                    if index + 1 != ast.statements().len() {
-                        return Err(OwnedCompileError::InternalInvariant {
-                            message: "parser exposed a non-final return statement",
-                        });
-                    }
-                    self.lower_return(return_statement)?;
-                    saw_return = true;
-                }
-            }
-        }
-        if !saw_return {
+        if !self.lower_statements(ast.statements())? {
             let eof = self.source.span(self.source.len(), self.source.len())?;
             self.emit(Instruction::Return { first: 0, count: 0 }, eof)?;
         }
@@ -425,7 +413,7 @@ impl<'a> Lowerer<'a> {
                 message: "instruction count passed limits but cannot fit a debug PC",
             })?;
         let mut debug_bytes = 0_usize;
-        for binding in &self.bindings {
+        for binding in self.closed_bindings.iter().chain(&self.bindings) {
             let name_len = self.source.slice(binding.name)?.len();
             check_limit(
                 OwnedCompileLimit::DebugNameBytes,
@@ -445,14 +433,18 @@ impl<'a> Lowerer<'a> {
                 self.limits.artifact.max_total_debug_bytes,
             )?;
         }
-        let mut locals = allocate_vec(self.bindings.len(), "local debug entries")?;
-        for binding in self.bindings {
+        let binding_count = self
+            .closed_bindings
+            .len()
+            .saturating_add(self.bindings.len());
+        let mut locals = allocate_vec(binding_count, "local debug entries")?;
+        for binding in self.closed_bindings.into_iter().chain(self.bindings) {
             let name = copy_bytes(self.source.slice(binding.name)?, "local debug name")?;
             locals.push(LocalDebug {
                 name,
                 register: binding.register,
                 start_pc: binding.start_pc,
-                end_pc,
+                end_pc: binding.end_pc.unwrap_or(end_pc),
             });
         }
 
@@ -518,6 +510,104 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    fn lower_statements(&mut self, statements: &[Statement]) -> Result<bool, OwnedCompileError> {
+        for (index, statement) in statements.iter().enumerate() {
+            let terminated = match statement {
+                Statement::Local(local) => {
+                    self.lower_local(*local)?;
+                    false
+                }
+                Statement::LocalList(local) => {
+                    self.lower_local_list(local)?;
+                    false
+                }
+                Statement::Assignment(assignment) => {
+                    self.lower_assignment(*assignment)?;
+                    false
+                }
+                Statement::AssignmentList(assignment) => {
+                    self.lower_assignment_list(assignment)?;
+                    false
+                }
+                Statement::If(statement) => self.lower_if(statement)?,
+                Statement::Return(return_statement) => {
+                    self.lower_return(return_statement)?;
+                    true
+                }
+            };
+            if terminated {
+                if index + 1 != statements.len() {
+                    return Err(OwnedCompileError::InternalInvariant {
+                        message: "parser exposed a statement after a terminating statement",
+                    });
+                }
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn lower_if(&mut self, statement: &IfStatement) -> Result<bool, OwnedCompileError> {
+        let mut end_jumps = allocate_vec(statement.clauses().len(), "if end branches")?;
+        let mut all_clauses_terminate = true;
+        for clause in statement.clauses() {
+            let condition = self.lower_expression(clause.condition())?;
+            let false_branch = self.code.len();
+            self.emit(
+                Instruction::JumpIfFalsy {
+                    condition,
+                    target: 0,
+                },
+                clause.span(),
+            )?;
+            let scope = self.bindings.len();
+            let terminated = self.lower_statements(clause.body().statements())?;
+            self.close_scope(scope)?;
+            all_clauses_terminate &= terminated;
+            if !terminated {
+                let branch = self.code.len();
+                self.emit(Instruction::Jump { target: 0 }, clause.span())?;
+                push_fallible(&mut end_jumps, branch, "if end branches")?;
+            }
+            self.patch_forward_branch(false_branch, self.code.len())?;
+        }
+
+        let else_terminates = if let Some(body) = statement.else_body() {
+            let scope = self.bindings.len();
+            let terminated = self.lower_statements(body.statements())?;
+            self.close_scope(scope)?;
+            terminated
+        } else {
+            false
+        };
+        let end = self.code.len();
+        for branch in end_jumps {
+            self.patch_forward_branch(branch, end)?;
+        }
+        Ok(all_clauses_terminate && else_terminates)
+    }
+
+    fn close_scope(&mut self, start: usize) -> Result<(), OwnedCompileError> {
+        let end_pc =
+            u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "instruction count passed limits but cannot fit a debug PC",
+            })?;
+        let closing = self.bindings.len().saturating_sub(start);
+        self.closed_bindings
+            .try_reserve(closing)
+            .map_err(|_| OwnedCompileError::Allocation {
+                what: "closed local bindings",
+                requested: self.closed_bindings.len().saturating_add(closing),
+            })?;
+        for binding in &self.bindings[start..] {
+            let mut binding = *binding;
+            binding.end_pc = Some(end_pc);
+            self.closed_bindings.push(binding);
+        }
+        self.bindings.truncate(start);
+        Ok(())
+    }
+
     fn lower_local(&mut self, statement: LocalStatement) -> Result<(), OwnedCompileError> {
         let register = match statement.value() {
             Some(value) => self.lower_expression(value)?,
@@ -530,7 +620,10 @@ impl<'a> Lowerer<'a> {
             .min(self.limits.artifact.max_total_debug_entries);
         check_limit(
             OwnedCompileLimit::Bindings,
-            self.bindings.len().saturating_add(1),
+            self.closed_bindings
+                .len()
+                .saturating_add(self.bindings.len())
+                .saturating_add(1),
             limit,
         )?;
         let start_pc =
@@ -543,6 +636,7 @@ impl<'a> Lowerer<'a> {
                 name: statement.name().span(),
                 register,
                 start_pc,
+                end_pc: None,
             },
             "local bindings",
         )
@@ -567,7 +661,11 @@ impl<'a> Lowerer<'a> {
         &mut self,
         statement: &LocalListStatement,
     ) -> Result<(), OwnedCompileError> {
-        let required = self.bindings.len().saturating_add(statement.names().len());
+        let required = self
+            .closed_bindings
+            .len()
+            .saturating_add(self.bindings.len())
+            .saturating_add(statement.names().len());
         let limit = self
             .limits
             .max_bindings
@@ -604,6 +702,7 @@ impl<'a> Lowerer<'a> {
                     name: name.span(),
                     register,
                     start_pc,
+                    end_pc: None,
                 },
                 "local bindings",
             )?;
@@ -1458,6 +1557,9 @@ impl<'a> Lowerer<'a> {
             | Instruction::JumpIfFalsy {
                 target: branch_target,
                 ..
+            }
+            | Instruction::Jump {
+                target: branch_target,
             } => *branch_target = target,
             _ => {
                 return Err(OwnedCompileError::InternalInvariant {

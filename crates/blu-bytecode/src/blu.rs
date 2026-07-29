@@ -316,6 +316,9 @@ pub enum Instruction {
         condition: u16,
         target: u32,
     },
+    Jump {
+        target: u32,
+    },
     Return {
         first: u16,
         count: u16,
@@ -356,6 +359,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::LessEqual { .. }
             | Instruction::JumpIfTruthy { .. }
             | Instruction::JumpIfFalsy { .. }
+            | Instruction::Jump { .. }
             | Instruction::Return { .. } => true,
         },
         SemanticProfile::Blu | SemanticProfile::Lua51 | SemanticProfile::Lua52 => matches!(
@@ -377,6 +381,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::LessEqual { .. }
                 | Instruction::JumpIfTruthy { .. }
                 | Instruction::JumpIfFalsy { .. }
+                | Instruction::Jump { .. }
                 | Instruction::Return { .. }
         ),
         _ => false,
@@ -1152,7 +1157,9 @@ fn validate_prototype(
     if prototype.code.iter().any(|instruction| {
         matches!(
             instruction,
-            Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. }
+            Instruction::JumpIfTruthy { .. }
+                | Instruction::JumpIfFalsy { .. }
+                | Instruction::Jump { .. }
         )
     }) && !prototype
         .required_features
@@ -1206,11 +1213,24 @@ fn validate_prototype(
     initialized.resize(registers, false);
     initialized[..prototype.parameter_count as usize].fill(true);
     let mut incoming = HashMap::<usize, Vec<bool>>::new();
+    let mut reachable = true;
     for (pc, instruction) in prototype.code.iter().copied().enumerate() {
         if let Some(branch_state) = incoming.remove(&pc) {
-            for (current, incoming) in initialized.iter_mut().zip(branch_state) {
-                *current &= incoming;
+            if reachable {
+                for (current, incoming) in initialized.iter_mut().zip(branch_state) {
+                    *current &= incoming;
+                }
+            } else {
+                initialized = branch_state;
+                reachable = true;
             }
+        }
+        if !reachable {
+            return Err(ValidationError::InvalidInstruction {
+                prototype: index,
+                pc,
+                what: "instruction is unreachable",
+            });
         }
         if !instruction_is_legal(prototype.profile, instruction) {
             return Err(ValidationError::InvalidInstruction {
@@ -1378,6 +1398,56 @@ fn validate_prototype(
                     incoming.insert(target, state);
                 }
             }
+            Instruction::Jump { target } => {
+                let target =
+                    usize::try_from(target).map_err(|_| ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "branch target does not fit this platform",
+                    })?;
+                if target <= pc || target >= prototype.code.len() {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "branch target must be a later instruction",
+                    });
+                }
+                if let Some(existing) = incoming.get_mut(&target) {
+                    for (current, incoming) in existing.iter_mut().zip(&initialized) {
+                        *current &= *incoming;
+                    }
+                } else {
+                    let state_bytes = incoming
+                        .len()
+                        .checked_add(1)
+                        .and_then(|count| count.checked_mul(registers))
+                        .ok_or(ValidationError::Limit {
+                            what: "branch validation state bytes",
+                            actual: usize::MAX,
+                            limit: limits.max_decoded_bytes,
+                        })?;
+                    check_limit(
+                        "branch validation state bytes",
+                        state_bytes,
+                        limits.max_decoded_bytes,
+                    )?;
+                    incoming
+                        .try_reserve(1)
+                        .map_err(|_| ValidationError::Allocation {
+                            what: "branch validation targets",
+                            requested: incoming.len().saturating_add(1),
+                        })?;
+                    let mut state = Vec::new();
+                    try_reserve_validation(
+                        &mut state,
+                        "branch register initialization",
+                        registers,
+                    )?;
+                    state.extend_from_slice(&initialized);
+                    incoming.insert(target, state);
+                }
+                reachable = false;
+            }
             Instruction::Return { first, count } => {
                 let end = usize::from(first).checked_add(usize::from(count)).ok_or(
                     ValidationError::InvalidInstruction {
@@ -1396,13 +1466,7 @@ fn validate_prototype(
                 for register in first..first + count {
                     check_read(index, pc, register, &initialized)?;
                 }
-                if pc + 1 != prototype.code.len() {
-                    return Err(ValidationError::InvalidInstruction {
-                        prototype: index,
-                        pc,
-                        what: "return must terminate straight-line code",
-                    });
-                }
+                reachable = false;
             }
         }
     }
@@ -1652,6 +1716,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::LessThan { .. }
                     | Instruction::LessEqual { .. } => 7,
                     Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. } => 7,
+                    Instruction::Jump { .. } => 5,
                     Instruction::Move { .. }
                     | Instruction::Not { .. }
                     | Instruction::Negate { .. }
@@ -1904,6 +1969,10 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
             Instruction::JumpIfFalsy { condition, target } => {
                 out.push(18);
                 put_u16(out, *condition);
+                put_u32(out, *target);
+            }
+            Instruction::Jump { target } => {
+                out.push(19);
                 put_u32(out, *target);
             }
             Instruction::Return { first, count } => {
@@ -2553,6 +2622,9 @@ fn read_prototype(
             },
             18 => Instruction::JumpIfFalsy {
                 condition: reader.u16()?,
+                target: reader.u32()?,
+            },
+            19 => Instruction::Jump {
                 target: reader.u32()?,
             },
             tag => {

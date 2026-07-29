@@ -1,8 +1,8 @@
 use crate::{
-    AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator,
-    DialectDirective, Expression, ExpressionId, ExpressionKind, Identifier, LexError, Lexed,
-    LexerLimits, LocalListStatement, LocalStatement, ReturnStatement, Statement, Token, TokenKind,
-    UnaryExpression, UnaryOperator, lex,
+    AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
+    DialectDirective, Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement,
+    LexError, Lexed, LexerLimits, LocalListStatement, LocalStatement, ReturnStatement, Statement,
+    Token, TokenKind, UnaryExpression, UnaryOperator, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -282,6 +282,8 @@ struct Parser<'a> {
     limits: ParseLimits,
     cursor: usize,
     statements: Vec<Statement>,
+    statement_count: usize,
+    block_depth: usize,
     expressions: Vec<Expression>,
     diagnostics: Vec<Diagnostic>,
 }
@@ -300,43 +302,15 @@ impl<'a> Parser<'a> {
             limits,
             cursor: 0,
             statements: allocate_vec(ast_capacity, "AST statements")?,
+            statement_count: 0,
+            block_depth: 0,
             expressions: allocate_vec(ast_capacity, "AST expressions")?,
             diagnostics: allocate_vec(diagnostic_capacity, "parser diagnostics")?,
         })
     }
 
     fn run(mut self) -> Result<(Option<Ast>, Vec<Diagnostic>), ParseError> {
-        while let Some(token) = self.current() {
-            match token.kind() {
-                TokenKind::Semicolon => {
-                    self.bump();
-                }
-                TokenKind::Local => self.parse_local()?,
-                TokenKind::Identifier => self.parse_assignment()?,
-                TokenKind::Return => {
-                    self.parse_return()?;
-                    while self.at(TokenKind::Semicolon) {
-                        self.bump();
-                    }
-                    if self.current().is_some() {
-                        self.report_current(
-                            "BLU-PARSE-0005",
-                            "unexpected token after return statement",
-                            &["end of source"],
-                        )?;
-                        while self.bump().is_some() {}
-                    }
-                }
-                _ => {
-                    self.report_current(
-                        "BLU-PARSE-0001",
-                        "expected a supported statement",
-                        &["local", "assignment", "return"],
-                    )?;
-                    self.bump();
-                }
-            }
-        }
+        self.parse_statements(&[])?;
 
         if !self.diagnostics.is_empty() {
             return Ok((None, self.diagnostics));
@@ -352,6 +326,155 @@ impl<'a> Parser<'a> {
             self.expressions,
         );
         Ok((Some(ast), self.diagnostics))
+    }
+
+    fn parse_statements(&mut self, terminators: &[TokenKind]) -> Result<(), ParseError> {
+        while let Some(token) = self.current() {
+            if terminators.contains(&token.kind()) {
+                break;
+            }
+            match token.kind() {
+                TokenKind::Semicolon => {
+                    self.bump();
+                }
+                TokenKind::Local => self.parse_local()?,
+                TokenKind::Identifier => self.parse_assignment()?,
+                TokenKind::If => self.parse_if()?,
+                TokenKind::Return => {
+                    self.parse_return()?;
+                    while self.at(TokenKind::Semicolon) {
+                        self.bump();
+                    }
+                    if self
+                        .current()
+                        .is_some_and(|token| !terminators.contains(&token.kind()))
+                    {
+                        self.report_current(
+                            "BLU-PARSE-0005",
+                            "unexpected token after return statement",
+                            &["end of source"],
+                        )?;
+                        while self
+                            .current()
+                            .is_some_and(|token| !terminators.contains(&token.kind()))
+                        {
+                            self.bump();
+                        }
+                    }
+                }
+                _ => {
+                    self.report_current(
+                        "BLU-PARSE-0001",
+                        "expected a supported statement",
+                        &["local", "assignment", "if", "return"],
+                    )?;
+                    self.bump();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn parse_if(&mut self) -> Result<(), ParseError> {
+        let Some(keyword) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "if parser entered without a current token",
+            });
+        };
+        let mut clauses = allocate_vec(1, "if clauses")?;
+        let mut clause_keyword = keyword;
+        loop {
+            let Some(condition) = self.parse_expression(0)? else {
+                return Ok(());
+            };
+            if !self.at(TokenKind::Then) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0018",
+                    "expected `then` after if condition",
+                    &["then"],
+                )?;
+                return Ok(());
+            }
+            let Some(then_token) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "then check succeeded without a current token",
+                });
+            };
+            let body =
+                self.parse_nested_block(&[TokenKind::ElseIf, TokenKind::Else, TokenKind::End])?;
+            let clause_end = body
+                .statements()
+                .last()
+                .map_or(then_token.span(), Statement::span);
+            push_fallible(
+                &mut clauses,
+                IfClause::new(condition.id, body, clause_keyword.span().merge(clause_end)?),
+                "if clauses",
+            )?;
+            if !self.at(TokenKind::ElseIf) {
+                break;
+            }
+            let Some(elseif) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "elseif check succeeded without a current token",
+                });
+            };
+            clause_keyword = elseif;
+        }
+
+        let else_body = if self.at(TokenKind::Else) {
+            self.bump();
+            Some(self.parse_nested_block(&[TokenKind::End])?)
+        } else {
+            None
+        };
+        if !self.at(TokenKind::End) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0019",
+                "expected `end` to close if statement",
+                &["end"],
+            )?;
+            return Ok(());
+        }
+        let Some(end) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "end check succeeded without a current token",
+            });
+        };
+        self.push_statement(Statement::If(IfStatement::new(
+            clauses,
+            else_body,
+            keyword.span().merge(end.span())?,
+        )))
+    }
+
+    fn parse_nested_block(&mut self, terminators: &[TokenKind]) -> Result<Block, ParseError> {
+        let depth = self.block_depth.saturating_add(1);
+        if depth > self.limits.max_expression_depth {
+            return Err(ParseError::Limit {
+                kind: ParseLimit::ExpressionDepth,
+                required: depth,
+                limit: self.limits.max_expression_depth,
+            });
+        }
+        let capacity = self
+            .lexed
+            .tokens()
+            .len()
+            .min(
+                self.limits
+                    .max_ast_nodes
+                    .saturating_sub(self.statement_count),
+            )
+            .min(64);
+        let nested = allocate_vec(capacity, "block statements")?;
+        let outer = core::mem::replace(&mut self.statements, nested);
+        self.block_depth = depth;
+        let parsed = self.parse_statements(terminators);
+        self.block_depth -= 1;
+        let body = core::mem::replace(&mut self.statements, outer);
+        parsed?;
+        Ok(Block::new(body))
     }
 
     fn parse_local(&mut self) -> Result<(), ParseError> {
@@ -722,13 +845,14 @@ impl<'a> Parser<'a> {
 
     fn push_statement(&mut self, statement: Statement) -> Result<(), ParseError> {
         self.check_ast_limit()?;
-        push_fallible(&mut self.statements, statement, "AST statements")
+        push_fallible(&mut self.statements, statement, "AST statements")?;
+        self.statement_count += 1;
+        Ok(())
     }
 
     fn check_ast_limit(&self) -> Result<(), ParseError> {
         let required = self
-            .statements
-            .len()
+            .statement_count
             .saturating_add(self.expressions.len())
             .saturating_add(1);
         if required > self.limits.max_ast_nodes {

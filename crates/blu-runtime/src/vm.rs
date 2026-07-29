@@ -1069,6 +1069,21 @@ impl Vm {
                         continue;
                     }
                 }
+                BluInstruction::Jump { target } => {
+                    pc = usize::try_from(target).map_err(|_| {
+                        RuntimeError::InvalidProgramCounter {
+                            pc: usize::MAX,
+                            code_words: prototype.code.len(),
+                        }
+                    })?;
+                    if pc >= prototype.code.len() {
+                        return Err(RuntimeError::InvalidProgramCounter {
+                            pc,
+                            code_words: prototype.code.len(),
+                        });
+                    }
+                    continue;
+                }
                 BluInstruction::Return { first, count } => {
                     let start = usize::from(first);
                     let end =

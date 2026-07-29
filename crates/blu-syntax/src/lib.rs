@@ -12,9 +12,9 @@ mod ast;
 mod parser;
 
 pub use ast::{
-    AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator,
-    Expression, ExpressionId, ExpressionKind, Identifier, LocalListStatement, LocalStatement,
-    ReturnStatement, Statement, UnaryExpression, UnaryOperator,
+    AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
+    Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement,
+    LocalListStatement, LocalStatement, ReturnStatement, Statement, UnaryExpression, UnaryOperator,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
@@ -132,6 +132,11 @@ pub enum TokenKind {
     Not,
     And,
     Or,
+    If,
+    Then,
+    ElseIf,
+    Else,
+    End,
     Nil,
     True,
     False,
@@ -819,6 +824,11 @@ pub fn lex(
                     b"not" => TokenKind::Not,
                     b"and" => TokenKind::And,
                     b"or" => TokenKind::Or,
+                    b"if" => TokenKind::If,
+                    b"then" => TokenKind::Then,
+                    b"elseif" => TokenKind::ElseIf,
+                    b"else" => TokenKind::Else,
+                    b"end" => TokenKind::End,
                     b"nil" => TokenKind::Nil,
                     b"true" => TokenKind::True,
                     b"false" => TokenKind::False,
