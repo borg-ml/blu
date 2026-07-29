@@ -277,7 +277,7 @@ fn floor_division_lowers_only_for_assigned_profiles_and_bootstrap_translation_re
 }
 
 #[test]
-fn syntax_profiles_and_missing_return_fail_structurally() {
+fn syntax_failures_are_structured_and_implicit_returns_execute() {
     let malformed = make_source(b"local = 40".to_vec());
     let error = OwnedCompiler::default()
         .compile(&malformed, SemanticProfile::Blu, compiler_identity())
@@ -285,19 +285,30 @@ fn syntax_profiles_and_missing_return_fail_structurally() {
     let rejected = error.syntax().expect("syntax rejection");
     assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0002");
 
-    let no_return = make_source(b"local answer = 40".to_vec());
-    let error = OwnedCompiler::default()
-        .compile(&no_return, SemanticProfile::Blu, compiler_identity())
-        .unwrap_err();
-    let diagnostic = error.diagnostic().expect("missing-return diagnostic");
-    assert_eq!(diagnostic.code().as_str(), "BLU-LOWER-0003");
-    assert_eq!(diagnostic.phase(), Phase::Lower);
-    assert_eq!(diagnostic.profile(), SemanticProfile::Blu);
-    assert_eq!(diagnostic.severity(), Severity::Error);
-    assert_eq!(
-        diagnostic.primary().span(),
-        no_return.span(0, no_return.len()).unwrap()
-    );
+    for bytes in [b"".as_slice(), b"local answer = 40".as_slice()] {
+        let source = make_source(bytes.to_vec());
+        for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                compiled.artifact().main().code.last(),
+                Some(&Instruction::Return { first: 0, count: 0 }),
+                "{profile}"
+            );
+            assert_eq!(
+                compiled.artifact().main().source_map.last(),
+                Some(&source.span(source.len(), source.len()).unwrap()),
+                "{profile}"
+            );
+            assert_eq!(
+                Vm::new(Dialect::Blu)
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default(),),
+                Ok(Vec::new()),
+                "{profile}"
+            );
+        }
+    }
 
     let unresolved = make_source(b"return missing".to_vec());
     let mut limits = OwnedCompileLimits::default();
@@ -340,6 +351,20 @@ fn compiler_limits_fail_before_artifact_creation() {
             kind: OwnedCompileLimit::Registers,
             required: 3,
             limit: 2,
+        })
+    ));
+
+    let empty = make_source(Vec::new());
+    let compiler = OwnedCompiler::new(OwnedCompileLimits {
+        max_instructions: 0,
+        ..OwnedCompileLimits::default()
+    });
+    assert!(matches!(
+        compiler.compile(&empty, SemanticProfile::Blu, compiler_identity()),
+        Err(OwnedCompileError::Limit {
+            kind: OwnedCompileLimit::Instructions,
+            required: 1,
+            limit: 0,
         })
     ));
 }

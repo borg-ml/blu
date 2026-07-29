@@ -407,12 +407,8 @@ impl<'a> Lowerer<'a> {
             }
         }
         if !saw_return {
-            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                "BLU-LOWER-0003",
-                Phase::Lower,
-                ast.span(),
-                "owned compiler slice requires a final return",
-            )?));
+            let eof = self.source.span(self.source.len(), self.source.len())?;
+            self.emit(Instruction::Return { first: 0, count: 0 }, eof)?;
         }
 
         let end_pc =

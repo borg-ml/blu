@@ -308,6 +308,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let implicit_return = SourceFile::new(
+            SourceId::new(3),
+            "implicit.blu",
+            b"local answer = 42".to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -349,6 +356,15 @@ mod tests {
                     .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
                 Ok(Vec::new()),
                 "empty return under {profile}"
+            );
+            let compiled = OwnedCompiler::default()
+                .compile(&implicit_return, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(Vec::new()),
+                "implicit return under {profile}"
             );
         }
     }
