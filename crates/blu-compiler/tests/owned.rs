@@ -1024,6 +1024,48 @@ fn repeat_until_executes_once_scopes_locals_and_tests_after_continue() {
 }
 
 #[test]
+fn do_blocks_restore_shadowed_bindings_and_propagate_returns() {
+    let scoped = make_source(
+        b"local value = 1\ndo\nlocal value = 2\nvalue = value + 3\nend\nreturn value".to_vec(),
+    );
+    let returning =
+        make_source(b"do return 7 end\nlocal unreachable = 9\nreturn unreachable".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&scoped, profile, compiler_identity())
+            .expect("scoped do block should compile");
+        let integer_profile = matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        );
+        let one = if integer_profile {
+            Value::Integer(1)
+        } else {
+            Value::Number(1.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![one]),
+            "{profile}"
+        );
+
+        let compiled = OwnedCompiler::default()
+            .compile(&returning, profile, compiler_identity())
+            .expect("returning do block should compile");
+        let seven = if integer_profile {
+            Value::Integer(7)
+        } else {
+            Value::Number(7.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![seven]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {

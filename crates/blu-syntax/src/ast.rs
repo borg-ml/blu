@@ -438,6 +438,28 @@ pub struct RepeatStatement {
     span: ByteSpan,
 }
 
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct DoStatement {
+    body: Block,
+    span: ByteSpan,
+}
+
+impl DoStatement {
+    pub(crate) const fn new(body: Block, span: ByteSpan) -> Self {
+        Self { body, span }
+    }
+
+    #[must_use]
+    pub const fn body(&self) -> &Block {
+        &self.body
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl RepeatStatement {
     pub(crate) const fn new(body: Block, condition: ExpressionId, span: ByteSpan) -> Self {
         Self {
@@ -504,6 +526,7 @@ pub enum Statement {
     If(IfStatement),
     While(WhileStatement),
     Repeat(RepeatStatement),
+    Do(DoStatement),
     Break(BreakStatement),
     Continue(ContinueStatement),
     Return(ReturnStatement),
@@ -520,6 +543,7 @@ impl Statement {
             Self::If(statement) => statement.span(),
             Self::While(statement) => statement.span(),
             Self::Repeat(statement) => statement.span(),
+            Self::Do(statement) => statement.span(),
             Self::Break(statement) => statement.span(),
             Self::Continue(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
@@ -559,6 +583,7 @@ impl Block {
                 }
                 Statement::While(statement) => statement.body().node_count(),
                 Statement::Repeat(statement) => statement.body().node_count(),
+                Statement::Do(statement) => statement.body().node_count(),
                 _ => 0,
             };
             count.saturating_add(1).saturating_add(nested)

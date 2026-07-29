@@ -158,6 +158,9 @@ owned `if`/`elseif`/`else` statements. Nested blocks own their statement lists,
 branch locals leave resolver scope at the block boundary, and local debug
 ranges end at that boundary. A conditional whose every branch returns does
 not acquire an artificial fallthrough return.
+Profile-neutral `do`/`end` statements create the same lexical binding and
+debug-range boundary without a runtime branch. If their body terminates,
+lowering omits unreachable statements that follow in the enclosing block.
 BluV1 separately feature-gates backward `Jump` targets. Validation records the
 definitely initialized registers at each declared back-edge target and rejects
 an edge that cannot preserve that entry state. The owned compiler uses this

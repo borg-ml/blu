@@ -93,6 +93,9 @@ short-circuit evaluation in every profile.
 Structured `if`/`elseif`/`else` blocks execute through the same validated
 forward control flow, retain branch-local lexical scope, and support
 path-terminating returns.
+Shared `do`/`end` blocks provide explicit lexical scope without adding a
+control-flow branch; unreachable statements after an unconditional nested
+return are not emitted.
 Block-scoped `while` loops add separately feature-gated backward branches;
 validation records the target's definite-initialization state, and runtime
 execution remains subject to the VM instruction limit.

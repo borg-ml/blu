@@ -13,9 +13,9 @@ mod parser;
 
 pub use ast::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
-    BreakStatement, ContinueStatement, Expression, ExpressionId, ExpressionKind, Identifier,
-    IfClause, IfStatement, LocalListStatement, LocalStatement, RepeatStatement, ReturnStatement,
-    Statement, UnaryExpression, UnaryOperator, WhileStatement,
+    BreakStatement, ContinueStatement, DoStatement, Expression, ExpressionId, ExpressionKind,
+    Identifier, IfClause, IfStatement, LocalListStatement, LocalStatement, RepeatStatement,
+    ReturnStatement, Statement, UnaryExpression, UnaryOperator, WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 

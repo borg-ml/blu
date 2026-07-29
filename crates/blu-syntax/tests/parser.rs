@@ -417,6 +417,28 @@ fn repeat_loops_own_a_body_and_trailing_condition() {
 }
 
 #[test]
+fn do_blocks_are_shared_and_own_nested_statements() {
+    for profile in SemanticProfile::ALL {
+        let source_file = source(b"do local value = 1\nvalue = value + 1 end".to_vec());
+        let parsed = accepted(&source_file, profile, ParseLimits::default());
+        let Statement::Do(statement) = &parsed.ast().statements()[0] else {
+            panic!("expected do statement");
+        };
+        assert_eq!(statement.body().statements().len(), 2);
+        assert_eq!(
+            source_file.slice(statement.span()).unwrap(),
+            source_file.bytes()
+        );
+    }
+
+    let missing_end = source(b"do local value = 1".to_vec());
+    let outcome = parse(&missing_end, SemanticProfile::Blu, ParseLimits::default())
+        .expect("parsing should complete");
+    let rejected = outcome.rejected().expect("missing end should be rejected");
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0025");
+}
+
+#[test]
 fn break_is_scoped_to_loop_bodies_and_terminates_its_block() {
     let source_file = source(b"while true do if ready then break end end".to_vec());
     let parsed = accepted(&source_file, SemanticProfile::Blu, ParseLimits::default());

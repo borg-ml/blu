@@ -524,7 +524,7 @@ impl<'a> Lowerer<'a> {
     }
 
     fn lower_statements(&mut self, statements: &[Statement]) -> Result<bool, OwnedCompileError> {
-        for (index, statement) in statements.iter().enumerate() {
+        for statement in statements {
             let terminated = match statement {
                 Statement::Local(local) => {
                     self.lower_local(*local)?;
@@ -551,6 +551,12 @@ impl<'a> Lowerer<'a> {
                     self.lower_repeat(statement)?;
                     false
                 }
+                Statement::Do(statement) => {
+                    let scope = self.bindings.len();
+                    let terminated = self.lower_statements(statement.body().statements())?;
+                    self.close_scope(scope)?;
+                    terminated
+                }
                 Statement::Break(statement) => {
                     self.lower_break(statement.span())?;
                     true
@@ -565,11 +571,6 @@ impl<'a> Lowerer<'a> {
                 }
             };
             if terminated {
-                if index + 1 != statements.len() {
-                    return Err(OwnedCompileError::InternalInvariant {
-                        message: "parser exposed a statement after a terminating statement",
-                    });
-                }
                 return Ok(true);
             }
         }

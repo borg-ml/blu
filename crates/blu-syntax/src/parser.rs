@@ -1,9 +1,9 @@
 use crate::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
-    BreakStatement, ContinueStatement, DialectDirective, Expression, ExpressionId, ExpressionKind,
-    Identifier, IfClause, IfStatement, LexError, Lexed, LexerLimits, LocalListStatement,
-    LocalStatement, RepeatStatement, ReturnStatement, Statement, Token, TokenKind, UnaryExpression,
-    UnaryOperator, WhileStatement, lex,
+    BreakStatement, ContinueStatement, DialectDirective, DoStatement, Expression, ExpressionId,
+    ExpressionKind, Identifier, IfClause, IfStatement, LexError, Lexed, LexerLimits,
+    LocalListStatement, LocalStatement, RepeatStatement, ReturnStatement, Statement, Token,
+    TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -345,6 +345,7 @@ impl<'a> Parser<'a> {
                 TokenKind::If => self.parse_if()?,
                 TokenKind::While => self.parse_while()?,
                 TokenKind::Repeat => self.parse_repeat()?,
+                TokenKind::Do => self.parse_do()?,
                 TokenKind::Break | TokenKind::Continue => {
                     let Some(keyword) = self.bump() else {
                         return Err(ParseError::InternalInvariant {
@@ -421,6 +422,7 @@ impl<'a> Parser<'a> {
                             "if",
                             "while",
                             "repeat",
+                            "do",
                             "break",
                             "continue",
                             "return",
@@ -581,6 +583,32 @@ impl<'a> Parser<'a> {
             body,
             condition.id,
             keyword.span().merge(condition_span)?,
+        )))
+    }
+
+    fn parse_do(&mut self) -> Result<(), ParseError> {
+        let Some(keyword) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "do parser entered without a current token",
+            });
+        };
+        let body = self.parse_nested_block(&[TokenKind::End])?;
+        if !self.at(TokenKind::End) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0025",
+                "expected `end` to close do statement",
+                &["end"],
+            )?;
+            return Ok(());
+        }
+        let Some(end) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "end check succeeded without a current token",
+            });
+        };
+        self.push_statement(Statement::Do(DoStatement::new(
+            body,
+            keyword.span().merge(end.span())?,
         )))
     }
 
