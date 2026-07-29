@@ -800,6 +800,43 @@ fn decimal_constants_follow_each_profile_numeric_policy() {
 }
 
 #[test]
+fn fractional_and_exponent_numbers_lower_for_every_profile() {
+    let source = make_source(b"return 1.5, .25, 2e3, 4.5E-2".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            compiled.artifact().main().constants,
+            [
+                Constant::Number(1.5),
+                Constant::Number(0.25),
+                Constant::Number(2_000.0),
+                Constant::Number(0.045),
+            ],
+            "{profile}"
+        );
+    }
+
+    let limits = OwnedCompileLimits {
+        max_number_literal_bytes: 4,
+        ..OwnedCompileLimits::default()
+    };
+    assert!(matches!(
+        OwnedCompiler::new(limits).compile(
+            &make_source(b"return 12.34".to_vec()),
+            SemanticProfile::Blu,
+            compiler_identity(),
+        ),
+        Err(OwnedCompileError::Limit {
+            kind: OwnedCompileLimit::NumberLiteralBytes,
+            required: 5,
+            limit: 4,
+        })
+    ));
+}
+
+#[test]
 fn source_and_debug_name_limits_are_checked_before_owned_copies() {
     let source = make_source(b"local answer = 1\nreturn answer".to_vec());
     let mut source_name_limits = OwnedCompileLimits::default();

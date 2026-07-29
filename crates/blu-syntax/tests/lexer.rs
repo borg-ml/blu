@@ -482,6 +482,41 @@ fn diagnostic_value_limits_map_through_lex_error() {
 }
 
 #[test]
+fn shared_fractional_and_exponent_decimal_forms_are_profile_neutral() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"return 1.5, .25, 2e3, 4.5E-2".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::Return,
+                TokenKind::DecimalNumber,
+                TokenKind::Comma,
+                TokenKind::DecimalNumber,
+                TokenKind::Comma,
+                TokenKind::DecimalNumber,
+                TokenKind::Comma,
+                TokenKind::DecimalNumber,
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn malformed_decimal_exponents_are_structured() {
+    let source = source(b"return 1e+".to_vec());
+    let lexed = lex(&source, SemanticProfile::Lua54, LexerLimits::default()).unwrap();
+    assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0009");
+    assert_eq!(lexed.diagnostics()[0].found(), Some(b"e+".as_slice()));
+    assert_eq!(
+        significant_kinds(&lexed),
+        [TokenKind::Return, TokenKind::DecimalNumber]
+    );
+}
+
+#[test]
 fn only_a_byte_zero_directive_participates_in_reconciliation() {
     let source = source(b"\n--!dialect lua54\nreturn 1".to_vec());
     let lexed = lex(&source, SemanticProfile::Lua53, LexerLimits::default()).unwrap();

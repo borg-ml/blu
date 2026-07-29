@@ -48,7 +48,9 @@ and runtime semantics exist. The separate `blu-syntax` crate now implements a
 bounded byte lexer and small parser/AST slice for the first owned-frontend
 program. It includes byte-zero dialect directives, stable raw-byte spans,
 retained trivia, the documented `//` profile gate, `local name = expression`,
-bare or expression-list `return`, nil/boolean/decimal-integer/identifier expressions,
+bare or expression-list `return`, nil/boolean/identifier expressions, shared
+decimal integers plus the digit-bearing fraction/exponent subset (`1.5`, `.25`,
+`2e3`, and `4.5e-2`),
 single- and double-quoted byte strings with the common Lua/Luau escaped delimiters,
 backslash, and `\a`/`\b`/`\f`/`\n`/`\r`/`\t`/`\v`, and
 `+`/`-`/`*`/`/`/`%`/`^`/`//`

@@ -489,6 +489,21 @@ fn nil_and_boolean_literals_have_distinct_ast_kinds() {
 }
 
 #[test]
+fn decimal_number_literals_have_a_distinct_ast_kind() {
+    let source = source(b"return 1.5, .25, 2e3".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+    for value in statement.values() {
+        assert_eq!(
+            parsed.ast().expression(*value).unwrap().kind(),
+            ExpressionKind::DecimalNumber
+        );
+    }
+}
+
+#[test]
 fn quoted_string_literal_retains_delimiters_in_its_ast_span() {
     let source = source(b"return 'blu'".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());

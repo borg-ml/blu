@@ -47,6 +47,8 @@ pub struct OwnedCompileLimits {
     pub max_return_values: usize,
     /// Maximum decimal-token length; defaults to 256 bytes.
     pub max_integer_literal_bytes: usize,
+    /// Maximum fractional or exponent-form decimal-token length.
+    pub max_number_literal_bytes: usize,
 }
 
 impl Default for OwnedCompileLimits {
@@ -62,6 +64,7 @@ impl Default for OwnedCompileLimits {
             // Bounded independently from source size while permitting the
             // decimal-to-float fallback used by the supported profiles.
             max_integer_literal_bytes: 256,
+            max_number_literal_bytes: 256,
         }
     }
 }
@@ -74,6 +77,7 @@ pub enum OwnedCompileLimit {
     Instructions,
     ReturnValues,
     IntegerLiteralBytes,
+    NumberLiteralBytes,
     StringLiteralBytes,
     TotalConstantBytes,
     SourceNameBytes,
@@ -90,6 +94,7 @@ impl fmt::Display for OwnedCompileLimit {
             Self::Instructions => formatter.write_str("instructions"),
             Self::ReturnValues => formatter.write_str("return values"),
             Self::IntegerLiteralBytes => formatter.write_str("integer literal bytes"),
+            Self::NumberLiteralBytes => formatter.write_str("number literal bytes"),
             Self::StringLiteralBytes => formatter.write_str("string literal bytes"),
             Self::TotalConstantBytes => formatter.write_str("total constant bytes"),
             Self::SourceNameBytes => formatter.write_str("source identity name bytes"),
@@ -696,6 +701,19 @@ impl<'a> Lowerer<'a> {
                 )?;
                 Ok(destination)
             }
+            ExpressionKind::DecimalNumber => {
+                let constant = self.decimal_number_constant(expression.span())?;
+                let constant_index = self.push_constant(constant)?;
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::LoadConstant {
+                        destination,
+                        constant: constant_index,
+                    },
+                    expression.span(),
+                )?;
+                Ok(destination)
+            }
             ExpressionKind::StringLiteral => {
                 let constant = self.string_constant(expression.span())?;
                 self.lower_constant(constant, expression.span())
@@ -921,6 +939,25 @@ impl<'a> Lowerer<'a> {
             .parse::<f64>()
             .map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "validated decimal-integer text failed numeric parsing",
+            })?;
+        Ok(Constant::Number(number))
+    }
+
+    fn decimal_number_constant(&self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {
+        let bytes = self.source.slice(span)?;
+        check_limit(
+            OwnedCompileLimit::NumberLiteralBytes,
+            bytes.len(),
+            self.limits.max_number_literal_bytes,
+        )?;
+        let text =
+            core::str::from_utf8(bytes).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "decimal-number AST is not ASCII",
+            })?;
+        let number = text
+            .parse::<f64>()
+            .map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "validated decimal-number text failed numeric parsing",
             })?;
         Ok(Constant::Number(number))
     }

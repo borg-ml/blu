@@ -135,6 +135,7 @@ pub enum TokenKind {
     False,
     Identifier,
     DecimalInteger,
+    DecimalNumber,
     StringLiteral,
     Equal,
     Comma,
@@ -433,11 +434,44 @@ pub fn lex(
                 TokenKind::RightParenthesis
             }
             b'0'..=b'9' => {
-                offset += 1;
-                while offset < bytes.len() && bytes[offset].is_ascii_digit() {
-                    offset += 1;
+                let scan = scan_decimal(bytes, start);
+                offset = scan.end;
+                if let Some(exponent) = scan.malformed_exponent {
+                    let span = source.span(exponent, offset)?;
+                    let diagnostic = diagnostic(
+                        "BLU-LEX-0009",
+                        explicit_profile,
+                        span,
+                        "decimal exponent requires at least one digit",
+                        limits.diagnostic_limits,
+                    )?
+                    .try_with_found(&bytes[exponent..offset])?
+                    .try_with_expected("decimal exponent digit")?;
+                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                 }
-                TokenKind::DecimalInteger
+                if scan.is_integer {
+                    TokenKind::DecimalInteger
+                } else {
+                    TokenKind::DecimalNumber
+                }
+            }
+            b'.' if bytes.get(offset + 1).is_some_and(u8::is_ascii_digit) => {
+                let scan = scan_decimal(bytes, start);
+                offset = scan.end;
+                if let Some(exponent) = scan.malformed_exponent {
+                    let span = source.span(exponent, offset)?;
+                    let diagnostic = diagnostic(
+                        "BLU-LEX-0009",
+                        explicit_profile,
+                        span,
+                        "decimal exponent requires at least one digit",
+                        limits.diagnostic_limits,
+                    )?
+                    .try_with_found(&bytes[exponent..offset])?
+                    .try_with_expected("decimal exponent digit")?;
+                    push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                }
+                TokenKind::DecimalNumber
             }
             byte if is_identifier_start(byte) => {
                 offset += 1;
@@ -480,6 +514,53 @@ pub fn lex(
         tokens,
         diagnostics,
     })
+}
+
+#[derive(Clone, Copy)]
+struct DecimalScan {
+    end: usize,
+    is_integer: bool,
+    malformed_exponent: Option<usize>,
+}
+
+fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
+    let mut offset = start;
+    let mut is_integer = true;
+    if bytes[offset] == b'.' {
+        is_integer = false;
+        offset += 1;
+    }
+    while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+        offset += 1;
+    }
+    if bytes.get(offset) == Some(&b'.') && bytes.get(offset + 1).is_some_and(u8::is_ascii_digit) {
+        is_integer = false;
+        offset += 1;
+        while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+            offset += 1;
+        }
+    }
+    let mut malformed_exponent = None;
+    if matches!(bytes.get(offset), Some(b'e' | b'E')) {
+        is_integer = false;
+        let exponent = offset;
+        offset += 1;
+        if matches!(bytes.get(offset), Some(b'+' | b'-')) {
+            offset += 1;
+        }
+        let digits = offset;
+        while offset < bytes.len() && bytes[offset].is_ascii_digit() {
+            offset += 1;
+        }
+        if offset == digits {
+            malformed_exponent = Some(exponent);
+        }
+    }
+    DecimalScan {
+        end: offset,
+        is_integer,
+        malformed_exponent,
+    }
 }
 
 fn is_initial_directive(bytes: &[u8]) -> bool {

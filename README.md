@@ -41,7 +41,9 @@ claim of complete Luau, Lua, or Blu compatibility.
 
 The first Blu-owned frontend substrate is also present: `blu-syntax` performs
 bounded byte-oriented lexing and parses the initial local/assignment-list/return arithmetic
-slice, including nil, boolean, and quoted byte-string literals with the common
+slice, including nil, boolean, shared decimal integers plus digit-bearing
+fraction/exponent forms (`1.5`, `.25`, `2e3`, `4.5e-2`),
+and quoted byte-string literals with the common
 Lua/Luau escaped delimiters, backslash, and single-letter control escapes
 plus semicolon separators, grouping parentheses, and profile-neutral
 `+`/`-`/`*`/`/`/`%`/`^`, into a spanned arena AST with explicit profile
@@ -53,6 +55,8 @@ profiles. Unary `#` measures byte strings, returning an integer for Lua
 5.3–5.5 and a number elsewhere; table length remains outside this frontend
 slice. Exponentiation follows the shared right-associative precedence above
 unary operators and always produces a number.
+Hexadecimal numerals, hexadecimal floats, numeric separators, and other
+profile-specific numeral extensions remain explicitly unsupported.
 `blu_compiler::owned::OwnedCompiler` resolves and lowers that slice into
 canonical BluV1 artifacts without native linkage or fallback; the same
 explicit-profile API is available from the public facade as
