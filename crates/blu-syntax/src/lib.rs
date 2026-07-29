@@ -144,6 +144,7 @@ pub enum TokenKind {
     Star,
     Slash,
     Percent,
+    Caret,
     FloorDivide,
     LeftParenthesis,
     RightParenthesis,
@@ -360,6 +361,10 @@ pub fn lex(
             b'%' => {
                 offset += 1;
                 TokenKind::Percent
+            }
+            b'^' => {
+                offset += 1;
+                TokenKind::Caret
             }
             quote @ (b'\'' | b'"') => {
                 offset += 1;

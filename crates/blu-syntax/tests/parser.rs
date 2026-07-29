@@ -345,6 +345,37 @@ fn modulo_shares_multiplication_precedence_and_is_left_associative() {
 }
 
 #[test]
+fn exponentiation_is_right_associative_and_binds_across_unary_negation() {
+    let source = source(b"return -2^2, 2^-2, 2^3^2".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected return statement");
+    };
+
+    let leading_negation = unary(&parsed, statement.values()[0]);
+    assert_eq!(leading_negation.operator(), UnaryOperator::Negate);
+    assert_eq!(
+        binary(&parsed, leading_negation.operand()).operator(),
+        BinaryOperator::Power
+    );
+
+    let negative_exponent = binary(&parsed, statement.values()[1]);
+    assert_eq!(negative_exponent.operator(), BinaryOperator::Power);
+    assert_eq!(
+        unary(&parsed, negative_exponent.right()).operator(),
+        UnaryOperator::Negate
+    );
+
+    let chained = binary(&parsed, statement.values()[2]);
+    assert_eq!(chained.operator(), BinaryOperator::Power);
+    assert_eq!(
+        binary(&parsed, chained.right()).operator(),
+        BinaryOperator::Power
+    );
+    assert_eq!(source.slice(chained.operator_span()).unwrap(), b"^");
+}
+
+#[test]
 fn grouping_parentheses_override_precedence_and_retain_their_span() {
     let source = source(b"return (a + b) // c".to_vec());
     let parsed = accepted(&source, SemanticProfile::Lua54, ParseLimits::default());

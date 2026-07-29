@@ -560,14 +560,16 @@ impl<'a> Parser<'a> {
         };
 
         while let Some(operator_token) = self.current() {
-            let Some((operator, precedence)) = binary_operator(operator_token.kind()) else {
+            let Some((operator, precedence, right_precedence)) =
+                binary_operator(operator_token.kind())
+            else {
                 break;
             };
             if precedence < minimum_precedence {
                 break;
             }
             self.bump();
-            let Some(right) = self.parse_expression(precedence.saturating_add(1))? else {
+            let Some(right) = self.parse_expression(right_precedence)? else {
                 break;
             };
             let depth = left.depth.max(right.depth).saturating_add(1);
@@ -823,14 +825,15 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn binary_operator(kind: TokenKind) -> Option<(BinaryOperator, u8)> {
+fn binary_operator(kind: TokenKind) -> Option<(BinaryOperator, u8, u8)> {
     match kind {
-        TokenKind::Plus => Some((BinaryOperator::Add, 1)),
-        TokenKind::Minus => Some((BinaryOperator::Subtract, 1)),
-        TokenKind::Star => Some((BinaryOperator::Multiply, 2)),
-        TokenKind::Slash => Some((BinaryOperator::Divide, 2)),
-        TokenKind::Percent => Some((BinaryOperator::Modulo, 2)),
-        TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 2)),
+        TokenKind::Plus => Some((BinaryOperator::Add, 1, 2)),
+        TokenKind::Minus => Some((BinaryOperator::Subtract, 1, 2)),
+        TokenKind::Star => Some((BinaryOperator::Multiply, 2, 3)),
+        TokenKind::Slash => Some((BinaryOperator::Divide, 2, 3)),
+        TokenKind::Percent => Some((BinaryOperator::Modulo, 2, 3)),
+        TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 2, 3)),
+        TokenKind::Caret => Some((BinaryOperator::Power, 4, 4)),
         _ => None,
     }
 }

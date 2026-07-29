@@ -39,6 +39,7 @@ pub enum BinaryOperator {
     Multiply,
     Divide,
     Modulo,
+    Power,
     FloorDivide,
 }
 
