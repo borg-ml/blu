@@ -16,6 +16,7 @@ use core::fmt;
 use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
+    fmt::Write as _,
     sync::Arc,
 };
 
@@ -2726,7 +2727,7 @@ impl Vm {
                 function: "tostring",
                 index: 1,
             })?;
-            let mut result = Vec::new();
+            let mut result = try_vec_with_capacity(rendered_value_len(value), "tostring result")?;
             append_value(&mut result, value);
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -4032,16 +4033,29 @@ fn append_value(output: &mut Vec<u8>, value: &Value) {
         Value::Nil => output.extend_from_slice(b"nil"),
         Value::Boolean(true) => output.extend_from_slice(b"true"),
         Value::Boolean(false) => output.extend_from_slice(b"false"),
-        Value::Number(value) => output.extend_from_slice(value.to_string().as_bytes()),
-        Value::Integer(value) => output.extend_from_slice(value.to_string().as_bytes()),
-        Value::String(value) => output.extend_from_slice(value),
-        Value::Table(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
-        Value::Closure(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
-        Value::Thread(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
-        Value::CoroutineFunction(value) => {
-            output.extend_from_slice(format!("CoroutineFunction({value:?})").as_bytes());
+        Value::Number(value) => {
+            write!(&mut ByteWriter(output), "{value}").expect("writing to bytes cannot fail");
         }
-        Value::NativeFunction(value) => output.extend_from_slice(format!("{value:?}").as_bytes()),
+        Value::Integer(value) => {
+            write!(&mut ByteWriter(output), "{value}").expect("writing to bytes cannot fail");
+        }
+        Value::String(value) => output.extend_from_slice(value),
+        Value::Table(value) => {
+            write!(&mut ByteWriter(output), "{value:?}").expect("writing to bytes cannot fail");
+        }
+        Value::Closure(value) => {
+            write!(&mut ByteWriter(output), "{value:?}").expect("writing to bytes cannot fail");
+        }
+        Value::Thread(value) => {
+            write!(&mut ByteWriter(output), "{value:?}").expect("writing to bytes cannot fail");
+        }
+        Value::CoroutineFunction(value) => {
+            write!(&mut ByteWriter(output), "CoroutineFunction({value:?})")
+                .expect("writing to bytes cannot fail");
+        }
+        Value::NativeFunction(value) => {
+            write!(&mut ByteWriter(output), "{value:?}").expect("writing to bytes cannot fail");
+        }
     }
 }
 
@@ -4050,15 +4064,47 @@ fn rendered_value_len(value: &Value) -> usize {
         Value::Nil => 3,
         Value::Boolean(true) => 4,
         Value::Boolean(false) => 5,
-        Value::Number(value) => value.to_string().len(),
-        Value::Integer(value) => value.to_string().len(),
+        Value::Number(value) => formatted_len(format_args!("{value}")),
+        Value::Integer(value) => formatted_len(format_args!("{value}")),
         Value::String(value) => value.len(),
-        Value::Table(value) => format!("{value:?}").len(),
-        Value::Closure(value) => format!("{value:?}").len(),
-        Value::Thread(value) => format!("{value:?}").len(),
-        Value::CoroutineFunction(value) => format!("CoroutineFunction({value:?})").len(),
-        Value::NativeFunction(value) => format!("{value:?}").len(),
+        Value::Table(value) => formatted_len(format_args!("{value:?}")),
+        Value::Closure(value) => formatted_len(format_args!("{value:?}")),
+        Value::Thread(value) => formatted_len(format_args!("{value:?}")),
+        Value::CoroutineFunction(value) => {
+            formatted_len(format_args!("CoroutineFunction({value:?})"))
+        }
+        Value::NativeFunction(value) => formatted_len(format_args!("{value:?}")),
     }
+}
+
+struct ByteWriter<'a>(&'a mut Vec<u8>);
+
+impl fmt::Write for ByteWriter<'_> {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.0.extend_from_slice(value.as_bytes());
+        Ok(())
+    }
+}
+
+#[derive(Default)]
+struct LengthWriter {
+    length: usize,
+}
+
+impl fmt::Write for LengthWriter {
+    fn write_str(&mut self, value: &str) -> fmt::Result {
+        self.length = self
+            .length
+            .checked_add(value.len())
+            .expect("a formatted runtime value cannot exceed usize");
+        Ok(())
+    }
+}
+
+fn formatted_len(arguments: fmt::Arguments<'_>) -> usize {
+    let mut writer = LengthWriter::default();
+    fmt::write(&mut writer, arguments).expect("counting formatted bytes cannot fail");
+    writer.length
 }
 
 impl fmt::Debug for Vm {
@@ -5806,6 +5852,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(result, [Value::String(Arc::from(&b"lu"[..]))]);
+    }
+
+    #[test]
+    fn runtime_value_rendering_uses_exact_single_buffers() {
+        let vm = Vm::default();
+        let values = [
+            Value::Nil,
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Number(-12.5),
+            Value::Integer(i64::MIN),
+            Value::String(Arc::from(&b"\0\xffblu"[..])),
+            vm.global(b"string").cloned().unwrap(),
+            vm.global(b"print").cloned().unwrap(),
+            Value::Thread(vm.main_thread),
+        ];
+
+        for value in values {
+            let expected = rendered_value_len(&value);
+            let mut rendered = try_vec_with_capacity(expected, "test rendering").unwrap();
+            append_value(&mut rendered, &value);
+            assert_eq!(rendered.len(), expected, "rendered {value:?}");
+            assert_eq!(rendered.capacity(), expected, "rendered {value:?}");
+        }
+
+        let tostring = match vm.global(b"tostring").cloned().unwrap() {
+            Value::NativeFunction(function) => vm.native_functions[function.0 as usize].clone(),
+            other => panic!("tostring is {other:?}"),
+        };
+        let mut vm = vm;
+        assert_eq!(
+            tostring(&mut vm, &[Value::Integer(i64::MIN)]),
+            Ok(vec![Value::String(Arc::from(
+                i64::MIN.to_string().into_bytes()
+            ))])
+        );
     }
 
     #[test]
