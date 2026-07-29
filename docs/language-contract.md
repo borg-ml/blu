@@ -158,6 +158,12 @@ owned `if`/`elseif`/`else` statements. Nested blocks own their statement lists,
 branch locals leave resolver scope at the block boundary, and local debug
 ranges end at that boundary. A conditional whose every branch returns does
 not acquire an artificial fallthrough return.
+BluV1 separately feature-gates backward `Jump` targets. Validation records the
+definitely initialized registers at each declared back-edge target and rejects
+an edge that cannot preserve that entry state. The owned compiler uses this
+substrate for block-scoped `while` loops. Every iteration, including an empty
+body, consumes the normal VM instruction budget; backward conditional branches
+and unstructured source jumps remain unsupported.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

@@ -30,7 +30,7 @@ use blu_core::{
 use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryOperator, Expression, ExpressionId,
     ExpressionKind, IfStatement, LocalListStatement, LocalStatement, ParseError, ParseLimits,
-    ParseOutcome, Rejected, ReturnStatement, Statement, UnaryOperator, parse,
+    ParseOutcome, Rejected, ReturnStatement, Statement, UnaryOperator, WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -493,6 +493,14 @@ impl<'a> Lowerer<'a> {
         }) {
             required_features = required_features | FeatureBits::FORWARD_BRANCHES;
         }
+        if self.code.iter().enumerate().any(|(pc, instruction)| {
+            matches!(
+                instruction,
+                Instruction::Jump { target } if (*target as usize) <= pc
+            )
+        }) {
+            required_features = required_features | FeatureBits::BACKWARD_BRANCHES;
+        }
         Ok(Prototype {
             profile: ast.profile(),
             source: self.source.identity().id(),
@@ -530,6 +538,10 @@ impl<'a> Lowerer<'a> {
                     false
                 }
                 Statement::If(statement) => self.lower_if(statement)?,
+                Statement::While(statement) => {
+                    self.lower_while(statement)?;
+                    false
+                }
                 Statement::Return(return_statement) => {
                     self.lower_return(return_statement)?;
                     true
@@ -585,6 +597,30 @@ impl<'a> Lowerer<'a> {
             self.patch_forward_branch(branch, end)?;
         }
         Ok(all_clauses_terminate && else_terminates)
+    }
+
+    fn lower_while(&mut self, statement: &WhileStatement) -> Result<(), OwnedCompileError> {
+        let start = self.code.len();
+        let condition = self.lower_expression(statement.condition())?;
+        let exit = self.code.len();
+        self.emit(
+            Instruction::JumpIfFalsy {
+                condition,
+                target: 0,
+            },
+            statement.span(),
+        )?;
+        let scope = self.bindings.len();
+        let terminated = self.lower_statements(statement.body().statements())?;
+        self.close_scope(scope)?;
+        if !terminated {
+            let target =
+                u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
+                    message: "loop target passed limits but cannot fit BluV1",
+                })?;
+            self.emit(Instruction::Jump { target }, statement.span())?;
+        }
+        self.patch_forward_branch(exit, self.code.len())
     }
 
     fn close_scope(&mut self, start: usize) -> Result<(), OwnedCompileError> {

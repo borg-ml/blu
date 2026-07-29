@@ -2,7 +2,7 @@ use crate::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
     DialectDirective, Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement,
     LexError, Lexed, LexerLimits, LocalListStatement, LocalStatement, ReturnStatement, Statement,
-    Token, TokenKind, UnaryExpression, UnaryOperator, lex,
+    Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -340,6 +340,7 @@ impl<'a> Parser<'a> {
                 TokenKind::Local => self.parse_local()?,
                 TokenKind::Identifier => self.parse_assignment()?,
                 TokenKind::If => self.parse_if()?,
+                TokenKind::While => self.parse_while()?,
                 TokenKind::Return => {
                     self.parse_return()?;
                     while self.at(TokenKind::Semicolon) {
@@ -366,7 +367,7 @@ impl<'a> Parser<'a> {
                     self.report_current(
                         "BLU-PARSE-0001",
                         "expected a supported statement",
-                        &["local", "assignment", "if", "return"],
+                        &["local", "assignment", "if", "while", "return"],
                     )?;
                     self.bump();
                 }
@@ -444,6 +445,45 @@ impl<'a> Parser<'a> {
         self.push_statement(Statement::If(IfStatement::new(
             clauses,
             else_body,
+            keyword.span().merge(end.span())?,
+        )))
+    }
+
+    fn parse_while(&mut self) -> Result<(), ParseError> {
+        let Some(keyword) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "while parser entered without a current token",
+            });
+        };
+        let Some(condition) = self.parse_expression(0)? else {
+            return Ok(());
+        };
+        if !self.at(TokenKind::Do) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0020",
+                "expected `do` after while condition",
+                &["do"],
+            )?;
+            return Ok(());
+        }
+        self.bump();
+        let body = self.parse_nested_block(&[TokenKind::End])?;
+        if !self.at(TokenKind::End) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0021",
+                "expected `end` to close while statement",
+                &["end"],
+            )?;
+            return Ok(());
+        }
+        let Some(end) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "end check succeeded without a current token",
+            });
+        };
+        self.push_statement(Statement::While(WhileStatement::new(
+            condition.id,
+            body,
             keyword.span().merge(end.span())?,
         )))
     }

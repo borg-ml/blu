@@ -59,13 +59,16 @@ impl FeatureBits {
     pub const COMPARISONS: Self = Self(1 << 4);
     /// Forward conditional branches with explicit absolute instruction targets.
     pub const FORWARD_BRANCHES: Self = Self(1 << 5);
+    /// Backward unconditional branches validated against target entry state.
+    pub const BACKWARD_BRANCHES: Self = Self(1 << 6);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
             | Self::FLOOR_DIVISION.0
             | Self::CONCATENATION.0
             | Self::COMPARISONS.0
-            | Self::FORWARD_BRANCHES.0,
+            | Self::FORWARD_BRANCHES.0
+            | Self::BACKWARD_BRANCHES.0,
     );
 
     #[must_use]
@@ -1154,6 +1157,20 @@ fn validate_prototype(
             feature: "comparisons",
         });
     }
+    if prototype.code.iter().enumerate().any(|(pc, instruction)| {
+        matches!(
+            instruction,
+            Instruction::Jump { target } if (*target as usize) <= pc
+        )
+    }) && !prototype
+        .required_features
+        .contains(FeatureBits::BACKWARD_BRANCHES)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "backward branches",
+        });
+    }
     if prototype.code.iter().any(|instruction| {
         matches!(
             instruction,
@@ -1213,6 +1230,22 @@ fn validate_prototype(
     initialized.resize(registers, false);
     initialized[..prototype.parameter_count as usize].fill(true);
     let mut incoming = HashMap::<usize, Vec<bool>>::new();
+    let mut backward_target_flags = Vec::new();
+    try_reserve_validation(
+        &mut backward_target_flags,
+        "backward branch target flags",
+        prototype.code.len(),
+    )?;
+    backward_target_flags.resize(prototype.code.len(), false);
+    for (pc, instruction) in prototype.code.iter().copied().enumerate() {
+        if let Instruction::Jump { target } = instruction {
+            let target = target as usize;
+            if target <= pc && target < backward_target_flags.len() {
+                backward_target_flags[target] = true;
+            }
+        }
+    }
+    let mut backward_states = HashMap::<usize, Vec<bool>>::new();
     let mut reachable = true;
     for (pc, instruction) in prototype.code.iter().copied().enumerate() {
         if let Some(branch_state) = incoming.remove(&pc) {
@@ -1231,6 +1264,36 @@ fn validate_prototype(
                 pc,
                 what: "instruction is unreachable",
             });
+        }
+        if backward_target_flags[pc] {
+            let state_bytes = backward_states
+                .len()
+                .checked_add(1)
+                .and_then(|count| count.checked_mul(registers))
+                .ok_or(ValidationError::Limit {
+                    what: "backward branch validation state bytes",
+                    actual: usize::MAX,
+                    limit: limits.max_decoded_bytes,
+                })?;
+            check_limit(
+                "backward branch validation state bytes",
+                state_bytes,
+                limits.max_decoded_bytes,
+            )?;
+            backward_states
+                .try_reserve(1)
+                .map_err(|_| ValidationError::Allocation {
+                    what: "backward branch validation targets",
+                    requested: backward_states.len().saturating_add(1),
+                })?;
+            let mut state = Vec::new();
+            try_reserve_validation(
+                &mut state,
+                "backward branch register initialization",
+                registers,
+            )?;
+            state.extend_from_slice(&initialized);
+            backward_states.insert(pc, state);
         }
         if !instruction_is_legal(prototype.profile, instruction) {
             return Err(ValidationError::InvalidInstruction {
@@ -1405,12 +1468,34 @@ fn validate_prototype(
                         pc,
                         what: "branch target does not fit this platform",
                     })?;
-                if target <= pc || target >= prototype.code.len() {
+                if target >= prototype.code.len() {
                     return Err(ValidationError::InvalidInstruction {
                         prototype: index,
                         pc,
-                        what: "branch target must be a later instruction",
+                        what: "branch target is out of bounds",
                     });
+                }
+                if target <= pc {
+                    let Some(target_state) = backward_states.get(&target) else {
+                        return Err(ValidationError::InvalidInstruction {
+                            prototype: index,
+                            pc,
+                            what: "backward branch target state is unavailable",
+                        });
+                    };
+                    if target_state
+                        .iter()
+                        .zip(&initialized)
+                        .any(|(required, current)| *required && !*current)
+                    {
+                        return Err(ValidationError::InvalidInstruction {
+                            prototype: index,
+                            pc,
+                            what: "backward branch loses initialized registers",
+                        });
+                    }
+                    reachable = false;
+                    continue;
                 }
                 if let Some(existing) = incoming.get_mut(&target) {
                     for (current, incoming) in existing.iter_mut().zip(&initialized) {

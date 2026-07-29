@@ -94,6 +94,9 @@ unsupported until loop control-flow validation is assigned.
 Structured `if`/`elseif`/`else` blocks execute through the same validated
 forward control flow, retain branch-local lexical scope, and support
 path-terminating returns.
+Block-scoped `while` loops add separately feature-gated backward branches;
+validation records the target's definite-initialization state, and runtime
+execution remains subject to the VM instruction limit.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

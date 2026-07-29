@@ -917,6 +917,38 @@ fn forward_branches_are_feature_gated_and_merge_register_initialization() {
             ..
         })
     ));
+
+    let mut loop_artifact = baseline_fixture(SemanticProfile::Blu);
+    loop_artifact.prototypes[0].required_features =
+        FeatureBits::BASELINE | FeatureBits::FORWARD_BRANCHES | FeatureBits::BACKWARD_BRANCHES;
+    loop_artifact.prototypes[0].code[1] = Instruction::JumpIfFalsy {
+        condition: 0,
+        target: 3,
+    };
+    loop_artifact.prototypes[0].code[2] = Instruction::Jump { target: 1 };
+    loop_artifact.prototypes[0].code[3] = Instruction::Return { first: 0, count: 1 };
+    let validated = ValidatedArtifact::new(loop_artifact, limits).unwrap();
+    let bytes = encode(&validated, limits).unwrap();
+    assert_eq!(
+        decode_validated(&bytes, limits).unwrap().main().code[2],
+        Instruction::Jump { target: 1 }
+    );
+    let mut loop_artifact = baseline_fixture(SemanticProfile::Blu);
+    loop_artifact.prototypes[0].code[1] = Instruction::JumpIfFalsy {
+        condition: 0,
+        target: 3,
+    };
+    loop_artifact.prototypes[0].code[2] = Instruction::Jump { target: 1 };
+    loop_artifact.prototypes[0].code[3] = Instruction::Return { first: 0, count: 1 };
+    loop_artifact.prototypes[0].required_features =
+        FeatureBits::BASELINE | FeatureBits::FORWARD_BRANCHES;
+    assert_eq!(
+        ValidatedArtifact::new(loop_artifact, limits),
+        Err(ValidationError::MissingFeature {
+            prototype: 0,
+            feature: "backward branches",
+        })
+    );
 }
 
 #[test]

@@ -400,12 +400,45 @@ impl IfStatement {
 }
 
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct WhileStatement {
+    condition: ExpressionId,
+    body: Block,
+    span: ByteSpan,
+}
+
+impl WhileStatement {
+    pub(crate) const fn new(condition: ExpressionId, body: Block, span: ByteSpan) -> Self {
+        Self {
+            condition,
+            body,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn condition(&self) -> ExpressionId {
+        self.condition
+    }
+
+    #[must_use]
+    pub const fn body(&self) -> &Block {
+        &self.body
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Statement {
     Local(LocalStatement),
     LocalList(LocalListStatement),
     Assignment(AssignmentStatement),
     AssignmentList(AssignmentListStatement),
     If(IfStatement),
+    While(WhileStatement),
     Return(ReturnStatement),
 }
 
@@ -418,6 +451,7 @@ impl Statement {
             Self::Assignment(statement) => statement.span(),
             Self::AssignmentList(statement) => statement.span(),
             Self::If(statement) => statement.span(),
+            Self::While(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
         }
     }
@@ -453,6 +487,7 @@ impl Block {
                     clauses
                         .saturating_add(statement.else_body().map_or(0, |block| block.node_count()))
                 }
+                Statement::While(statement) => statement.body().node_count(),
                 _ => 0,
             };
             count.saturating_add(1).saturating_add(nested)

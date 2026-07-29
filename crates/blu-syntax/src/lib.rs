@@ -15,6 +15,7 @@ pub use ast::{
     AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
     Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement,
     LocalListStatement, LocalStatement, ReturnStatement, Statement, UnaryExpression, UnaryOperator,
+    WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
@@ -137,6 +138,8 @@ pub enum TokenKind {
     ElseIf,
     Else,
     End,
+    While,
+    Do,
     Nil,
     True,
     False,
@@ -829,6 +832,8 @@ pub fn lex(
                     b"elseif" => TokenKind::ElseIf,
                     b"else" => TokenKind::Else,
                     b"end" => TokenKind::End,
+                    b"while" => TokenKind::While,
+                    b"do" => TokenKind::Do,
                     b"nil" => TokenKind::Nil,
                     b"true" => TokenKind::True,
                     b"false" => TokenKind::False,

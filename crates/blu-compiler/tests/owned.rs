@@ -875,6 +875,51 @@ return value"#
 }
 
 #[test]
+fn while_loops_execute_with_scoped_locals_and_instruction_limits() {
+    let source = make_source(
+        b"local index = 0\nlocal total = 0\nwhile index < 5 do\nlocal next = index + 1\nindex = next\ntotal = total + index\nend\nreturn total, index"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .required_features
+                .contains(FeatureBits::BACKWARD_BRANCHES),
+            "{profile}"
+        );
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            vec![Value::Integer(15), Value::Integer(5)]
+        } else {
+            vec![Value::Number(15.0), Value::Number(5.0)]
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(expected),
+            "{profile}"
+        );
+    }
+
+    let infinite = make_source(b"while true do end".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&infinite, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert!(matches!(
+        Vm::default()
+            .with_instruction_limit(16)
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Err(blu_runtime::RuntimeError::InstructionLimit { limit: 16 })
+    ));
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {

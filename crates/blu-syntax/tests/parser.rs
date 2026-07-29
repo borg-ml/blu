@@ -376,6 +376,19 @@ fn conditional_blocks_retain_clauses_else_and_nested_statements() {
 }
 
 #[test]
+fn while_loops_own_nested_blocks() {
+    let source =
+        source(b"while ready do local value = 1\nif value then ready = false end end".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::While(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected while statement");
+    };
+    assert_eq!(statement.body().statements().len(), 2);
+    assert!(matches!(statement.body().statements()[1], Statement::If(_)));
+    assert_eq!(source.slice(statement.span()).unwrap(), source.bytes());
+}
+
+#[test]
 fn multiplication_binds_above_addition_and_is_left_associative() {
     let source = source(b"return a + b * c * d + e".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());

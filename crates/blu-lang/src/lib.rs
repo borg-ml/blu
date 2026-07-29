@@ -473,6 +473,14 @@ return value"#
             SourceLimits::default(),
         )
         .unwrap();
+        let while_loop = SourceFile::new(
+            SourceId::new(24),
+            "while-loop.blu",
+            b"local index = 0\nlocal total = 0\nwhile index < 5 do\nlocal next = index + 1\nindex = next\ntotal = total + index\nend\nreturn total, index"
+                .to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -482,6 +490,23 @@ return value"#
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&while_loop, profile, compiler.clone())
+                .unwrap();
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                vec![Value::Integer(15), Value::Integer(5)]
+            } else {
+                vec![Value::Number(15.0), Value::Number(5.0)]
+            };
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(expected),
+                "{profile}"
+            );
             let compiled = OwnedCompiler::default()
                 .compile(&conditionals, profile, compiler.clone())
                 .unwrap();
