@@ -759,15 +759,44 @@ impl<'a> Lowerer<'a> {
             },
             statement.span(),
         )?;
-        let step_constant = if matches!(
-            self.profile,
-            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
-        ) {
-            Constant::Integer(1)
+        let (step, ascending) = if let Some(step_expression) = statement.step() {
+            let Some(sign) = self.numeric_for_step_sign(step_expression, false)? else {
+                return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                    "BLU-COMPILE-0003",
+                    Phase::Lower,
+                    self.expression(step_expression)?.span(),
+                    "numeric for step must currently be a nonzero numeric literal",
+                )?));
+            };
+            if sign == 0 {
+                return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                    "BLU-COMPILE-0004",
+                    Phase::Lower,
+                    self.expression(step_expression)?.span(),
+                    "zero numeric for step is profile-specific and not yet executable",
+                )?));
+            }
+            let source = self.lower_expression(step_expression)?;
+            let snapshot = self.allocate_register()?;
+            self.emit(
+                Instruction::Move {
+                    destination: snapshot,
+                    source,
+                },
+                statement.span(),
+            )?;
+            (snapshot, sign > 0)
         } else {
-            Constant::Number(1.0)
+            let step_constant = if matches!(
+                self.profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Constant::Integer(1)
+            } else {
+                Constant::Number(1.0)
+            };
+            (self.lower_constant(step_constant, statement.span())?, true)
         };
-        let step = self.lower_constant(step_constant, statement.span())?;
 
         let loop_scope = self.bindings.len();
         let binding_limit = self
@@ -803,8 +832,8 @@ impl<'a> Lowerer<'a> {
         self.emit(
             Instruction::LessEqual {
                 destination: condition,
-                left: index,
-                right: limit,
+                left: if ascending { index } else { limit },
+                right: if ascending { limit } else { index },
             },
             statement.span(),
         )?;
@@ -864,6 +893,37 @@ impl<'a> Lowerer<'a> {
             self.patch_forward_branch(branch, end)?;
         }
         self.close_scope(loop_scope)
+    }
+
+    fn numeric_for_step_sign(
+        &self,
+        expression: ExpressionId,
+        negated: bool,
+    ) -> Result<Option<i8>, OwnedCompileError> {
+        let expression = self.expression(expression)?;
+        let sign = match expression.kind() {
+            ExpressionKind::DecimalInteger => {
+                Some(constant_sign(self.decimal_constant(expression.span())?))
+            }
+            ExpressionKind::DecimalNumber => Some(constant_sign(
+                self.decimal_number_constant(expression.span())?,
+            )),
+            ExpressionKind::HexInteger => {
+                Some(constant_sign(self.hex_integer_constant(expression.span())?))
+            }
+            ExpressionKind::HexNumber => {
+                Some(constant_sign(self.hex_number_constant(expression.span())?))
+            }
+            ExpressionKind::BinaryInteger => Some(constant_sign(
+                self.binary_integer_constant(expression.span())?,
+            )),
+            ExpressionKind::Group(inner) => return self.numeric_for_step_sign(inner, negated),
+            ExpressionKind::Unary(unary) if unary.operator() == UnaryOperator::Negate => {
+                return self.numeric_for_step_sign(unary.operand(), !negated);
+            }
+            _ => None,
+        };
+        Ok(sign.map(|sign| if negated { -sign } else { sign }))
     }
 
     fn lower_break(&mut self, span: ByteSpan) -> Result<(), OwnedCompileError> {
@@ -1908,6 +1968,16 @@ fn copy_string(value: &str, what: &'static str) -> Result<String, OwnedCompileEr
         })?;
     copied.push_str(value);
     Ok(copied)
+}
+
+fn constant_sign(constant: Constant) -> i8 {
+    match constant {
+        Constant::Integer(value) => value.signum() as i8,
+        Constant::Number(value) if value > 0.0 => 1,
+        Constant::Number(value) if value < 0.0 => -1,
+        Constant::Number(_) => 0,
+        _ => 0,
+    }
 }
 
 fn copy_bytes(bytes: &[u8], what: &'static str) -> Result<Vec<u8>, OwnedCompileError> {

@@ -439,7 +439,7 @@ fn do_blocks_are_shared_and_own_nested_statements() {
 }
 
 #[test]
-fn numeric_for_retains_controls_body_and_explicit_step_rejection() {
+fn numeric_for_retains_controls_body_and_optional_step() {
     for profile in SemanticProfile::ALL {
         let source_file = source(b"for index = 1, 3 do local value = index end".to_vec());
         let parsed = accepted(&source_file, profile, ParseLimits::default());
@@ -454,12 +454,11 @@ fn numeric_for_retains_controls_body_and_explicit_step_rejection() {
     }
 
     let explicit_step = source(b"for index = 3, 1, -1 do end".to_vec());
-    let outcome = parse(&explicit_step, SemanticProfile::Blu, ParseLimits::default())
-        .expect("parsing should complete");
-    let rejected = outcome
-        .rejected()
-        .expect("explicit step should be rejected");
-    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0029");
+    let parsed = accepted(&explicit_step, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::NumericFor(statement) = &parsed.ast().statements()[0] else {
+        panic!("expected numeric for statement");
+    };
+    assert!(statement.step().is_some());
 }
 
 #[test]

@@ -449,6 +449,7 @@ pub struct NumericForStatement {
     name: Identifier,
     initial: ExpressionId,
     limit: ExpressionId,
+    step: Option<ExpressionId>,
     body: Block,
     span: ByteSpan,
 }
@@ -458,6 +459,7 @@ impl NumericForStatement {
         name: Identifier,
         initial: ExpressionId,
         limit: ExpressionId,
+        step: Option<ExpressionId>,
         body: Block,
         span: ByteSpan,
     ) -> Self {
@@ -465,6 +467,7 @@ impl NumericForStatement {
             name,
             initial,
             limit,
+            step,
             body,
             span,
         }
@@ -483,6 +486,11 @@ impl NumericForStatement {
     #[must_use]
     pub const fn limit(&self) -> ExpressionId {
         self.limit
+    }
+
+    #[must_use]
+    pub const fn step(&self) -> Option<ExpressionId> {
+        self.step
     }
 
     #[must_use]

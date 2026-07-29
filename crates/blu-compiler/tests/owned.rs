@@ -1112,6 +1112,56 @@ fn numeric_for_snapshots_bounds_scopes_index_and_supports_loop_control() {
 }
 
 #[test]
+fn numeric_for_accepts_nonzero_literal_steps_and_rejects_unresolved_zero_behavior() {
+    let descending = make_source(
+        b"local total = 0\nfor index = 5, 1, -2 do total = total + index end\nreturn total"
+            .to_vec(),
+    );
+    let fractional = make_source(
+        b"local total = 0\nfor index = 1, 2, 0.5 do total = total + index end\nreturn total"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&descending, profile, compiler_identity())
+            .expect("negative literal step should compile");
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Value::Integer(9)
+        } else {
+            Value::Number(9.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
+
+        let compiled = OwnedCompiler::default()
+            .compile(&fractional, profile, compiler_identity())
+            .expect("positive fractional step should compile");
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Number(4.5)]),
+            "{profile}"
+        );
+    }
+
+    for bytes in [
+        b"for index = 1, 3, 0 do end".as_slice(),
+        b"local step = 1\nfor index = 1, 3, step do end".as_slice(),
+    ] {
+        let source = make_source(bytes.to_vec());
+        let error = OwnedCompiler::default()
+            .compile(&source, SemanticProfile::Blu, compiler_identity())
+            .expect_err("unassigned step semantics should fail explicitly");
+        assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
+    }
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {

@@ -658,14 +658,12 @@ impl<'a> Parser<'a> {
         let Some(limit) = self.parse_expression(0)? else {
             return Ok(());
         };
-        if self.at(TokenKind::Comma) {
-            self.report_current(
-                "BLU-PARSE-0029",
-                "explicit numeric for steps are not yet supported",
-                &["do"],
-            )?;
-            return Ok(());
-        }
+        let step = if self.at(TokenKind::Comma) {
+            self.bump();
+            self.parse_expression(0)?.map(|expression| expression.id)
+        } else {
+            None
+        };
         if !self.at(TokenKind::Do) {
             self.report_current_or_eof(
                 "BLU-PARSE-0030",
@@ -696,6 +694,7 @@ impl<'a> Parser<'a> {
             name,
             initial.id,
             limit.id,
+            step,
             body,
             keyword.span().merge(end.span())?,
         )))
