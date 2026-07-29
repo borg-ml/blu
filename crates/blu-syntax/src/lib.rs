@@ -150,6 +150,7 @@ pub enum TokenKind {
     Percent,
     Caret,
     Hash,
+    Concatenate,
     FloorDivide,
     LeftParenthesis,
     RightParenthesis,
@@ -374,6 +375,10 @@ pub fn lex(
             b'#' => {
                 offset += 1;
                 TokenKind::Hash
+            }
+            b'.' if bytes.get(offset + 1) == Some(&b'.') => {
+                offset += 2;
+                TokenKind::Concatenate
             }
             b'[' if long_comment_opener(bytes, offset).is_some() => {
                 let (delimiter_len, equals) =
@@ -726,21 +731,6 @@ pub fn lex(
                         .try_with_expected("decimal exponent digit")?;
                         push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                     }
-                    if scan.adjacent_dots {
-                        let span = source.span(start, offset)?;
-                        let diagnostic = diagnostic(
-                            "BLU-LEX-0010",
-                            explicit_profile,
-                            span,
-                            "a trailing decimal point must be separated from a following dot",
-                            limits.diagnostic_limits,
-                        )?
-                        .try_with_found(&bytes[start..offset])?
-                        .try_with_help(
-                            "insert whitespace before a future concatenation operator",
-                        )?;
-                        push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
-                    }
                     if scan.has_separator && !supports_numeric_separators(explicit_profile) {
                         push_numeric_separator_diagnostic(
                             source,
@@ -834,14 +824,12 @@ struct DecimalScan {
     end: usize,
     is_integer: bool,
     malformed_exponent: Option<usize>,
-    adjacent_dots: bool,
     has_separator: bool,
 }
 
 fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
     let mut offset = start;
     let mut is_integer = true;
-    let mut adjacent_dots = false;
     let mut has_separator = false;
     let leading_dot = bytes[offset] == b'.';
     if leading_dot {
@@ -853,11 +841,15 @@ fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
         offset += 1;
     }
     if !leading_dot && bytes.get(offset) == Some(&b'.') {
-        is_integer = false;
         if bytes.get(offset + 1) == Some(&b'.') {
-            adjacent_dots = true;
-            offset += 2;
+            return DecimalScan {
+                end: offset,
+                is_integer,
+                malformed_exponent: None,
+                has_separator,
+            };
         } else {
+            is_integer = false;
             offset += 1;
         }
         while offset < bytes.len() && (bytes[offset].is_ascii_digit() || bytes[offset] == b'_') {
@@ -887,7 +879,6 @@ fn scan_decimal(bytes: &[u8], start: usize) -> DecimalScan {
         end: offset,
         is_integer,
         malformed_exponent,
-        adjacent_dots,
         has_separator,
     }
 }

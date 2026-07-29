@@ -53,8 +53,14 @@ impl FeatureBits {
     pub const INTEGER_CONSTANTS: Self = Self(1 << 1);
     /// Profile-gated numeric floor division.
     pub const FLOOR_DIVISION: Self = Self(1 << 2);
-    pub const SUPPORTED: Self =
-        Self(Self::BASELINE.0 | Self::INTEGER_CONSTANTS.0 | Self::FLOOR_DIVISION.0);
+    /// Profile-neutral string/number concatenation with independent operands.
+    pub const CONCATENATION: Self = Self(1 << 3);
+    pub const SUPPORTED: Self = Self(
+        Self::BASELINE.0
+            | Self::INTEGER_CONSTANTS.0
+            | Self::FLOOR_DIVISION.0
+            | Self::CONCATENATION.0,
+    );
 
     #[must_use]
     pub const fn empty() -> Self {
@@ -276,6 +282,11 @@ pub enum Instruction {
         left: u16,
         right: u16,
     },
+    Concatenate {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
     Return {
         first: u16,
         count: u16,
@@ -310,6 +321,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::Modulo { .. }
             | Instruction::Power { .. }
             | Instruction::FloorDivide { .. }
+            | Instruction::Concatenate { .. }
             | Instruction::Return { .. } => true,
         },
         SemanticProfile::Blu | SemanticProfile::Lua51 | SemanticProfile::Lua52 => matches!(
@@ -325,6 +337,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::Divide { .. }
                 | Instruction::Modulo { .. }
                 | Instruction::Power { .. }
+                | Instruction::Concatenate { .. }
                 | Instruction::Return { .. }
         ),
         _ => false,
@@ -1068,6 +1081,19 @@ fn validate_prototype(
             feature: "floor division",
         });
     }
+    if prototype
+        .code
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::Concatenate { .. }))
+        && !prototype
+            .required_features
+            .contains(FeatureBits::CONCATENATION)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "concatenation",
+        });
+    }
     let Some(&source_len) = sources.get(&prototype.source) else {
         return Err(ValidationError::InvalidSourceMap {
             prototype: index,
@@ -1197,6 +1223,11 @@ fn validate_prototype(
                 right,
             }
             | Instruction::FloorDivide {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::Concatenate {
                 destination,
                 left,
                 right,
@@ -1474,7 +1505,8 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::Divide { .. }
                     | Instruction::Modulo { .. }
                     | Instruction::Power { .. }
-                    | Instruction::FloorDivide { .. } => 7,
+                    | Instruction::FloorDivide { .. }
+                    | Instruction::Concatenate { .. } => 7,
                     Instruction::Move { .. }
                     | Instruction::Not { .. }
                     | Instruction::Negate { .. }
@@ -1675,6 +1707,16 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 right,
             } => {
                 out.push(3);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::Concatenate {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(13);
                 put_u16(out, *destination);
                 put_u16(out, *left);
                 put_u16(out, *right);
@@ -2299,6 +2341,11 @@ fn read_prototype(
             12 => Instruction::Length {
                 destination: reader.u16()?,
                 source: reader.u16()?,
+            },
+            13 => Instruction::Concatenate {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

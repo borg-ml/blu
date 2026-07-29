@@ -89,14 +89,24 @@ pub fn translate_baseline_to_luau(
                 what: "upvalues",
             });
         }
-        if prototype
-            .code
-            .iter()
-            .any(|instruction| matches!(instruction, BluInstruction::FloorDivide { .. }))
-        {
+        if prototype.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                BluInstruction::FloorDivide { .. } | BluInstruction::Concatenate { .. }
+            )
+        }) {
+            let instruction = if prototype
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction, BluInstruction::FloorDivide { .. }))
+            {
+                "floor division"
+            } else {
+                "concatenation"
+            };
             return Err(TranslationError::UnsupportedInstruction {
                 prototype: prototype_index,
-                instruction: "floor division",
+                instruction,
             });
         }
 
@@ -316,6 +326,10 @@ fn translate_instruction(
         BluInstruction::FloorDivide { .. } => Err(TranslationError::UnsupportedInstruction {
             prototype,
             instruction: "floor division",
+        }),
+        BluInstruction::Concatenate { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "concatenation",
         }),
         BluInstruction::Return { first, count } => {
             let result_field = count

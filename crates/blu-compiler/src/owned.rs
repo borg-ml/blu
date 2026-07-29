@@ -476,6 +476,13 @@ impl<'a> Lowerer<'a> {
         {
             required_features = required_features | FeatureBits::FLOOR_DIVISION;
         }
+        if self
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::Concatenate { .. }))
+        {
+            required_features = required_features | FeatureBits::CONCATENATION;
+        }
         Ok(Prototype {
             profile: ast.profile(),
             source: self.source.identity().id(),
@@ -896,6 +903,20 @@ impl<'a> Lowerer<'a> {
                     let destination = self.allocate_register()?;
                     self.emit(
                         Instruction::FloorDivide {
+                            destination,
+                            left,
+                            right,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
+                }
+                BinaryOperator::Concatenate => {
+                    let left = self.lower_expression(binary.left())?;
+                    let right = self.lower_expression(binary.right())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::Concatenate {
                             destination,
                             left,
                             right,

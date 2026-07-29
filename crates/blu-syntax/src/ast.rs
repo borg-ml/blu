@@ -41,6 +41,7 @@ pub enum BinaryOperator {
     Modulo,
     Power,
     FloorDivide,
+    Concatenate,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]

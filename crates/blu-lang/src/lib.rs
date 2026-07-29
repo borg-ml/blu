@@ -428,6 +428,13 @@ mod tests {
             SourceLimits::default(),
         )
         .unwrap();
+        let concatenation = SourceFile::new(
+            SourceId::new(20),
+            "concatenation.blu",
+            br#"return "a" .. 1 .. 2.5, 1 + 2 .. "x""#.to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -437,6 +444,18 @@ mod tests {
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&concatenation, profile, compiler.clone())
+                .unwrap();
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![
+                    Value::String(Arc::from(&b"a12.5"[..])),
+                    Value::String(Arc::from(&b"3x"[..])),
+                ]),
+                "{profile}"
+            );
             let compiled = OwnedCompiler::default()
                 .compile(&long_string, profile, compiler.clone())
                 .unwrap();

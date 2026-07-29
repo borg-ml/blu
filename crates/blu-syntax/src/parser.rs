@@ -604,7 +604,7 @@ impl<'a> Parser<'a> {
             _ => return self.parse_primary(),
         };
         self.bump();
-        let Some(operand) = self.parse_expression(3)? else {
+        let Some(operand) = self.parse_expression(4)? else {
             return Ok(None);
         };
         let span = operator.span().merge(self.expression(operand.id)?.span())?;
@@ -836,13 +836,14 @@ impl<'a> Parser<'a> {
 
 fn binary_operator(kind: TokenKind) -> Option<(BinaryOperator, u8, u8)> {
     match kind {
-        TokenKind::Plus => Some((BinaryOperator::Add, 1, 2)),
-        TokenKind::Minus => Some((BinaryOperator::Subtract, 1, 2)),
-        TokenKind::Star => Some((BinaryOperator::Multiply, 2, 3)),
-        TokenKind::Slash => Some((BinaryOperator::Divide, 2, 3)),
-        TokenKind::Percent => Some((BinaryOperator::Modulo, 2, 3)),
-        TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 2, 3)),
-        TokenKind::Caret => Some((BinaryOperator::Power, 4, 4)),
+        TokenKind::Concatenate => Some((BinaryOperator::Concatenate, 1, 1)),
+        TokenKind::Plus => Some((BinaryOperator::Add, 2, 3)),
+        TokenKind::Minus => Some((BinaryOperator::Subtract, 2, 3)),
+        TokenKind::Star => Some((BinaryOperator::Multiply, 3, 4)),
+        TokenKind::Slash => Some((BinaryOperator::Divide, 3, 4)),
+        TokenKind::Percent => Some((BinaryOperator::Modulo, 3, 4)),
+        TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 3, 4)),
+        TokenKind::Caret => Some((BinaryOperator::Power, 5, 5)),
         _ => None,
     }
 }

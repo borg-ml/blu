@@ -631,6 +631,61 @@ fn ordinary_division_lowers_for_every_profile() {
 }
 
 #[test]
+fn concatenation_is_canonical_profile_neutral_and_directly_executable() {
+    let source = make_source(br#"return "a" .. 1 .. 2.5, 1 + 2 .. "x""#.to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .required_features
+                .contains(FeatureBits::CONCATENATION),
+            "{profile}"
+        );
+        assert_eq!(
+            compiled
+                .artifact()
+                .main()
+                .code
+                .iter()
+                .filter(|instruction| matches!(instruction, Instruction::Concatenate { .. }))
+                .count(),
+            3,
+            "{profile}"
+        );
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let translation_error = translate_baseline_to_luau(
+                decode_validated(compiled.bytes(), BluLimits::default()).unwrap(),
+                profile,
+                BluLimits::default(),
+            )
+            .unwrap_err();
+            assert!(
+                matches!(
+                    translation_error,
+                    TranslationError::UnsupportedInstruction {
+                        instruction: "concatenation",
+                        ..
+                    }
+                ),
+                "{profile}: {translation_error:?}"
+            );
+        }
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::String(std::sync::Arc::from(&b"a12.5"[..])),
+                Value::String(std::sync::Arc::from(&b"3x"[..]))
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn modulo_lowers_for_every_profile() {
     let source = make_source(b"return -7 % 3, 7 % -3".to_vec());
     for profile in SemanticProfile::ALL {

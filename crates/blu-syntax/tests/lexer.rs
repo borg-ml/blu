@@ -648,12 +648,25 @@ fn shared_fractional_and_exponent_decimal_forms_are_profile_neutral() {
 }
 
 #[test]
-fn adjacent_decimal_and_concatenation_dots_are_malformed_in_every_profile() {
+fn concatenation_is_shared_and_disambiguated_from_decimal_points() {
     for profile in SemanticProfile::ALL {
-        let source = source(b"return 1..2".to_vec());
+        let source = source(b"return 1..2, 1. .. .5".to_vec());
         let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
-        assert_eq!(lexed.diagnostics()[0].code().as_str(), "BLU-LEX-0010");
-        assert_eq!(lexed.diagnostics()[0].found(), Some(b"1..2".as_slice()));
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::Return,
+                TokenKind::DecimalInteger,
+                TokenKind::Concatenate,
+                TokenKind::DecimalInteger,
+                TokenKind::Comma,
+                TokenKind::DecimalNumber,
+                TokenKind::Concatenate,
+                TokenKind::DecimalNumber,
+            ],
+            "{profile}"
+        );
     }
 }
 

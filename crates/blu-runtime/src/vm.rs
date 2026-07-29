@@ -997,6 +997,20 @@ impl Vm {
                     )?;
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::Concatenate {
+                    destination,
+                    left,
+                    right,
+                } => {
+                    let left = blu_register(&registers, left)?.clone();
+                    let right = blu_register(&registers, right)?.clone();
+                    let value = self.concat_value(
+                        left,
+                        right,
+                        CallContext::new(&mut remaining, 0, GcRoots::default()),
+                    )?;
+                    set_blu_register(&mut registers, destination, value)?;
+                }
                 BluInstruction::Return { first, count } => {
                     let start = usize::from(first);
                     let end =

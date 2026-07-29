@@ -47,7 +47,7 @@ and quoted or long-bracket byte-string literals. Quoted strings implement the
 shared escapes plus explicit profile rules for byte, Unicode, whitespace, and
 line-continuation escapes; long strings use profile-specific newline handling
 plus semicolon separators, grouping parentheses, and profile-neutral
-`+`/`-`/`*`/`/`/`%`/`^`, into a spanned arena AST with explicit profile
+`+`/`-`/`*`/`/`/`%`/`^` plus right-associative `..`, into a spanned arena AST with explicit profile
 reconciliation. Unary `not`
 follows common Lua truthiness and produces a boolean under every profile;
 unary `-` preserves integers in Lua 5.3–5.5 and negates numbers in the other

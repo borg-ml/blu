@@ -131,6 +131,11 @@ lone CR bytes; Lua 5.1–5.5 normalize them to LF, and Blu explicitly chooses th
 Lua normalization rule. Per-constant and aggregate payload limits are checked
 before allocation. A bare return uses a zero-width validated register
 range and produces no values.
+The canonical concatenation instruction names independent left and right
+registers and executes string/number coercion directly for every profile.
+The Luau bootstrap translator rejects it explicitly because Luau's range-form
+opcode requires verified contiguous operands; it does not silently rewrite
+canonical register semantics.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success
