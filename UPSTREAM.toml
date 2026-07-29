@@ -7,6 +7,11 @@ typeinfo_min = 1
 typeinfo_max = 3
 typeinfo_target = 3
 
+[source_compiler]
+crate = "luau0-src"
+version = "0.20.7+luau728"
+luau_release = 728
+
 [[lua]]
 dialect = "lua51"
 version = "5.1.5"

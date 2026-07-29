@@ -27,6 +27,7 @@ execution coverage, not yet a claim of complete Luau, Lua, or Blu compatibility.
 ## Repository layout
 
 - `blu-lang`: public facade crate for embedding Blu.
+- `blu-compiler`: isolated in-process Luau source compiler adapter.
 - `blu-bytecode`: versioned Luau instruction decoding and serialized chunk loading.
 - `blu-runtime`: values, heap, interpreter, interruption, and Rust host API.
 - `blu-conformance`: differential execution against pinned Luau and Lua runtimes.
@@ -46,6 +47,15 @@ defined in [docs/language-contract.md](docs/language-contract.md).
 
 Rust applications should depend on the `blu-lang` crate. The bare `blu` name on
 crates.io belongs to an unrelated project.
+
+```rust
+use blu_lang::{Engine, Value};
+
+let values = Engine::default()
+    .execute("return 20 + 22")
+    .expect("valid Blu source");
+assert_eq!(values, vec![Value::Number(42.0)]);
+```
 
 ## Intended embedders
 

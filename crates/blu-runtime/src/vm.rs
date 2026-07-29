@@ -18,6 +18,7 @@ pub struct Vm {
     globals: HashMap<Arc<[u8]>, Value>,
     native_functions: Vec<NativeFunction>,
     protected_call: Option<NativeFunctionId>,
+    error_handler_call: Option<NativeFunctionId>,
     output: Vec<u8>,
     active_roots: Vec<Vec<Value>>,
 }
@@ -39,6 +40,7 @@ impl Vm {
             globals: HashMap::new(),
             native_functions: Vec::new(),
             protected_call: None,
+            error_handler_call: None,
             output: Vec::new(),
             active_roots: Vec::new(),
         };
@@ -939,6 +941,51 @@ impl Vm {
                         ],
                     });
                 }
+                if self.error_handler_call == Some(function) {
+                    let target = arguments.first().cloned().ok_or(RuntimeError::Argument {
+                        function: "xpcall",
+                        index: 1,
+                    })?;
+                    let handler = arguments.get(1).cloned().ok_or(RuntimeError::Argument {
+                        function: "xpcall",
+                        index: 2,
+                    })?;
+                    let result = self.call_value(
+                        chunk,
+                        target,
+                        arguments.get(2..).unwrap_or_default(),
+                        remaining,
+                        depth,
+                        roots.clone(),
+                    );
+                    return Ok(match result {
+                        Ok(values) => {
+                            let mut protected = Vec::with_capacity(values.len() + 1);
+                            protected.push(Value::Boolean(true));
+                            protected.extend(values);
+                            protected
+                        }
+                        Err(error) => {
+                            let handled = self.call_value(
+                                chunk,
+                                handler,
+                                &[runtime_error_value(error)],
+                                remaining,
+                                depth,
+                                roots,
+                            );
+                            match handled {
+                                Ok(values) => vec![
+                                    Value::Boolean(false),
+                                    values.into_iter().next().unwrap_or(Value::Nil),
+                                ],
+                                Err(error) => {
+                                    vec![Value::Boolean(false), runtime_error_value(error)]
+                                }
+                            }
+                        }
+                    });
+                }
                 let function = self
                     .native_functions
                     .get(function.0 as usize)
@@ -1364,6 +1411,65 @@ impl Vm {
             Ok(vec![Value::String(Arc::from(value.type_name().as_bytes()))])
         });
         self.set_global(&b"type"[..], Value::NativeFunction(type_function));
+        self.set_global(&b"typeof"[..], Value::NativeFunction(type_function));
+
+        let tonumber = self.register_function(|_, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "tonumber",
+                index: 1,
+            })?;
+            let base = arguments
+                .get(1)
+                .map(|value| {
+                    value.as_number().ok_or(RuntimeError::Type {
+                        operation: "tonumber",
+                        expected: "number",
+                        actual: value.type_name(),
+                    })
+                })
+                .transpose()?
+                .unwrap_or(10.0) as u32;
+            if !(2..=36).contains(&base) {
+                return Err(RuntimeError::ConversionBase(base));
+            }
+            if base == 10
+                && let Some(value) = value.as_number()
+            {
+                return Ok(vec![Value::Number(value)]);
+            }
+            let Value::String(value) = value else {
+                return if base == 10 {
+                    Ok(vec![Value::Nil])
+                } else {
+                    Err(RuntimeError::Type {
+                        operation: "tonumber",
+                        expected: "string",
+                        actual: value.type_name(),
+                    })
+                };
+            };
+            let Ok(value) = std::str::from_utf8(value) else {
+                return Ok(vec![Value::Nil]);
+            };
+            let value = value.trim();
+            let parsed = if base == 10 {
+                value.parse::<f64>().ok()
+            } else {
+                let (negative, digits) = value
+                    .strip_prefix('-')
+                    .map_or((false, value), |digits| (true, digits));
+                let digits = digits.strip_prefix('+').unwrap_or(digits);
+                u64::from_str_radix(digits, base).ok().map(|value| {
+                    if negative {
+                        -(value as f64)
+                    } else {
+                        value as f64
+                    }
+                })
+            };
+            Ok(vec![parsed.map_or(Value::Nil, Value::Number)])
+        });
+        self.set_global(&b"tonumber"[..], Value::NativeFunction(tonumber));
 
         let tostring = self.register_function(|_, arguments| {
             let value = arguments.first().ok_or(RuntimeError::Argument {
@@ -1550,6 +1656,10 @@ impl Vm {
         let pcall = self.register_function(|_, _| Err(RuntimeError::NativeFunction(u32::MAX)));
         self.protected_call = Some(pcall);
         self.set_global(&b"pcall"[..], Value::NativeFunction(pcall));
+
+        let xpcall = self.register_function(|_, _| Err(RuntimeError::NativeFunction(u32::MAX)));
+        self.error_handler_call = Some(xpcall);
+        self.set_global(&b"xpcall"[..], Value::NativeFunction(xpcall));
 
         let print = self.register_function(|vm, arguments| {
             for (index, value) in arguments.iter().enumerate() {
@@ -1944,6 +2054,13 @@ fn concat_bytes(value: &Value) -> Option<Vec<u8>> {
     }
 }
 
+fn runtime_error_value(error: RuntimeError) -> Value {
+    match error {
+        RuntimeError::Raised(value) => value,
+        error => Value::String(Arc::from(error.to_string().into_bytes())),
+    }
+}
+
 fn append_value(output: &mut Vec<u8>, value: &Value) {
     match value {
         Value::Nil => output.extend_from_slice(b"nil"),
@@ -1968,6 +2085,7 @@ impl fmt::Debug for Vm {
             .field("globals", &self.globals)
             .field("native_function_count", &self.native_functions.len())
             .field("protected_call", &self.protected_call)
+            .field("error_handler_call", &self.error_handler_call)
             .field("active_frame_count", &self.active_roots.len())
             .finish_non_exhaustive()
     }
@@ -2458,6 +2576,7 @@ pub enum RuntimeError {
         position: i64,
         length: usize,
     },
+    ConversionBase(u32),
 }
 
 impl fmt::Display for RuntimeError {
@@ -2557,6 +2676,9 @@ impl fmt::Display for RuntimeError {
                 f,
                 "{function} position {position} is invalid for length {length}"
             ),
+            Self::ConversionBase(base) => {
+                write!(f, "tonumber base {base} is outside the range 2..=36")
+            }
         }
     }
 }

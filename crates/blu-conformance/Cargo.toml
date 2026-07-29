@@ -10,5 +10,6 @@ authors.workspace = true
 publish = false
 
 [dependencies]
+blu-compiler.workspace = true
 blu-runtime.workspace = true
 tempfile.workspace = true

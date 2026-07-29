@@ -13,9 +13,19 @@ name = "blu-bytecode"
 version = "0.1.0"
 
 [[package]]
+name = "blu-compiler"
+version = "0.1.0"
+dependencies = [
+ "blu-bytecode",
+ "blu-runtime",
+ "luau0-src",
+]
+
+[[package]]
 name = "blu-conformance"
 version = "0.1.0"
 dependencies = [
+ "blu-compiler",
  "blu-runtime",
  "tempfile",
 ]
@@ -25,6 +35,7 @@ name = "blu-lang"
 version = "0.1.0"
 dependencies = [
  "blu-bytecode",
+ "blu-compiler",
  "blu-runtime",
 ]
 
@@ -33,6 +44,18 @@ name = "blu-runtime"
 version = "0.1.0"
 dependencies = [
  "blu-bytecode",
+]
+
+[[package]]
+name = "cc"
+version = "1.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5add81bb678e6cb321aff7fa0dc7689ad82b112dbc032cea19f91d6b8e3582b9"
+dependencies = [
+ "find-msvc-tools",
+ "jobserver",
+ "libc",
+ "shlex",
 ]
 
 [[package]]
@@ -58,6 +81,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "da7c62ceae207dd37ea5b845da6a0696c799f85e97da1ab5b7910be3c1c80223"
 
 [[package]]
+name = "find-msvc-tools"
+version = "0.1.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5baebc0774151f905a1a2cc41989300b1e6fbb29aff0ceffa1064fdd3088d582"
+
+[[package]]
 name = "getrandom"
 version = "0.4.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -66,6 +95,16 @@ dependencies = [
  "cfg-if",
  "libc",
  "r-efi",
+]
+
+[[package]]
+name = "jobserver"
+version = "0.1.35"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1c00acbd29eabad4a2392fa0e921c874934dbbf4194312ad20f04a0ed67a3cb3"
+dependencies = [
+ "getrandom",
+ "libc",
 ]
 
 [[package]]
@@ -79,6 +118,15 @@ name = "linux-raw-sys"
 version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "32a66949e030da00e8c7d4434b251670a91556f4144941d37452769c25d58a53"
+
+[[package]]
+name = "luau0-src"
+version = "0.20.7+luau728"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6aa644236297645ba62215330b2a2d60cf7ee6263c33578baf8e54662868ed59"
+dependencies = [
+ "cc",
+]
 
 [[package]]
 name = "once_cell"
@@ -104,6 +152,12 @@ dependencies = [
  "linux-raw-sys",
  "windows-sys",
 ]
+
+[[package]]
+name = "shlex"
+version = "2.0.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
 name = "tempfile"

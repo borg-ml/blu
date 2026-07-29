@@ -1,6 +1,6 @@
 [package]
-name = "blu-lang"
-description = "High-performance Lua-family language and Rust runtime"
+name = "blu-compiler"
+description = "In-process Luau source compiler adapter for Blu"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -10,5 +10,9 @@ authors.workspace = true
 
 [dependencies]
 blu-bytecode.workspace = true
-blu-compiler.workspace = true
+
+[build-dependencies]
+luau0-src = "=0.20.7"
+
+[dev-dependencies]
 blu-runtime.workspace = true

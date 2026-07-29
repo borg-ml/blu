@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/blu-bytecode",
+    "crates/blu-compiler",
     "crates/blu-conformance",
     "crates/blu-lang",
     "crates/blu-runtime",
@@ -17,5 +18,6 @@ authors = ["Borg contributors"]
 
 [workspace.dependencies]
 blu-bytecode = { version = "0.1.0", path = "crates/blu-bytecode" }
+blu-compiler = { version = "0.1.0", path = "crates/blu-compiler" }
 blu-runtime = { version = "0.1.0", path = "crates/blu-runtime" }
 tempfile = "3.23"

@@ -1,3 +1,4 @@
+use blu_compiler::Compiler as SourceCompiler;
 use blu_runtime::{
     Value, Vm,
     bytecode::{LoadLimits, disassemble, load},
@@ -446,6 +447,42 @@ local result = math.abs(-3) + math.floor(2.9) + math.ceil(2.1) + math.sqrt(16)
     + (math.pi > 3 and 1 or 0) + (math.huge > 1e300 and 1 or 0)
 print(type(result) .. ":" .. tostring(result))
 "#;
+const ERROR_HANDLER_CALL_SOURCE: &str = r#"
+local ok, value = xpcall(function(input)
+    return input * 2
+end, function(message)
+    return "unexpected"
+end, 5)
+local failed, message = xpcall(function()
+    error("boom")
+end, function(caught)
+    return "handled:" .. type(caught)
+end)
+return ok and value == 10 and not failed and message == "handled:string"
+"#;
+const ERROR_HANDLER_CALL_REFERENCE_SOURCE: &str = r#"
+local ok, value = xpcall(function(input)
+    return input * 2
+end, function(message)
+    return "unexpected"
+end, 5)
+local failed, message = xpcall(function()
+    error("boom")
+end, function(caught)
+    return "handled:" .. type(caught)
+end)
+local result = ok and value == 10 and not failed and message == "handled:string"
+print(type(result) .. ":" .. tostring(result))
+"#;
+const NUMBER_CONVERSION_SOURCE: &str = r#"
+return tonumber("12.5") + tonumber("ff", 16) + tonumber(3)
+    + (typeof(tonumber("invalid")) == "nil" and 1 or 0)
+"#;
+const NUMBER_CONVERSION_REFERENCE_SOURCE: &str = r#"
+local result = tonumber("12.5") + tonumber("ff", 16) + tonumber(3)
+    + (typeof(tonumber("invalid")) == "nil" and 1 or 0)
+print(type(result) .. ":" .. tostring(result))
+"#;
 
 fn main() -> ExitCode {
     match run() {
@@ -672,6 +709,22 @@ fn run() -> Result<(), String> {
         &args.upstream,
         temporary.path(),
     )?;
+    verify_program_case(
+        "error-handler protected calls",
+        ERROR_HANDLER_CALL_SOURCE,
+        ERROR_HANDLER_CALL_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    verify_program_case(
+        "number conversion",
+        NUMBER_CONVERSION_SOURCE,
+        NUMBER_CONVERSION_REFERENCE_SOURCE,
+        &compiler,
+        &args.upstream,
+        temporary.path(),
+    )?;
 
     let portable_source = temporary.path().join("portable.lua");
     fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
@@ -701,6 +754,19 @@ fn run() -> Result<(), String> {
             "Blu portable program returned unexpected output {:?}",
             String::from_utf8_lossy(&output)
         ));
+    }
+    let bundled_chunk = SourceCompiler::default()
+        .compile(PORTABLE_SOURCE)
+        .map_err(|error| format!("bundled source compiler failed portable source: {error}"))?;
+    let mut bundled_vm = Vm::default();
+    bundled_vm.execute(&bundled_chunk).map_err(|error| {
+        format!(
+            "Blu failed bytecode from bundled source compiler: {error}\n{}",
+            disassemble(&bundled_chunk)
+        )
+    })?;
+    if bundled_vm.take_output() != b"14\nlu\n" {
+        return Err("bundled source compiler produced incorrect portable output".into());
     }
     verify_portable_reference("Luau", &args.upstream, &portable_source)?;
     for (name, executable) in &lua_references {
