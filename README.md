@@ -40,7 +40,7 @@ explicitly as unimplemented. This is meaningful execution coverage, not yet a
 claim of complete Luau, Lua, or Blu compatibility.
 
 The first Blu-owned frontend substrate is also present: `blu-syntax` performs
-bounded byte-oriented lexing and parses the initial local/return arithmetic
+bounded byte-oriented lexing and parses the initial local/bare-or-valued-return arithmetic
 slice, including nil, boolean, and escape-free quoted byte-string literals
 plus grouping parentheses, into a spanned arena AST with explicit profile
 reconciliation. String escapes fail explicitly until their profile-specific

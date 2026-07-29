@@ -520,9 +520,7 @@ impl<'a> Lowerer<'a> {
         let limit = self.limits.max_return_values.min(u16::MAX as usize);
         check_limit(OwnedCompileLimit::ReturnValues, values.len(), limit)?;
         if values.is_empty() {
-            return Err(OwnedCompileError::InternalInvariant {
-                message: "parser exposed an empty return list",
-            });
+            return self.emit(Instruction::Return { first: 0, count: 0 }, statement.span());
         }
         let mut registers = allocate_vec(values.len(), "return registers")?;
         for expression_id in values.iter().copied() {

@@ -366,6 +366,46 @@ fn not_is_canonical_profile_neutral_and_bootstrap_translatable() {
 }
 
 #[test]
+fn zero_result_return_is_legal_for_every_profile_and_translates_without_a_register() {
+    let limits = BluLimits::default();
+    for profile in SemanticProfile::ALL {
+        let mut artifact = baseline_fixture(profile);
+        let prototype = &mut artifact.prototypes[0];
+        prototype.register_count = 0;
+        prototype.constants.clear();
+        prototype.code = vec![Instruction::Return { first: 0, count: 0 }];
+        prototype.source_map.truncate(1);
+        prototype.locals.clear();
+        assert!(
+            ValidatedArtifact::new(artifact, limits).is_ok(),
+            "{profile}"
+        );
+    }
+
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let mut artifact = baseline_fixture(profile);
+        let prototype = &mut artifact.prototypes[0];
+        prototype.register_count = 0;
+        prototype.constants.clear();
+        prototype.code = vec![Instruction::Return { first: 0, count: 0 }];
+        prototype.source_map.truncate(1);
+        prototype.locals.clear();
+        let translated = translate_baseline_to_luau(
+            ValidatedArtifact::new(artifact, limits).unwrap(),
+            profile,
+            limits,
+        )
+        .unwrap()
+        .into_validated_chunk()
+        .into_chunk();
+        let instruction = translated.prototypes[0].instructions[0];
+        assert_eq!(instruction.opcode(), Opcode::Return);
+        assert_eq!(instruction.a(), 0);
+        assert_eq!(instruction.b(), 1);
+    }
+}
+
+#[test]
 fn floor_division_wire_feature_and_profile_legality_are_explicit() {
     let limits = BluLimits::default();
     let instruction = Instruction::FloorDivide {

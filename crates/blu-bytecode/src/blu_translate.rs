@@ -261,7 +261,11 @@ fn translate_instruction(
                 })?;
             Ok(abc(
                 Opcode::Return,
-                register(prototype, first)?,
+                if count == 0 {
+                    0
+                } else {
+                    register(prototype, first)?
+                },
                 result_field,
                 0,
             ))

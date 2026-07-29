@@ -387,6 +387,12 @@ impl<'a> Parser<'a> {
             });
         };
         let mut values = allocate_vec(1, "return expression list")?;
+        if self.current().is_none() {
+            return self.push_statement(Statement::Return(ReturnStatement::new(
+                values,
+                keyword.span(),
+            )));
+        }
         let Some(first) = self.parse_expression(0)? else {
             return Ok(());
         };

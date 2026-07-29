@@ -48,7 +48,7 @@ and runtime semantics exist. The separate `blu-syntax` crate now implements a
 bounded byte lexer and small parser/AST slice for the first owned-frontend
 program. It includes byte-zero dialect directives, stable raw-byte spans,
 retained trivia, the documented `//` profile gate, `local name = expression`,
-expression-list `return`, nil/boolean/decimal-integer/identifier expressions,
+bare or expression-list `return`, nil/boolean/decimal-integer/identifier expressions,
 escape-free single- and double-quoted byte strings, and `+`/`//` precedence
 plus grouping parentheses and unary `not`. String escapes are rejected until their
 profile-specific rules are implemented. Parsing retains the explicit profile and rejects
@@ -65,8 +65,8 @@ that every process or host allocation is VM-accounted.
 The separate `blu_compiler::owned::OwnedCompiler`, also re-exported through
 `blu_lang::frontend`, compiles exactly this AST slice: declaration-ordered
 locals (with explicit shadowing), decimal integer
-literals, truthiness-based boolean `not`, numeric `+`, profile-gated `//`, and a final expression-list
-`return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
+literals, truthiness-based boolean `not`, numeric `+`, profile-gated `//`, and
+a final bare or expression-list `return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
 BluV1 Integer constants and use normal IEEE-754 parsing above that; Lua 5.1,
 Lua 5.2, and Luau always use the latter Number policy. Blu currently uses the
 Number policy for its bootstrap path, which is not a final Blu
@@ -106,7 +106,8 @@ the single-prototype scalar baseline slice for all seven profiles without
 translation. Baseline register moves preserve non-contiguous values without
 coercing their types. Escape-free quoted strings are copied as exact source
 bytes between their delimiters, with per-constant and aggregate payload limits
-checked before allocation.
+checked before allocation. A bare return uses a zero-width validated register
+range and produces no values.
 It also executes floor division where the dialect matrix assigns it: Luau
 numbers and Lua 5.3--5.5 integers or numbers. Integer constants remain a
 lossless storage feature, so the executor rejects them explicitly for profiles

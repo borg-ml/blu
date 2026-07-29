@@ -1126,7 +1126,7 @@ fn validate_prototype(
                         what: "return register range overflows",
                     },
                 )?;
-                if count == 0 || end > registers {
+                if end > registers {
                     return Err(ValidationError::InvalidInstruction {
                         prototype: index,
                         pc,

@@ -241,6 +241,19 @@ fn return_expression_lists_are_spanned_and_comma_separated() {
 }
 
 #[test]
+fn bare_return_has_an_empty_value_list_and_keyword_span() {
+    for bytes in [b"return".as_slice(), b"return -- done".as_slice()] {
+        let source = source(bytes.to_vec());
+        let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+        let Statement::Return(statement) = &parsed.ast().statements()[0] else {
+            panic!("expected return statement");
+        };
+        assert!(statement.values().is_empty());
+        assert_eq!(source.slice(statement.span()).unwrap(), b"return");
+    }
+}
+
+#[test]
 fn malformed_input_is_a_structural_rejection_with_stable_diagnostics() {
     let source = source(b"local = 1\nreturn value +".to_vec());
     let outcome = parse(&source, SemanticProfile::Blu, ParseLimits::default()).unwrap();
@@ -281,7 +294,7 @@ fn empty_trivia_only_and_truncated_inputs_do_not_panic() {
         assert!(parsed.ast().span().is_empty());
     }
 
-    let source = source(b"return".to_vec());
+    let source = source(b"return 1 +".to_vec());
     let outcome = parse(&source, SemanticProfile::Blu, ParseLimits::default()).unwrap();
     let rejected = outcome.rejected().unwrap();
     assert_eq!(rejected.diagnostics().len(), 1);
@@ -351,7 +364,7 @@ fn ast_depth_and_diagnostic_limits_are_structured() {
 
 #[test]
 fn diagnostic_value_limits_map_through_parse_error() {
-    let source = source(b"return".to_vec());
+    let source = source(b"return 1 +".to_vec());
     assert!(matches!(
         parse(
             &source,
