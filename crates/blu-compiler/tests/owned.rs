@@ -1605,6 +1605,88 @@ fn owned_method_calls_pass_receiver_once_before_explicit_arguments() {
 }
 
 #[test]
+fn owned_callable_tables_resume_across_call_result_forms() {
+    let source = make_source(
+        b"local callable callable = setmetatable({}, {__call = function(self, first, ...) return self == callable, first, ... end}) local scalar = callable(3) local a, b, c = callable(4, 5) local list = {callable(6, 7)} local function forward(...) return callable(...) end return scalar, a, b, c, list[1], list[2], list[3], forward(8, 9)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let number = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::Boolean(true),
+                number(4),
+                number(5),
+                Value::Boolean(true),
+                number(6),
+                number(7),
+                Value::Boolean(true),
+                number(8),
+                number(9),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_callable_table_chains_prepend_each_receiver() {
+    let source = make_source(
+        b"local outer local middle middle = setmetatable({}, {__call = function(second, first, value) return second == middle, first == outer, value end}) outer = setmetatable({}, {__call = middle}) return outer(9)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let nine = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Value::Integer(9)
+        } else {
+            Value::Number(9.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true), Value::Boolean(true), nine]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_callable_table_cycles_fail_at_the_profile_bound() {
+    let source = make_source(
+        b"local value = {} setmetatable(value, {__call = value}) return value()".to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::MetatableLoop),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_indexing_non_tables_returns_structured_type_errors() {
     for bytes in [
         br#"local value = 1; return value["key"]"#.as_slice(),

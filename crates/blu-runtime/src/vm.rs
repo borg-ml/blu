@@ -1307,6 +1307,8 @@ impl Vm {
                     } else {
                         try_clone_values(fixed_arguments, "BluV1 table call arguments")?
                     };
+                    let (function, arguments) =
+                        self.resolve_blu_callable(function, arguments, prototype.profile)?;
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
@@ -1400,6 +1402,9 @@ impl Vm {
                         register: end.saturating_sub(1),
                         count: registers.len(),
                     })?;
+                    let arguments = try_clone_values(arguments, "BluV1 call arguments")?;
+                    let (function, arguments) =
+                        self.resolve_blu_callable(function, arguments, prototype.profile)?;
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
@@ -1408,7 +1413,6 @@ impl Vm {
                                 limit: self.call_limit,
                             });
                         }
-                        let arguments = try_clone_values(arguments, "BluV1 call arguments")?;
                         let (child_artifact, child, profile, _) =
                             self.heap.blu_closure_parts(*child_closure)?;
                         let child_prototype = child_artifact
@@ -1465,8 +1469,13 @@ impl Vm {
                     }
                     let roots =
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
-                    let values =
-                        self.call_value(function, arguments, &mut remaining, callers.len(), roots)?;
+                    let values = self.call_value(
+                        function,
+                        &arguments,
+                        &mut remaining,
+                        callers.len(),
+                        roots,
+                    )?;
                     let value = values.into_iter().next().unwrap_or(Value::Nil);
                     set_blu_register(
                         &mut self.heap,
@@ -1514,6 +1523,8 @@ impl Vm {
                     } else {
                         try_clone_values(fixed_arguments, "BluV1 call arguments")?
                     };
+                    let (function, arguments) =
+                        self.resolve_blu_callable(function, arguments, prototype.profile)?;
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
@@ -1669,6 +1680,8 @@ impl Vm {
                     } else {
                         try_clone_values(fixed_arguments, "BluV1 return call arguments")?
                     };
+                    let (function, arguments) =
+                        self.resolve_blu_callable(function, arguments, prototype.profile)?;
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
@@ -4344,6 +4357,39 @@ impl Vm {
                 actual: value.type_name(),
             })
         }
+    }
+
+    fn resolve_blu_callable(
+        &self,
+        mut function: Value,
+        mut arguments: Vec<Value>,
+        profile: SemanticProfile,
+    ) -> Result<(Value, Vec<Value>), RuntimeError> {
+        for _ in 0..metatable_loop_limit(profile) {
+            let Value::Table(table) = function else {
+                return Ok((function, arguments));
+            };
+            let Some(metatable) = self.heap.table_metatable(table)? else {
+                return Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function or __call metamethod",
+                    actual: "table",
+                });
+            };
+            function = self
+                .heap
+                .table_get(metatable, &Value::String(Arc::from(&b"__call"[..])))?;
+            if matches!(function, Value::Nil) {
+                return Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function or __call metamethod",
+                    actual: "table",
+                });
+            }
+            arguments =
+                try_prefixed_values(Value::Table(table), &arguments, "BluV1 __call arguments")?;
+        }
+        Err(RuntimeError::MetatableLoop)
     }
 
     fn resolve_blu_index(

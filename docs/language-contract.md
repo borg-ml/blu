@@ -267,10 +267,14 @@ initialized argument registers, and initializes one destination. Owned postfix
 calls evaluate the callee first and each scalar argument left-to-right, then
 copy arguments to that contiguous range. Direct execution delegates to the
 existing VM call path, preserving native registration, structured errors, call
-limits, active GC roots, and callable-table behavior. The expression result is
+limits, and active GC roots. Callable tables resolve bounded `__call` chains
+before dispatch; every retry prepends its table receiver, and Blu closure
+handlers use the same explicit continuations as scalar, fixed-result, vararg,
+return, and table-list calls. Cycles fail at the profile's metatable-loop
+bound. The expression result is
 the first returned value or `nil`; additional values are discarded. Call
 statements discard that scalar result. Colon method calls evaluate their
-receiver once, perform raw table lookup before evaluating explicit arguments,
+receiver once, perform resumable table lookup before evaluating explicit arguments,
 and pass the receiver as the first argument. `FIXED_MULTI_RESULTS` adds a
 canonical call instruction with a validated, statically requested contiguous
 result range. Direct execution truncates excess results and pads missing

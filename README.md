@@ -155,8 +155,10 @@ results with `nil`. Call statements support side-effecting APIs such as
 `print`. A final call or method call in a return statement forwards every
 result. Sole Blu closure calls replace the current frame; preceding fixed
 return values remain in a GC-rooted bounded continuation and are prepended
-after the call completes. General resumable direct-BluV1 callbacks remain
-explicit later work. Owned variadic functions support scalar and fixed-width
+after the call completes. Callable tables resolve bounded `__call` chains,
+prepend every table receiver, and enter Blu closure handlers through those
+same continuations. Remaining resumable callbacks stay explicit later work.
+Owned variadic functions support scalar and fixed-width
 `...` reads with nil padding, dynamic return forwarding, and dynamic final
 call arguments, and final table-constructor expansion, including fixed
 prefixes and method receivers; active and suspended varargs remain GC roots.
