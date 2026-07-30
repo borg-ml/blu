@@ -3981,7 +3981,7 @@ fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
 #[test]
 fn base_library_counts_follow_profile_numeric_subtypes() {
     let source = make_source(
-        b"local packed=table.pack(10,nil,30) local first,second=string.byte('AZ',1,2) return rawlen('abc'),rawlen({10,20}),select('#',10,20,30),string.len('abc'),first,second,packed.n"
+        b"local packed=table.pack(10,nil,30) local first,second=string.byte('AZ',1,2) local next_key=next({10}) local iterator,state,initial=ipairs({10}) local ipairs_key=iterator(state,initial) return rawlen('abc'),rawlen({10,20}),select('#',10,20,30),string.len('abc'),first,second,packed.n,next_key,initial,ipairs_key"
             .to_vec(),
     );
     for profile in SemanticProfile::ALL {
@@ -4012,6 +4012,9 @@ fn base_library_counts_follow_profile_numeric_subtypes() {
                 integral(65),
                 integral(90),
                 integral(3),
+                integral(1),
+                integral(0),
+                integral(1),
             ]),
             "{profile}"
         );

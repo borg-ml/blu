@@ -4630,10 +4630,14 @@ impl Vm {
             })?;
             let table = table_id(table)?;
             let key = arguments.get(1).unwrap_or(&Value::Nil);
-            Ok(vm
-                .heap
-                .table_next(table, key)?
-                .map_or_else(Vec::new, |(key, value)| vec![key, value]))
+            let Some((key, value)) = vm.heap.table_next(table, key)? else {
+                return Ok(Vec::new());
+            };
+            let key = match key {
+                Value::Integer(value) => profiled_integral_math_result(vm, "next", value as f64)?,
+                key => key,
+            };
+            Ok(vec![key, value])
         });
         self.set_global(&b"next"[..], Value::NativeFunction(next));
 
@@ -4658,10 +4662,13 @@ impl Vm {
             if matches!(value, Value::Nil) {
                 Ok(Vec::new())
             } else {
-                Ok(vec![Value::Integer(index), value])
+                Ok(vec![
+                    profiled_integral_math_result(vm, "ipairs", index as f64)?,
+                    value,
+                ])
             }
         });
-        let ipairs = self.register_function(move |_, arguments| {
+        let ipairs = self.register_function(move |vm, arguments| {
             let table = arguments.first().ok_or(RuntimeError::Argument {
                 function: "ipairs",
                 index: 1,
@@ -4670,7 +4677,7 @@ impl Vm {
             Ok(vec![
                 Value::NativeFunction(inext),
                 table.clone(),
-                Value::Integer(0),
+                profiled_integral_math_result(vm, "ipairs", 0.0)?,
             ])
         });
         self.set_global(&b"ipairs"[..], Value::NativeFunction(ipairs));

@@ -413,7 +413,8 @@ hexadecimal strings, and follows profile-specific explicit-base parsing,
 non-finite spelling acceptance, and overflow behavior.
 Integral counts and bytes returned by `rawlen`, `select("#", ...)`,
 `string.len`, `string.byte`, and `table.pack.n` likewise use integers in Blu
-and Lua 5.3–5.5 and numbers in legacy profiles.
+and Lua 5.3–5.5 and numbers in legacy profiles. Array keys exposed by `next`
+and the initial and advancing indices of `ipairs` use the same profile split.
 `string.find` currently implements the common byte-oriented literal-search
 slice: relative start indices, empty needles, nil misses, and explicit
 `plain=true`. Searches without `plain` support search-relative `^`, subject-end
