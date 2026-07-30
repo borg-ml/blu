@@ -229,6 +229,12 @@ performs raw value-keyed access, and returns `nil` for absent keys. Indexing a
 non-table and invalid table keys return structured runtime errors. Indexed
 assignment lists, final-field MULTRET expansion, and metamethod-aware owned
 table access remain unsupported rather than silently approximated.
+Owned unary `#` measures the raw sequence length of tables without a `__len`
+handler, using the same profile-specific integer/number result subtype as
+string length. Lua 5.1 ignores table `__len` and therefore remains raw. Blu,
+Luau, and Lua 5.2–5.5 require the handler when present; until operation
+continuations can invoke it yieldably, that case returns the structured
+`UnsupportedMetamethod` error instead of ignoring the handler.
 BluV1 scalar fixed calls require the `FIXED_CALLS` feature bit. The instruction names
 one initialized function register and a validated contiguous range of
 initialized argument registers, and initializes one destination. Owned postfix

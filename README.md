@@ -133,6 +133,9 @@ reads and single-target writes. These execute directly through the generational
 heap, return `nil` for absent keys, and retain active registers as GC roots
 during allocation and table growth. Metamethod dispatch, indexed assignment
 lists, and final-field MULTRET expansion remain explicit later work.
+Unary `#` also measures raw table sequences. Lua 5.1 explicitly ignores
+`__len`; profiles that require a present handler fail structurally until the
+yieldable metamethod continuation is implemented.
 Bounded postfix calls evaluate the callee and fixed scalar arguments
 left-to-right and dispatch through the VM's existing
 closure/native/table-call path. Scalar contexts produce the first result or

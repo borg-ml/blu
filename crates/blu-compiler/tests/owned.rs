@@ -9,7 +9,7 @@ use blu_core::{
     CompilerId, CompilerIdentity, DiagnosticError, DiagnosticLimit, IdentityLimits, Phase,
     SemanticProfile, SourceFile, SourceId, SourceLimits,
 };
-use blu_runtime::{Dialect, Value, Vm};
+use blu_runtime::{Dialect, RuntimeError, Value, Vm};
 use sha2::{Digest, Sha256};
 
 fn make_source(bytes: impl Into<Vec<u8>>) -> SourceFile {
@@ -1569,6 +1569,56 @@ fn byte_string_length_lowers_for_every_profile() {
             3,
             "{profile}"
         );
+    }
+}
+
+#[test]
+fn owned_table_length_is_raw_or_explicitly_requires_a_metamethod_continuation() {
+    let raw = make_source(b"return #{1, 2, 3}, #{}".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&raw, profile, compiler_identity())
+            .unwrap();
+        let modern = matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                if modern {
+                    Value::Integer(3)
+                } else {
+                    Value::Number(3.0)
+                },
+                if modern {
+                    Value::Integer(0)
+                } else {
+                    Value::Number(0.0)
+                },
+            ]),
+            "{profile}"
+        );
+    }
+
+    let metamethod = make_source(
+        b"local value = setmetatable({1, 2}, {__len = function() return 9 end}) return #value"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&metamethod, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if profile == SemanticProfile::Lua51 {
+            assert_eq!(result, Ok(vec![Value::Number(2.0)]));
+        } else {
+            assert!(matches!(
+                result,
+                Err(RuntimeError::UnsupportedMetamethod { name: "__len", .. })
+            ));
+        }
     }
 }
 

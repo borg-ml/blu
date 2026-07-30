@@ -1560,16 +1560,30 @@ impl Vm {
                     source,
                 } => {
                     let source = blu_register(&registers, source)?;
-                    let Value::String(bytes) = source else {
-                        return Err(RuntimeError::Type {
-                            operation: "length",
-                            expected: "string",
-                            actual: source.type_name(),
-                        });
+                    let length = match source {
+                        Value::String(bytes) => bytes.len(),
+                        Value::Table(table) => {
+                            if prototype.profile != SemanticProfile::Lua51
+                                && let Some(handler) = self.metamethod(source, "__len")?
+                            {
+                                return Err(RuntimeError::UnsupportedMetamethod {
+                                    name: "__len",
+                                    actual: handler.type_name(),
+                                });
+                            }
+                            self.heap.table_length(*table)?
+                        }
+                        other => {
+                            return Err(RuntimeError::Type {
+                                operation: "length",
+                                expected: "string or table",
+                                actual: other.type_name(),
+                            });
+                        }
                     };
-                    let length = i64::try_from(bytes.len()).map_err(|_| {
+                    let length = i64::try_from(length).map_err(|_| {
                         RuntimeError::UnsupportedBluV1Structure {
-                            what: "string length exceeds i64",
+                            what: "length exceeds i64",
                         }
                     })?;
                     let value = if matches!(
@@ -6709,7 +6723,7 @@ mod tests {
             ),
             Err(RuntimeError::Type {
                 operation: "length",
-                expected: "string",
+                expected: "string or table",
                 actual: "boolean",
             })
         );
