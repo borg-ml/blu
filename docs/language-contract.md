@@ -329,7 +329,10 @@ argument to `math.atan`; Lua 5.3–5.5 interpret it as the `x` coordinate for
 `atan2(y, x)`. Blu selects the modern two-coordinate form and defaults `x` to
 one when omitted. `math.asin` and `math.acos` use the shared numeric contract
 in every profile, return NaN outside their real domains, and reject non-number
-arguments structurally.
+arguments structurally. `math.floor` and `math.ceil` return numbers for Luau
+and Lua 5.1–5.2. Blu follows Lua 5.3–5.5 by returning exact integers when the
+rounded value fits `i64`, retaining a floating result for finite out-of-range
+values, infinities, and NaN.
 
 ## Authority profiles
 

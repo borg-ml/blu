@@ -2376,6 +2376,41 @@ fn math_asin_and_acos_follow_the_shared_profile_contract() {
 }
 
 #[test]
+fn math_floor_and_ceil_return_profile_appropriate_numeric_subtypes() {
+    for profile in SemanticProfile::ALL {
+        let source =
+            make_source(b"return math.floor(1.8), math.ceil(-1.8), math.floor(1e100)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let modern = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default(),),
+            Ok(vec![
+                if modern {
+                    Value::Integer(1)
+                } else {
+                    Value::Number(1.0)
+                },
+                if modern {
+                    Value::Integer(-1)
+                } else {
+                    Value::Number(-1.0)
+                },
+                Value::Number(1e100),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

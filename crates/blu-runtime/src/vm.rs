@@ -4565,13 +4565,21 @@ impl Vm {
             let value = number_argument(arguments, 0, "math.abs")?;
             Ok(vec![Value::Number(value.abs())])
         });
-        let floor = self.register_function(|_, arguments| {
+        let floor = self.register_function(|vm, arguments| {
             let value = number_argument(arguments, 0, "math.floor")?;
-            Ok(vec![Value::Number(value.floor())])
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "math.floor",
+                value.floor(),
+            )?])
         });
-        let ceil = self.register_function(|_, arguments| {
+        let ceil = self.register_function(|vm, arguments| {
             let value = number_argument(arguments, 0, "math.ceil")?;
-            Ok(vec![Value::Number(value.ceil())])
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "math.ceil",
+                value.ceil(),
+            )?])
         });
         let sqrt = self.register_function(|_, arguments| {
             let value = number_argument(arguments, 0, "math.sqrt")?;
@@ -4774,6 +4782,30 @@ fn number_argument(
         expected: "number",
         actual: value.type_name(),
     })
+}
+
+fn profiled_integral_math_result(
+    vm: &Vm,
+    operation: &'static str,
+    value: f64,
+) -> Result<Value, RuntimeError> {
+    match vm.active_profile()? {
+        SemanticProfile::Luau | SemanticProfile::Lua51 | SemanticProfile::Lua52 => {
+            Ok(Value::Number(value))
+        }
+        SemanticProfile::Blu
+        | SemanticProfile::Lua53
+        | SemanticProfile::Lua54
+        | SemanticProfile::Lua55 => {
+            let upper_exclusive = -(i64::MIN as f64);
+            if value.is_finite() && value >= i64::MIN as f64 && value < upper_exclusive {
+                Ok(Value::Integer(value as i64))
+            } else {
+                Ok(Value::Number(value))
+            }
+        }
+        profile => Err(RuntimeError::UnsupportedSemanticProfile { operation, profile }),
+    }
 }
 
 fn thread_argument(
