@@ -481,7 +481,9 @@ Blu plugin is active.
 The initial shared math library includes `math.fmod` and `math.modf`.
 `math.fmod` requires two numeric arguments and uses truncating remainder
 semantics, so the result follows the dividend's sign and is intentionally
-distinct from the language `%` operator.
+distinct from the language `%` operator. Blu and Lua 5.3–5.5 preserve
+all-integer inputs and reject an integer zero divisor; Luau and Lua 5.1–5.2
+use number semantics, including NaN for a zero divisor.
 
 Serialized bytecode and mutable embedding inputs are checked again at the
 execution boundary. Loaders, compiler artifacts, and portable packages also

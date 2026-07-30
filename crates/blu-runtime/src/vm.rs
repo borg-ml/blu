@@ -6320,9 +6320,44 @@ impl Vm {
                 number_argument(arguments, 0, "math.deg")?.to_degrees(),
             )])
         });
-        let fmod = self.register_function(|_, arguments| {
-            let dividend = number_argument(arguments, 0, "math.fmod")?;
-            let divisor = number_argument(arguments, 1, "math.fmod")?;
+        let fmod = self.register_function(|vm, arguments| {
+            let dividend = arguments.first().ok_or(RuntimeError::Argument {
+                function: "math.fmod",
+                index: 1,
+            })?;
+            let divisor = arguments.get(1).ok_or(RuntimeError::Argument {
+                function: "math.fmod",
+                index: 2,
+            })?;
+            if matches!(
+                vm.active_profile()?,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                if let (Value::Integer(dividend), Value::Integer(divisor)) = (dividend, divisor) {
+                    if *divisor == 0 {
+                        return Err(RuntimeError::DivideByZero);
+                    }
+                    let result = if *dividend == i64::MIN && *divisor == -1 {
+                        0
+                    } else {
+                        dividend % divisor
+                    };
+                    return Ok(vec![Value::Integer(result)]);
+                }
+            }
+            let dividend = dividend.as_number().ok_or(RuntimeError::Type {
+                operation: "math.fmod",
+                expected: "number",
+                actual: dividend.type_name(),
+            })?;
+            let divisor = divisor.as_number().ok_or(RuntimeError::Type {
+                operation: "math.fmod",
+                expected: "number",
+                actual: divisor.type_name(),
+            })?;
             Ok(vec![Value::Number(dividend % divisor)])
         });
         let modf = self.register_function(|vm, arguments| {

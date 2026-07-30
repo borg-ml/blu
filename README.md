@@ -24,7 +24,8 @@ variadic and multiple-return calls, globals and imports, Rust native functions,
 protected calls, `pairs`/`ipairs`/`next`, string method dispatch, core
 metamethods, an initial standard library, and host-configured cached `require`.
 The math slice includes shared truncating `math.fmod`; unlike floor-based `%`,
-its remainder preserves the dividend's sign. `math.atan` follows the
+its remainder preserves the dividend's sign, with modern integer preservation
+and zero-divisor errors. `math.atan` follows the
 legacy one-argument Luau/Lua 5.1–5.2 contract or modern Blu/Lua 5.3–5.5
 `atan2(y, x)` contract according to the active profile; `math.asin` and
 `math.acos` follow the shared numeric contract. Profile-aware `math.floor` and

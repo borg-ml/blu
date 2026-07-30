@@ -3879,6 +3879,51 @@ fn math_min_and_max_preserve_selected_subtypes_and_lua_nan_ordering() {
 }
 
 #[test]
+fn math_fmod_preserves_modern_integer_semantics_and_zero_split() {
+    let source =
+        make_source(b"return math.fmod(math.floor(-7),math.floor(3)),math.fmod(-7.5,3)".to_vec());
+    let zero_source = make_source(b"return math.fmod(math.floor(7),math.floor(0))".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let modern = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                if modern {
+                    Value::Integer(-1)
+                } else {
+                    Value::Number(-1.0)
+                },
+                Value::Number(-1.5),
+            ]),
+            "{profile}"
+        );
+
+        let compiled = OwnedCompiler::default()
+            .compile(&zero_source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if modern {
+            assert_eq!(result, Err(RuntimeError::DivideByZero), "{profile}");
+        } else {
+            assert!(
+                matches!(result, Ok(values) if matches!(values.as_slice(), [Value::Number(value)] if value.is_nan())),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(
