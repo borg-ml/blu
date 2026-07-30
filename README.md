@@ -41,6 +41,8 @@ Capture-free `string.match` uses the same byte-pattern engine, limits, and
 structured unsupported-feature behavior.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
+`table.sort` provides bounded default ordering for uniform number and byte-string
+sequences; custom comparator callbacks remain explicit pending resumable calls.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
 remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,

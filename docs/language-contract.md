@@ -424,6 +424,10 @@ traces active frames, globals, threads, upvalues, and host-retained values.
 as whole-process memory. Pinned Luau returns no values from `collect`; Lua
 profiles return zero using their legacy-number or modern-integer policy. Other
 commands differ by upstream version and fail explicitly until profile-dispatched.
+`table.sort` supports bounded default ascending order for uniform numeric
+sequences without NaN and uniform byte-string sequences. It returns no values
+and accepts an omitted or nil comparator. Custom comparator callbacks and
+metamethod ordering fail explicitly until native operations can resume calls.
 
 ## Authority profiles
 

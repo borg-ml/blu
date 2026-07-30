@@ -5908,14 +5908,86 @@ impl Vm {
             }
             Ok(values)
         });
+        let sort = self.register_function(|vm, arguments| {
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.sort",
+                index: 1,
+            })?;
+            let table = table_id(table)?;
+            if arguments
+                .get(1)
+                .is_some_and(|value| !matches!(value, Value::Nil))
+            {
+                return Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "table.sort",
+                    feature: "custom comparators",
+                });
+            }
+            let length = vm.heap.table_length(table)?;
+            if length > MAX_DYNAMIC_REGISTERS {
+                return Err(RuntimeError::StackLimit {
+                    required: length,
+                    limit: MAX_DYNAMIC_REGISTERS,
+                });
+            }
+            let mut values = try_vec_with_capacity(length, "table.sort values")?;
+            for index in 1..=length {
+                values.push(vm.heap.table_get(table, &Value::Integer(index as i64))?);
+            }
+            let numeric = values
+                .iter()
+                .all(|value| value.as_number().is_some_and(|value| !value.is_nan()));
+            let strings = values.iter().all(|value| matches!(value, Value::String(_)));
+            if !numeric && !strings {
+                let actual = values
+                    .iter()
+                    .find(|value| {
+                        if numeric {
+                            value.as_number().is_none()
+                        } else {
+                            !matches!(value, Value::String(_))
+                        }
+                    })
+                    .map_or("nil", Value::type_name);
+                return Err(RuntimeError::Type {
+                    operation: "table.sort",
+                    expected: "uniform ordered numbers or strings",
+                    actual,
+                });
+            }
+            if numeric {
+                values.sort_unstable_by(|left, right| {
+                    left.as_number()
+                        .expect("numeric sort values were validated")
+                        .partial_cmp(
+                            &right
+                                .as_number()
+                                .expect("numeric sort values were validated"),
+                        )
+                        .expect("NaN sort values were rejected")
+                });
+            } else {
+                values.sort_unstable_by(|left, right| match (left, right) {
+                    (Value::String(left), Value::String(right)) => left.cmp(right),
+                    _ => unreachable!("string sort values were validated"),
+                });
+            }
+            let mut roots = GcRoots::from_values(arguments)?;
+            roots.extend(GcRoots::from_values(&values)?)?;
+            for (offset, value) in values.into_iter().enumerate() {
+                vm.table_set(table, Value::Integer((offset + 1) as i64), value, &roots)?;
+            }
+            Ok(Vec::new())
+        });
 
-        let table = self.heap.allocate_table(0, 5)?;
+        let table = self.heap.allocate_table(0, 6)?;
         for (name, function) in [
             (&b"insert"[..], insert),
             (&b"remove"[..], remove),
             (&b"concat"[..], concat),
             (&b"pack"[..], pack),
             (&b"unpack"[..], unpack),
+            (&b"sort"[..], sort),
         ] {
             self.heap.table_set(
                 table,

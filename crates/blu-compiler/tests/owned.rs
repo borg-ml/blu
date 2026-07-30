@@ -2740,6 +2740,85 @@ fn collectgarbage_rejects_unassigned_commands_and_wrong_types() {
 }
 
 #[test]
+fn table_sort_orders_number_and_string_sequences_without_results() {
+    let source = make_source(
+        b"local numbers={3,1.5,2} local result=table.sort(numbers,nil) local words={'b','aa','a'} table.sort(words) return numbers[1],numbers[2],numbers[3],words[1],words[2],words[3],result"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let two = if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            Value::Integer(2)
+        } else {
+            Value::Number(2.0)
+        };
+        let three = if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            Value::Integer(3)
+        } else {
+            Value::Number(3.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::Number(1.5),
+                two,
+                three,
+                Value::String(Arc::from(&b"a"[..])),
+                Value::String(Arc::from(&b"aa"[..])),
+                Value::String(Arc::from(&b"b"[..])),
+                Value::Nil
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn table_sort_rejects_custom_comparators_and_unordered_values() {
+    for profile in SemanticProfile::ALL {
+        for (source, expected) in [
+            (
+                b"return table.sort({2,1}, function(a,b) return a>b end)".as_slice(),
+                "comparator",
+            ),
+            (b"return table.sort({1,'a'})".as_slice(), "type"),
+        ] {
+            let source = make_source(source.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            let result = Vm::default()
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+            match expected {
+                "comparator" => assert!(matches!(
+                    result,
+                    Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "table.sort",
+                        ..
+                    })
+                )),
+                "type" => assert!(matches!(result, Err(RuntimeError::Type { .. }))),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[test]
 fn decimal_and_hexadecimal_byte_escapes_decode_by_profile() {
     let decimal = make_source(br#"return "\0\7\65\255""#.to_vec());
     for profile in SemanticProfile::ALL {
