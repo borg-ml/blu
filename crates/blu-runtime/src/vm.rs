@@ -18,7 +18,10 @@ use std::{
     borrow::Cow,
     collections::{HashMap, HashSet},
     fmt::Write as _,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 const MAX_DYNAMIC_REGISTERS: usize = 1_000_000;
@@ -153,11 +156,40 @@ impl HostRoot {
     }
 }
 
+/// A thread-safe cooperative interruption signal for a [`Vm`].
+///
+/// The interpreter observes the signal at instruction boundaries. Native host
+/// callbacks must implement their own cancellation contract when they perform
+/// long-running or blocking work.
+#[derive(Clone, Debug)]
+pub struct InterruptHandle {
+    interrupted: Arc<AtomicBool>,
+}
+
+impl InterruptHandle {
+    /// Requests interruption of the associated VM.
+    pub fn interrupt(&self) {
+        self.interrupted.store(true, Ordering::Release);
+    }
+
+    /// Clears a prior interruption request so the VM can execute again.
+    pub fn reset(&self) {
+        self.interrupted.store(false, Ordering::Release);
+    }
+
+    /// Reports whether interruption is currently requested.
+    #[must_use]
+    pub fn is_interrupted(&self) -> bool {
+        self.interrupted.load(Ordering::Acquire)
+    }
+}
+
 #[derive(Clone)]
 pub struct Vm {
     dialect: Dialect,
     active_profile: Option<SemanticProfile>,
     instruction_limit: u64,
+    interrupted: Arc<AtomicBool>,
     call_limit: usize,
     heap_object_limit: usize,
     heap: Heap,
@@ -217,6 +249,7 @@ impl Vm {
             dialect,
             active_profile: None,
             instruction_limit: 10_000_000,
+            interrupted: Arc::new(AtomicBool::new(false)),
             call_limit: 1_000,
             heap_object_limit: 1_000_000,
             heap,
@@ -270,6 +303,23 @@ impl Vm {
     pub fn with_instruction_limit(mut self, limit: u64) -> Self {
         self.instruction_limit = limit;
         self
+    }
+
+    /// Returns a cloneable handle that can cooperatively interrupt execution
+    /// from another thread.
+    #[must_use]
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        InterruptHandle {
+            interrupted: Arc::clone(&self.interrupted),
+        }
+    }
+
+    fn check_interrupted(&self) -> Result<(), RuntimeError> {
+        if self.interrupted.load(Ordering::Acquire) {
+            Err(RuntimeError::Interrupted)
+        } else {
+            Ok(())
+        }
     }
 
     #[must_use]
@@ -900,6 +950,7 @@ impl Vm {
         let mut remaining = self.instruction_limit;
         let mut pc = 0usize;
         loop {
+            self.check_interrupted()?;
             let prototype = artifact
                 .prototypes
                 .get(prototype_index)
@@ -3500,6 +3551,7 @@ impl Vm {
         depth: usize,
     ) -> Result<Vec<Value>, RuntimeError> {
         loop {
+            self.check_interrupted()?;
             self.active_profile = Some(frame.profile);
             let depth = depth + callers.len();
             if *remaining == 0 {
@@ -9692,6 +9744,7 @@ impl fmt::Debug for Vm {
         f.debug_struct("Vm")
             .field("dialect", &self.dialect)
             .field("instruction_limit", &self.instruction_limit)
+            .field("interrupted", &self.interrupted.load(Ordering::Acquire))
             .field("call_limit", &self.call_limit)
             .field("heap_object_limit", &self.heap_object_limit)
             .field("output_limit", &self.output_limit)
@@ -10622,6 +10675,7 @@ pub enum RuntimeError {
     InstructionLimit {
         limit: u64,
     },
+    Interrupted,
     CallLimit {
         limit: usize,
     },
@@ -10805,6 +10859,7 @@ impl fmt::Display for RuntimeError {
             Self::InstructionLimit { limit } => {
                 write!(f, "instruction limit {limit} exceeded")
             }
+            Self::Interrupted => f.write_str("execution interrupted"),
             Self::CallLimit { limit } => write!(f, "call depth limit {limit} exceeded"),
             Self::StackLimit { required, limit } => {
                 write!(
@@ -11652,6 +11707,43 @@ mod tests {
             .execute(&chunk)
             .unwrap_err();
         assert_eq!(error, RuntimeError::InstructionLimit { limit: 8 });
+    }
+
+    #[test]
+    fn external_interrupt_handle_stops_both_engines_and_can_be_reset() {
+        let mut vm = Vm::default();
+        let interrupt = vm.interrupt_handle();
+        let signaling_handle = interrupt.clone();
+        std::thread::spawn(move || signaling_handle.interrupt())
+            .join()
+            .unwrap();
+        assert!(interrupt.is_interrupted());
+
+        let chunk = load(RETURN_THREE_V12, LoadLimits::default()).unwrap();
+        assert_eq!(vm.execute(&chunk), Err(RuntimeError::Interrupted));
+        assert_eq!(
+            vm.execute_blu_v1(
+                validated_blu_program(
+                    SemanticProfile::Blu,
+                    vec![BluConstant::Number(42.0)],
+                    vec![
+                        BluInstruction::LoadConstant {
+                            destination: 0,
+                            constant: 0,
+                        },
+                        BluInstruction::Return { first: 0, count: 1 },
+                    ],
+                    FeatureBits::BASELINE,
+                    1,
+                ),
+                BluLimits::default(),
+            ),
+            Err(RuntimeError::Interrupted)
+        );
+
+        interrupt.reset();
+        assert!(!interrupt.is_interrupted());
+        assert_eq!(vm.execute(&chunk), Ok(vec![Value::Number(3.0)]));
     }
 
     #[test]

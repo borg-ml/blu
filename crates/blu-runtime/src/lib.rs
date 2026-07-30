@@ -21,4 +21,4 @@ pub use memory::{
     checked_reallocation_peak, checked_vector_bytes,
 };
 pub use value::{NativeFunctionId, Value};
-pub use vm::{RuntimeError, Vm};
+pub use vm::{InterruptHandle, RuntimeError, Vm};

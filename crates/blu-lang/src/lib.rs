@@ -10,7 +10,7 @@ pub use blu_compiler::{
     CompileError, CompileOptions, CompiledBytecode, Compiler, LUAU_COMPILER_RELEASE,
 };
 pub use blu_package as package;
-pub use blu_runtime::{Dialect, RuntimeError, Value, Vm};
+pub use blu_runtime::{Dialect, InterruptHandle, RuntimeError, Value, Vm};
 
 /// Explicit, Blu-owned source frontend APIs.
 ///
@@ -50,6 +50,12 @@ impl Engine {
 
     pub const fn vm_mut(&mut self) -> &mut Vm {
         &mut self.vm
+    }
+
+    /// Returns a thread-safe handle for cooperatively interrupting execution.
+    #[must_use]
+    pub fn interrupt_handle(&self) -> InterruptHandle {
+        self.vm.interrupt_handle()
     }
 
     #[must_use]

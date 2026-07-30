@@ -652,7 +652,14 @@ validation or return a structured runtime error before allocation. The VM also
 has configurable captured-output and live arena-object limits. Crossing the
 object threshold first performs tracing collection with active registers,
 callers, globals, modules, and threads rooted; retained objects then fail with
-a structured limit error. Output growth is preflighted and uses fallible
+a structured limit error. Embedders can clone `Vm::interrupt_handle` and
+request interruption safely from another thread. Both bytecode engines observe
+the persistent signal at instruction boundaries and return
+`RuntimeError::Interrupted`; resetting the handle permits later execution.
+This is cooperative VM interruption, not preemption of a currently running
+native callback. Blocking or long-running host functions must honor
+cancellation through their own declared contract.
+Output growth is preflighted and uses fallible
 reservation. Guest-driven arena, table, closure-upvalue, and thread-root
 capacity growth also uses checked fallible reservation and returns structured
 allocation errors. The runtime now exposes deterministic logical byte

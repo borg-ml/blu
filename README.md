@@ -191,6 +191,9 @@ return are not emitted.
 Block-scoped `while` loops add separately feature-gated backward branches;
 validation records the target's definite-initialization state, and runtime
 execution remains subject to the VM instruction limit.
+Embedders can also request persistent cooperative interruption from another
+thread through `Vm::interrupt_handle` or `Engine::interrupt_handle`; both
+execution engines stop with a structured error at an instruction boundary.
 Shared `break` statements are structurally restricted to loop bodies and patch
 only the innermost loop's exit, including through nested conditional blocks.
 `continue` is an explicit Blu/Luau extension that restarts the innermost loop;
