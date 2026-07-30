@@ -5495,6 +5495,95 @@ impl Vm {
             Value::String(Arc::from(&b"upper"[..])),
             Value::NativeFunction(string_upper),
         )?;
+        let string_split = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "string.split",
+                    profile,
+                });
+            }
+            let input = arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.split",
+                index: 1,
+            })?;
+            let input = try_concat_bytes(input)?.ok_or(RuntimeError::Type {
+                operation: "string.split",
+                expected: "string or number",
+                actual: input.type_name(),
+            })?;
+            let separator = match arguments.get(1) {
+                None | Some(Value::Nil) => Cow::Borrowed(&b","[..]),
+                Some(value) => try_concat_bytes(value)?.ok_or(RuntimeError::Type {
+                    operation: "string.split",
+                    expected: "string or number separator",
+                    actual: value.type_name(),
+                })?,
+            };
+            let field_count = if separator.is_empty() {
+                input.len()
+            } else {
+                let mut count = 1usize;
+                let mut start = 0usize;
+                while start <= input.len() {
+                    let Some(offset) = input[start..]
+                        .windows(separator.len())
+                        .position(|candidate| candidate == separator.as_ref())
+                    else {
+                        break;
+                    };
+                    count = count.saturating_add(1);
+                    start += offset + separator.len();
+                }
+                count
+            };
+            if field_count > MAX_TABLE_INITIAL_CAPACITY {
+                return Err(RuntimeError::TableCapacity {
+                    kind: "array",
+                    requested: field_count as u64,
+                    limit: MAX_TABLE_INITIAL_CAPACITY,
+                });
+            }
+            let roots = GcRoots::from_values(arguments)?;
+            let table = vm.allocate_table(field_count, 0, &roots)?;
+            let mut field = 0usize;
+            let mut start = 0usize;
+            if separator.is_empty() {
+                for byte in input.iter() {
+                    field += 1;
+                    vm.table_set(
+                        table,
+                        Value::Integer(field as i64),
+                        Value::String(Arc::from(std::slice::from_ref(byte))),
+                        &roots,
+                    )?;
+                }
+            } else {
+                loop {
+                    let next = input[start..]
+                        .windows(separator.len())
+                        .position(|candidate| candidate == separator.as_ref());
+                    let end = next.map_or(input.len(), |offset| start + offset);
+                    field += 1;
+                    vm.table_set(
+                        table,
+                        Value::Integer(field as i64),
+                        Value::String(Arc::from(&input[start..end])),
+                        &roots,
+                    )?;
+                    let Some(_) = next else {
+                        break;
+                    };
+                    start = end + separator.len();
+                }
+            }
+            Ok(vec![Value::Table(table)])
+        });
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"split"[..])),
+            Value::NativeFunction(string_split),
+        )?;
         self.set_global(&b"string"[..], Value::Table(string));
 
         self.install_table_library()?;

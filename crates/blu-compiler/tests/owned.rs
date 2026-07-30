@@ -4140,6 +4140,61 @@ fn luau_math_extensions_are_profile_gated_and_edge_compatible() {
 }
 
 #[test]
+fn string_split_matches_luau_byte_and_empty_field_semantics() {
+    let source = make_source(
+        b"local a=string.split('a,b,,c',',') local b=string.split('a,b') local c=string.split('ab','') local d=string.split('','') local e=string.split('a--b--','--') local f=string.split(123,'2') return #a,a[1],a[2],a[3],a[4],b[1],b[2],c[1],c[2],#d,d[1],e[1],e[2],e[3],f[1],f[2]"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let length = |value| {
+                if profile == SemanticProfile::Blu {
+                    Value::Integer(value)
+                } else {
+                    Value::Number(value as f64)
+                }
+            };
+            assert_eq!(
+                result,
+                Ok(vec![
+                    length(4),
+                    Value::String(Arc::from(&b"a"[..])),
+                    Value::String(Arc::from(&b"b"[..])),
+                    Value::String(Arc::from(&b""[..])),
+                    Value::String(Arc::from(&b"c"[..])),
+                    Value::String(Arc::from(&b"a"[..])),
+                    Value::String(Arc::from(&b"b"[..])),
+                    Value::String(Arc::from(&b"a"[..])),
+                    Value::String(Arc::from(&b"b"[..])),
+                    length(0),
+                    Value::Nil,
+                    Value::String(Arc::from(&b"a"[..])),
+                    Value::String(Arc::from(&b"b"[..])),
+                    Value::String(Arc::from(&b""[..])),
+                    Value::String(Arc::from(&b"1"[..])),
+                    Value::String(Arc::from(&b"3"[..])),
+                ]),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "string.split",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
     let source = make_source(
         b"return tonumber(' 42 '),tonumber('ff',16),tonumber('0x10'),tonumber(3),tonumber('3.0',10),tonumber('nan'),tonumber('inf'),tonumber('ffffffffffffffff',16),tonumber('0x1.8p1'),tonumber('-0x1p2'),tonumber('x')"

@@ -59,6 +59,8 @@ pairs. Zero-width `%f[set]` byte frontiers share the bracket-set engine.
 `%0`, `%1`–`%9`, `%%`, empty-match progress, replacement counts,
 profile-specific Lua 5.1 escape handling, and explicit rejection of callback
 and table-`__index` replacement paths that require resumable calls.
+Blu/Luau `string.split` produces bounded byte-string arrays with Luau-compatible
+default, empty-separator, consecutive-separator, and empty-field behavior.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
 `table.sort` provides bounded default ordering for uniform number and byte-string

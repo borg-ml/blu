@@ -466,6 +466,10 @@ reject them. The second result is the profile-typed
 replacement count. Direct table replacements select by the first capture or
 full match; callback replacements and table `__index` handlers fail
 explicitly pending resumable calls.
+Blu and Luau provide `string.split` with a default comma separator,
+non-overlapping byte-string separators, retained empty fields, and byte-wise
+splitting for an empty separator. Its output table capacity is checked before
+allocation. Lua profiles reject the Luau-only function explicitly.
 `collectgarbage` supports the shared `collect` and `count` commands. Collection
 traces active frames, globals, threads, upvalues, and host-retained values.
 `count` reports the runtime's accounted GC-heap kibibytes; it is not presented
