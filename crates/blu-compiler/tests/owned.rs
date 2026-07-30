@@ -2404,6 +2404,61 @@ fn string_find_rejects_nonportable_pattern_classes_explicitly() {
 }
 
 #[test]
+fn string_find_supports_sets_ranges_classes_and_negation() {
+    let source = make_source(
+        b"local a, b = string.find('0bZ]', '[a-c]') local c, d = string.find('0bZ]', '[^%d]') local e, f = string.find('0bZ]', '[]]') return a, b, c, d, e, f"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let index = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                index(2),
+                index(2),
+                index(2),
+                index(2),
+                index(4),
+                index(4)
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn string_find_rejects_malformed_sets_structurally() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(b"return string.find('abc', '[abc')".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "string.find",
+                feature: "malformed Lua pattern sets",
+            })
+        ));
+    }
+}
+
+#[test]
 fn string_find_preflights_pattern_work() {
     let source = make_source(
         b"return string.find(string.rep('a', 4000), string.rep('a', 3000) .. 'b')".to_vec(),

@@ -33,8 +33,8 @@ number-only legacy behavior or return modern exact integers when representable.
 Byte-oriented `string.find` supports literal searches, relative starts, empty
 needles, nil misses, explicit plain mode, basic anchors, wildcard bytes,
 portable byte classes, class negation, and escaped punctuation under a work
-limit. Unimplemented Lua-pattern syntax fails structurally instead of being
-treated as literal text.
+limit. Bracket sets support byte ranges, classes, and negation. Unimplemented
+Lua-pattern syntax fails structurally instead of being treated as literal text.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
 remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,

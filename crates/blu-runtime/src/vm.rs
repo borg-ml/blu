@@ -6162,6 +6162,7 @@ enum BasicPatternAtom {
     Literal(u8),
     Any,
     Class(u8),
+    Set([u64; 4]),
 }
 
 fn find_basic_lua_pattern(
@@ -6206,10 +6207,14 @@ fn find_basic_lua_pattern(
                 atoms.push(BasicPatternAtom::Literal(escaped));
             }
             index += 2;
-        } else if b"*+?-[]()".contains(&byte) {
+        } else if byte == b'[' {
+            let (set, next) = parse_basic_pattern_set(pattern, index)?;
+            atoms.push(BasicPatternAtom::Set(set));
+            index = next;
+        } else if b"*+?-]()".contains(&byte) {
             return Err(RuntimeError::UnsupportedLibraryFeature {
                 function: "string.find",
-                feature: "Lua pattern repetition, sets, and captures",
+                feature: "Lua pattern repetition and captures",
             });
         } else {
             atoms.push(BasicPatternAtom::Literal(byte));
@@ -6243,12 +6248,92 @@ fn find_basic_lua_pattern(
                 BasicPatternAtom::Literal(expected) => expected == byte,
                 BasicPatternAtom::Any => true,
                 BasicPatternAtom::Class(class) => byte_matches_pattern_class(*byte, *class),
+                BasicPatternAtom::Set(set) => pattern_set_contains(set, *byte),
             })
         {
             return Ok(Some((position, end)));
         }
     }
     Ok(None)
+}
+
+fn parse_basic_pattern_set(
+    pattern: &[u8],
+    start: usize,
+) -> Result<([u64; 4], usize), RuntimeError> {
+    let mut cursor = start + 1;
+    let negated = pattern.get(cursor) == Some(&b'^');
+    cursor += usize::from(negated);
+    let first_item = cursor;
+    let mut closing = None;
+    while cursor < pattern.len() {
+        if pattern[cursor] == b']' && cursor > first_item {
+            closing = Some(cursor);
+            break;
+        }
+        if pattern[cursor] == b'%' {
+            cursor = cursor.saturating_add(1);
+        }
+        cursor = cursor.saturating_add(1);
+    }
+    let closing = closing.ok_or(RuntimeError::UnsupportedLibraryFeature {
+        function: "string.find",
+        feature: "malformed Lua pattern sets",
+    })?;
+
+    let mut set = [0_u64; 4];
+    cursor = first_item;
+    while cursor < closing {
+        let byte = pattern[cursor];
+        if byte == b'%' {
+            let escaped = pattern.get(cursor + 1).copied().ok_or(
+                RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.find",
+                    feature: "malformed Lua pattern sets",
+                },
+            )?;
+            if matches!(
+                escaped.to_ascii_lowercase(),
+                b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
+            ) {
+                for candidate in u8::MIN..=u8::MAX {
+                    if byte_matches_pattern_class(candidate, escaped) {
+                        pattern_set_insert(&mut set, candidate);
+                    }
+                }
+            } else if escaped.is_ascii_alphanumeric() {
+                return Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.find",
+                    feature: "dialect-specific Lua pattern classes and captures",
+                });
+            } else {
+                pattern_set_insert(&mut set, escaped);
+            }
+            cursor += 2;
+        } else if cursor + 2 < closing && pattern[cursor + 1] == b'-' {
+            for candidate in byte..=pattern[cursor + 2] {
+                pattern_set_insert(&mut set, candidate);
+            }
+            cursor += 3;
+        } else {
+            pattern_set_insert(&mut set, byte);
+            cursor += 1;
+        }
+    }
+    if negated {
+        for word in &mut set {
+            *word = !*word;
+        }
+    }
+    Ok((set, closing + 1))
+}
+
+fn pattern_set_insert(set: &mut [u64; 4], byte: u8) {
+    set[usize::from(byte) / 64] |= 1_u64 << (byte % 64);
+}
+
+fn pattern_set_contains(set: &[u64; 4], byte: u8) -> bool {
+    set[usize::from(byte) / 64] & (1_u64 << (byte % 64)) != 0
 }
 
 fn byte_matches_pattern_class(byte: u8, class: u8) -> bool {
