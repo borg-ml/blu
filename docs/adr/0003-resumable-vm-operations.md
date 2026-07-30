@@ -1,6 +1,6 @@
 # ADR 0003: Represent yieldable VM operations as explicit continuations
 
-- Status: Draft
+- Status: Accepted
 - Date: 2026-07-29
 
 ## Context
@@ -44,6 +44,13 @@ callee's semantic profile. Resumable operations must preserve both contracts.
 
 Every VM operation that can invoke yieldable code will be represented as an
 explicit operation continuation in the owned frame engine.
+
+The first implemented non-ordinary-call consumer is BluV1 final-call
+table-list expansion: the caller record retains the destination table and
+next array index, then consumes the callee's complete result vector after a
+Blu closure or native function returns. This establishes the caller/operation
+combination permitted below; iterator, metamethod, protected-call, and library
+callback continuations remain incremental follow-up work.
 
 Before invoking user code, the VM records enough owned state to do exactly one
 of the following when the invocation finishes:

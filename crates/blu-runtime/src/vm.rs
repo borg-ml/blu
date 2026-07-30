@@ -84,6 +84,16 @@ enum BluReturnDisposition {
     Propagate(Vec<Value>),
 }
 
+enum BluIndexResolution {
+    Value(Value),
+    Call { function: Value, receiver: Value },
+}
+
+enum BluNewIndexResolution {
+    Raw(TableId),
+    Call { function: Value, receiver: Value },
+}
+
 impl GcRoots {
     fn from_values(values: &[Value]) -> Result<Self, RuntimeError> {
         Ok(Self {
@@ -975,24 +985,124 @@ impl Vm {
                     table,
                     key,
                 } => {
-                    let table = blu_register(&registers, table)?;
-                    let Value::Table(table) = table else {
+                    let table_value = blu_register(&registers, table)?;
+                    let Value::Table(table) = table_value else {
                         return Err(RuntimeError::Type {
                             operation: "table index",
                             expected: "table",
-                            actual: table.type_name(),
+                            actual: table_value.type_name(),
                         });
                     };
-                    let value = self
-                        .heap
-                        .table_get(*table, blu_register(&registers, key)?)?;
-                    set_blu_register(
-                        &mut self.heap,
-                        &mut registers,
-                        &open_upvalues,
-                        destination,
-                        value,
-                    )?;
+                    let key = blu_register(&registers, key)?.clone();
+                    match self.resolve_blu_index(*table, &key, prototype.profile)? {
+                        BluIndexResolution::Value(value) => {
+                            set_blu_register(
+                                &mut self.heap,
+                                &mut registers,
+                                &open_upvalues,
+                                destination,
+                                value,
+                            )?;
+                        }
+                        BluIndexResolution::Call { function, receiver } => {
+                            let mut arguments =
+                                try_vec_with_capacity(2, "BluV1 __index arguments")?;
+                            arguments.push(receiver);
+                            arguments.push(key);
+                            if let Value::Closure(child_closure) = &function
+                                && self.heap.is_blu_closure(*child_closure)?
+                            {
+                                if callers.len() >= self.call_limit {
+                                    return Err(RuntimeError::CallLimit {
+                                        limit: self.call_limit,
+                                    });
+                                }
+                                let (child_artifact, child, profile, _) =
+                                    self.heap.blu_closure_parts(*child_closure)?;
+                                let child_prototype = child_artifact
+                                    .prototypes
+                                    .get(child)
+                                    .ok_or(RuntimeError::InvalidPrototype(child))?;
+                                let child_constants = materialize_blu_constants(child_prototype)?;
+                                let child_register_count =
+                                    usize::from(child_prototype.register_count);
+                                let mut child_registers = try_vec_with_capacity(
+                                    child_register_count,
+                                    "BluV1 runtime registers",
+                                )?;
+                                child_registers.resize(child_register_count, Value::Nil);
+                                let copied = arguments
+                                    .len()
+                                    .min(usize::from(child_prototype.parameter_count));
+                                child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                                let child_varargs = if child_prototype.is_vararg {
+                                    try_clone_values(
+                                        arguments
+                                            .get(usize::from(child_prototype.parameter_count)..)
+                                            .unwrap_or_default(),
+                                        "BluV1 frame varargs",
+                                    )?
+                                } else {
+                                    Vec::new()
+                                };
+                                let mut child_open_upvalues = try_vec_with_capacity(
+                                    child_register_count,
+                                    "BluV1 open upvalues",
+                                )?;
+                                child_open_upvalues.resize(child_register_count, None);
+                                try_reserve_exact(&mut callers, 1, "BluV1 __index caller frame")?;
+                                callers.push(BluCaller {
+                                    artifact,
+                                    prototype: prototype_index,
+                                    constants,
+                                    registers,
+                                    varargs,
+                                    open_upvalues,
+                                    closure,
+                                    pc: pc + 1,
+                                    result: BluCallResult::Fixed {
+                                        destination,
+                                        count: 1,
+                                    },
+                                });
+                                artifact = child_artifact;
+                                prototype_index = child;
+                                constants = child_constants;
+                                registers = child_registers;
+                                varargs = child_varargs;
+                                open_upvalues = child_open_upvalues;
+                                closure = Some(*child_closure);
+                                pc = 0;
+                                self.active_profile = Some(profile);
+                                continue;
+                            }
+                            let roots = blu_frame_roots(
+                                &registers,
+                                &varargs,
+                                &open_upvalues,
+                                closure,
+                                &callers,
+                            )?;
+                            let value = self
+                                .call_value(
+                                    function,
+                                    &arguments,
+                                    &mut remaining,
+                                    callers.len(),
+                                    roots,
+                                )?
+                                .into_iter()
+                                .next()
+                                .unwrap_or(Value::Nil);
+                            set_blu_register(
+                                &mut self.heap,
+                                &mut registers,
+                                &open_upvalues,
+                                destination,
+                                value,
+                            )?;
+                        }
+                    }
                 }
                 BluInstruction::SetTable { table, key, value } => {
                     let table_value = blu_register(&registers, table)?;
@@ -1006,9 +1116,110 @@ impl Vm {
                     let table = *table;
                     let key = blu_register(&registers, key)?.clone();
                     let value = blu_register(&registers, value)?.clone();
-                    let roots =
-                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
-                    self.table_set(table, key, value, &roots)?;
+                    match self.resolve_blu_new_index(table, &key, prototype.profile)? {
+                        BluNewIndexResolution::Raw(target) => {
+                            let roots = blu_frame_roots(
+                                &registers,
+                                &varargs,
+                                &open_upvalues,
+                                closure,
+                                &callers,
+                            )?;
+                            self.table_set(target, key, value, &roots)?;
+                        }
+                        BluNewIndexResolution::Call { function, receiver } => {
+                            let mut arguments =
+                                try_vec_with_capacity(3, "BluV1 __newindex arguments")?;
+                            arguments.push(receiver);
+                            arguments.push(key);
+                            arguments.push(value);
+                            if let Value::Closure(child_closure) = &function
+                                && self.heap.is_blu_closure(*child_closure)?
+                            {
+                                if callers.len() >= self.call_limit {
+                                    return Err(RuntimeError::CallLimit {
+                                        limit: self.call_limit,
+                                    });
+                                }
+                                let (child_artifact, child, profile, _) =
+                                    self.heap.blu_closure_parts(*child_closure)?;
+                                let child_prototype = child_artifact
+                                    .prototypes
+                                    .get(child)
+                                    .ok_or(RuntimeError::InvalidPrototype(child))?;
+                                let child_constants = materialize_blu_constants(child_prototype)?;
+                                let child_register_count =
+                                    usize::from(child_prototype.register_count);
+                                let mut child_registers = try_vec_with_capacity(
+                                    child_register_count,
+                                    "BluV1 runtime registers",
+                                )?;
+                                child_registers.resize(child_register_count, Value::Nil);
+                                let copied = arguments
+                                    .len()
+                                    .min(usize::from(child_prototype.parameter_count));
+                                child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                                let child_varargs = if child_prototype.is_vararg {
+                                    try_clone_values(
+                                        arguments
+                                            .get(usize::from(child_prototype.parameter_count)..)
+                                            .unwrap_or_default(),
+                                        "BluV1 frame varargs",
+                                    )?
+                                } else {
+                                    Vec::new()
+                                };
+                                let mut child_open_upvalues = try_vec_with_capacity(
+                                    child_register_count,
+                                    "BluV1 open upvalues",
+                                )?;
+                                child_open_upvalues.resize(child_register_count, None);
+                                try_reserve_exact(
+                                    &mut callers,
+                                    1,
+                                    "BluV1 __newindex caller frame",
+                                )?;
+                                callers.push(BluCaller {
+                                    artifact,
+                                    prototype: prototype_index,
+                                    constants,
+                                    registers,
+                                    varargs,
+                                    open_upvalues,
+                                    closure,
+                                    pc: pc + 1,
+                                    result: BluCallResult::Fixed {
+                                        destination: 0,
+                                        count: 0,
+                                    },
+                                });
+                                artifact = child_artifact;
+                                prototype_index = child;
+                                constants = child_constants;
+                                registers = child_registers;
+                                varargs = child_varargs;
+                                open_upvalues = child_open_upvalues;
+                                closure = Some(*child_closure);
+                                pc = 0;
+                                self.active_profile = Some(profile);
+                                continue;
+                            }
+                            let roots = blu_frame_roots(
+                                &registers,
+                                &varargs,
+                                &open_upvalues,
+                                closure,
+                                &callers,
+                            )?;
+                            self.call_value(
+                                function,
+                                &arguments,
+                                &mut remaining,
+                                callers.len(),
+                                roots,
+                            )?;
+                        }
+                    }
                 }
                 BluInstruction::SetListVarargs { table, start } => {
                     let table_value = blu_register(&registers, table)?;
@@ -3638,6 +3849,83 @@ impl Vm {
         }
     }
 
+    fn resolve_blu_index(
+        &self,
+        mut table: TableId,
+        key: &Value,
+        profile: SemanticProfile,
+    ) -> Result<BluIndexResolution, RuntimeError> {
+        for _ in 0..metatable_loop_limit(profile) {
+            let value = self.heap.table_get(table, key)?;
+            if !matches!(value, Value::Nil) {
+                return Ok(BluIndexResolution::Value(value));
+            }
+            let Some(metatable) = self.heap.table_metatable(table)? else {
+                return Ok(BluIndexResolution::Value(Value::Nil));
+            };
+            let handler = self
+                .heap
+                .table_get(metatable, &Value::String(Arc::from(&b"__index"[..])))?;
+            match handler {
+                Value::Nil => return Ok(BluIndexResolution::Value(Value::Nil)),
+                Value::Table(next) => table = next,
+                function @ (Value::Closure(_)
+                | Value::CoroutineFunction(_)
+                | Value::NativeFunction(_)) => {
+                    return Ok(BluIndexResolution::Call {
+                        function,
+                        receiver: Value::Table(table),
+                    });
+                }
+                other => {
+                    return Err(RuntimeError::UnsupportedMetamethod {
+                        name: "__index",
+                        actual: other.type_name(),
+                    });
+                }
+            }
+        }
+        Err(RuntimeError::MetatableLoop)
+    }
+
+    fn resolve_blu_new_index(
+        &self,
+        mut table: TableId,
+        key: &Value,
+        profile: SemanticProfile,
+    ) -> Result<BluNewIndexResolution, RuntimeError> {
+        for _ in 0..metatable_loop_limit(profile) {
+            if !matches!(self.heap.table_get(table, key)?, Value::Nil) {
+                return Ok(BluNewIndexResolution::Raw(table));
+            }
+            let Some(metatable) = self.heap.table_metatable(table)? else {
+                return Ok(BluNewIndexResolution::Raw(table));
+            };
+            let handler = self
+                .heap
+                .table_get(metatable, &Value::String(Arc::from(&b"__newindex"[..])))?;
+            match handler {
+                Value::Nil => return Ok(BluNewIndexResolution::Raw(table)),
+                Value::Table(next) => table = next,
+                function @ (Value::Closure(_)
+                | Value::CoroutineFunction(_)
+                | Value::NativeFunction(_)) => {
+                    return Ok(BluNewIndexResolution::Call {
+                        function,
+                        receiver: Value::Table(table),
+                    });
+                }
+                other => {
+                    return Err(RuntimeError::UnsupportedMetamethod {
+                        name: "__newindex",
+                        actual: other.type_name(),
+                    });
+                }
+            }
+        }
+        Err(RuntimeError::MetatableLoop)
+    }
+
     fn compare_value(
         &mut self,
         opcode: Opcode,
@@ -5300,6 +5588,17 @@ fn append_blu_varargs(
     try_reserve_exact(&mut arguments, varargs.len(), what)?;
     arguments.extend(varargs.iter().cloned());
     Ok(arguments)
+}
+
+const fn metatable_loop_limit(profile: SemanticProfile) -> usize {
+    match profile {
+        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55 => 2_000,
+        SemanticProfile::Blu
+        | SemanticProfile::Luau
+        | SemanticProfile::Lua51
+        | SemanticProfile::Lua52 => 100,
+        _ => 100,
+    }
 }
 
 fn try_clone_callers(callers: &[Caller]) -> Result<Vec<Caller>, RuntimeError> {

@@ -233,9 +233,13 @@ right-hand side is evaluated; every right-hand side is then snapshotted before
 source-order commits begin. This preserves simultaneous assignment and the
 pinned `value[1], value = replacement, other` behavior. Local declarations
 likewise allocate a distinct binding register when initialized from an
-existing local, so later rebinding does not alias the two names. Final-field
-MULTRET expansion and metamethod-aware owned table access remain unsupported
-rather than silently approximated.
+existing local, so later rebinding does not alias the two names. Missing table
+reads follow `__index` table chains or invoke closure/native handlers through
+the bounded caller continuation stack; missing writes do the same for
+`__newindex`. Existing keys remain raw writes. Handler operands are
+snapshotted before invocation, and method lookup uses the same resumable read.
+Luau, Blu, Lua 5.1, and Lua 5.2 bound a chain at 100 steps; Lua 5.3–5.5 use
+their pinned 2,000-step limit.
 Owned unary `#` measures the raw sequence length of tables without a `__len`
 handler, using the same profile-specific integer/number result subtype as
 string length. Lua 5.1 ignores table `__len` and therefore remains raw. Blu,
@@ -292,8 +296,7 @@ A final call field likewise consumes every result through a resumable
 `DYNAMIC_CALL_RESULTS` table-fill continuation; suspended frames, outer
 callers, the destination table, and not-yet-inserted return values remain GC
 roots during growth. Active and saved-frame vararg vectors are GC roots.
-Metamethod-aware method lookup and general resumable direct-BluV1 callbacks
-remain unsupported.
+General resumable direct-BluV1 callbacks remain unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions
 and both `local function name(...) ... end` and simple
 `function name(...) ... end` declarations with bounded parameter vectors and

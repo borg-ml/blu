@@ -133,8 +133,9 @@ reads and single-target writes. These execute directly through the generational
 heap, return `nil` for absent keys, and retain active registers as GC roots
 during allocation and table growth. Mixed identifier/index/field assignment
 lists snapshot every target and right-hand side before committing writes.
-Metamethod dispatch and final-field MULTRET expansion remain explicit later
-work.
+Table and method reads follow `__index` table chains or resumably invoke
+closure/native handlers; writes likewise follow `__newindex` chains or
+handlers. Final-field vararg and call MULTRET expansion are implemented.
 Unary `#` also measures raw table sequences. Lua 5.1 explicitly ignores
 `__len`; profiles that require a present handler fail structurally until the
 yieldable metamethod continuation is implemented.
@@ -147,8 +148,7 @@ results with `nil`. Call statements support side-effecting APIs such as
 `print`. A final call or method call in a return statement forwards every
 result. Sole Blu closure calls replace the current frame; preceding fixed
 return values remain in a GC-rooted bounded continuation and are prepended
-after the call completes. Dynamic argument and table-constructor tails,
-metamethod-aware method lookup, and resumable direct-BluV1 calls remain
+after the call completes. General resumable direct-BluV1 callbacks remain
 explicit later work. Owned variadic functions support scalar and fixed-width
 `...` reads with nil padding, dynamic return forwarding, and dynamic final
 call arguments, and final table-constructor expansion, including fixed

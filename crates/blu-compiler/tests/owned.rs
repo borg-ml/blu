@@ -2990,6 +2990,104 @@ fn owned_table_constructors_expand_native_final_call_results() {
 }
 
 #[test]
+fn owned_table_access_invokes_resumable_index_metamethods() {
+    for bytes in [
+        b"local fallback = {value = 42} local proxy = setmetatable({}, {__index = fallback}) return proxy.value"
+            .as_slice(),
+        b"local proxy = setmetatable({}, {__index = function(self, key) return key .. \"!\" end}) return proxy.value"
+            .as_slice(),
+    ] {
+        for profile in SemanticProfile::ALL {
+            let source = make_source(bytes.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .expect("__index source should compile");
+            let expected = if bytes.starts_with(b"local fallback") {
+                if matches!(
+                    profile,
+                    SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) {
+                    Value::Integer(42)
+                } else {
+                    Value::Number(42.0)
+                }
+            } else {
+                Value::String(b"value!".to_vec().into())
+            };
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(vec![expected]),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
+fn owned_table_assignment_invokes_resumable_newindex_metamethods() {
+    for bytes in [
+        b"local target = {} local proxy = setmetatable({}, {__newindex = target}) proxy.value = 42 return target.value"
+            .as_slice(),
+        b"local target = {} local proxy = setmetatable({}, {__newindex = function(self, key, value) target[key] = value + 1 end}) proxy.value = 41 return target.value"
+            .as_slice(),
+    ] {
+        for profile in SemanticProfile::ALL {
+            let source = make_source(bytes.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .expect("__newindex source should compile");
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(42)
+            } else {
+                Value::Number(42.0)
+            };
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(vec![expected]),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
+fn owned_table_index_invokes_native_handlers_and_propagates_errors() {
+    let source = make_source(
+        b"local proxy = setmetatable({}, {__index = native_index}) return proxy.answer".to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    let mut vm = Vm::default();
+    let native_index = vm.register_function(|_, arguments| {
+        Ok(vec![arguments.get(1).cloned().unwrap_or(Value::Nil)])
+    });
+    vm.set_global(
+        b"native_index".as_slice(),
+        Value::NativeFunction(native_index),
+    );
+    assert_eq!(
+        vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::String(b"answer".to_vec().into())])
+    );
+
+    let failing = vm.register_function(|_, _| Err(RuntimeError::Breakpoint { pc: 73 }));
+    vm.set_global(b"native_index".as_slice(), Value::NativeFunction(failing));
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Err(RuntimeError::Breakpoint { pc: 73 })
+    );
+}
+
+#[test]
 fn active_and_suspended_blu_varargs_remain_gc_roots() {
     for bytes in [
         b"local function keep(...) collect() return (...).value end return keep({value = 42})"
