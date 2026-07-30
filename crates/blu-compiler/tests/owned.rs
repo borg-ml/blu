@@ -5577,6 +5577,38 @@ fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
 }
 
 #[test]
+fn legacy_gcinfo_is_profile_gated_and_reports_integer_kibibytes() {
+    let source = make_source(b"return gcinfo()".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        match profile {
+            SemanticProfile::Blu => {
+                assert!(
+                    matches!(result, Ok(values) if matches!(values.as_slice(), [Value::Integer(value)] if *value >= 0))
+                );
+            }
+            SemanticProfile::Luau | SemanticProfile::Lua51 => {
+                assert!(
+                    matches!(result, Ok(values) if matches!(values.as_slice(), [Value::Number(value)] if *value >= 0.0 && value.fract() == 0.0))
+                );
+            }
+            _ => assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "gcinfo",
+                    profile,
+                }),
+                "{profile}"
+            ),
+        }
+    }
+}
+
+#[test]
 fn base_library_counts_follow_profile_numeric_subtypes() {
     let source = make_source(
         b"local packed=table.pack(10,nil,30) local first,second=string.byte('AZ',1,2) local next_key=next({10}) local iterator,state,initial=ipairs({10}) local ipairs_key=iterator(state,initial) return rawlen('abc'),rawlen({10,20}),select('#',10,20,30),string.len('abc'),first,second,packed.n,next_key,initial,ipairs_key"

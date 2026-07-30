@@ -5385,6 +5385,25 @@ impl Vm {
             &b"collectgarbage"[..],
             Value::NativeFunction(collectgarbage),
         );
+        let gcinfo = self.register_function(|vm, _| {
+            let profile = vm.active_profile()?;
+            if !matches!(
+                profile,
+                SemanticProfile::Blu | SemanticProfile::Luau | SemanticProfile::Lua51
+            ) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "gcinfo",
+                    profile,
+                });
+            }
+            let kibibytes = vm.memory_usage().current_bytes / 1024;
+            Ok(vec![if profile == SemanticProfile::Blu {
+                Value::Integer(kibibytes as i64)
+            } else {
+                Value::Number(kibibytes as f64)
+            }])
+        });
+        self.set_global(&b"gcinfo"[..], Value::NativeFunction(gcinfo));
 
         let pcall = self.register_function(|_, _| Err(RuntimeError::NativeFunction(u32::MAX)));
         self.protected_call = Some(pcall);

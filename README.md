@@ -55,6 +55,8 @@ extraction, and field replacement in Blu, Luau, Lua 5.2, and Lua 5.3 profiles,
 with explicit profile-specific input conversion and result subtypes.
 Legacy `table.getn` and `table.maxn` are also profile-gated to the pinned
 versions that retain them, while Blu exposes both for migration.
+The legacy `gcinfo` memory counter is likewise available only in Blu, Luau,
+and Lua 5.1 profiles.
 Core `tonumber` conversion preserves profile subtypes, hexadecimal integer and
 floating strings, and the explicit-base grammar and overflow behavior of each
 profile.
