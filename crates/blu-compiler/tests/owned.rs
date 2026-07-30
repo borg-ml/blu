@@ -4243,6 +4243,174 @@ fn math_abs_and_log_follow_profile_numeric_contracts() {
 }
 
 #[test]
+fn math_random_and_randomseed_follow_profile_contracts() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(
+            b"math.randomseed(123,456) return math.random(),math.random(1,1),math.random(-2,-2)"
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let compiled_again = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let first = Vm::default()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap();
+        let second = Vm::default()
+            .execute_blu_v1(
+                compiled_again.into_validated_artifact(),
+                BluLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(first, second, "{profile}");
+        assert!(matches!(first[0], Value::Number(value) if (0.0..1.0).contains(&value)));
+        if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            assert_eq!(first[1..], [Value::Integer(1), Value::Integer(-2)]);
+        } else {
+            assert_eq!(first[1..], [Value::Number(1.0), Value::Number(-2.0)]);
+        }
+
+        let source = make_source(b"return math.randomseed(123,456)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let seeds = Vm::default()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap();
+        if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            assert_eq!(seeds, vec![Value::Integer(123), Value::Integer(456)]);
+        } else {
+            assert!(seeds.is_empty(), "{profile}");
+        }
+
+        let source = make_source(b"return math.random(0)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            assert!(
+                matches!(result, Ok(values) if matches!(values.as_slice(), [Value::Integer(_)]))
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(blu_runtime::RuntimeError::InvalidRange {
+                    operation: "math.random"
+                })
+            ));
+        }
+
+        let source = make_source(b"return math.randomseed()".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            assert!(matches!(
+                result,
+                Ok(values)
+                    if matches!(
+                        values.as_slice(),
+                        [Value::Integer(_), Value::Integer(_)]
+                    )
+            ));
+        } else {
+            assert!(matches!(
+                result,
+                Err(blu_runtime::RuntimeError::Argument {
+                    function: "math.randomseed",
+                    index: 1
+                })
+            ));
+        }
+
+        let source = make_source(b"return math.random(2.5,2.5)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        match profile {
+            SemanticProfile::Luau | SemanticProfile::Lua51 => {
+                assert_eq!(result, Ok(vec![Value::Number(2.0)]));
+            }
+            SemanticProfile::Lua52 => {
+                assert_eq!(result, Ok(vec![Value::Number(3.0)]));
+            }
+            _ => assert!(matches!(
+                result,
+                Err(blu_runtime::RuntimeError::Type {
+                    operation: "math.random",
+                    ..
+                })
+            )),
+        }
+
+        let fractional_seed = make_source(b"math.randomseed(2.5) return math.random()".to_vec());
+        let integral_seed = make_source(b"math.randomseed(2) return math.random()".to_vec());
+        let fractional = OwnedCompiler::default()
+            .compile(&fractional_seed, profile, compiler_identity())
+            .unwrap();
+        let integral = OwnedCompiler::default()
+            .compile(&integral_seed, profile, compiler_identity())
+            .unwrap();
+        let fractional = Vm::default()
+            .execute_blu_v1(fractional.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            assert!(matches!(
+                fractional,
+                Err(blu_runtime::RuntimeError::Type {
+                    operation: "math.randomseed",
+                    ..
+                })
+            ));
+        } else {
+            assert_eq!(
+                fractional,
+                Vm::default()
+                    .execute_blu_v1(integral.into_validated_artifact(), BluLimits::default())
+            );
+        }
+
+        let source = make_source(b"return math.random(1,2,3)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(blu_runtime::RuntimeError::ArgumentCount {
+                function: "math.random",
+                actual: 3,
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn math_min_and_max_preserve_selected_subtypes_and_lua_nan_ordering() {
     let source = make_source(
         b"local nan=0/0 local a=math.min(nan,1) local b=math.max(1,nan) return math.min(3,2),math.max(2,3),math.min(3,2.5),a~=a,b"

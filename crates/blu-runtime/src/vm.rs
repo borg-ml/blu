@@ -182,6 +182,7 @@ pub struct Vm {
     native_result_limit: usize,
     native_function_limit: usize,
     global_limit: usize,
+    random_state: u64,
 }
 
 impl Default for Vm {
@@ -240,6 +241,7 @@ impl Vm {
             native_result_limit: DEFAULT_NATIVE_RESULT_LIMIT,
             native_function_limit: DEFAULT_NATIVE_FUNCTION_LIMIT,
             global_limit: DEFAULT_GLOBAL_LIMIT,
+            random_state: 0x4d59_5df4_d0f3_3173,
         };
         vm.native_functions
             .try_reserve(BUILTIN_NATIVE_CAPACITY)
@@ -6978,6 +6980,31 @@ impl Vm {
         Ok(())
     }
 
+    fn next_random_u64(&mut self) -> u64 {
+        let mut state = self.random_state;
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        self.random_state = state;
+        state.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    }
+
+    fn random_integer_inclusive(&mut self, lower: i64, upper: i64) -> i64 {
+        let width = (upper as i128 - lower as i128 + 1) as u128;
+        if width == (1u128 << 64) {
+            return self.next_random_u64() as i64;
+        }
+        let domain = 1u128 << 64;
+        let limit = domain - domain % width;
+        let sample = loop {
+            let sample = self.next_random_u64() as u128;
+            if sample < limit {
+                break sample;
+            }
+        };
+        (lower as i128 + (sample % width) as i128) as i64
+    }
+
     fn install_math_library(&mut self) -> Result<(), RuntimeError> {
         let abs = self.register_function(|vm, arguments| {
             let value = arguments.first().ok_or(RuntimeError::Argument {
@@ -7359,8 +7386,99 @@ impl Vm {
                 number_argument(arguments, 0, "math.round")?.round(),
             )])
         });
+        let random = self.register_function(|vm, arguments| {
+            if arguments.len() > 2 {
+                return Err(RuntimeError::ArgumentCount {
+                    function: "math.random",
+                    expected: "zero, one, or two",
+                    actual: arguments.len(),
+                });
+            }
+            if arguments.is_empty() {
+                let bits = vm.next_random_u64() >> 11;
+                return Ok(vec![Value::Number(
+                    bits as f64 * (1.0 / (1u64 << 53) as f64),
+                )]);
+            }
+            let profile = vm.active_profile()?;
+            let (lower, upper) = if arguments.len() == 1 {
+                let upper = random_integer_argument(profile, arguments, 0, "math.random")?;
+                if upper == 0
+                    && matches!(
+                        profile,
+                        SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    )
+                {
+                    (i64::MIN, i64::MAX)
+                } else {
+                    (1, upper)
+                }
+            } else {
+                (
+                    random_integer_argument(profile, arguments, 0, "math.random")?,
+                    random_integer_argument(profile, arguments, 1, "math.random")?,
+                )
+            };
+            if lower > upper {
+                return Err(RuntimeError::InvalidRange {
+                    operation: "math.random",
+                });
+            }
+            let value = vm.random_integer_inclusive(lower, upper);
+            Ok(vec![if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }])
+        });
+        let randomseed = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if arguments.len() > 2 {
+                return Err(RuntimeError::ArgumentCount {
+                    function: "math.randomseed",
+                    expected: "at most two",
+                    actual: arguments.len(),
+                });
+            }
+            let modern = matches!(
+                profile,
+                SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            );
+            if arguments.is_empty() && !modern {
+                return Err(RuntimeError::Argument {
+                    function: "math.randomseed",
+                    index: 1,
+                });
+            }
+            let first = if arguments.is_empty() {
+                vm.next_random_u64() as i64
+            } else {
+                random_seed_argument(profile, arguments, 0)?
+            };
+            let second = if modern {
+                arguments
+                    .get(1)
+                    .map(|_| random_seed_argument(profile, arguments, 1))
+                    .transpose()?
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            vm.random_state = mix_random_seed(first as u64, second as u64);
+            if modern {
+                Ok(vec![Value::Integer(first), Value::Integer(second)])
+            } else {
+                Ok(Vec::new())
+            }
+        });
 
-        let table = self.heap.allocate_table(0, 26)?;
+        let table = self.heap.allocate_table(0, 28)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -7386,6 +7504,8 @@ impl Vm {
             (&b"clamp"[..], Value::NativeFunction(clamp)),
             (&b"sign"[..], Value::NativeFunction(sign)),
             (&b"round"[..], Value::NativeFunction(round)),
+            (&b"random"[..], Value::NativeFunction(random)),
+            (&b"randomseed"[..], Value::NativeFunction(randomseed)),
             (&b"pi"[..], Value::Number(core::f64::consts::PI)),
             (&b"huge"[..], Value::Number(f64::INFINITY)),
         ] {
@@ -7599,6 +7719,112 @@ fn integer_argument(
             expected: "number",
             actual: value.type_name(),
         })
+}
+
+fn random_integer_argument(
+    profile: SemanticProfile,
+    arguments: &[Value],
+    index: usize,
+    function: &'static str,
+) -> Result<i64, RuntimeError> {
+    let value = arguments.get(index).ok_or(RuntimeError::Argument {
+        function,
+        index: index + 1,
+    })?;
+    if matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    ) {
+        return exact_integer_conversion(value, profile).ok_or(RuntimeError::Type {
+            operation: function,
+            expected: "integer-representable number",
+            actual: value.type_name(),
+        });
+    }
+    let parsed;
+    let value = if let Value::String(bytes) = value {
+        parsed = parse_default_number(trim_ascii_bytes(bytes), profile);
+        parsed.as_ref().ok_or(RuntimeError::Type {
+            operation: function,
+            expected: "number",
+            actual: "string",
+        })?
+    } else {
+        value
+    };
+    let number = value.as_number().ok_or(RuntimeError::Type {
+        operation: function,
+        expected: "number",
+        actual: value.type_name(),
+    })?;
+    if !number.is_finite() {
+        return Err(RuntimeError::Type {
+            operation: function,
+            expected: "finite number",
+            actual: value.type_name(),
+        });
+    }
+    Ok(match profile {
+        SemanticProfile::Lua52 => number.round(),
+        SemanticProfile::Luau | SemanticProfile::Lua51 => number.trunc(),
+        _ => unreachable!("modern random arguments are handled above"),
+    } as i64)
+}
+
+fn random_seed_argument(
+    profile: SemanticProfile,
+    arguments: &[Value],
+    index: usize,
+) -> Result<i64, RuntimeError> {
+    if matches!(
+        profile,
+        SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+    ) {
+        return random_integer_argument(profile, arguments, index, "math.randomseed");
+    }
+    let value = arguments.get(index).ok_or(RuntimeError::Argument {
+        function: "math.randomseed",
+        index: index + 1,
+    })?;
+    let parsed;
+    let value = if let Value::String(bytes) = value {
+        parsed = parse_default_number(trim_ascii_bytes(bytes), profile);
+        parsed.as_ref().ok_or(RuntimeError::Type {
+            operation: "math.randomseed",
+            expected: "number",
+            actual: "string",
+        })?
+    } else {
+        value
+    };
+    let number = value.as_number().ok_or(RuntimeError::Type {
+        operation: "math.randomseed",
+        expected: "number",
+        actual: value.type_name(),
+    })?;
+    if !number.is_finite() {
+        return Err(RuntimeError::Type {
+            operation: "math.randomseed",
+            expected: "finite number",
+            actual: value.type_name(),
+        });
+    }
+    Ok(number.trunc() as i64)
+}
+
+fn mix_random_seed(first: u64, second: u64) -> u64 {
+    let mut state = first ^ second.rotate_left(32) ^ 0x9e37_79b9_7f4a_7c15;
+    state = (state ^ (state >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    state = (state ^ (state >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    state ^= state >> 31;
+    if state == 0 {
+        0x4d59_5df4_d0f3_3173
+    } else {
+        state
+    }
 }
 
 fn trim_ascii_bytes(mut bytes: &[u8]) -> &[u8] {
@@ -9925,6 +10151,11 @@ pub enum RuntimeError {
         function: &'static str,
         index: usize,
     },
+    ArgumentCount {
+        function: &'static str,
+        expected: &'static str,
+        actual: usize,
+    },
     Heap(HeapError),
     DivideByZero,
     Breakpoint {
@@ -10102,6 +10333,14 @@ impl fmt::Display for RuntimeError {
             Self::Argument { function, index } => {
                 write!(f, "{function} requires argument {index}")
             }
+            Self::ArgumentCount {
+                function,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "{function} expected {expected} arguments, received {actual}"
+            ),
             Self::Heap(error) => error.fmt(f),
             Self::DivideByZero => f.write_str("integer divide by zero"),
             Self::Breakpoint { pc } => write!(f, "breakpoint at word {pc}"),

@@ -37,6 +37,10 @@ distinguishes Lua 5.1's ignored extra arguments from modern base selection.
 NaN ordering, using exact mixed integer/number comparisons across `i64`.
 Modern-profile `math.type`, `math.tointeger`, and `math.ult` provide numeric
 subtype introspection, exact integral conversion, and unsigned comparison.
+Profile-aware `math.random` and `math.randomseed` provide a deterministic,
+non-cryptographic generator with explicit legacy coercion, result-subtype,
+zero-bound, seed-arity, and seed-return contracts; seeded reproducibility is
+guaranteed, but upstream implementations' exact random sequences are not.
 Blu/Luau profiles also expose `math.clamp`, `math.sign`, and `math.round` with
 the pinned Luau edge behavior.
 The `bit32` library provides variadic AND/OR/XOR, NOT, shifts, rotates, field

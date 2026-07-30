@@ -457,6 +457,18 @@ source operators.
 follow the Lua 5.3–5.5 contracts in those profiles and Blu. They fail with an
 explicit unsupported-profile error in Luau and Lua 5.1–5.2, where the
 functions do not exist upstream.
+`math.random()` returns a number in `[0, 1)`. Bounded results are numbers in
+Luau and Lua 5.1–5.2 and integers in Blu and Lua 5.3–5.5. Luau and Lua 5.1
+truncate fractional bounds, Lua 5.2 rounds them, and modern profiles require
+integer-representable bounds. `math.random(0)` selects the full signed integer
+range only in Blu and Lua 5.4–5.5; earlier profiles reject the empty interval.
+`math.randomseed(x, y)` returns no values in Luau and Lua 5.1–5.3 and returns
+the two effective integer seeds in Blu and Lua 5.4–5.5. Only those modern
+profiles permit an omitted seed. Legacy seed arguments truncate fractional
+values, while Blu and Lua 5.4–5.5 require integer-representable seeds. Blu's
+generator is deterministic and non-cryptographic: equal explicit seeds
+produce equal streams, but the exact stream is not promised to match any
+upstream implementation or remain a portable language guarantee.
 Blu and Luau expose the Luau numeric extensions `math.clamp`, `math.sign`, and
 `math.round`. They return numbers, preserve Luau NaN behavior, use
 ties-away-from-zero rounding, and reject inverted clamp bounds structurally.
@@ -579,7 +591,8 @@ Blu plugin is active.
 
 ## Resource limits
 
-The initial shared math library includes `math.fmod` and `math.modf`.
+The initial shared math library includes `math.fmod`, `math.modf`,
+`math.random`, and `math.randomseed`.
 `math.fmod` requires two numeric arguments and uses truncating remainder
 semantics, so the result follows the dividend's sign and is intentionally
 distinct from the language `%` operator. Blu and Lua 5.3–5.5 preserve
