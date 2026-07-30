@@ -3979,6 +3979,46 @@ fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
 }
 
 #[test]
+fn base_library_counts_follow_profile_numeric_subtypes() {
+    let source = make_source(
+        b"local packed=table.pack(10,nil,30) local first,second=string.byte('AZ',1,2) return rawlen('abc'),rawlen({10,20}),select('#',10,20,30),string.len('abc'),first,second,packed.n"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let modern = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        let integral = |value| {
+            if modern {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                integral(3),
+                integral(2),
+                integral(3),
+                integral(3),
+                integral(65),
+                integral(90),
+                integral(3),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

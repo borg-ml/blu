@@ -411,6 +411,9 @@ selection so NaN does not silently replace or get replaced by another operand.
 for Blu and Lua 5.3–5.5, returns numbers for legacy profiles, accepts ordinary
 hexadecimal strings, and follows profile-specific explicit-base parsing,
 non-finite spelling acceptance, and overflow behavior.
+Integral counts and bytes returned by `rawlen`, `select("#", ...)`,
+`string.len`, `string.byte`, and `table.pack.n` likewise use integers in Blu
+and Lua 5.3–5.5 and numbers in legacy profiles.
 `string.find` currently implements the common byte-oriented literal-search
 slice: relative start indices, empty needles, nil misses, and explicit
 `plain=true`. Searches without `plain` support search-relative `^`, subject-end

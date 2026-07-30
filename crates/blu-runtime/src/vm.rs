@@ -4875,7 +4875,11 @@ impl Vm {
                     });
                 }
             };
-            Ok(vec![Value::Number(length as f64)])
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "rawlen",
+                length as f64,
+            )?])
         });
         self.set_global(&b"rawlen"[..], Value::NativeFunction(rawlen));
 
@@ -4901,15 +4905,17 @@ impl Vm {
         });
         self.set_global(&b"assert"[..], Value::NativeFunction(assert));
 
-        let select = self.register_function(|_, arguments| {
+        let select = self.register_function(|vm, arguments| {
             let selector = arguments.first().ok_or(RuntimeError::Argument {
                 function: "select",
                 index: 1,
             })?;
             if matches!(selector, Value::String(value) if &**value == b"#") {
-                return Ok(vec![Value::Integer(
-                    arguments.len().saturating_sub(1) as i64
-                )]);
+                return Ok(vec![profiled_integral_math_result(
+                    vm,
+                    "select",
+                    arguments.len().saturating_sub(1) as f64,
+                )?]);
             }
             let index = selector.as_number().ok_or(RuntimeError::Type {
                 operation: "select",
@@ -5272,14 +5278,16 @@ impl Vm {
             Value::String(Arc::from(&b"gsub"[..])),
             Value::NativeFunction(string_gsub),
         )?;
-        let string_len = self.register_function(|_, arguments| {
+        let string_len = self.register_function(|vm, arguments| {
             let string = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.len",
                 index: 1,
             })?;
-            Ok(vec![Value::Integer(
-                string_bytes(string, "string.len")?.len() as i64,
-            )])
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "string.len",
+                string_bytes(string, "string.len")?.len() as f64,
+            )?])
         });
         self.heap.table_set(
             string,
@@ -5315,7 +5323,13 @@ impl Vm {
                 });
             }
             let mut values = try_vec_with_capacity(bytes.len(), "string.byte results")?;
-            values.extend(bytes.iter().map(|value| Value::Integer(i64::from(*value))));
+            for value in bytes {
+                values.push(profiled_integral_math_result(
+                    vm,
+                    "string.byte",
+                    f64::from(*value),
+                )?);
+            }
             Ok(values)
         });
         self.heap.table_set(
@@ -6009,6 +6023,7 @@ impl Vm {
         });
         let pack = self.register_function(|vm, arguments| {
             let roots = GcRoots::from_values(arguments)?;
+            let count = profiled_integral_math_result(vm, "table.pack", arguments.len() as f64)?;
             let table = vm.allocate_table(arguments.len(), 1, &roots)?;
             for (index, value) in arguments.iter().enumerate() {
                 vm.table_set(
@@ -6018,12 +6033,7 @@ impl Vm {
                     &roots,
                 )?;
             }
-            vm.table_set(
-                table,
-                Value::String(Arc::from(&b"n"[..])),
-                Value::Integer(arguments.len() as i64),
-                &roots,
-            )?;
+            vm.table_set(table, Value::String(Arc::from(&b"n"[..])), count, &roots)?;
             Ok(vec![Value::Table(table)])
         });
         let unpack = self.register_function(|vm, arguments| {
