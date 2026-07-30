@@ -197,7 +197,8 @@ execution engines stop with a structured error at an instruction boundary.
 Absolute wall-clock deadlines use the same safe boundary and remain distinct
 from deterministic instruction fuel. Native callbacks can query the active
 artifact profile and cooperatively poll both conditions through the public VM
-API.
+API. Coroutine task states have a separate live-count limit that collects
+unreachable tasks before rejecting growth.
 Shared `break` statements are structurally restricted to loop bodies and patch
 only the innermost loop's exit, including through nested conditional blocks.
 `continue` is an explicit Blu/Luau extension that restarts the innermost loop;

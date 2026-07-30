@@ -5795,6 +5795,45 @@ fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
 }
 
 #[test]
+fn task_limit_collects_unreachable_coroutines_before_rejecting_growth() {
+    let source = make_source(b"return coroutine.create(function() end)".to_vec());
+    let compile = || {
+        OwnedCompiler::default()
+            .compile(&source, SemanticProfile::Blu, compiler_identity())
+            .unwrap()
+    };
+
+    let mut blocked = Vm::default().with_task_limit(1);
+    assert_eq!(blocked.task_limit(), 1);
+    assert_eq!(
+        blocked.execute_blu_v1(compile().into_validated_artifact(), BluLimits::default()),
+        Err(RuntimeError::TaskLimit {
+            required: 2,
+            limit: 1,
+        })
+    );
+
+    let mut vm = Vm::default().with_task_limit(2);
+    let first = vm
+        .execute_blu_v1(compile().into_validated_artifact(), BluLimits::default())
+        .unwrap();
+    assert!(matches!(first.as_slice(), [Value::Thread(_)]));
+    assert_eq!(
+        vm.execute_blu_v1(compile().into_validated_artifact(), BluLimits::default()),
+        Err(RuntimeError::TaskLimit {
+            required: 3,
+            limit: 2,
+        })
+    );
+
+    assert_eq!(vm.release_values(&first), 1);
+    let replacement = vm
+        .execute_blu_v1(compile().into_validated_artifact(), BluLimits::default())
+        .unwrap();
+    assert!(matches!(replacement.as_slice(), [Value::Thread(_)]));
+}
+
+#[test]
 fn legacy_gcinfo_is_profile_gated_and_reports_integer_kibibytes() {
     let source = make_source(b"return gcinfo()".to_vec());
     for profile in SemanticProfile::ALL {

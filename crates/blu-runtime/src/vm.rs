@@ -31,6 +31,7 @@ const DEFAULT_HOST_VALUE_LIMIT: usize = 4096;
 const DEFAULT_NATIVE_RESULT_LIMIT: usize = MAX_DYNAMIC_REGISTERS;
 const DEFAULT_NATIVE_FUNCTION_LIMIT: usize = 1_000_000;
 const DEFAULT_GLOBAL_LIMIT: usize = 1_000_000;
+const DEFAULT_TASK_LIMIT: usize = 100_000;
 const BUILTIN_NATIVE_CAPACITY: usize = 128;
 const BUILTIN_GLOBAL_CAPACITY: usize = 64;
 
@@ -216,6 +217,7 @@ pub struct Vm {
     native_result_limit: usize,
     native_function_limit: usize,
     global_limit: usize,
+    task_limit: usize,
     random_state: u64,
 }
 
@@ -277,6 +279,7 @@ impl Vm {
             native_result_limit: DEFAULT_NATIVE_RESULT_LIMIT,
             native_function_limit: DEFAULT_NATIVE_FUNCTION_LIMIT,
             global_limit: DEFAULT_GLOBAL_LIMIT,
+            task_limit: DEFAULT_TASK_LIMIT,
             random_state: 0x4d59_5df4_d0f3_3173,
         };
         vm.native_functions
@@ -384,6 +387,19 @@ impl Vm {
     pub fn with_global_limit(mut self, limit: usize) -> Self {
         self.global_limit = limit;
         self
+    }
+
+    /// Sets the maximum number of live task states, including the main thread.
+    #[must_use]
+    pub fn with_task_limit(mut self, limit: usize) -> Self {
+        self.task_limit = limit;
+        self
+    }
+
+    /// Returns the configured maximum live task-state count.
+    #[must_use]
+    pub const fn task_limit(&self) -> usize {
+        self.task_limit
     }
 
     /// Sets the maximum number of heap-handle occurrences retained for the
@@ -814,10 +830,50 @@ impl Vm {
         thread_roots: &[Value],
         roots: &GcRoots,
     ) -> Result<ThreadId, RuntimeError> {
+        self.ensure_task_capacity(1, roots, thread_roots)?;
         self.ensure_heap_objects(1, roots, thread_roots.iter(), std::iter::empty())?;
         let requested = self.heap.thread_allocation_bytes(thread_roots.len())?;
         self.collect_if_needed(requested, roots, thread_roots, std::iter::empty())?;
         Ok(self.heap.allocate_thread(thread_roots)?)
+    }
+
+    fn ensure_task_capacity(
+        &mut self,
+        additional: usize,
+        roots: &GcRoots,
+        thread_roots: &[Value],
+    ) -> Result<(), RuntimeError> {
+        let required =
+            self.threads
+                .len()
+                .checked_add(additional)
+                .ok_or(RuntimeError::TaskLimit {
+                    required: usize::MAX,
+                    limit: self.task_limit,
+                })?;
+        if required <= self.task_limit {
+            return Ok(());
+        }
+
+        self.collect_internal(
+            roots.values.iter().chain(thread_roots),
+            roots.upvalues.iter().copied(),
+        )?;
+        let required =
+            self.threads
+                .len()
+                .checked_add(additional)
+                .ok_or(RuntimeError::TaskLimit {
+                    required: usize::MAX,
+                    limit: self.task_limit,
+                })?;
+        if required > self.task_limit {
+            return Err(RuntimeError::TaskLimit {
+                required,
+                limit: self.task_limit,
+            });
+        }
+        Ok(())
     }
 
     fn closure_push_upvalue(
@@ -9799,6 +9855,7 @@ impl fmt::Debug for Vm {
             .field("retained_value_count", &self.host_root_count)
             .field("host_value_limit", &self.host_value_limit)
             .field("native_result_limit", &self.native_result_limit)
+            .field("task_limit", &self.task_limit)
             .finish_non_exhaustive()
     }
 }
@@ -10744,6 +10801,10 @@ pub enum RuntimeError {
         required: usize,
         limit: usize,
     },
+    TaskLimit {
+        required: usize,
+        limit: usize,
+    },
     MetatableProtected,
     MetatableLoop,
     UnsupportedMetamethod {
@@ -10934,6 +10995,12 @@ impl fmt::Display for RuntimeError {
                 write!(
                     f,
                     "global registry requires {required} distinct names, limit is {limit}"
+                )
+            }
+            Self::TaskLimit { required, limit } => {
+                write!(
+                    f,
+                    "runtime requires {required} live tasks, limit is {limit}"
                 )
             }
             Self::MetatableProtected => f.write_str("cannot change a protected metatable"),

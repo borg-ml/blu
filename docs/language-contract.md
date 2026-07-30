@@ -683,7 +683,12 @@ reserve fallibly before changing logical state. Resumed protected-error
 unwinding uses fallible independent frame/caller snapshots, including
 registers, constants, varargs, and open-upvalue indexes. Guest-created
 coroutine-state entries and `require` loading/cache bookkeeping reserve their
-maps before insertion. Native-function and global registries have configurable
+maps before insertion. Live task states, including the main thread, have an
+independent configurable bound through `Vm::with_task_limit`. Coroutine
+creation first collects unreachable thread handles while rooting the proposed
+function and active state, then returns `RuntimeError::TaskLimit` without
+installing a partial coroutine if the bound remains exceeded.
+Native-function and global registries have configurable
 entry limits; `try_register_function` and `try_set_global` reserve collection
 growth fallibly and reject over-limit mutations atomically. The older
 convenience methods remain panic-on-error compatibility wrappers. Built-in
