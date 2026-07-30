@@ -136,9 +136,9 @@ lists snapshot every target and right-hand side before committing writes.
 Table and method reads follow `__index` table chains or resumably invoke
 closure/native handlers; writes likewise follow `__newindex` chains or
 handlers. Final-field vararg and call MULTRET expansion are implemented.
-Unary `#` also measures raw table sequences. Lua 5.1 explicitly ignores
-`__len`; profiles that require a present handler fail structurally until the
-yieldable metamethod continuation is implemented.
+Unary `#` measures raw table sequences in Lua 5.1. Other profiles resumably
+invoke a present table `__len` closure or native handler and otherwise use the
+raw sequence length.
 Bounded postfix calls evaluate the callee and fixed scalar arguments
 left-to-right and dispatch through the VM's existing
 closure/native/table-call path. Scalar contexts produce the first result or

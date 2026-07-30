@@ -1616,7 +1616,7 @@ fn byte_string_length_lowers_for_every_profile() {
 }
 
 #[test]
-fn owned_table_length_is_raw_or_explicitly_requires_a_metamethod_continuation() {
+fn owned_table_length_is_raw_or_invokes_a_resumable_metamethod() {
     let raw = make_source(b"return #{1, 2, 3}, #{}".to_vec());
     for profile in SemanticProfile::ALL {
         let compiled = OwnedCompiler::default()
@@ -1656,11 +1656,13 @@ fn owned_table_length_is_raw_or_explicitly_requires_a_metamethod_continuation() 
             Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
         if profile == SemanticProfile::Lua51 {
             assert_eq!(result, Ok(vec![Value::Number(2.0)]));
+        } else if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            assert_eq!(result, Ok(vec![Value::Integer(9)]));
         } else {
-            assert!(matches!(
-                result,
-                Err(RuntimeError::UnsupportedMetamethod { name: "__len", .. })
-            ));
+            assert_eq!(result, Ok(vec![Value::Number(9.0)]));
         }
     }
 }

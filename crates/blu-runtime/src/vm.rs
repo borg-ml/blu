@@ -2061,19 +2061,17 @@ impl Vm {
                     destination,
                     source,
                 } => {
-                    let source = blu_register(&registers, source)?;
-                    let length = match source {
-                        Value::String(bytes) => bytes.len(),
+                    let source = blu_register(&registers, source)?.clone();
+                    let (length, handler) = match &source {
+                        Value::String(bytes) => (Some(bytes.len()), None),
                         Value::Table(table) => {
                             if prototype.profile != SemanticProfile::Lua51
-                                && let Some(handler) = self.metamethod(source, "__len")?
+                                && let Some(handler) = self.metamethod(&source, "__len")?
                             {
-                                return Err(RuntimeError::UnsupportedMetamethod {
-                                    name: "__len",
-                                    actual: handler.type_name(),
-                                });
+                                (None, Some(handler))
+                            } else {
+                                (Some(self.heap.table_length(*table)?), None)
                             }
-                            self.heap.table_length(*table)?
                         }
                         other => {
                             return Err(RuntimeError::Type {
@@ -2083,6 +2081,98 @@ impl Vm {
                             });
                         }
                     };
+                    if let Some(function) = handler {
+                        let mut arguments = try_vec_with_capacity(1, "BluV1 __len arguments")?;
+                        arguments.push(source);
+                        if let Value::Closure(child_closure) = &function
+                            && self.heap.is_blu_closure(*child_closure)?
+                        {
+                            if callers.len() >= self.call_limit {
+                                return Err(RuntimeError::CallLimit {
+                                    limit: self.call_limit,
+                                });
+                            }
+                            let (child_artifact, child, profile, _) =
+                                self.heap.blu_closure_parts(*child_closure)?;
+                            let child_prototype = child_artifact
+                                .prototypes
+                                .get(child)
+                                .ok_or(RuntimeError::InvalidPrototype(child))?;
+                            let child_constants = materialize_blu_constants(child_prototype)?;
+                            let child_register_count = usize::from(child_prototype.register_count);
+                            let mut child_registers = try_vec_with_capacity(
+                                child_register_count,
+                                "BluV1 runtime registers",
+                            )?;
+                            child_registers.resize(child_register_count, Value::Nil);
+                            let copied = arguments
+                                .len()
+                                .min(usize::from(child_prototype.parameter_count));
+                            child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                            let child_varargs = if child_prototype.is_vararg {
+                                try_clone_values(
+                                    arguments
+                                        .get(usize::from(child_prototype.parameter_count)..)
+                                        .unwrap_or_default(),
+                                    "BluV1 frame varargs",
+                                )?
+                            } else {
+                                Vec::new()
+                            };
+                            let mut child_open_upvalues =
+                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
+                            child_open_upvalues.resize(child_register_count, None);
+                            try_reserve_exact(&mut callers, 1, "BluV1 __len caller frame")?;
+                            callers.push(BluCaller {
+                                artifact,
+                                prototype: prototype_index,
+                                constants,
+                                registers,
+                                varargs,
+                                open_upvalues,
+                                closure,
+                                pc: pc + 1,
+                                result: BluCallResult::Fixed {
+                                    destination,
+                                    count: 1,
+                                },
+                            });
+                            artifact = child_artifact;
+                            prototype_index = child;
+                            constants = child_constants;
+                            registers = child_registers;
+                            varargs = child_varargs;
+                            open_upvalues = child_open_upvalues;
+                            closure = Some(*child_closure);
+                            pc = 0;
+                            self.active_profile = Some(profile);
+                            continue;
+                        }
+                        let roots = blu_frame_roots(
+                            &registers,
+                            &varargs,
+                            &open_upvalues,
+                            closure,
+                            &callers,
+                        )?;
+                        let value = self
+                            .call_value(function, &arguments, &mut remaining, callers.len(), roots)?
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Value::Nil);
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            destination,
+                            value,
+                        )?;
+                        pc += 1;
+                        continue;
+                    }
+                    let length = length.ok_or(RuntimeError::UnsupportedBluV1Structure {
+                        what: "length result is missing",
+                    })?;
                     let length = i64::try_from(length).map_err(|_| {
                         RuntimeError::UnsupportedBluV1Structure {
                             what: "length exceeds i64",
