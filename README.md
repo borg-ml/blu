@@ -34,7 +34,7 @@ number-only legacy behavior or return modern exact integers when representable.
 `math.abs` preserves modern integer inputs, while `math.log` explicitly
 distinguishes Lua 5.1's ignored extra arguments from modern base selection.
 `math.min` and `math.max` preserve the selected modern subtype and upstream
-NaN ordering.
+NaN ordering, using exact mixed integer/number comparisons across `i64`.
 Modern-profile `math.type`, `math.tointeger`, and `math.ult` provide numeric
 subtype introspection, exact integral conversion, and unsigned comparison.
 Blu/Luau profiles also expose `math.clamp`, `math.sign`, and `math.round` with
@@ -75,8 +75,9 @@ artifact profile, including Lua 5.1 main-thread nil and Luau main-thread
 yieldability.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
-`table.sort` provides bounded default ordering for uniform number and byte-string
-sequences; custom comparator callbacks remain explicit pending resumable calls.
+`table.sort` provides bounded, exact default ordering for uniform number and
+byte-string sequences; custom comparator callbacks remain explicit pending
+resumable calls.
 Overlap-safe bounded `table.move` is available for Blu, Luau, and Lua 5.3–5.5,
 with explicit rejection in Lua 5.1–5.2 profiles.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers

@@ -3422,6 +3422,28 @@ fn table_sort_orders_number_and_string_sequences_without_results() {
 }
 
 #[test]
+fn numeric_libraries_preserve_exact_mixed_ordering() {
+    let source = make_source(
+        b"local i=9007199254740993 local n=9007199254740992.0 local hi=0x7fffffffffffffff local hif=9223372036854775808.0 local values={i,n,hi,hif} table.sort(values) return math.min(i,n),math.max(i,n),values[1],values[2],values[3],values[4]"
+            .to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![
+            Value::Number(9_007_199_254_740_992.0),
+            Value::Integer(9_007_199_254_740_993),
+            Value::Number(9_007_199_254_740_992.0),
+            Value::Integer(9_007_199_254_740_993),
+            Value::Integer(i64::MAX),
+            Value::Number(9_223_372_036_854_775_808.0),
+        ])
+    );
+}
+
+#[test]
 fn table_sort_rejects_custom_comparators_and_unordered_values() {
     for profile in SemanticProfile::ALL {
         for (source, expected) in [

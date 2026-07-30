@@ -6514,14 +6514,13 @@ impl Vm {
             }
             if numeric {
                 values.sort_unstable_by(|left, right| {
-                    left.as_number()
-                        .expect("numeric sort values were validated")
-                        .partial_cmp(
-                            &right
-                                .as_number()
-                                .expect("numeric sort values were validated"),
-                        )
-                        .expect("NaN sort values were rejected")
+                    if left.numeric_less(right) == Some(true) {
+                        core::cmp::Ordering::Less
+                    } else if right.numeric_less(left) == Some(true) {
+                        core::cmp::Ordering::Greater
+                    } else {
+                        core::cmp::Ordering::Equal
+                    }
                 });
             } else {
                 values.sort_unstable_by(|left, right| match (left, right) {
@@ -6930,20 +6929,19 @@ impl Vm {
                 function: "math.min",
                 index: 1,
             })?;
-            let mut result = selected.as_number().ok_or(RuntimeError::Type {
+            selected.as_number().ok_or(RuntimeError::Type {
                 operation: "math.min",
                 expected: "number",
                 actual: selected.type_name(),
             })?;
             for value in values {
-                let numeric = value.as_number().ok_or(RuntimeError::Type {
+                value.as_number().ok_or(RuntimeError::Type {
                     operation: "math.min",
                     expected: "number",
                     actual: value.type_name(),
                 })?;
-                if numeric < result {
+                if value.numeric_less(selected) == Some(true) {
                     selected = value;
-                    result = numeric;
                 }
             }
             if matches!(
@@ -6955,7 +6953,11 @@ impl Vm {
             ) {
                 Ok(vec![selected.clone()])
             } else {
-                Ok(vec![Value::Number(result)])
+                Ok(vec![Value::Number(
+                    selected
+                        .as_number()
+                        .expect("selected math.min value was validated"),
+                )])
             }
         });
         let max = self.register_function(|vm, arguments| {
@@ -6964,20 +6966,19 @@ impl Vm {
                 function: "math.max",
                 index: 1,
             })?;
-            let mut result = selected.as_number().ok_or(RuntimeError::Type {
+            selected.as_number().ok_or(RuntimeError::Type {
                 operation: "math.max",
                 expected: "number",
                 actual: selected.type_name(),
             })?;
             for value in values {
-                let numeric = value.as_number().ok_or(RuntimeError::Type {
+                value.as_number().ok_or(RuntimeError::Type {
                     operation: "math.max",
                     expected: "number",
                     actual: value.type_name(),
                 })?;
-                if numeric > result {
+                if selected.numeric_less(value) == Some(true) {
                     selected = value;
-                    result = numeric;
                 }
             }
             if matches!(
@@ -6989,7 +6990,11 @@ impl Vm {
             ) {
                 Ok(vec![selected.clone()])
             } else {
-                Ok(vec![Value::Number(result)])
+                Ok(vec![Value::Number(
+                    selected
+                        .as_number()
+                        .expect("selected math.max value was validated"),
+                )])
             }
         });
         let math_type = self.register_function(|vm, arguments| {

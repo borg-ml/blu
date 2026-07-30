@@ -444,6 +444,8 @@ second argument as the logarithm base.
 `math.min` and `math.max` retain the selected operand's integer subtype in Blu
 and Lua 5.3–5.5, return numbers in legacy profiles, and use upstream ordered
 selection so NaN does not silently replace or get replaced by another operand.
+Mixed integer/number selection uses the same exact full-range comparison as
+source operators.
 `math.type`, `math.tointeger`, and unsigned integer comparison `math.ult`
 follow the Lua 5.3–5.5 contracts in those profiles and Blu. They fail with an
 explicit unsupported-profile error in Luau and Lua 5.1–5.2, where the
@@ -542,7 +544,8 @@ profiles return zero using their legacy-number or modern-integer policy. Other
 commands differ by upstream version and fail explicitly until profile-dispatched.
 `table.sort` supports bounded default ascending order for uniform numeric
 sequences without NaN and uniform byte-string sequences. It returns no values
-and accepts an omitted or nil comparator. Custom comparator callbacks and
+and accepts an omitted or nil comparator. Numeric sorting uses exact mixed
+integer/number ordering without `f64` round-trip loss. Custom comparator callbacks and
 metamethod ordering fail explicitly until native operations can resume calls.
 `table.move` performs bounded overlap-safe moves and returns the destination
 table for Blu, Luau, and Lua 5.3–5.5. Lua 5.1–5.2 calls fail with an explicit
