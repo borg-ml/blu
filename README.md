@@ -39,9 +39,9 @@ Modern-profile `math.type`, `math.tointeger`, and `math.ult` provide numeric
 subtype introspection, exact integral conversion, and unsigned comparison.
 Blu/Luau profiles also expose `math.clamp`, `math.sign`, and `math.round` with
 the pinned Luau edge behavior.
-The initial `bit32` slice provides variadic AND/OR/XOR, NOT, and logical or
-arithmetic shifts in Blu, Luau, Lua 5.2, and Lua 5.3 profiles, with explicit
-profile-specific input conversion and result subtypes.
+The `bit32` library provides variadic AND/OR/XOR, NOT, shifts, rotates, field
+extraction, and field replacement in Blu, Luau, Lua 5.2, and Lua 5.3 profiles,
+with explicit profile-specific input conversion and result subtypes.
 Core `tonumber` conversion preserves profile subtypes, hexadecimal integer and
 floating strings, and the explicit-base grammar and overflow behavior of each
 profile.

@@ -7072,8 +7072,66 @@ impl Vm {
                 f64::from(result),
             )?])
         });
+        let lrotate = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.lrotate")?;
+            let value = bit32_argument(vm, arguments, 0, "bit32.lrotate")?;
+            let displacement = bit32_argument(vm, arguments, 1, "bit32.lrotate")?;
+            let result = value.rotate_left(displacement);
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.lrotate",
+                f64::from(result),
+            )?])
+        });
+        let rrotate = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.rrotate")?;
+            let value = bit32_argument(vm, arguments, 0, "bit32.rrotate")?;
+            let displacement = bit32_argument(vm, arguments, 1, "bit32.rrotate")?;
+            let result = value.rotate_right(displacement);
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.rrotate",
+                f64::from(result),
+            )?])
+        });
+        let extract = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.extract")?;
+            let value = bit32_argument(vm, arguments, 0, "bit32.extract")?;
+            let field = bit32_argument(vm, arguments, 1, "bit32.extract")?;
+            let width = if arguments.len() > 2 {
+                bit32_argument(vm, arguments, 2, "bit32.extract")?
+            } else {
+                1
+            };
+            let mask = bit32_field_mask(field, width, "bit32.extract")?;
+            let result = (value >> field) & mask;
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.extract",
+                f64::from(result),
+            )?])
+        });
+        let replace = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.replace")?;
+            let value = bit32_argument(vm, arguments, 0, "bit32.replace")?;
+            let replacement = bit32_argument(vm, arguments, 1, "bit32.replace")?;
+            let field = bit32_argument(vm, arguments, 2, "bit32.replace")?;
+            let width = if arguments.len() > 3 {
+                bit32_argument(vm, arguments, 3, "bit32.replace")?
+            } else {
+                1
+            };
+            let mask = bit32_field_mask(field, width, "bit32.replace")?;
+            let shifted_mask = mask << field;
+            let result = (value & !shifted_mask) | ((replacement & mask) << field);
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.replace",
+                f64::from(result),
+            )?])
+        });
 
-        let table = self.heap.allocate_table(0, 7)?;
+        let table = self.heap.allocate_table(0, 11)?;
         for (name, function) in [
             (&b"band"[..], band),
             (&b"bor"[..], bor),
@@ -7082,6 +7140,10 @@ impl Vm {
             (&b"lshift"[..], lshift),
             (&b"rshift"[..], rshift),
             (&b"arshift"[..], arshift),
+            (&b"lrotate"[..], lrotate),
+            (&b"rrotate"[..], rrotate),
+            (&b"extract"[..], extract),
+            (&b"replace"[..], replace),
         ] {
             self.heap.table_set(
                 table,
@@ -7421,6 +7483,17 @@ fn bit32_shift(value: u32, displacement: i32) -> u32 {
     } else {
         value >> displacement.unsigned_abs()
     }
+}
+
+fn bit32_field_mask(field: u32, width: u32, operation: &'static str) -> Result<u32, RuntimeError> {
+    if field >= 32 || width == 0 || width > 32 - field {
+        return Err(RuntimeError::InvalidRange { operation });
+    }
+    Ok(if width == 32 {
+        u32::MAX
+    } else {
+        (1u32 << width) - 1
+    })
 }
 
 fn number_argument(

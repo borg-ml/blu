@@ -4077,7 +4077,7 @@ fn math_type_and_tointeger_follow_modern_profile_contracts() {
 #[test]
 fn bit32_core_follows_profile_specific_conversion_and_result_rules() {
     let source = make_source(
-        b"return bit32.band(),bit32.bor(),bit32.bxor(),bit32.band(0xffffffff,0x12345678),bit32.bnot(0),bit32.lshift(1,-1),bit32.rshift(1,-1),bit32.lshift(1,32),bit32.arshift(0x80000000,1),bit32.band('3',1),bit32.band(-1,0xffffffff)"
+        b"return bit32.band(),bit32.bor(),bit32.bxor(),bit32.band(0xffffffff,0x12345678),bit32.bnot(0),bit32.lshift(1,-1),bit32.rshift(1,-1),bit32.lshift(1,32),bit32.arshift(0x80000000,1),bit32.band('3',1),bit32.band(-1,0xffffffff),bit32.lrotate(0x12345678,8),bit32.rrotate(0x12345678,8),bit32.lrotate(1,-1),bit32.extract(0xabcdef01,8,8),bit32.extract(0xabcdef01,0,32),bit32.replace(0xabcdef01,0x12,8,8)"
             .to_vec(),
     );
     for profile in SemanticProfile::ALL {
@@ -4114,6 +4114,12 @@ fn bit32_core_follows_profile_specific_conversion_and_result_rules() {
                     integral(0xc000_0000),
                     integral(1),
                     integral(4_294_967_295),
+                    integral(0x3456_7812),
+                    integral(0x7812_3456),
+                    integral(0x8000_0000),
+                    integral(0xef),
+                    integral(0xabcd_ef01),
+                    integral(0xabcd_1201),
                 ]),
                 "{profile}"
             );
@@ -4185,6 +4191,37 @@ fn bit32_core_follows_profile_specific_conversion_and_result_rules() {
                 result,
                 Err(RuntimeError::UnsupportedSemanticProfile {
                     operation: "bit32.bnot",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+
+        let invalid_range = make_source(b"return bit32.extract(1,31,2)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&invalid_range, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Luau
+                | SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+        ) {
+            assert_eq!(
+                result,
+                Err(RuntimeError::InvalidRange {
+                    operation: "bit32.extract",
+                }),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "bit32.extract",
                     profile,
                 }),
                 "{profile}"

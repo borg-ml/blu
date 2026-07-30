@@ -420,15 +420,15 @@ Blu and Luau expose the Luau numeric extensions `math.clamp`, `math.sign`, and
 ties-away-from-zero rounding, and reject inverted clamp bounds structurally.
 Lua profiles reject these functions explicitly because they are absent from
 the corresponding standard libraries.
-The initial `bit32` library exposes `band`, `bor`, `bxor`, `bnot`, `lshift`,
-`rshift`, and `arshift` in Blu, Luau, Lua 5.2, and Lua 5.3 profiles. Luau
-truncates numeric inputs toward zero, Lua 5.2 rounds them ties-to-even, and Lua
-5.3 requires integer-representable inputs; strings use the active profile's
-numeric grammar. Results are numbers in Luau and Lua 5.2 and integers in Blu
-and Lua 5.3. Lua 5.1, 5.4, and 5.5 reject these functions explicitly because
-their standard libraries do not expose `bit32`. Blu deliberately selects
-Luau's input conversion with Lua 5.3-style integer results. Rotates and
-field extraction/replacement remain unsupported rather than silently emulated.
+The `bit32` library exposes `band`, `bor`, `bxor`, `bnot`, `lshift`, `rshift`,
+`arshift`, `lrotate`, `rrotate`, `extract`, and `replace` in Blu, Luau, Lua
+5.2, and Lua 5.3 profiles. Luau truncates numeric inputs toward zero, Lua 5.2
+rounds them ties-to-even, and Lua 5.3 requires integer-representable inputs;
+strings use the active profile's numeric grammar. Results are numbers in Luau
+and Lua 5.2 and integers in Blu and Lua 5.3. Lua 5.1, 5.4, and 5.5 reject
+these functions explicitly because their standard libraries do not expose
+`bit32`. Blu deliberately selects Luau's input conversion with Lua 5.3-style
+integer results. Field offsets and widths are range-checked structurally.
 `tonumber` preserves existing numeric subtypes and integer string conversions
 for Blu and Lua 5.3–5.5, returns numbers for legacy profiles, accepts ordinary
 hexadecimal integer and floating strings, and follows profile-specific explicit-base parsing,
