@@ -546,7 +546,8 @@ return value"#
         let fixed_calls = SourceFile::new(
             SourceId::new(33),
             "fixed-calls.blu",
-            br#"print("owned"); return string.sub("blue", 2), type({})"#.to_vec(),
+            br#"local object = {kind = type}; print("owned"); return string.sub("blue", 2), type({}), object:kind()"#
+                .to_vec(),
             SourceLimits::default(),
         )
         .unwrap();
@@ -567,6 +568,7 @@ return value"#
                 engine.execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
                 Ok(vec![
                     Value::String(b"lue".as_slice().into()),
+                    Value::String(b"table".as_slice().into()),
                     Value::String(b"table".as_slice().into()),
                 ]),
                 "{profile}"

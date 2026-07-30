@@ -3,9 +3,9 @@ use crate::{
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
     DialectDirective, DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression,
     Identifier, IfClause, IfStatement, IndexExpression, LexError, Lexed, LexerLimits,
-    LocalListStatement, LocalStatement, NumericForStatement, RepeatStatement, ReturnStatement,
-    Statement, TableConstructor, TableField, Token, TokenKind, UnaryExpression, UnaryOperator,
-    WhileStatement, lex,
+    LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement, RepeatStatement,
+    ReturnStatement, Statement, TableConstructor, TableField, Token, TokenKind, UnaryExpression,
+    UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -879,7 +879,7 @@ impl<'a> Parser<'a> {
         let target_expression = self.parse_postfix(target_expression)?;
         if matches!(
             self.expression(target_expression.id)?.kind(),
-            ExpressionKind::Call(_)
+            ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
         ) && !self.at(TokenKind::Equal)
             && !self.at(TokenKind::Comma)
         {
@@ -1184,6 +1184,77 @@ impl<'a> Parser<'a> {
                         span,
                     ),
                     expression.depth.saturating_add(1),
+                )?;
+            } else if self.at(TokenKind::Colon) {
+                self.bump();
+                let Some(name) = self
+                    .current()
+                    .filter(|token| token.kind() == TokenKind::Identifier)
+                else {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0032",
+                        "expected a method name after `:`",
+                        &["identifier"],
+                    )?;
+                    return Ok(expression);
+                };
+                self.bump();
+                if !self.at(TokenKind::LeftParenthesis) {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0033",
+                        "expected `(` after method name",
+                        &["("],
+                    )?;
+                    return Ok(expression);
+                }
+                self.bump();
+                let mut arguments = allocate_vec(2, "method call arguments")?;
+                let mut depth = expression.depth;
+                if !self.at(TokenKind::RightParenthesis) {
+                    loop {
+                        let Some(argument) = self.parse_expression(0)? else {
+                            return Ok(expression);
+                        };
+                        self.check_ast_limit()?;
+                        self.call_argument_count = self.call_argument_count.saturating_add(1);
+                        push_fallible(&mut arguments, argument.id, "method call arguments")?;
+                        depth = depth.max(argument.depth);
+                        if !self.at(TokenKind::Comma) {
+                            break;
+                        }
+                        self.bump();
+                    }
+                }
+                let Some(close) = self
+                    .current()
+                    .filter(|token| token.kind() == TokenKind::RightParenthesis)
+                else {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0031",
+                        "expected `)` after call arguments",
+                        &[")"],
+                    )?;
+                    return Ok(expression);
+                };
+                self.bump();
+                let first_argument = self.call_arguments.len();
+                let argument_count = arguments.len();
+                for argument in arguments {
+                    push_fallible(&mut self.call_arguments, argument, "AST call arguments")?;
+                }
+                let span = self.expression(expression.id)?.span().merge(close.span())?;
+                expression = self.push_expression(
+                    Expression::new(
+                        ExpressionKind::MethodCall(MethodCallExpression::new(
+                            expression.id,
+                            Identifier::new(name.span()),
+                            first_argument,
+                            argument_count,
+                            span,
+                        )),
+                        span,
+                    ),
+                    depth.saturating_add(1),
                 )?;
             } else if self.at(TokenKind::LeftParenthesis) {
                 self.bump();

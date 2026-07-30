@@ -219,8 +219,11 @@ copy arguments to that contiguous range. Direct execution delegates to the
 existing VM call path, preserving native registration, structured errors, call
 limits, active GC roots, and callable-table behavior. The expression result is
 the first returned value or `nil`; additional values are discarded. Call
-statements discard that scalar result. MULTRET/vararg adjustment, method-call
-sugar, owned closures, and resumable direct-BluV1 calls remain unsupported.
+statements discard that scalar result. Colon method calls evaluate their
+receiver once, perform raw table lookup before evaluating explicit arguments,
+and pass the receiver as the first argument. MULTRET/vararg adjustment, owned
+closures, metamethod-aware method lookup, and resumable direct-BluV1 calls
+remain unsupported.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

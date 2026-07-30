@@ -228,6 +228,32 @@ fn postfix_calls_retain_callee_arguments_and_chaining() {
 }
 
 #[test]
+fn method_calls_retain_receiver_method_and_explicit_arguments() {
+    let source =
+        source(br#"object:notify("first"); return factory().method:invoke("second")"#.to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    assert!(matches!(parsed.ast().statements()[0], Statement::Call(_)));
+    let Statement::Return(returned) = &parsed.ast().statements()[1] else {
+        panic!("expected return");
+    };
+    let ExpressionKind::MethodCall(call) = parsed
+        .ast()
+        .expression(returned.values()[0])
+        .unwrap()
+        .kind()
+    else {
+        panic!("expected method call");
+    };
+    assert_eq!(source.slice(call.method().span()).unwrap(), b"invoke");
+    assert_eq!(call.argument_count(), 1);
+    assert_eq!(parsed.ast().method_call_arguments(call).unwrap().len(), 1);
+    assert!(matches!(
+        parsed.ast().expression(call.receiver()).unwrap().kind(),
+        ExpressionKind::Field(_)
+    ));
+}
+
+#[test]
 fn local_name_and_value_lists_preserve_order_and_adjustment_shape() {
     for profile in SemanticProfile::ALL {
         let source = source(b"local first, second, missing = 40, 2\nreturn first".to_vec());

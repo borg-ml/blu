@@ -15,9 +15,9 @@ pub use ast::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
     DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, Identifier, IfClause,
-    IfStatement, IndexExpression, LocalListStatement, LocalStatement, NumericForStatement,
-    RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField, UnaryExpression,
-    UnaryOperator, WhileStatement,
+    IfStatement, IndexExpression, LocalListStatement, LocalStatement, MethodCallExpression,
+    NumericForStatement, RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField,
+    UnaryExpression, UnaryOperator, WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
@@ -166,6 +166,7 @@ pub enum TokenKind {
     GreaterEqual,
     Comma,
     Semicolon,
+    Colon,
     Plus,
     Minus,
     Star,
@@ -403,6 +404,10 @@ pub fn lex(
             b';' => {
                 offset += 1;
                 TokenKind::Semicolon
+            }
+            b':' => {
+                offset += 1;
+                TokenKind::Colon
             }
             b'+' => {
                 offset += 1;

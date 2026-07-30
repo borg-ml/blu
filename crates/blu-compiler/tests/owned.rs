@@ -1334,6 +1334,29 @@ fn owned_fixed_calls_reach_host_registered_globals() {
 }
 
 #[test]
+fn owned_method_calls_pass_receiver_once_before_explicit_arguments() {
+    let source = make_source(
+        br#"local object = {method = host_second}; return object:method("registered")"#.to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .expect("method calls should compile");
+        let mut vm = Vm::default();
+        let second = vm.register_function(|_, arguments| {
+            assert!(matches!(arguments.first(), Some(Value::Table(_))));
+            Ok(vec![arguments.get(1).cloned().unwrap_or(Value::Nil)])
+        });
+        vm.set_global(b"host_second".as_slice(), Value::NativeFunction(second));
+        assert_eq!(
+            vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::String(b"registered".as_slice().into())]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_indexing_non_tables_returns_structured_type_errors() {
     for bytes in [
         br#"local value = 1; return value["key"]"#.as_slice(),

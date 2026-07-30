@@ -224,6 +224,58 @@ impl CallExpression {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct MethodCallExpression {
+    receiver: ExpressionId,
+    method: Identifier,
+    first_argument: usize,
+    argument_count: usize,
+    span: ByteSpan,
+}
+
+impl MethodCallExpression {
+    pub(crate) const fn new(
+        receiver: ExpressionId,
+        method: Identifier,
+        first_argument: usize,
+        argument_count: usize,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            receiver,
+            method,
+            first_argument,
+            argument_count,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn receiver(self) -> ExpressionId {
+        self.receiver
+    }
+
+    #[must_use]
+    pub const fn method(self) -> Identifier {
+        self.method
+    }
+
+    #[must_use]
+    pub const fn first_argument(self) -> usize {
+        self.first_argument
+    }
+
+    #[must_use]
+    pub const fn argument_count(self) -> usize {
+        self.argument_count
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl TableConstructor {
     pub(crate) const fn new(first_field: usize, field_count: usize) -> Self {
         Self {
@@ -293,6 +345,7 @@ pub enum ExpressionKind {
     Index(IndexExpression),
     Field(FieldExpression),
     Call(CallExpression),
+    MethodCall(MethodCallExpression),
     Unary(UnaryExpression),
     Binary(BinaryExpression),
 }
@@ -916,6 +969,12 @@ impl Ast {
 
     #[must_use]
     pub fn call_arguments(&self, call: CallExpression) -> Option<&[ExpressionId]> {
+        let end = call.first_argument().checked_add(call.argument_count())?;
+        self.call_arguments.get(call.first_argument()..end)
+    }
+
+    #[must_use]
+    pub fn method_call_arguments(&self, call: MethodCallExpression) -> Option<&[ExpressionId]> {
         let end = call.first_argument().checked_add(call.argument_count())?;
         self.call_arguments.get(call.first_argument()..end)
     }
