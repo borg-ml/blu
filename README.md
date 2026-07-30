@@ -40,7 +40,8 @@ All four Lua repetition suffixes are bounded: greedy `*`/`+`/`?` and minimal
 `string.find` and `string.match` return bounded nested substring and position
 captures from the same byte-pattern engine, including `%1` through `%9`
 backreferences to completed substring captures and bounded `%bxy` nested byte
-pairs. `string.gsub` adds bounded
+pairs. Zero-width `%f[set]` byte frontiers share the bracket-set engine.
+`string.gsub` adds bounded
 string/number replacement, `%0`, `%%`, empty-match progress, replacement
 counts, and explicit capture-reference/callback rejection.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap

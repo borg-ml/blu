@@ -2811,6 +2811,66 @@ fn string_patterns_reject_malformed_balanced_atoms_structurally() {
 }
 
 #[test]
+fn string_patterns_match_zero_width_frontiers() {
+    let source = make_source(
+        b"local a,b=string.find('hello world','%f[%a]world') local c=string.match('123abc','%f[%a]%a+') local d,e=string.find('abc','%f[%z]') local f=string.match('abc','%f[%d]') return a,b,c,d,e,f"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let index = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                index(7),
+                index(11),
+                Value::String(Arc::from(&b"abc"[..])),
+                index(4),
+                index(3),
+                Value::Nil,
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn string_patterns_reject_malformed_frontiers_structurally() {
+    for profile in SemanticProfile::ALL {
+        for pattern in [b"%f".as_slice(), b"%fa".as_slice()] {
+            let mut source = b"return string.match('abc', '".to_vec();
+            source.extend_from_slice(pattern);
+            source.extend_from_slice(b"')");
+            let compiled = OwnedCompiler::default()
+                .compile(&make_source(source), profile, compiler_identity())
+                .unwrap();
+            assert!(matches!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.match",
+                    feature: "malformed Lua frontier patterns",
+                })
+            ));
+        }
+    }
+}
+
+#[test]
 fn string_gsub_replaces_bounded_matches_and_reports_profile_typed_counts() {
     let source = make_source(
         b"local a,b=string.gsub('abc123','%d','[%0]') local c,d=string.gsub('abc','','-') local e,f=string.gsub('aaaa','a',7,2) return a,b,c,d,e,f"

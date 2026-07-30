@@ -6424,6 +6424,7 @@ enum BasicPatternAtom {
     Set([u64; 4]),
     Backreference(u8),
     Balanced(u8, u8),
+    Frontier([u64; 4]),
     CaptureStart(u8),
     CaptureEnd(u8),
     PositionCapture(u8),
@@ -6507,6 +6508,16 @@ fn find_basic_lua_pattern(
                 )?;
                 index += 2;
                 BasicPatternAtom::Balanced(open, close)
+            } else if escaped == b'f' {
+                if pattern.get(index + 2) != Some(&b'[') {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: operation,
+                        feature: "malformed Lua frontier patterns",
+                    });
+                }
+                let (set, next) = parse_basic_pattern_set(pattern, index + 2, operation)?;
+                index = next - 2;
+                BasicPatternAtom::Frontier(set)
             } else if matches!(
                 escaped.to_ascii_lowercase(),
                 b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
@@ -6717,6 +6728,29 @@ fn match_basic_pattern_at(
                     });
                     continue;
                 }
+                if let BasicPatternAtom::Frontier(set) = current.atom {
+                    if !matches!(current.repetition, BasicPatternRepetition::One) {
+                        return Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: operation,
+                            feature: "repetition applied to Lua frontier patterns",
+                        });
+                    }
+                    charge_pattern_work(work, 2, work_limit)?;
+                    let previous = position
+                        .checked_sub(1)
+                        .and_then(|previous| haystack.get(previous))
+                        .copied()
+                        .unwrap_or(0);
+                    let next = haystack.get(position).copied().unwrap_or(0);
+                    if !pattern_set_contains(&set, previous) && pattern_set_contains(&set, next) {
+                        states.push(BasicPatternState::Match {
+                            piece: piece + 1,
+                            position,
+                            event,
+                        });
+                    }
+                    continue;
+                }
                 if let BasicPatternAtom::Balanced(open, close) = current.atom {
                     if !matches!(current.repetition, BasicPatternRepetition::One) {
                         return Err(RuntimeError::UnsupportedLibraryFeature {
@@ -6913,6 +6947,7 @@ fn basic_pattern_atom_matches(atom: &BasicPatternAtom, byte: u8) -> bool {
         BasicPatternAtom::Set(set) => pattern_set_contains(set, byte),
         BasicPatternAtom::Backreference(_)
         | BasicPatternAtom::Balanced(_, _)
+        | BasicPatternAtom::Frontier(_)
         | BasicPatternAtom::CaptureStart(_)
         | BasicPatternAtom::CaptureEnd(_)
         | BasicPatternAtom::PositionCapture(_) => false,
