@@ -5342,7 +5342,9 @@ impl Vm {
                 function: "tostring",
                 index: 1,
             })?;
-            let mut result = try_vec_with_capacity(rendered_value_len(value), "tostring result")?;
+            let required = rendered_value_len(value);
+            ensure_string_result_length(required)?;
+            let mut result = try_vec_with_capacity(required, "tostring result")?;
             append_value(&mut result, value);
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -5651,7 +5653,7 @@ impl Vm {
             } else {
                 &string[(start - 1) as usize..end as usize]
             };
-            Ok(vec![Value::String(Arc::from(result))])
+            Ok(vec![limited_string_value(result)?])
         });
         let string_find = self.register_function(|vm, arguments| {
             let haystack = string_bytes(
@@ -5754,9 +5756,9 @@ impl Vm {
                 return Ok(vec![Value::Nil]);
             };
             if found.capture_count == 0 {
-                Ok(vec![Value::String(Arc::from(
+                Ok(vec![limited_string_value(
                     &haystack[found.start..found.end],
-                ))])
+                )?])
             } else {
                 let mut values =
                     try_vec_with_capacity(found.capture_count, "string.match captures")?;
@@ -5994,8 +5996,9 @@ impl Vm {
                 function: "string.reverse",
                 index: 1,
             })?;
-            let mut result =
-                try_clone_bytes(string_bytes(string, "string.reverse")?, "reversed string")?;
+            let string = string_bytes(string, "string.reverse")?;
+            ensure_string_result_length(string.len())?;
+            let mut result = try_clone_bytes(string, "reversed string")?;
             result.reverse();
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -6081,8 +6084,9 @@ impl Vm {
                 function: "string.lower",
                 index: 1,
             })?;
-            let mut result =
-                try_clone_bytes(string_bytes(value, "string.lower")?, "lowercase string")?;
+            let value = string_bytes(value, "string.lower")?;
+            ensure_string_result_length(value.len())?;
+            let mut result = try_clone_bytes(value, "lowercase string")?;
             result.make_ascii_lowercase();
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -6096,8 +6100,9 @@ impl Vm {
                 function: "string.upper",
                 index: 1,
             })?;
-            let mut result =
-                try_clone_bytes(string_bytes(value, "string.upper")?, "uppercase string")?;
+            let value = string_bytes(value, "string.upper")?;
+            ensure_string_result_length(value.len())?;
+            let mut result = try_clone_bytes(value, "uppercase string")?;
             result.make_ascii_uppercase();
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -6123,6 +6128,7 @@ impl Vm {
                 expected: "string or number",
                 actual: input.type_name(),
             })?;
+            ensure_string_result_length(input.len())?;
             let separator = match arguments.get(1) {
                 None | Some(Value::Nil) => Cow::Borrowed(&b","[..]),
                 Some(value) => try_concat_bytes(value)?.ok_or(RuntimeError::Type {
@@ -9506,6 +9512,22 @@ fn append_limited_string(result: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Runti
     Ok(())
 }
 
+fn ensure_string_result_length(required: usize) -> Result<(), RuntimeError> {
+    if required > MAX_STRING_BYTES {
+        Err(RuntimeError::StringLimit {
+            required,
+            limit: MAX_STRING_BYTES,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn limited_string_value(bytes: &[u8]) -> Result<Value, RuntimeError> {
+    ensure_string_result_length(bytes.len())?;
+    Ok(Value::String(Arc::from(bytes)))
+}
+
 fn append_basic_capture_values(
     values: &mut Vec<Value>,
     vm: &Vm,
@@ -9527,9 +9549,7 @@ fn append_basic_capture_values(
                 (capture.start + 1) as f64,
             )?);
         } else {
-            values.push(Value::String(Arc::from(
-                &haystack[capture.start..capture.end],
-            )));
+            values.push(limited_string_value(&haystack[capture.start..capture.end])?);
         }
     }
     Ok(())
@@ -9541,7 +9561,7 @@ fn gsub_table_key(
     found: &BasicPatternMatch,
 ) -> Result<Value, RuntimeError> {
     let Some(capture) = found.captures.first().filter(|_| found.capture_count != 0) else {
-        return Ok(Value::String(Arc::from(&haystack[found.start..found.end])));
+        return limited_string_value(&haystack[found.start..found.end]);
     };
     if !capture.set {
         return Err(RuntimeError::UnsupportedLibraryFeature {
@@ -9552,9 +9572,7 @@ fn gsub_table_key(
     if capture.position {
         profiled_integral_math_result(vm, "string.gsub", (capture.start + 1) as f64)
     } else {
-        Ok(Value::String(Arc::from(
-            &haystack[capture.start..capture.end],
-        )))
+        limited_string_value(&haystack[capture.start..capture.end])
     }
 }
 
@@ -12659,6 +12677,40 @@ mod tests {
                 actual: "string",
             })
         ));
+    }
+
+    #[test]
+    fn direct_string_transformations_reject_oversized_host_inputs_before_copying() {
+        let mut vm = Vm::default();
+        let oversized = Value::String(Arc::from(vec![b'A'; MAX_STRING_BYTES + 1]));
+        let expected = RuntimeError::StringLimit {
+            required: MAX_STRING_BYTES + 1,
+            limit: MAX_STRING_BYTES,
+        };
+
+        for (name, arguments) in [
+            (
+                b"sub".as_slice(),
+                vec![oversized.clone(), Value::Integer(1)],
+            ),
+            (b"reverse".as_slice(), vec![oversized.clone()]),
+            (b"lower".as_slice(), vec![oversized.clone()]),
+            (b"upper".as_slice(), vec![oversized.clone()]),
+            (b"split".as_slice(), vec![oversized.clone()]),
+        ] {
+            assert_eq!(
+                native(&vm, b"string", name)(&mut vm, &arguments),
+                Err(expected.clone()),
+                "string.{}",
+                String::from_utf8_lossy(name)
+            );
+        }
+
+        let Value::NativeFunction(tostring) = vm.global(b"tostring").unwrap() else {
+            panic!("tostring is not a native function");
+        };
+        let tostring = vm.native_functions[tostring.0 as usize].clone();
+        assert_eq!(tostring(&mut vm, &[oversized]), Err(expected));
     }
 
     #[test]

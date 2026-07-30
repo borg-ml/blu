@@ -699,7 +699,10 @@ allocations performed inside host callback code remain the embedder's
 responsibility. Built-in concatenation and the string transformation,
 repetition, character, byte-expansion, and `table.unpack` result buffers use
 checked fallible reservation; concatenation also enforces the 64 MiB
-string-result limit.
+string-result limit. Direct-copy operations including `tostring`,
+`string.sub`, `string.match` captures, `string.reverse`, `string.lower`,
+`string.upper`, and `string.split` validate that same bound before copying
+even when an oversized input string originated in host code.
 Accounted guest heap growth triggers collection at the configured byte
 threshold before reserving more storage. Active and saved frames trace both
 their values and every live open-upvalue cell.
