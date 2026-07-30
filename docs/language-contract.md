@@ -518,6 +518,9 @@ Integral counts and bytes returned by `rawlen`, `select("#", ...)`,
 `string.len`, `string.byte`, and `table.pack.n` likewise use integers in Blu
 and Lua 5.3–5.5 and numbers in legacy profiles. Array keys exposed by `next`
 and the initial and advancing indices of `ipairs` use the same profile split.
+`rawlen` is available in Blu, Luau, and Lua 5.2–5.5 but rejected explicitly
+for Lua 5.1, which predates it. `typeof` is a Blu/Luau extension; Lua profiles
+retain only the shared `type` function.
 `string.find` currently implements the common byte-oriented literal-search
 slice: relative start indices, empty needles, nil misses, and explicit
 `plain=true`. Searches without `plain` support search-relative `^`, subject-end

@@ -5114,7 +5114,21 @@ impl Vm {
             Ok(vec![Value::String(Arc::from(value.type_name().as_bytes()))])
         });
         self.set_global(&b"type"[..], Value::NativeFunction(type_function));
-        self.set_global(&b"typeof"[..], Value::NativeFunction(type_function));
+        let typeof_function = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "typeof",
+                    profile,
+                });
+            }
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "typeof",
+                index: 1,
+            })?;
+            Ok(vec![Value::String(Arc::from(value.type_name().as_bytes()))])
+        });
+        self.set_global(&b"typeof"[..], Value::NativeFunction(typeof_function));
 
         let tonumber = self.register_function(|vm, arguments| {
             let value = arguments.first().ok_or(RuntimeError::Argument {
@@ -5291,6 +5305,13 @@ impl Vm {
         self.set_global(&b"rawequal"[..], Value::NativeFunction(rawequal));
 
         let rawlen = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if profile == SemanticProfile::Lua51 {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "rawlen",
+                    profile,
+                });
+            }
             let value = arguments.first().ok_or(RuntimeError::Argument {
                 function: "rawlen",
                 index: 1,

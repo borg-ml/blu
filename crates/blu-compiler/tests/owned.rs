@@ -5799,9 +5799,69 @@ fn legacy_gcinfo_is_profile_gated_and_reports_integer_kibibytes() {
 }
 
 #[test]
+fn typeof_and_rawlen_follow_profile_availability() {
+    let typeof_source = make_source(b"return typeof({})".to_vec());
+    let rawlen_source = make_source(b"return rawlen('abc'),rawlen({10,20})".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&typeof_source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert_eq!(
+                result,
+                Ok(vec![Value::String(Arc::from(&b"table"[..]))]),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "typeof",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+
+        let compiled = OwnedCompiler::default()
+            .compile(&rawlen_source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if profile == SemanticProfile::Lua51 {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "rawlen",
+                    profile,
+                })
+            );
+        } else {
+            let modern = matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            );
+            let value = |integer| {
+                if modern {
+                    Value::Integer(integer)
+                } else {
+                    Value::Number(integer as f64)
+                }
+            };
+            assert_eq!(result, Ok(vec![value(3), value(2)]), "{profile}");
+        }
+    }
+}
+
+#[test]
 fn base_library_counts_follow_profile_numeric_subtypes() {
     let source = make_source(
-        b"local first,second=string.byte('AZ',1,2) local next_key=next({10}) local iterator,state,initial=ipairs({10}) local ipairs_key=iterator(state,initial) return rawlen('abc'),rawlen({10,20}),select('#',10,20,30),string.len('abc'),first,second,next_key,initial,ipairs_key"
+        b"local first,second=string.byte('AZ',1,2) local next_key=next({10}) local iterator,state,initial=ipairs({10}) local ipairs_key=iterator(state,initial) return select('#',10,20,30),string.len('abc'),first,second,next_key,initial,ipairs_key"
             .to_vec(),
     );
     for profile in SemanticProfile::ALL {
@@ -5825,8 +5885,6 @@ fn base_library_counts_follow_profile_numeric_subtypes() {
         assert_eq!(
             Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
             Ok(vec![
-                integral(3),
-                integral(2),
                 integral(3),
                 integral(3),
                 integral(65),
