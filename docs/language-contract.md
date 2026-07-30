@@ -162,7 +162,9 @@ produce Boolean values. `Equal`, `LessThan`, and `LessEqual` are the artifact
 primitives; the compiler derives `~=`, `>`, and `>=` with Boolean negation or
 operand reversal while preserving source evaluation order. Equality between
 unlike scalar types is false. Ordering accepts compatible numeric operands or
-two byte strings. Table handler results resume into Boolean conversion. Luau
+two byte strings. Mixed integer/number equality and ordering compare exactly
+across the full signed 64-bit range without lossy integer-to-`f64` conversion;
+NaN remains unequal to itself and unordered. Table handler results resume into Boolean conversion. Luau
 and Lua 5.1–5.2 require both operands to expose the same comparison handler;
 Lua 5.3–5.5 search left then right. Luau and Lua 5.1–5.4 implement a missing
 `__le` as `not (right < left)`, while Lua 5.5 removed that fallback. Blu

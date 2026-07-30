@@ -153,7 +153,9 @@ executes with Luau number semantics and Blu/Lua 5.3–5.5 integer-preserving
 modern semantics.
 The owned path also directly executes profile-neutral `==`, `~=`, `<`, `<=`,
 `>`, and `>=`; ordered comparisons accept only compatible numbers or byte
-strings, while equality between unlike scalar types is false.
+strings, while equality between unlike scalar types is false. Mixed
+integer/number comparisons remain exact across the full 64-bit range instead
+of first converting integers to `f64`; NaN is unequal and unordered.
 Operand-returning `and` and `or` use validated forward branches and preserve
 short-circuit evaluation in every profile.
 Structured `if`/`elseif`/`else` blocks execute through the same validated

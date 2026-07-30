@@ -2690,9 +2690,8 @@ impl Vm {
                             Some(false)
                         }
                         Opcode::JumpIfLt => {
-                            if let (Some(left), Some(right)) = (left.as_number(), right.as_number())
-                            {
-                                Some(left < right)
+                            if let Some(value) = left.numeric_less(&right) {
+                                Some(value)
                             } else if let (Value::String(left), Value::String(right)) =
                                 (&left, &right)
                             {
@@ -2702,9 +2701,8 @@ impl Vm {
                             }
                         }
                         Opcode::JumpIfLe => {
-                            if let (Some(left), Some(right)) = (left.as_number(), right.as_number())
-                            {
-                                Some(left <= right)
+                            if let Some(value) = left.numeric_less_equal(&right) {
+                                Some(value)
                             } else if let (Value::String(left), Value::String(right)) =
                                 (&left, &right)
                             {
@@ -4690,8 +4688,8 @@ impl Vm {
                 }
             }
             Opcode::JumpIfLt | Opcode::JumpIfNotLt => {
-                if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
-                    left < right
+                if let Some(value) = left.numeric_less(&right) {
+                    value
                 } else if let (Value::String(left), Value::String(right)) = (&left, &right) {
                     left < right
                 } else {
@@ -4714,8 +4712,8 @@ impl Vm {
                 }
             }
             Opcode::JumpIfLe | Opcode::JumpIfNotLe => {
-                if let (Some(left), Some(right)) = (left.as_number(), right.as_number()) {
-                    left <= right
+                if let Some(value) = left.numeric_less_equal(&right) {
+                    value
                 } else if let (Value::String(left), Value::String(right)) = (&left, &right) {
                     left <= right
                 } else if let Some(function) = self.shared_metamethod(&left, &right, "__le")? {

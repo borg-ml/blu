@@ -1,4 +1,5 @@
 use crate::{ClosureId, TableId, ThreadId};
+use core::cmp::Ordering;
 use core::fmt;
 use std::sync::Arc;
 
@@ -48,6 +49,66 @@ impl Value {
             _ => None,
         }
     }
+
+    pub(crate) fn numeric_equal(&self, other: &Self) -> Option<bool> {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => Some(left == right),
+            (Self::Integer(left), Self::Integer(right)) => Some(left == right),
+            (Self::Integer(integer), Self::Number(number))
+            | (Self::Number(number), Self::Integer(integer)) => {
+                Some(integer_number_order(*integer, *number) == Some(Ordering::Equal))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn numeric_less(&self, other: &Self) -> Option<bool> {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => Some(left < right),
+            (Self::Integer(left), Self::Integer(right)) => Some(left < right),
+            (Self::Integer(integer), Self::Number(number)) => {
+                Some(integer_number_order(*integer, *number) == Some(Ordering::Less))
+            }
+            (Self::Number(number), Self::Integer(integer)) => {
+                Some(integer_number_order(*integer, *number) == Some(Ordering::Greater))
+            }
+            _ => None,
+        }
+    }
+
+    pub(crate) fn numeric_less_equal(&self, other: &Self) -> Option<bool> {
+        match (self, other) {
+            (Self::Number(left), Self::Number(right)) => Some(left <= right),
+            (Self::Integer(left), Self::Integer(right)) => Some(left <= right),
+            (Self::Integer(integer), Self::Number(number)) => Some(matches!(
+                integer_number_order(*integer, *number),
+                Some(Ordering::Less | Ordering::Equal)
+            )),
+            (Self::Number(number), Self::Integer(integer)) => Some(matches!(
+                integer_number_order(*integer, *number),
+                Some(Ordering::Greater | Ordering::Equal)
+            )),
+            _ => None,
+        }
+    }
+}
+
+fn integer_number_order(integer: i64, number: f64) -> Option<Ordering> {
+    if number.is_nan() {
+        return None;
+    }
+    if number >= -(i64::MIN as f64) {
+        return Some(Ordering::Less);
+    }
+    if number < i64::MIN as f64 {
+        return Some(Ordering::Greater);
+    }
+    let truncated = number as i64;
+    match integer.cmp(&truncated) {
+        Ordering::Equal if number > truncated as f64 => Some(Ordering::Less),
+        Ordering::Equal if number < truncated as f64 => Some(Ordering::Greater),
+        ordering => Some(ordering),
+    }
 }
 
 impl fmt::Debug for Value {
@@ -77,10 +138,10 @@ impl PartialEq for Value {
         match (self, other) {
             (Self::Nil, Self::Nil) => true,
             (Self::Boolean(left), Self::Boolean(right)) => left == right,
-            (Self::Number(left), Self::Number(right)) => left == right,
-            (Self::Integer(left), Self::Integer(right)) => left == right,
-            (Self::Number(left), Self::Integer(right))
-            | (Self::Integer(right), Self::Number(left)) => *left == *right as f64,
+            (Self::Number(_), Self::Number(_))
+            | (Self::Integer(_), Self::Integer(_))
+            | (Self::Number(_), Self::Integer(_))
+            | (Self::Integer(_), Self::Number(_)) => self.numeric_equal(other).unwrap_or(false),
             (Self::String(left), Self::String(right)) => left == right,
             (Self::Table(left), Self::Table(right)) => left == right,
             (Self::Closure(left), Self::Closure(right)) => left == right,

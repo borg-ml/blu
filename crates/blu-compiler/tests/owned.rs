@@ -1849,6 +1849,33 @@ fn owned_indexing_non_tables_returns_structured_type_errors() {
 }
 
 #[test]
+fn blu_mixed_numeric_comparisons_are_exact_beyond_f64_precision() {
+    let source = make_source(
+        b"local i=9007199254740993 local n=9007199254740992.0 local hi=0x7fffffffffffffff local hif=9223372036854775808.0 local lo=0x8000000000000000 local lof=-9223372036854775808.0 local nan=0/0 local t={[i]='integer',[n]='number'} return i==n,i>n,i<=n,hi==hif,hi<hif,lo==lof,nan==nan,nan<0,nan<=0,t[i],t[n]"
+            .to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
+            Value::Boolean(true),
+            Value::Boolean(true),
+            Value::Boolean(false),
+            Value::Boolean(false),
+            Value::Boolean(false),
+            Value::String(Arc::from(&b"integer"[..])),
+            Value::String(Arc::from(&b"number"[..])),
+        ])
+    );
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {
