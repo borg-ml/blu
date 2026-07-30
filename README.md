@@ -44,8 +44,8 @@ captures from the same byte-pattern engine, including `%1` through `%9`
 backreferences to completed substring captures and bounded `%bxy` nested byte
 pairs. Zero-width `%f[set]` byte frontiers share the bracket-set engine.
 `string.gsub` adds bounded
-string/number replacement, `%0`, `%%`, empty-match progress, replacement
-counts, and explicit capture-reference/callback rejection.
+string/number replacement, `%0`, `%1`–`%9`, `%%`, empty-match progress,
+replacement counts, and explicit callback rejection.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
 `table.sort` provides bounded default ordering for uniform number and byte-string

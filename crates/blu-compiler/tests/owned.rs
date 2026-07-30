@@ -2936,12 +2936,49 @@ fn string_gsub_replaces_bounded_matches_and_reports_profile_typed_counts() {
 }
 
 #[test]
+fn string_gsub_expands_substring_and_position_capture_references() {
+    let source = make_source(
+        b"local a,b=string.gsub('ab12','(%a+)(%d+)','%2-%1-%0') local c,d=string.gsub('ab','a','%1') local e,f=string.gsub('ab','()a','[%1]') return a,b,c,d,e,f"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let count = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::String(Arc::from(&b"12-ab-ab12"[..])),
+                count(1),
+                Value::String(Arc::from(&b"ab"[..])),
+                count(1),
+                Value::String(Arc::from(&b"[1]b"[..])),
+                count(1),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn string_gsub_rejects_unimplemented_replacements_structurally() {
     for profile in SemanticProfile::ALL {
         for source in [
             b"return string.gsub('a','a',function() return 'b' end)".as_slice(),
-            b"return string.gsub('a','(a)','%1')".as_slice(),
-            b"return string.gsub('a','a','%1')".as_slice(),
+            b"return string.gsub('a','(a)','%2')".as_slice(),
         ] {
             let source = make_source(source.to_vec());
             let compiled = OwnedCompiler::default()

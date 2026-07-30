@@ -5204,7 +5204,7 @@ impl Vm {
                 let first = found.start;
                 let end = found.end;
                 append_limited_string(&mut result, &haystack[copied_until..first])?;
-                append_gsub_replacement(&mut result, &replacement, &haystack[first..end])?;
+                append_gsub_replacement(&mut result, &replacement, haystack, &found)?;
                 replacements += 1;
                 if end > first {
                     search_start = end;
@@ -7129,7 +7129,8 @@ fn append_basic_capture_values(
 fn append_gsub_replacement(
     result: &mut Vec<u8>,
     replacement: &[u8],
-    matched: &[u8],
+    haystack: &[u8],
+    found: &BasicPatternMatch,
 ) -> Result<(), RuntimeError> {
     let mut index = 0;
     while index < replacement.len() {
@@ -7147,13 +7148,29 @@ fn append_gsub_replacement(
                     feature: "malformed replacement escapes",
                 })?;
         match escaped {
-            b'0' => append_limited_string(result, matched)?,
+            b'0' => append_limited_string(result, &haystack[found.start..found.end])?,
             b'%' => append_limited_string(result, b"%")?,
             b'1'..=b'9' => {
-                return Err(RuntimeError::UnsupportedLibraryFeature {
-                    function: "string.gsub",
-                    feature: "capture replacement references",
-                });
+                let capture_index = usize::from(escaped - b'1');
+                if found.capture_count == 0 && capture_index == 0 {
+                    append_limited_string(result, &haystack[found.start..found.end])?;
+                } else {
+                    let capture = found
+                        .captures
+                        .get(capture_index)
+                        .filter(|capture| capture_index < found.capture_count && capture.set);
+                    let Some(capture) = capture else {
+                        return Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: "string.gsub",
+                            feature: "invalid replacement capture reference",
+                        });
+                    };
+                    if capture.position {
+                        append_usize_decimal(result, capture.start + 1)?;
+                    } else {
+                        append_limited_string(result, &haystack[capture.start..capture.end])?;
+                    }
+                }
             }
             _ => {
                 return Err(RuntimeError::UnsupportedLibraryFeature {
@@ -7165,6 +7182,20 @@ fn append_gsub_replacement(
         index += 2;
     }
     Ok(())
+}
+
+fn append_usize_decimal(result: &mut Vec<u8>, mut value: usize) -> Result<(), RuntimeError> {
+    let mut digits = [0_u8; 40];
+    let mut start = digits.len();
+    loop {
+        start -= 1;
+        digits[start] = b'0' + (value % 10) as u8;
+        value /= 10;
+        if value == 0 {
+            break;
+        }
+    }
+    append_limited_string(result, &digits[start..])
 }
 
 fn try_concat_bytes(value: &Value) -> Result<Option<Cow<'_, [u8]>>, RuntimeError> {
