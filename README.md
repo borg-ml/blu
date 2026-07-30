@@ -38,7 +38,8 @@ Lua-pattern syntax fails structurally instead of being treated as literal text.
 All four Lua repetition suffixes are bounded: greedy `*`/`+`/`?` and minimal
 `-`.
 `string.find` and `string.match` return bounded nested substring and position
-captures from the same byte-pattern engine. `string.gsub` adds bounded
+captures from the same byte-pattern engine, including `%1` through `%9`
+backreferences to completed substring captures. `string.gsub` adds bounded
 string/number replacement, `%0`, `%%`, empty-match progress, replacement
 counts, and explicit capture-reference/callback rejection.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap

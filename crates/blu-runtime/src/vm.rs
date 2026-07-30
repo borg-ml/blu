@@ -6422,6 +6422,7 @@ enum BasicPatternAtom {
     Any,
     Class(u8),
     Set([u64; 4]),
+    Backreference(u8),
     CaptureStart(u8),
     CaptureEnd(u8),
     PositionCapture(u8),
@@ -6495,6 +6496,8 @@ fn find_basic_lua_pattern(
                 b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
             ) {
                 BasicPatternAtom::Class(escaped)
+            } else if matches!(escaped, b'1'..=b'9') {
+                BasicPatternAtom::Backreference(escaped - b'1')
             } else if escaped.is_ascii_alphanumeric() {
                 return Err(RuntimeError::UnsupportedLibraryFeature {
                     function: operation,
@@ -6698,6 +6701,38 @@ fn match_basic_pattern_at(
                     });
                     continue;
                 }
+                if let BasicPatternAtom::Backreference(capture) = current.atom {
+                    if !matches!(current.repetition, BasicPatternRepetition::One) {
+                        return Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: operation,
+                            feature: "repetition applied to Lua pattern backreferences",
+                        });
+                    }
+                    let captures = materialize_basic_captures(&events, event);
+                    let capture = captures[usize::from(capture)];
+                    if !capture.set {
+                        return Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: operation,
+                            feature: "invalid Lua pattern capture reference",
+                        });
+                    }
+                    if capture.position {
+                        continue;
+                    }
+                    let captured = &haystack[capture.start..capture.end];
+                    charge_pattern_work(work, captured.len().max(1), work_limit)?;
+                    let Some(end) = position.checked_add(captured.len()) else {
+                        continue;
+                    };
+                    if haystack.get(position..end) == Some(captured) {
+                        states.push(BasicPatternState::Match {
+                            piece: piece + 1,
+                            position: end,
+                            event,
+                        });
+                    }
+                    continue;
+                }
                 if matches!(current.repetition, BasicPatternRepetition::One) {
                     let Some(byte) = haystack.get(position) else {
                         continue;
@@ -6828,7 +6863,8 @@ fn basic_pattern_atom_matches(atom: &BasicPatternAtom, byte: u8) -> bool {
         BasicPatternAtom::Any => true,
         BasicPatternAtom::Class(class) => byte_matches_pattern_class(byte, *class),
         BasicPatternAtom::Set(set) => pattern_set_contains(set, byte),
-        BasicPatternAtom::CaptureStart(_)
+        BasicPatternAtom::Backreference(_)
+        | BasicPatternAtom::CaptureStart(_)
         | BasicPatternAtom::CaptureEnd(_)
         | BasicPatternAtom::PositionCapture(_) => false,
     }

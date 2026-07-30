@@ -2697,6 +2697,67 @@ fn string_find_and_match_return_nested_and_position_captures() {
 }
 
 #[test]
+fn string_patterns_match_completed_substring_backreferences() {
+    let source = make_source(
+        b"local a,b,c=string.find('xxabab','(ab)%1') local d=string.match('abac','(ab)%1') local e=string.match('x','(a*)%1') local f=string.match('abc','()%1') return a,b,c,d,e,f"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let index = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                index(3),
+                index(6),
+                Value::String(Arc::from(&b"ab"[..])),
+                Value::Nil,
+                Value::String(Arc::from(&b""[..])),
+                Value::Nil,
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn string_patterns_reject_invalid_backreferences_structurally() {
+    for profile in SemanticProfile::ALL {
+        for source in [
+            b"return string.match('abc', '%1')".as_slice(),
+            b"return string.match('abc', '(a)%2')".as_slice(),
+        ] {
+            let source = make_source(source.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert!(matches!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Err(RuntimeError::UnsupportedLibraryFeature {
+                    feature: "invalid Lua pattern capture reference",
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[test]
 fn string_gsub_replaces_bounded_matches_and_reports_profile_typed_counts() {
     let source = make_source(
         b"local a,b=string.gsub('abc123','%d','[%0]') local c,d=string.gsub('abc','','-') local e,f=string.gsub('aaaa','a',7,2) return a,b,c,d,e,f"

@@ -419,7 +419,9 @@ legacy-number or modern-integer policy.
 captures when present and otherwise returns the full matched byte slice.
 Nested substring captures and `()` position captures are bounded to 32 and
 execute through linked capture events rather than recursive host calls.
-Backreferences remain explicit unsupported features.
+`%1` through `%9` match completed substring captures byte-for-byte under the
+same work limit. References to absent or unfinished captures fail structurally,
+while position-capture references follow the upstream non-match behavior.
 `string.gsub` uses the same engine with bounded non-overlapping replacement
 and Lua-compatible empty-match progress. String and numeric replacements
 support literal bytes, `%%`, and `%0`; the second result is the profile-typed
