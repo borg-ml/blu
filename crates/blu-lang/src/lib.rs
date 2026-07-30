@@ -543,6 +543,13 @@ return value"#
             SourceLimits::default(),
         )
         .unwrap();
+        let fixed_calls = SourceFile::new(
+            SourceId::new(33),
+            "fixed-calls.blu",
+            br#"print("owned"); return string.sub("blue", 2), type({})"#.to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -552,6 +559,19 @@ return value"#
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&fixed_calls, profile, compiler.clone())
+                .unwrap();
+            let mut engine = Engine::default();
+            assert_eq!(
+                engine.execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![
+                    Value::String(b"lue".as_slice().into()),
+                    Value::String(b"table".as_slice().into()),
+                ]),
+                "{profile}"
+            );
+            assert_eq!(engine.vm_mut().take_output(), b"owned\n", "{profile}");
             let compiled = OwnedCompiler::default()
                 .compile(&tables, profile, compiler.clone())
                 .unwrap();

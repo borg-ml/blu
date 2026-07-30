@@ -13,11 +13,11 @@ mod parser;
 
 pub use ast::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
-    BinaryOperator, Block, BreakStatement, ContinueStatement, DoStatement, Expression,
-    ExpressionId, ExpressionKind, FieldExpression, Identifier, IfClause, IfStatement,
-    IndexExpression, LocalListStatement, LocalStatement, NumericForStatement, RepeatStatement,
-    ReturnStatement, Statement, TableConstructor, TableField, UnaryExpression, UnaryOperator,
-    WhileStatement,
+    BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
+    DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, Identifier, IfClause,
+    IfStatement, IndexExpression, LocalListStatement, LocalStatement, NumericForStatement,
+    RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField, UnaryExpression,
+    UnaryOperator, WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 

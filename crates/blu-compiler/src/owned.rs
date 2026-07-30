@@ -29,9 +29,10 @@ use blu_core::{
 };
 use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryOperator,
-    Expression, ExpressionId, ExpressionKind, IfStatement, LocalListStatement, LocalStatement,
-    NumericForStatement, ParseError, ParseLimits, ParseOutcome, Rejected, RepeatStatement,
-    ReturnStatement, Statement, TableConstructor, TableField, UnaryOperator, WhileStatement, parse,
+    CallExpression, Expression, ExpressionId, ExpressionKind, IfStatement, LocalListStatement,
+    LocalStatement, NumericForStatement, ParseError, ParseLimits, ParseOutcome, Rejected,
+    RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField, UnaryOperator,
+    WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -77,6 +78,7 @@ pub enum OwnedCompileLimit {
     Constants,
     Instructions,
     ReturnValues,
+    CallArguments,
     IntegerLiteralBytes,
     NumberLiteralBytes,
     StringLiteralBytes,
@@ -94,6 +96,7 @@ impl fmt::Display for OwnedCompileLimit {
             Self::Constants => formatter.write_str("constants"),
             Self::Instructions => formatter.write_str("instructions"),
             Self::ReturnValues => formatter.write_str("return values"),
+            Self::CallArguments => formatter.write_str("call arguments"),
             Self::IntegerLiteralBytes => formatter.write_str("integer literal bytes"),
             Self::NumberLiteralBytes => formatter.write_str("number literal bytes"),
             Self::StringLiteralBytes => formatter.write_str("string literal bytes"),
@@ -369,6 +372,7 @@ struct Lowerer<'a> {
     profile: SemanticProfile,
     expressions: &'a [Expression],
     table_fields: &'a [TableField],
+    call_arguments: &'a [ExpressionId],
     limits: OwnedCompileLimits,
     bindings: Vec<Binding>,
     closed_bindings: Vec<Binding>,
@@ -393,6 +397,7 @@ impl<'a> Lowerer<'a> {
             profile: ast.profile(),
             expressions: ast.expressions(),
             table_fields: ast.table_field_arena(),
+            call_arguments: ast.call_argument_arena(),
             limits,
             bindings: allocate_vec(capacity.min(limits.max_bindings), "local bindings")?,
             closed_bindings: allocate_vec(
@@ -526,6 +531,13 @@ impl<'a> Lowerer<'a> {
         }) {
             required_features = required_features | FeatureBits::TABLES;
         }
+        if self
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::Call { .. }))
+        {
+            required_features = required_features | FeatureBits::FIXED_CALLS;
+        }
         Ok(Prototype {
             profile: ast.profile(),
             source: self.source.identity().id(),
@@ -560,6 +572,10 @@ impl<'a> Lowerer<'a> {
                 }
                 Statement::AssignmentList(assignment) => {
                     self.lower_assignment_list(assignment)?;
+                    false
+                }
+                Statement::Call(statement) => {
+                    self.lower_expression(statement.call())?;
                     false
                 }
                 Statement::If(statement) => self.lower_if(statement)?,
@@ -1293,6 +1309,75 @@ impl<'a> Lowerer<'a> {
         Ok(())
     }
 
+    fn lower_call(&mut self, call: CallExpression) -> Result<u16, OwnedCompileError> {
+        let end = call
+            .first_argument()
+            .checked_add(call.argument_count())
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "call argument range overflows",
+            })?;
+        if end > self.call_arguments.len() {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "call argument range is out of bounds",
+            });
+        }
+        let limit = self
+            .limits
+            .artifact
+            .max_registers_per_prototype
+            .min(u16::MAX as usize);
+        check_limit(
+            OwnedCompileLimit::CallArguments,
+            call.argument_count(),
+            limit,
+        )?;
+
+        let function = self.lower_expression(call.function())?;
+        let mut sources = allocate_vec(call.argument_count(), "call argument registers")?;
+        for index in call.first_argument()..end {
+            sources.push(self.lower_expression(self.call_arguments[index])?);
+        }
+        let arguments = if sources.is_empty() {
+            0
+        } else {
+            let first = self.allocate_register()?;
+            self.emit(
+                Instruction::Move {
+                    destination: first,
+                    source: sources[0],
+                },
+                call.span(),
+            )?;
+            for source in sources.iter().copied().skip(1) {
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::Move {
+                        destination,
+                        source,
+                    },
+                    call.span(),
+                )?;
+            }
+            first
+        };
+        let destination = self.allocate_register()?;
+        let argument_count = u16::try_from(call.argument_count()).map_err(|_| {
+            OwnedCompileError::InternalInvariant {
+                message: "call argument count passed limits but cannot fit BluV1",
+            }
+        })?;
+        self.emit(
+            Instruction::Call {
+                destination,
+                function,
+                arguments,
+                argument_count,
+            },
+            call.span(),
+        )?;
+        Ok(destination)
+    }
+
     fn lower_expression(&mut self, id: ExpressionId) -> Result<u16, OwnedCompileError> {
         let expression = *self.expression(id)?;
         match expression.kind() {
@@ -1423,6 +1508,7 @@ impl<'a> Lowerer<'a> {
                 )?;
                 Ok(destination)
             }
+            ExpressionKind::Call(call) => self.lower_call(call),
             ExpressionKind::Unary(unary) => match unary.operator() {
                 UnaryOperator::Not => {
                     let source = self.lower_expression(unary.operand())?;

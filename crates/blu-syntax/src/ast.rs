@@ -180,6 +180,50 @@ pub struct TableConstructor {
     field_count: usize,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CallExpression {
+    function: ExpressionId,
+    first_argument: usize,
+    argument_count: usize,
+    span: ByteSpan,
+}
+
+impl CallExpression {
+    pub(crate) const fn new(
+        function: ExpressionId,
+        first_argument: usize,
+        argument_count: usize,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            function,
+            first_argument,
+            argument_count,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn function(self) -> ExpressionId {
+        self.function
+    }
+
+    #[must_use]
+    pub const fn first_argument(self) -> usize {
+        self.first_argument
+    }
+
+    #[must_use]
+    pub const fn argument_count(self) -> usize {
+        self.argument_count
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl TableConstructor {
     pub(crate) const fn new(first_field: usize, field_count: usize) -> Self {
         Self {
@@ -248,6 +292,7 @@ pub enum ExpressionKind {
     Group(ExpressionId),
     Index(IndexExpression),
     Field(FieldExpression),
+    Call(CallExpression),
     Unary(UnaryExpression),
     Binary(BinaryExpression),
 }
@@ -286,6 +331,28 @@ pub struct AssignmentStatement {
     target: AssignmentTarget,
     value: ExpressionId,
     span: ByteSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CallStatement {
+    call: ExpressionId,
+    span: ByteSpan,
+}
+
+impl CallStatement {
+    pub(crate) const fn new(call: ExpressionId, span: ByteSpan) -> Self {
+        Self { call, span }
+    }
+
+    #[must_use]
+    pub const fn call(self) -> ExpressionId {
+        self.call
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
 }
 
 impl AssignmentStatement {
@@ -698,6 +765,7 @@ pub enum Statement {
     LocalList(LocalListStatement),
     Assignment(AssignmentStatement),
     AssignmentList(AssignmentListStatement),
+    Call(CallStatement),
     If(IfStatement),
     While(WhileStatement),
     Repeat(RepeatStatement),
@@ -716,6 +784,7 @@ impl Statement {
             Self::LocalList(statement) => statement.span(),
             Self::Assignment(statement) => statement.span(),
             Self::AssignmentList(statement) => statement.span(),
+            Self::Call(statement) => statement.span(),
             Self::If(statement) => statement.span(),
             Self::While(statement) => statement.span(),
             Self::Repeat(statement) => statement.span(),
@@ -780,6 +849,7 @@ pub struct Ast {
     block: Block,
     expressions: Vec<Expression>,
     table_fields: Vec<TableField>,
+    call_arguments: Vec<ExpressionId>,
 }
 
 impl Ast {
@@ -789,6 +859,7 @@ impl Ast {
         statements: Vec<Statement>,
         expressions: Vec<Expression>,
         table_fields: Vec<TableField>,
+        call_arguments: Vec<ExpressionId>,
     ) -> Self {
         Self {
             profile,
@@ -796,6 +867,7 @@ impl Ast {
             block: Block::new(statements),
             expressions,
             table_fields,
+            call_arguments,
         }
     }
 
@@ -843,10 +915,22 @@ impl Ast {
     }
 
     #[must_use]
+    pub fn call_arguments(&self, call: CallExpression) -> Option<&[ExpressionId]> {
+        let end = call.first_argument().checked_add(call.argument_count())?;
+        self.call_arguments.get(call.first_argument()..end)
+    }
+
+    #[must_use]
+    pub fn call_argument_arena(&self) -> &[ExpressionId] {
+        &self.call_arguments
+    }
+
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.block
             .node_count()
             .saturating_add(self.expressions.len())
             .saturating_add(self.table_fields.len())
+            .saturating_add(self.call_arguments.len())
     }
 }

@@ -193,6 +193,41 @@ fn table_fields_and_dot_access_use_bounded_arenas() {
 }
 
 #[test]
+fn postfix_calls_retain_callee_arguments_and_chaining() {
+    let source =
+        source(br#"print("start"); return string.sub("blue", 2, 3), factory()("value")"#.to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    assert!(matches!(parsed.ast().statements()[0], Statement::Call(_)));
+    let Statement::Return(returned) = &parsed.ast().statements()[1] else {
+        panic!("expected return");
+    };
+    let ExpressionKind::Call(sub) = parsed
+        .ast()
+        .expression(returned.values()[0])
+        .unwrap()
+        .kind()
+    else {
+        panic!("expected string.sub call");
+    };
+    assert_eq!(sub.argument_count(), 3);
+    assert_eq!(parsed.ast().call_arguments(sub).unwrap().len(), 3);
+
+    let ExpressionKind::Call(outer) = parsed
+        .ast()
+        .expression(returned.values()[1])
+        .unwrap()
+        .kind()
+    else {
+        panic!("expected chained call");
+    };
+    assert_eq!(outer.argument_count(), 1);
+    assert!(matches!(
+        parsed.ast().expression(outer.function()).unwrap().kind(),
+        ExpressionKind::Call(_)
+    ));
+}
+
+#[test]
 fn local_name_and_value_lists_preserve_order_and_adjustment_shape() {
     for profile in SemanticProfile::ALL {
         let source = source(b"local first, second, missing = 40, 2\nreturn first".to_vec());

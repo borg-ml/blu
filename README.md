@@ -123,6 +123,12 @@ reads and single-target writes. These execute directly through the generational
 heap, return `nil` for absent keys, and retain active registers as GC roots
 during allocation and table growth. Metamethod dispatch, indexed assignment
 lists, and final-field MULTRET expansion remain explicit later work.
+Bounded postfix calls evaluate the callee and fixed scalar arguments
+left-to-right, dispatch through the VM's existing closure/native/table-call
+path, and produce the first result or `nil`. Call statements support
+side-effecting APIs such as `print`. Variable argument/result adjustment,
+method-call sugar, owned function declarations, and resumable direct-BluV1
+calls remain explicit later work.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

@@ -65,6 +65,8 @@ impl FeatureBits {
     pub const GLOBALS: Self = Self(1 << 7);
     /// Heap-allocated tables with general value-keyed reads and writes.
     pub const TABLES: Self = Self(1 << 8);
+    /// Fixed-argument calls producing one scalar result.
+    pub const FIXED_CALLS: Self = Self(1 << 9);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -74,7 +76,8 @@ impl FeatureBits {
             | Self::FORWARD_BRANCHES.0
             | Self::BACKWARD_BRANCHES.0
             | Self::GLOBALS.0
-            | Self::TABLES.0,
+            | Self::TABLES.0
+            | Self::FIXED_CALLS.0,
     );
 
     #[must_use]
@@ -267,6 +270,12 @@ pub enum Instruction {
         key: u16,
         value: u16,
     },
+    Call {
+        destination: u16,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
     Move {
         destination: u16,
         source: u16,
@@ -377,6 +386,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::NewTable { .. }
             | Instruction::GetTable { .. }
             | Instruction::SetTable { .. }
+            | Instruction::Call { .. }
             | Instruction::Move { .. }
             | Instruction::Not { .. }
             | Instruction::Negate { .. }
@@ -405,6 +415,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::NewTable { .. }
                 | Instruction::GetTable { .. }
                 | Instruction::SetTable { .. }
+                | Instruction::Call { .. }
                 | Instruction::Move { .. }
                 | Instruction::Not { .. }
                 | Instruction::Negate { .. }
@@ -1164,6 +1175,19 @@ fn validate_prototype(
             feature: "globals",
         });
     }
+    if prototype
+        .code
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::Call { .. }))
+        && !prototype
+            .required_features
+            .contains(FeatureBits::FIXED_CALLS)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "fixed calls",
+        });
+    }
     if prototype.code.iter().any(|instruction| {
         matches!(
             instruction,
@@ -1428,6 +1452,33 @@ fn validate_prototype(
                 check_read(index, pc, table, &initialized)?;
                 check_read(index, pc, key, &initialized)?;
                 check_read(index, pc, value, &initialized)?;
+            }
+            Instruction::Call {
+                destination,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                check_register(index, pc, destination, registers)?;
+                check_read(index, pc, function, &initialized)?;
+                let end = usize::from(arguments)
+                    .checked_add(usize::from(argument_count))
+                    .ok_or(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "call argument register range overflows",
+                    })?;
+                if end > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "call argument register range is invalid",
+                    });
+                }
+                for register in arguments..arguments + argument_count {
+                    check_read(index, pc, register, &initialized)?;
+                }
+                initialized[destination as usize] = true;
             }
             Instruction::Move {
                 destination,
@@ -1915,6 +1966,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::Equal { .. }
                     | Instruction::LessThan { .. }
                     | Instruction::LessEqual { .. } => 7,
+                    Instruction::Call { .. } => 9,
                     Instruction::NewTable { .. } => 3,
                     Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. } => 7,
                     Instruction::Jump { .. } => 5,
@@ -2049,6 +2101,18 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 put_u16(out, *table);
                 put_u16(out, *key);
                 put_u16(out, *value);
+            }
+            Instruction::Call {
+                destination,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(25);
+                put_u16(out, *destination);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
             }
             Instruction::Add {
                 destination,
@@ -2878,6 +2942,12 @@ fn read_prototype(
                 table: reader.u16()?,
                 key: reader.u16()?,
                 value: reader.u16()?,
+            },
+            25 => Instruction::Call {
+                destination: reader.u16()?,
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

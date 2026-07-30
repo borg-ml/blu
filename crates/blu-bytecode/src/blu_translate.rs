@@ -377,6 +377,10 @@ fn translate_instruction(
             prototype,
             instruction: "tables",
         }),
+        BluInstruction::Call { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "fixed calls",
+        }),
         BluInstruction::Return { first, count } => {
             let result_field = count
                 .checked_add(1)

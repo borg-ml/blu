@@ -1275,6 +1275,65 @@ fn owned_table_fields_and_dot_sugar_preserve_source_order() {
 }
 
 #[test]
+fn owned_fixed_calls_use_globals_fields_scalar_adjustment_and_output() {
+    let source =
+        make_source(br#"print("captured"); return string.sub("blue", 2), type({})"#.to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .expect("fixed calls should compile");
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .required_features
+                .contains(FeatureBits::FIXED_CALLS)
+        );
+        let mut vm = Vm::default();
+        assert_eq!(
+            vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::String(b"lue".as_slice().into()),
+                Value::String(b"table".as_slice().into()),
+            ]),
+            "{profile}"
+        );
+        assert_eq!(vm.take_output(), b"captured\n", "{profile}");
+    }
+}
+
+#[test]
+fn owned_fixed_calls_propagate_native_errors() {
+    let source = make_source(br#"return error("owned failure")"#.to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert!(matches!(
+        Vm::default().execute_blu_v1(
+            compiled.into_validated_artifact(),
+            BluLimits::default()
+        ),
+        Err(blu_runtime::RuntimeError::Raised(Value::String(message)))
+            if message.as_ref() == b"owned failure"
+    ));
+}
+
+#[test]
+fn owned_fixed_calls_reach_host_registered_globals() {
+    let source = make_source(br#"return host_echo("registered")"#.to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    let mut vm = Vm::default();
+    let echo = vm.register_function(|_, arguments| Ok(arguments.to_vec()));
+    vm.set_global(b"host_echo".as_slice(), Value::NativeFunction(echo));
+    assert_eq!(
+        vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::String(b"registered".as_slice().into())])
+    );
+}
+
+#[test]
 fn owned_indexing_non_tables_returns_structured_type_errors() {
     for bytes in [
         br#"local value = 1; return value["key"]"#.as_slice(),

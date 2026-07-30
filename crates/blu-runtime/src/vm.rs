@@ -918,6 +918,29 @@ impl Vm {
                     let roots = GcRoots::from_values(&registers)?;
                     self.table_set(table, key, value, &roots)?;
                 }
+                BluInstruction::Call {
+                    destination,
+                    function,
+                    arguments,
+                    argument_count,
+                } => {
+                    let function = blu_register(&registers, function)?.clone();
+                    let start = usize::from(arguments);
+                    let end = start.checked_add(usize::from(argument_count)).ok_or(
+                        RuntimeError::Register {
+                            register: usize::MAX,
+                            count: registers.len(),
+                        },
+                    )?;
+                    let arguments = registers.get(start..end).ok_or(RuntimeError::Register {
+                        register: end.saturating_sub(1),
+                        count: registers.len(),
+                    })?;
+                    let roots = GcRoots::from_values(&registers)?;
+                    let values = self.call_value(function, arguments, &mut remaining, 0, roots)?;
+                    let value = values.into_iter().next().unwrap_or(Value::Nil);
+                    set_blu_register(&mut registers, destination, value)?;
+                }
                 BluInstruction::Add {
                     destination,
                     left,

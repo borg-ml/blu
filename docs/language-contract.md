@@ -211,6 +211,16 @@ performs raw value-keyed access, and returns `nil` for absent keys. Indexing a
 non-table and invalid table keys return structured runtime errors. Indexed
 assignment lists, final-field MULTRET expansion, and metamethod-aware owned
 table access remain unsupported rather than silently approximated.
+BluV1 fixed calls require the `FIXED_CALLS` feature bit. The instruction names
+one initialized function register and a validated contiguous range of
+initialized argument registers, and initializes one destination. Owned postfix
+calls evaluate the callee first and each scalar argument left-to-right, then
+copy arguments to that contiguous range. Direct execution delegates to the
+existing VM call path, preserving native registration, structured errors, call
+limits, active GC roots, and callable-table behavior. The expression result is
+the first returned value or `nil`; additional values are discarded. Call
+statements discard that scalar result. MULTRET/vararg adjustment, method-call
+sugar, owned closures, and resumable direct-BluV1 calls remain unsupported.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success
