@@ -4628,6 +4628,16 @@ impl Vm {
             };
             Ok(vec![Value::Number(result)])
         });
+        let asin = self.register_function(|_, arguments| {
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.asin")?.asin(),
+            )])
+        });
+        let acos = self.register_function(|_, arguments| {
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.acos")?.acos(),
+            )])
+        });
         let rad = self.register_function(|_, arguments| {
             Ok(vec![Value::Number(
                 number_argument(arguments, 0, "math.rad")?.to_radians(),
@@ -4686,7 +4696,7 @@ impl Vm {
             Ok(vec![Value::Number(result)])
         });
 
-        let table = self.heap.allocate_table(0, 17)?;
+        let table = self.heap.allocate_table(0, 19)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -4698,6 +4708,8 @@ impl Vm {
             (&b"cos"[..], Value::NativeFunction(cos)),
             (&b"tan"[..], Value::NativeFunction(tan)),
             (&b"atan"[..], Value::NativeFunction(atan)),
+            (&b"asin"[..], Value::NativeFunction(asin)),
+            (&b"acos"[..], Value::NativeFunction(acos)),
             (&b"rad"[..], Value::NativeFunction(rad)),
             (&b"deg"[..], Value::NativeFunction(deg)),
             (&b"fmod"[..], Value::NativeFunction(fmod)),

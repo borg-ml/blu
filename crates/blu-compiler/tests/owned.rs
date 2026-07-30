@@ -2348,6 +2348,34 @@ fn math_atan_uses_the_explicit_profile_specific_second_argument_contract() {
 }
 
 #[test]
+fn math_asin_and_acos_follow_the_shared_profile_contract() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(b"return math.asin(1), math.acos(1), math.asin(2)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let values =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        let values = values.unwrap();
+        assert_eq!(values[0], Value::Number(core::f64::consts::FRAC_PI_2));
+        assert_eq!(values[1], Value::Number(0.0));
+        assert!(matches!(values[2], Value::Number(value) if value.is_nan()));
+
+        let source = make_source(b"return math.acos('x')".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(blu_runtime::RuntimeError::Type {
+                operation: "math.acos",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

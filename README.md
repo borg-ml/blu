@@ -26,7 +26,8 @@ metamethods, an initial standard library, and host-configured cached `require`.
 The math slice includes shared truncating `math.fmod`; unlike floor-based `%`,
 its remainder preserves the dividend's sign. `math.atan` follows the
 legacy one-argument Luau/Lua 5.1–5.2 contract or modern Blu/Lua 5.3–5.5
-`atan2(y, x)` contract according to the active profile.
+`atan2(y, x)` contract according to the active profile; `math.asin` and
+`math.acos` follow the shared numeric contract.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
 remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,
