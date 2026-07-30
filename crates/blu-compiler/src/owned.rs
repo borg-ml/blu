@@ -635,17 +635,21 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         {
             required_features = required_features | FeatureBits::FIXED_CALLS;
         }
-        if self
-            .code
-            .iter()
-            .any(|instruction| matches!(instruction, Instruction::CallResults { .. }))
-        {
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::CallResults { .. } | Instruction::CallVarargsResults { .. }
+            )
+        }) {
             required_features = required_features | FeatureBits::FIXED_MULTI_RESULTS;
         }
         if self.code.iter().any(|instruction| {
             matches!(
                 instruction,
-                Instruction::ReturnCall { .. } | Instruction::ReturnCallPrefix { .. }
+                Instruction::ReturnCall { .. }
+                    | Instruction::ReturnCallPrefix { .. }
+                    | Instruction::ReturnCallVarargs { .. }
+                    | Instruction::ReturnCallVarargsPrefix { .. }
             )
         }) {
             required_features = required_features | FeatureBits::RETURN_CALLS;
@@ -663,7 +667,11 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         if self.code.iter().any(|instruction| {
             matches!(
                 instruction,
-                Instruction::Varargs { .. } | Instruction::ReturnVarargs { .. }
+                Instruction::Varargs { .. }
+                    | Instruction::ReturnVarargs { .. }
+                    | Instruction::CallVarargsResults { .. }
+                    | Instruction::ReturnCallVarargs { .. }
+                    | Instruction::ReturnCallVarargsPrefix { .. }
             )
         }) {
             required_features = required_features | FeatureBits::VARARGS;
@@ -1157,6 +1165,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             iterator,
             &[state, control],
             statement.names().len(),
+            false,
             statement.span(),
         )?;
         self.emit(
@@ -1994,23 +2003,36 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         result_count: usize,
     ) -> Result<Vec<u16>, OwnedCompileError> {
         let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
-        if let Some(argument) = self.call_arguments.get(end.saturating_sub(1)).copied()
+        let expands_varargs = if let Some(argument) =
+            self.call_arguments.get(end.saturating_sub(1)).copied()
             && end > call.first_argument()
             && matches!(self.expression(argument)?.kind(), ExpressionKind::Vararg)
         {
+            true
+        } else {
+            false
+        };
+        if expands_varargs && !self.is_vararg {
             return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                "BLU-COMPILE-0007",
+                "BLU-COMPILE-0006",
                 Phase::Lower,
-                self.expression(argument)?.span(),
-                "dynamic vararg call arguments are not yet implemented",
+                self.expression(self.call_arguments[end - 1])?.span(),
+                "vararg expression is outside a variadic function",
             )?));
         }
         let function = self.lower_expression(call.function())?;
         let mut sources = allocate_vec(call.argument_count(), "call argument registers")?;
-        for index in call.first_argument()..end {
+        let fixed_end = end - usize::from(expands_varargs);
+        for index in call.first_argument()..fixed_end {
             sources.push(self.lower_expression(self.call_arguments[index])?);
         }
-        self.emit_fixed_call_results(function, &sources, result_count, call.span())
+        self.emit_fixed_call_results(
+            function,
+            &sources,
+            result_count,
+            expands_varargs,
+            call.span(),
+        )
     }
 
     fn lower_method_call(&mut self, call: MethodCallExpression) -> Result<u16, OwnedCompileError> {
@@ -2026,15 +2048,21 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         result_count: usize,
     ) -> Result<Vec<u16>, OwnedCompileError> {
         let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
-        if let Some(argument) = self.call_arguments.get(end.saturating_sub(1)).copied()
+        let expands_varargs = if let Some(argument) =
+            self.call_arguments.get(end.saturating_sub(1)).copied()
             && end > call.first_argument()
             && matches!(self.expression(argument)?.kind(), ExpressionKind::Vararg)
         {
+            true
+        } else {
+            false
+        };
+        if expands_varargs && !self.is_vararg {
             return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                "BLU-COMPILE-0007",
+                "BLU-COMPILE-0006",
                 Phase::Lower,
-                self.expression(argument)?.span(),
-                "dynamic vararg method-call arguments are not yet implemented",
+                self.expression(self.call_arguments[end - 1])?.span(),
+                "vararg expression is outside a variadic function",
             )?));
         }
         let receiver = self.lower_expression(call.receiver())?;
@@ -2062,10 +2090,17 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 })?;
         let mut sources = allocate_vec(source_count, "method call argument registers")?;
         sources.push(receiver);
-        for index in call.first_argument()..end {
+        let fixed_end = end - usize::from(expands_varargs);
+        for index in call.first_argument()..fixed_end {
             sources.push(self.lower_expression(self.call_arguments[index])?);
         }
-        self.emit_fixed_call_results(function, &sources, result_count, call.span())
+        self.emit_fixed_call_results(
+            function,
+            &sources,
+            result_count,
+            expands_varargs,
+            call.span(),
+        )
     }
 
     fn lower_call_expression_results(
@@ -2119,19 +2154,46 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         prefix: Option<(u16, u16)>,
     ) -> Result<bool, OwnedCompileError> {
         let expression = *self.expression(id)?;
-        let (function, sources, span) = match expression.kind() {
+        let (function, sources, expands_varargs, span) = match expression.kind() {
             ExpressionKind::Call(call) => {
                 let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
+                let expands_varargs = end > call.first_argument()
+                    && matches!(
+                        self.expression(self.call_arguments[end - 1])?.kind(),
+                        ExpressionKind::Vararg
+                    );
+                if expands_varargs && !self.is_vararg {
+                    return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0006",
+                        Phase::Lower,
+                        self.expression(self.call_arguments[end - 1])?.span(),
+                        "vararg expression is outside a variadic function",
+                    )?));
+                }
                 let function = self.lower_expression(call.function())?;
                 let mut sources =
                     allocate_vec(call.argument_count(), "return call argument registers")?;
-                for index in call.first_argument()..end {
+                let fixed_end = end - usize::from(expands_varargs);
+                for index in call.first_argument()..fixed_end {
                     sources.push(self.lower_expression(self.call_arguments[index])?);
                 }
-                (function, sources, call.span())
+                (function, sources, expands_varargs, call.span())
             }
             ExpressionKind::MethodCall(call) => {
                 let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
+                let expands_varargs = end > call.first_argument()
+                    && matches!(
+                        self.expression(self.call_arguments[end - 1])?.kind(),
+                        ExpressionKind::Vararg
+                    );
+                if expands_varargs && !self.is_vararg {
+                    return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0006",
+                        Phase::Lower,
+                        self.expression(self.call_arguments[end - 1])?.span(),
+                        "vararg expression is outside a variadic function",
+                    )?));
+                }
                 let receiver = self.lower_expression(call.receiver())?;
                 let key = self.lower_constant(
                     Constant::String(copy_bytes(
@@ -2157,15 +2219,30 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 let mut sources =
                     allocate_vec(source_count, "return method call argument registers")?;
                 sources.push(receiver);
-                for index in call.first_argument()..end {
+                let fixed_end = end - usize::from(expands_varargs);
+                for index in call.first_argument()..fixed_end {
                     sources.push(self.lower_expression(self.call_arguments[index])?);
                 }
-                (function, sources, call.span())
+                (function, sources, expands_varargs, call.span())
             }
             _ => return Ok(false),
         };
         let (arguments, argument_count) = self.copy_call_arguments(&sources, span)?;
-        let instruction = if let Some((first, count)) = prefix {
+        let instruction = if let (true, Some((first, count))) = (expands_varargs, prefix) {
+            Instruction::ReturnCallVarargsPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            }
+        } else if expands_varargs {
+            Instruction::ReturnCallVarargs {
+                function,
+                arguments,
+                argument_count,
+            }
+        } else if let Some((first, count)) = prefix {
             Instruction::ReturnCallPrefix {
                 first,
                 count,
@@ -2207,6 +2284,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         function: u16,
         sources: &[u16],
         result_count: usize,
+        expands_varargs: bool,
         span: ByteSpan,
     ) -> Result<Vec<u16>, OwnedCompileError> {
         let limit = self
@@ -2227,7 +2305,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         for _ in 1..result_count {
             results.push(self.allocate_register()?);
         }
-        if result_count == 1 {
+        if expands_varargs {
+            self.emit(
+                Instruction::CallVarargsResults {
+                    destination,
+                    function,
+                    arguments,
+                    argument_count,
+                    result_count,
+                },
+                span,
+            )?;
+        } else if result_count == 1 {
             self.emit(
                 Instruction::Call {
                     destination,

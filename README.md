@@ -150,9 +150,10 @@ return values remain in a GC-rooted bounded continuation and are prepended
 after the call completes. Dynamic argument and table-constructor tails,
 metamethod-aware method lookup, and resumable direct-BluV1 calls remain
 explicit later work. Owned variadic functions support scalar and fixed-width
-`...` reads with nil padding plus dynamic return forwarding, including fixed
-prefixes; active and suspended varargs remain GC roots. Dynamic `call(...)`
-and `{...}` positions reject explicitly rather than truncating.
+`...` reads with nil padding, dynamic return forwarding, and dynamic final
+call arguments, including fixed prefixes and method receivers; active and
+suspended varargs remain GC roots. Dynamic `{...}` constructor fields reject
+explicitly rather than truncating.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

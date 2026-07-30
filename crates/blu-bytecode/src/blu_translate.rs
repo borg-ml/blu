@@ -397,7 +397,11 @@ fn translate_instruction(
             prototype,
             instruction: "closures",
         }),
-        BluInstruction::Varargs { .. } | BluInstruction::ReturnVarargs { .. } => {
+        BluInstruction::Varargs { .. }
+        | BluInstruction::ReturnVarargs { .. }
+        | BluInstruction::CallVarargsResults { .. }
+        | BluInstruction::ReturnCallVarargs { .. }
+        | BluInstruction::ReturnCallVarargsPrefix { .. } => {
             Err(TranslationError::UnsupportedInstruction {
                 prototype,
                 instruction: "varargs",

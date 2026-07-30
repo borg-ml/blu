@@ -437,6 +437,63 @@ fn dynamic_vararg_returns_round_trip_and_require_vararg_metadata() {
 }
 
 #[test]
+fn dynamic_vararg_calls_round_trip_canonically() {
+    let limits = BluLimits::default();
+    for code in [
+        vec![
+            Instruction::LoadConstant {
+                destination: 0,
+                constant: 0,
+            },
+            Instruction::LoadConstant {
+                destination: 1,
+                constant: 1,
+            },
+            Instruction::CallVarargsResults {
+                destination: 2,
+                function: 0,
+                arguments: 1,
+                argument_count: 1,
+                result_count: 1,
+            },
+            Instruction::ReturnCallVarargsPrefix {
+                first: 2,
+                count: 1,
+                function: 0,
+                arguments: 1,
+                argument_count: 1,
+            },
+        ],
+        vec![
+            Instruction::LoadConstant {
+                destination: 0,
+                constant: 0,
+            },
+            Instruction::ReturnCallVarargs {
+                function: 0,
+                arguments: 0,
+                argument_count: 0,
+            },
+        ],
+    ] {
+        let mut artifact = fixture();
+        let prototype = &mut artifact.prototypes[0];
+        prototype.register_count = 3;
+        prototype.is_vararg = true;
+        prototype.required_features = FeatureBits::BASELINE
+            | FeatureBits::FIXED_MULTI_RESULTS
+            | FeatureBits::RETURN_CALLS
+            | FeatureBits::VARARGS;
+        prototype.source_map.truncate(code.len());
+        prototype.locals.clear();
+        prototype.code = code;
+        let validated = ValidatedArtifact::new(artifact, limits).unwrap();
+        let bytes = encode(&validated, limits).unwrap();
+        assert_eq!(decode_validated(&bytes, limits).unwrap(), validated);
+    }
+}
+
+#[test]
 fn closure_instructions_round_trip_with_validated_capture_metadata() {
     let limits = BluLimits::default();
     let validated = ValidatedArtifact::new(closure_fixture(), limits).unwrap();

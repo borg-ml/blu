@@ -1109,7 +1109,16 @@ impl Vm {
                     arguments,
                     argument_count,
                     result_count,
+                }
+                | BluInstruction::CallVarargsResults {
+                    destination,
+                    function,
+                    arguments,
+                    argument_count,
+                    result_count,
                 } => {
+                    let expands_varargs =
+                        matches!(instruction, BluInstruction::CallVarargsResults { .. });
                     let function = blu_register(&registers, function)?.clone();
                     let start = usize::from(arguments);
                     let end = start.checked_add(usize::from(argument_count)).ok_or(
@@ -1118,10 +1127,20 @@ impl Vm {
                             count: registers.len(),
                         },
                     )?;
-                    let arguments = registers.get(start..end).ok_or(RuntimeError::Register {
-                        register: end.saturating_sub(1),
-                        count: registers.len(),
-                    })?;
+                    let fixed_arguments =
+                        registers.get(start..end).ok_or(RuntimeError::Register {
+                            register: end.saturating_sub(1),
+                            count: registers.len(),
+                        })?;
+                    let arguments = if expands_varargs {
+                        append_blu_varargs(
+                            fixed_arguments,
+                            &varargs,
+                            "BluV1 dynamic call arguments",
+                        )?
+                    } else {
+                        try_clone_values(fixed_arguments, "BluV1 call arguments")?
+                    };
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
@@ -1130,7 +1149,6 @@ impl Vm {
                                 limit: self.call_limit,
                             });
                         }
-                        let arguments = try_clone_values(arguments, "BluV1 call arguments")?;
                         let (child_artifact, child, profile, _) =
                             self.heap.blu_closure_parts(*child_closure)?;
                         let child_prototype = child_artifact
@@ -1187,8 +1205,13 @@ impl Vm {
                     }
                     let roots =
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
-                    let values =
-                        self.call_value(function, arguments, &mut remaining, callers.len(), roots)?;
+                    let values = self.call_value(
+                        function,
+                        &arguments,
+                        &mut remaining,
+                        callers.len(),
+                        roots,
+                    )?;
                     let mut values = values.into_iter();
                     for offset in 0..result_count {
                         let target =
@@ -1207,22 +1230,50 @@ impl Vm {
                         )?;
                     }
                 }
-                BluInstruction::ReturnCall { .. } | BluInstruction::ReturnCallPrefix { .. } => {
-                    let (prefix, function, arguments, argument_count) = match instruction {
-                        BluInstruction::ReturnCall {
-                            function,
-                            arguments,
-                            argument_count,
-                        } => (None, function, arguments, argument_count),
-                        BluInstruction::ReturnCallPrefix {
-                            first,
-                            count,
-                            function,
-                            arguments,
-                            argument_count,
-                        } => (Some((first, count)), function, arguments, argument_count),
-                        _ => unreachable!(),
-                    };
+                BluInstruction::ReturnCall { .. }
+                | BluInstruction::ReturnCallPrefix { .. }
+                | BluInstruction::ReturnCallVarargs { .. }
+                | BluInstruction::ReturnCallVarargsPrefix { .. } => {
+                    let (prefix, function, arguments, argument_count, expands_varargs) =
+                        match instruction {
+                            BluInstruction::ReturnCall {
+                                function,
+                                arguments,
+                                argument_count,
+                            } => (None, function, arguments, argument_count, false),
+                            BluInstruction::ReturnCallPrefix {
+                                first,
+                                count,
+                                function,
+                                arguments,
+                                argument_count,
+                            } => (
+                                Some((first, count)),
+                                function,
+                                arguments,
+                                argument_count,
+                                false,
+                            ),
+                            BluInstruction::ReturnCallVarargs {
+                                function,
+                                arguments,
+                                argument_count,
+                            } => (None, function, arguments, argument_count, true),
+                            BluInstruction::ReturnCallVarargsPrefix {
+                                first,
+                                count,
+                                function,
+                                arguments,
+                                argument_count,
+                            } => (
+                                Some((first, count)),
+                                function,
+                                arguments,
+                                argument_count,
+                                true,
+                            ),
+                            _ => unreachable!(),
+                        };
                     let function = blu_register(&registers, function)?.clone();
                     let start = usize::from(arguments);
                     let end = start.checked_add(usize::from(argument_count)).ok_or(
@@ -1231,10 +1282,20 @@ impl Vm {
                             count: registers.len(),
                         },
                     )?;
-                    let arguments = registers.get(start..end).ok_or(RuntimeError::Register {
-                        register: end.saturating_sub(1),
-                        count: registers.len(),
-                    })?;
+                    let fixed_arguments =
+                        registers.get(start..end).ok_or(RuntimeError::Register {
+                            register: end.saturating_sub(1),
+                            count: registers.len(),
+                        })?;
+                    let arguments = if expands_varargs {
+                        append_blu_varargs(
+                            fixed_arguments,
+                            &varargs,
+                            "BluV1 dynamic return call arguments",
+                        )?
+                    } else {
+                        try_clone_values(fixed_arguments, "BluV1 return call arguments")?
+                    };
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
@@ -1243,7 +1304,6 @@ impl Vm {
                                 limit: self.call_limit,
                             });
                         }
-                        let arguments = try_clone_values(arguments, "BluV1 return call arguments")?;
                         let (child_artifact, child, profile, _) =
                             self.heap.blu_closure_parts(*child_closure)?;
                         let child_prototype = child_artifact
@@ -1309,8 +1369,13 @@ impl Vm {
                     }
                     let roots =
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
-                    let mut values =
-                        self.call_value(function, arguments, &mut remaining, callers.len(), roots)?;
+                    let mut values = self.call_value(
+                        function,
+                        &arguments,
+                        &mut remaining,
+                        callers.len(),
+                        roots,
+                    )?;
                     if let Some((first, count)) = prefix {
                         let start = usize::from(first);
                         let end = start.checked_add(usize::from(count)).ok_or(
@@ -4994,6 +5059,30 @@ fn try_reserve_exact<T>(
 
 fn try_clone_values(values: &[Value], what: &'static str) -> Result<Vec<Value>, RuntimeError> {
     try_clone_slice(values, what)
+}
+
+fn append_blu_varargs(
+    prefix: &[Value],
+    varargs: &[Value],
+    what: &'static str,
+) -> Result<Vec<Value>, RuntimeError> {
+    let required = prefix
+        .len()
+        .checked_add(varargs.len())
+        .ok_or(RuntimeError::StackLimit {
+            required: usize::MAX,
+            limit: MAX_DYNAMIC_REGISTERS,
+        })?;
+    if required > MAX_DYNAMIC_REGISTERS {
+        return Err(RuntimeError::StackLimit {
+            required,
+            limit: MAX_DYNAMIC_REGISTERS,
+        });
+    }
+    let mut arguments = try_clone_values(prefix, what)?;
+    try_reserve_exact(&mut arguments, varargs.len(), what)?;
+    arguments.extend(varargs.iter().cloned());
+    Ok(arguments)
 }
 
 fn try_clone_callers(callers: &[Caller]) -> Result<Vec<Caller>, RuntimeError> {

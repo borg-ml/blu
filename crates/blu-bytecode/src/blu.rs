@@ -295,12 +295,31 @@ pub enum Instruction {
         argument_count: u16,
         result_count: u16,
     },
+    CallVarargsResults {
+        destination: u16,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+        result_count: u16,
+    },
     ReturnCall {
         function: u16,
         arguments: u16,
         argument_count: u16,
     },
     ReturnCallPrefix {
+        first: u16,
+        count: u16,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
+    ReturnCallVarargs {
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
+    ReturnCallVarargsPrefix {
         first: u16,
         count: u16,
         function: u16,
@@ -439,8 +458,11 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::SetTable { .. }
             | Instruction::Call { .. }
             | Instruction::CallResults { .. }
+            | Instruction::CallVarargsResults { .. }
             | Instruction::ReturnCall { .. }
             | Instruction::ReturnCallPrefix { .. }
+            | Instruction::ReturnCallVarargs { .. }
+            | Instruction::ReturnCallVarargsPrefix { .. }
             | Instruction::NewClosure { .. }
             | Instruction::GetUpvalue { .. }
             | Instruction::SetUpvalue { .. }
@@ -476,8 +498,11 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::SetTable { .. }
                 | Instruction::Call { .. }
                 | Instruction::CallResults { .. }
+                | Instruction::CallVarargsResults { .. }
                 | Instruction::ReturnCall { .. }
                 | Instruction::ReturnCallPrefix { .. }
+                | Instruction::ReturnCallVarargs { .. }
+                | Instruction::ReturnCallVarargsPrefix { .. }
                 | Instruction::NewClosure { .. }
                 | Instruction::GetUpvalue { .. }
                 | Instruction::SetUpvalue { .. }
@@ -1218,13 +1243,14 @@ fn validate_prototype(
             profile: prototype.profile,
         });
     }
-    if prototype
-        .code
-        .iter()
-        .any(|instruction| matches!(instruction, Instruction::CallResults { .. }))
-        && !prototype
-            .required_features
-            .contains(FeatureBits::FIXED_MULTI_RESULTS)
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::CallResults { .. } | Instruction::CallVarargsResults { .. }
+        )
+    }) && !prototype
+        .required_features
+        .contains(FeatureBits::FIXED_MULTI_RESULTS)
     {
         return Err(ValidationError::MissingFeature {
             prototype: index,
@@ -1234,7 +1260,10 @@ fn validate_prototype(
     if prototype.code.iter().any(|instruction| {
         matches!(
             instruction,
-            Instruction::ReturnCall { .. } | Instruction::ReturnCallPrefix { .. }
+            Instruction::ReturnCall { .. }
+                | Instruction::ReturnCallPrefix { .. }
+                | Instruction::ReturnCallVarargs { .. }
+                | Instruction::ReturnCallVarargsPrefix { .. }
         )
     }) && !prototype
         .required_features
@@ -1248,7 +1277,11 @@ fn validate_prototype(
     if prototype.code.iter().any(|instruction| {
         matches!(
             instruction,
-            Instruction::Varargs { .. } | Instruction::ReturnVarargs { .. }
+            Instruction::Varargs { .. }
+                | Instruction::ReturnVarargs { .. }
+                | Instruction::CallVarargsResults { .. }
+                | Instruction::ReturnCallVarargs { .. }
+                | Instruction::ReturnCallVarargsPrefix { .. }
         )
     }) {
         if !prototype.required_features.contains(FeatureBits::VARARGS) {
@@ -1614,6 +1647,13 @@ fn validate_prototype(
                 arguments,
                 argument_count,
                 result_count,
+            }
+            | Instruction::CallVarargsResults {
+                destination,
+                function,
+                arguments,
+                argument_count,
+                result_count,
             } => {
                 check_read(index, pc, function, &initialized)?;
                 let argument_end = usize::from(arguments)
@@ -1653,6 +1693,11 @@ fn validate_prototype(
                 function,
                 arguments,
                 argument_count,
+            }
+            | Instruction::ReturnCallVarargs {
+                function,
+                arguments,
+                argument_count,
             } => {
                 check_read(index, pc, function, &initialized)?;
                 let end = usize::from(arguments)
@@ -1675,6 +1720,13 @@ fn validate_prototype(
                 reachable = false;
             }
             Instruction::ReturnCallPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::ReturnCallVarargsPrefix {
                 first,
                 count,
                 function,
@@ -2069,6 +2121,8 @@ fn validate_prototype(
             Instruction::Return { .. }
                 | Instruction::ReturnCall { .. }
                 | Instruction::ReturnCallPrefix { .. }
+                | Instruction::ReturnCallVarargs { .. }
+                | Instruction::ReturnCallVarargsPrefix { .. }
                 | Instruction::ReturnVarargs { .. }
         )
     ) {
@@ -2321,9 +2375,10 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::LessThan { .. }
                     | Instruction::LessEqual { .. } => 7,
                     Instruction::Call { .. } => 9,
-                    Instruction::CallResults { .. } => 11,
-                    Instruction::ReturnCall { .. } => 7,
-                    Instruction::ReturnCallPrefix { .. } => 11,
+                    Instruction::CallResults { .. } | Instruction::CallVarargsResults { .. } => 11,
+                    Instruction::ReturnCall { .. } | Instruction::ReturnCallVarargs { .. } => 7,
+                    Instruction::ReturnCallPrefix { .. }
+                    | Instruction::ReturnCallVarargsPrefix { .. } => 11,
                     Instruction::NewTable { .. } => 3,
                     Instruction::NewClosure { .. }
                     | Instruction::GetUpvalue { .. }
@@ -2490,6 +2545,20 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 put_u16(out, *argument_count);
                 put_u16(out, *result_count);
             }
+            Instruction::CallVarargsResults {
+                destination,
+                function,
+                arguments,
+                argument_count,
+                result_count,
+            } => {
+                out.push(34);
+                put_u16(out, *destination);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+                put_u16(out, *result_count);
+            }
             Instruction::ReturnCall {
                 function,
                 arguments,
@@ -2508,6 +2577,30 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 argument_count,
             } => {
                 out.push(31);
+                put_u16(out, *first);
+                put_u16(out, *count);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
+            Instruction::ReturnCallVarargs {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(35);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
+            Instruction::ReturnCallVarargsPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(36);
                 put_u16(out, *first);
                 put_u16(out, *count);
                 put_u16(out, *function);
@@ -3415,6 +3508,25 @@ fn read_prototype(
             33 => Instruction::ReturnVarargs {
                 first: reader.u16()?,
                 count: reader.u16()?,
+            },
+            34 => Instruction::CallVarargsResults {
+                destination: reader.u16()?,
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+                result_count: reader.u16()?,
+            },
+            35 => Instruction::ReturnCallVarargs {
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+            },
+            36 => Instruction::ReturnCallVarargsPrefix {
+                first: reader.u16()?,
+                count: reader.u16()?,
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

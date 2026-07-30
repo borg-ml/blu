@@ -283,12 +283,14 @@ from named parameters and declare the `VARARGS` feature. Fixed scalar reads
 and fixed adjustment such as `local first, second = ...` use a validated
 destination range, truncate excess arguments, and pad missing arguments with
 `nil`. Direct dynamic returns and fixed-prefix forms such as `return head, ...`
-forward every vararg through bounded caller continuations. Active and
-saved-frame vararg vectors are GC roots. Dynamic-width final call arguments
-such as `target(...)` and final constructor fields `{...}` fail with
-`BLU-COMPILE-0007` until the capped dynamic area is encoded canonically; they
-are never silently reduced to one value. Metamethod-aware method lookup and
-resumable direct-BluV1 calls remain unsupported.
+forward every vararg through bounded caller continuations. Final call
+arguments such as `target(prefix, ...)` and `receiver:method(...)` preserve
+their fixed prefix and append the complete vararg vector for fixed-result and
+tail-return calls. Active and saved-frame vararg vectors are GC roots. Dynamic
+final constructor fields `{...}` fail with `BLU-COMPILE-0007` until their
+array expansion is encoded canonically; they are never silently reduced to
+one value. Metamethod-aware method lookup and resumable direct-BluV1 calls
+remain unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions
 and both `local function name(...) ... end` and simple
 `function name(...) ... end` declarations with bounded parameter vectors and
