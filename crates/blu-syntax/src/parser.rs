@@ -2,11 +2,11 @@ use crate::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
     DialectDirective, DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression,
-    FunctionBody, FunctionExpression, FunctionId, Identifier, IfClause, IfStatement,
-    IndexExpression, LexError, Lexed, LexerLimits, LocalFunctionStatement, LocalListStatement,
-    LocalStatement, MethodCallExpression, NumericForStatement, RepeatStatement, ReturnStatement,
-    Statement, TableConstructor, TableField, Token, TokenKind, UnaryExpression, UnaryOperator,
-    WhileStatement, lex,
+    FunctionBody, FunctionExpression, FunctionId, FunctionStatement, Identifier, IfClause,
+    IfStatement, IndexExpression, LexError, Lexed, LexerLimits, LocalFunctionStatement,
+    LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement, RepeatStatement,
+    ReturnStatement, Statement, TableConstructor, TableField, Token, TokenKind, UnaryExpression,
+    UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -359,6 +359,7 @@ impl<'a> Parser<'a> {
                     self.bump();
                 }
                 TokenKind::Local => self.parse_local()?,
+                TokenKind::Function => self.parse_function_statement()?,
                 TokenKind::Identifier => self.parse_assignment()?,
                 TokenKind::If => self.parse_if()?,
                 TokenKind::While => self.parse_while()?,
@@ -437,6 +438,7 @@ impl<'a> Parser<'a> {
                         "expected a supported statement",
                         &[
                             "local",
+                            "function",
                             "assignment",
                             "if",
                             "while",
@@ -821,6 +823,40 @@ impl<'a> Parser<'a> {
             "AST functions",
         )?;
         Ok(Some(id))
+    }
+
+    fn parse_function_statement(&mut self) -> Result<(), ParseError> {
+        let Some(keyword) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "function parser entered without a current token",
+            });
+        };
+        if !self.at(TokenKind::Identifier) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0039",
+                "expected a function name",
+                &["identifier"],
+            )?;
+            return Ok(());
+        }
+        let Some(name) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "identifier check succeeded without a current token",
+            });
+        };
+        let Some(function) = self.parse_function_body(keyword)? else {
+            return Ok(());
+        };
+        let Some(body) = self.functions.get(function.as_usize()) else {
+            return Err(ParseError::InternalInvariant {
+                message: "new function body is out of bounds",
+            });
+        };
+        self.push_statement(Statement::Function(FunctionStatement::new(
+            Identifier::new(name.span()),
+            function,
+            keyword.span().merge(body.span())?,
+        )))
     }
 
     fn parse_local(&mut self) -> Result<(), ParseError> {

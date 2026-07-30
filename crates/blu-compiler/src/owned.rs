@@ -384,6 +384,13 @@ struct OuterBinding {
     source: Upvalue,
 }
 
+#[derive(Clone, Copy)]
+enum AssignmentDestination {
+    Local(u16),
+    Upvalue(u16),
+    Global(u32),
+}
+
 struct Lowerer<'a, 'prototypes> {
     source: &'a SourceFile,
     ast: &'a Ast,
@@ -638,6 +645,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     self.emit(
                         Instruction::Move {
                             destination,
+                            source: closure,
+                        },
+                        function.span(),
+                    )?;
+                    false
+                }
+                Statement::Function(function) => {
+                    let closure = self.lower_function(function.function(), function.span())?;
+                    let name = self.global_name_constant(function.name().span())?;
+                    self.emit(
+                        Instruction::StoreGlobal {
+                            name,
                             source: closure,
                         },
                         function.span(),
@@ -1328,17 +1347,21 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         &mut self,
         statement: &AssignmentListStatement,
     ) -> Result<(), OwnedCompileError> {
-        let mut destinations = allocate_vec(
-            statement.targets().len(),
-            "assignment destination registers",
-        )?;
+        let mut destinations = allocate_vec(statement.targets().len(), "assignment destinations")?;
         for target in statement.targets() {
             let AssignmentTarget::Identifier(target) = target else {
                 return Err(OwnedCompileError::InternalInvariant {
                     message: "indexed assignment reached list lowering",
                 });
             };
-            destinations.push(self.resolve(target.span())?);
+            let destination = if let Some(register) = self.resolve_local(target.span())? {
+                AssignmentDestination::Local(register)
+            } else if let Some(upvalue) = self.resolve_upvalue(target.span())? {
+                AssignmentDestination::Upvalue(upvalue)
+            } else {
+                AssignmentDestination::Global(self.global_name_constant(target.span())?)
+            };
+            destinations.push(destination);
         }
         let capacity = statement.targets().len().max(statement.values().len());
         let mut sources = allocate_vec(capacity, "assignment source registers")?;
@@ -1365,13 +1388,22 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             sources.push(self.lower_constant(Constant::Nil, target.span())?);
         }
         for (destination, source) in destinations.into_iter().zip(sources) {
-            self.emit(
-                Instruction::Move {
-                    destination,
-                    source,
-                },
-                statement.span(),
-            )?;
+            match destination {
+                AssignmentDestination::Local(destination) => self.emit(
+                    Instruction::Move {
+                        destination,
+                        source,
+                    },
+                    statement.span(),
+                )?,
+                AssignmentDestination::Upvalue(upvalue) => self.emit(
+                    Instruction::SetUpvalue { upvalue, source },
+                    statement.span(),
+                )?,
+                AssignmentDestination::Global(name) => {
+                    self.emit(Instruction::StoreGlobal { name, source }, statement.span())?
+                }
+            }
         }
         Ok(())
     }
@@ -2328,19 +2360,6 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             message,
             self.limits.parse.lexer.diagnostic_limits,
         )?)
-    }
-
-    fn resolve(&self, name: ByteSpan) -> Result<u16, OwnedCompileError> {
-        if let Some(register) = self.resolve_local(name)? {
-            Ok(register)
-        } else {
-            Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                "BLU-RESOLVE-0001",
-                Phase::Resolve,
-                name,
-                "local name is unresolved",
-            )?))
-        }
     }
 
     fn resolve_local(&self, name: ByteSpan) -> Result<Option<u16>, OwnedCompileError> {

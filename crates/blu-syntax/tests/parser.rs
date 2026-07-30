@@ -291,6 +291,19 @@ fn function_expressions_and_local_functions_own_parameters_and_bodies() {
 }
 
 #[test]
+fn named_function_statements_own_global_names_and_bodies() {
+    let source = source(b"function answer(value) return value + 2 end".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Function(function) = parsed.ast().statements()[0] else {
+        panic!("expected named function statement");
+    };
+    assert_eq!(source.slice(function.name().span()).unwrap(), b"answer");
+    let body = parsed.ast().function(function.function()).unwrap();
+    assert_eq!(body.parameters().len(), 1);
+    assert!(matches!(body.body().statements()[0], Statement::Return(_)));
+}
+
+#[test]
 fn nested_function_loop_control_does_not_inherit_outer_loop_scope() {
     let source = source(b"while true do local function invalid() break end end".to_vec());
     let ParseOutcome::Rejected(rejected) =

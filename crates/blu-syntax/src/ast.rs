@@ -455,6 +455,38 @@ pub struct LocalFunctionStatement {
     span: ByteSpan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FunctionStatement {
+    name: Identifier,
+    function: FunctionId,
+    span: ByteSpan,
+}
+
+impl FunctionStatement {
+    pub(crate) const fn new(name: Identifier, function: FunctionId, span: ByteSpan) -> Self {
+        Self {
+            name,
+            function,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> Identifier {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn function(self) -> FunctionId {
+        self.function
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl LocalFunctionStatement {
     pub(crate) const fn new(name: Identifier, function: FunctionId, span: ByteSpan) -> Self {
         Self {
@@ -917,6 +949,7 @@ impl BreakStatement {
 pub enum Statement {
     Local(LocalStatement),
     LocalFunction(LocalFunctionStatement),
+    Function(FunctionStatement),
     LocalList(LocalListStatement),
     Assignment(AssignmentStatement),
     AssignmentList(AssignmentListStatement),
@@ -937,6 +970,7 @@ impl Statement {
         match self {
             Self::Local(statement) => statement.span(),
             Self::LocalFunction(statement) => statement.span(),
+            Self::Function(statement) => statement.span(),
             Self::LocalList(statement) => statement.span(),
             Self::Assignment(statement) => statement.span(),
             Self::AssignmentList(statement) => statement.span(),
@@ -988,6 +1022,7 @@ impl Block {
                 Statement::Do(statement) => statement.body().node_count(),
                 Statement::NumericFor(statement) => statement.body().node_count(),
                 Statement::LocalFunction(_) => 0,
+                Statement::Function(_) => 0,
                 _ => 0,
             };
             count.saturating_add(1).saturating_add(nested)

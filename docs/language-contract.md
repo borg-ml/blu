@@ -82,10 +82,10 @@ extra values, and initialize missing values to `nil`. Function-call/MULTRET
 adjustment remains outside this owned slice. Fixed scalar assignment lists
 likewise snapshot every right-hand expression before moving adjusted values
 into targets from left to right, permitting swaps without partial-write
-observations. An
-unresolved assignment target fails in resolution rather than implicitly
-selecting global semantics. Semicolons are retained tokens and act as optional
-statement separators or empty statements, including after `return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
+observations. Identifier targets resolve to active locals, enclosing upvalues,
+or the VM global registry in that order. Semicolons are retained tokens and
+act as optional statement separators or empty statements, including after
+`return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
 BluV1 Integer constants and use normal IEEE-754 parsing above that; Lua 5.1,
 Lua 5.2, and Luau always use the latter Number policy. Blu currently uses the
 Number policy for its bootstrap path, which is not a final Blu
@@ -195,8 +195,9 @@ require the `GLOBALS` feature bit. Validation rejects non-string name
 references and reads from uninitialized registers. Direct execution reads and
 writes the VM embedding registry; an absent name produces `nil`. The owned
 frontend resolves lexical locals first and otherwise lowers scalar identifier
-reads and single-target assignments as globals. Global list assignment and
-versioned `_ENV`/`getfenv`/`setfenv` behavior remain unsupported.
+reads and assignments as globals. Assignment lists preserve simultaneous
+right-hand-side evaluation across mixed local, captured, and global identifier
+targets. Versioned `_ENV`/`getfenv`/`setfenv` behavior remains unsupported.
 BluV1 table construction and indexed access require the `TABLES` feature bit.
 The owned grammar accepts bounded constructors with sequential array fields,
 identifier-keyed fields, and bracket-keyed fields, plus bracket or dot-name
@@ -232,13 +233,16 @@ generational upvalue cells, refreshes suspended parent registers after child
 returns, and uses an explicit caller stack bounded by the VM call limit.
 Registers, active closures, open upvalues, and suspended callers participate
 in allocation roots. Bootstrap translation continues to reject closure
-instructions explicitly. MULTRET/vararg adjustment, owned function syntax,
-metamethod-aware method lookup, and resumable direct-BluV1 calls remain
-unsupported.
+instructions explicitly. MULTRET/vararg adjustment, dotted and colon-method
+function declarations, metamethod-aware method lookup, and resumable
+direct-BluV1 calls remain unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions
-and `local function name(...) ... end` declarations with bounded parameter
-vectors and function-owned lexical blocks. Loop-control scope is reset at
-every function boundary. The owned compiler lowers noncapturing functions to
+and both `local function name(...) ... end` and simple
+`function name(...) ... end` declarations with bounded parameter vectors and
+function-owned lexical blocks. Loop-control scope is reset at every function
+boundary. Simple named declarations install the resulting closure in the VM
+global registry; dotted and colon-method declaration names remain unsupported.
+The owned compiler lowers noncapturing functions to
 recursive BluV1 prototype trees, emits `NEWCLOSURE`, and records fixed
 parameters for bounded child-frame argument copying. This path executes in all
 seven explicit profiles. Lexical resolution emits `GETUPVALUE` and

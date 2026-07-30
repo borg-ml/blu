@@ -378,6 +378,24 @@ fn assignment_lists_snapshot_rhs_and_adjust_fixed_scalar_values() {
             .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
         Ok(vec![Value::Number(1.0)])
     );
+
+    for bytes in [
+        b"first, second = 1, 2 first, second = second, first return first, second".as_slice(),
+        b"local first, second = 1, 2 local function swap() first, second = second, first end swap() return first, second"
+            .as_slice(),
+    ] {
+        let source = make_source(bytes.to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, SemanticProfile::Blu, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(
+                compiled.into_validated_artifact(),
+                BluLimits::default()
+            ),
+            Ok(vec![Value::Number(2.0), Value::Number(1.0)])
+        );
+    }
 }
 
 #[test]
@@ -2081,6 +2099,26 @@ fn owned_noncapturing_functions_lower_to_recursive_prototypes_and_execute() {
             Ok(vec![Value::Number(42.0)]),
             "{profile}"
         );
+    }
+}
+
+#[test]
+fn owned_named_function_statements_install_recursive_globals() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(
+            b"function factorial(value) if value <= 1 then return 1 end return value * factorial(value - 1) end return factorial(5)"
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let mut vm = Vm::default();
+        assert_eq!(
+            vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Number(120.0)]),
+            "{profile}"
+        );
+        assert!(matches!(vm.global(b"factorial"), Some(Value::Closure(_))));
     }
 }
 
