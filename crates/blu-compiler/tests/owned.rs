@@ -4322,6 +4322,77 @@ fn modern_bitwise_syntax_uses_64_bit_integer_semantics_and_profile_gates() {
 }
 
 #[test]
+fn compound_assignments_evaluate_targets_once_and_use_luau_operators() {
+    let source = make_source(
+        b"local a=5 a+=3 local b=5 b-=3 local c=5 c*=3 local d=5 d/=2 local e=5 e%=3 local f=2 f^=3 local g='a' g..='b' local calls=0 local t={[1]=10} local function target() calls+=1 return t end local function key() calls+=1 return 1 end target()[key()]+=(function() calls+=1 return 5 end)() return a,b,c,d,e,f,g,t[1],calls"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let integral = |value| {
+                if profile == SemanticProfile::Blu {
+                    Value::Integer(value)
+                } else {
+                    Value::Number(value as f64)
+                }
+            };
+            assert_eq!(
+                Vm::default().execute_blu_v1(
+                    compiled.unwrap().into_validated_artifact(),
+                    BluLimits::default()
+                ),
+                Ok(vec![
+                    integral(8),
+                    integral(2),
+                    integral(15),
+                    Value::Number(2.5),
+                    integral(2),
+                    Value::Number(8.0),
+                    Value::String(Arc::from(&b"ab"[..])),
+                    integral(15),
+                    integral(3),
+                ]),
+                "{profile}"
+            );
+        } else {
+            assert!(compiled.is_err(), "{profile}: {compiled:?}");
+        }
+    }
+
+    let floor = make_source(b"local x=5 x//=2 return x".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&floor, SemanticProfile::Luau, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Number(2.0)])
+    );
+    assert!(matches!(
+        OwnedCompiler::default().compile(&floor, SemanticProfile::Blu, compiler_identity()),
+        Err(OwnedCompileError::Diagnostic(_))
+    ));
+
+    let snapshot = make_source(
+        b"local x=10 local function rhs() x=100 return 5 end x+=rhs() return x".to_vec(),
+    );
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let compiled = OwnedCompiler::default()
+            .compile(&snapshot, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![if profile == SemanticProfile::Blu {
+                Value::Integer(15)
+            } else {
+                Value::Number(15.0)
+            }]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn luau_math_extensions_are_profile_gated_and_edge_compatible() {
     let source = make_source(
         b"return math.clamp(5,1,3),math.clamp(-1,1,3),math.sign(-3),math.sign(0),math.sign(0/0),math.round(1.5),math.round(-1.5),math.round(1.49)"

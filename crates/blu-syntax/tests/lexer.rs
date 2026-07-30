@@ -1064,3 +1064,34 @@ fn bitwise_tokens_are_lexed_only_for_blu_and_modern_lua_profiles() {
         }
     }
 }
+
+#[test]
+fn compound_assignment_tokens_are_blu_and_luau_only() {
+    let source = source(b"a+=b a-=b a*=b a/=b a//=b a%=b a^=b a..=b".to_vec());
+    for profile in SemanticProfile::ALL {
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        let supported = matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau);
+        assert_eq!(lexed.has_errors(), !supported, "{profile}");
+        let operators = significant_kinds(&lexed)
+            .into_iter()
+            .filter(|kind| *kind != TokenKind::Identifier)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            operators,
+            [
+                TokenKind::PlusEqual,
+                TokenKind::MinusEqual,
+                TokenKind::StarEqual,
+                TokenKind::SlashEqual,
+                TokenKind::FloorDivideEqual,
+                TokenKind::PercentEqual,
+                TokenKind::CaretEqual,
+                TokenKind::ConcatenateEqual,
+            ],
+            "{profile}"
+        );
+        if !supported {
+            assert_eq!(lexed.diagnostics().len(), 8, "{profile}");
+        }
+    }
+}

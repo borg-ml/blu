@@ -114,6 +114,9 @@ above unary operators and always produces a number.
 Blu and Lua 5.3–5.5 source profiles support 64-bit integer `&`, `|`, binary
 and unary `~`, `<<`, and `>>`, including Lua precedence and reversed negative
 shifts. Luau and Lua 5.1–5.2 reject this syntax during lexing.
+Blu and Luau additionally support `+=`, `-=`, `*=`, `/=`, `//=`, `%=`, `^=`,
+and `..=` statements. Indexed receivers and keys and the previous value are
+evaluated exactly once before the right-hand expression.
 Hexadecimal integers are accepted in every profile. Lua 5.3–5.5 use their
 wrapping 64-bit integer representation; Blu, Luau, Lua 5.1, and Lua 5.2 use
 numbers. Internal numeric separators are accepted only by Blu and Luau.

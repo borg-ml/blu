@@ -178,6 +178,14 @@ The owned compiler uses these branches for operand-returning, short-circuit
 `and` and `or` in every profile. The bootstrap translator rejects them rather
 than mapping unproved control-flow structure to Luau jumps. Backward branches
 remain unsupported until bounded loop CFG validation is implemented.
+Blu and Luau source profiles support the compound-assignment statements `+=`,
+`-=`, `*=`, `/=`, `//=`, `%=`, `^=`, and `..=`. Lua profiles reject their
+tokens lexically. Lowering snapshots an indexed receiver, key, and previous
+value before evaluating the right-hand expression, then uses the same
+arithmetic, concatenation, and resumable metamethod instructions as the
+corresponding binary operator. Blu `//=` remains a structured lowering error
+while Blu floor-division semantics are unassigned; the other seven operators
+are assigned. Compound assignment accepts exactly one target.
 An unconditional forward `Jump` completes the structured substrate used by
 owned `if`/`elseif`/`else` statements. Nested blocks own their statement lists,
 branch locals leave resolver scope at the block boundary, and local debug

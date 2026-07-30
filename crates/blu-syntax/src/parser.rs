@@ -1,12 +1,13 @@
 use crate::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
-    BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
-    DialectDirective, DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression,
-    FunctionBody, FunctionExpression, FunctionId, FunctionStatement, GenericForStatement,
-    Identifier, IfClause, IfStatement, IndexExpression, LexError, Lexed, LexerLimits,
-    LocalFunctionStatement, LocalListStatement, LocalStatement, MethodCallExpression,
-    NumericForStatement, RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField,
-    Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
+    BinaryOperator, Block, BreakStatement, CallExpression, CallStatement,
+    CompoundAssignmentOperator, CompoundAssignmentStatement, ContinueStatement, DialectDirective,
+    DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody,
+    FunctionExpression, FunctionId, FunctionStatement, GenericForStatement, Identifier, IfClause,
+    IfStatement, IndexExpression, LexError, Lexed, LexerLimits, LocalFunctionStatement,
+    LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement, RepeatStatement,
+    ReturnStatement, Statement, TableConstructor, TableField, Token, TokenKind, UnaryExpression,
+    UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -1195,6 +1196,16 @@ impl<'a> Parser<'a> {
                 });
             }
         };
+        if let Some(operator) = compound_assignment_operator(self.current().map(Token::kind)) {
+            self.bump();
+            let Some(value) = self.parse_expression(0)? else {
+                return Ok(());
+            };
+            let span = target.span().merge(self.expression(value.id)?.span())?;
+            return self.push_statement(Statement::CompoundAssignment(
+                CompoundAssignmentStatement::new(first_target, operator, value.id, span),
+            ));
+        }
         targets.push(first_target);
         while self.at(TokenKind::Comma) {
             self.bump();
@@ -1914,6 +1925,20 @@ fn binary_operator(kind: TokenKind) -> Option<(BinaryOperator, u8, u8)> {
         TokenKind::Percent => Some((BinaryOperator::Modulo, 10, 11)),
         TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 10, 11)),
         TokenKind::Caret => Some((BinaryOperator::Power, 12, 12)),
+        _ => None,
+    }
+}
+
+fn compound_assignment_operator(kind: Option<TokenKind>) -> Option<CompoundAssignmentOperator> {
+    match kind? {
+        TokenKind::PlusEqual => Some(CompoundAssignmentOperator::Add),
+        TokenKind::MinusEqual => Some(CompoundAssignmentOperator::Subtract),
+        TokenKind::StarEqual => Some(CompoundAssignmentOperator::Multiply),
+        TokenKind::SlashEqual => Some(CompoundAssignmentOperator::Divide),
+        TokenKind::FloorDivideEqual => Some(CompoundAssignmentOperator::FloorDivide),
+        TokenKind::PercentEqual => Some(CompoundAssignmentOperator::Modulo),
+        TokenKind::CaretEqual => Some(CompoundAssignmentOperator::Power),
+        TokenKind::ConcatenateEqual => Some(CompoundAssignmentOperator::Concatenate),
         _ => None,
     }
 }

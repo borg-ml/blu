@@ -551,6 +551,62 @@ pub struct AssignmentStatement {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum CompoundAssignmentOperator {
+    Add,
+    Subtract,
+    Multiply,
+    Divide,
+    FloorDivide,
+    Modulo,
+    Power,
+    Concatenate,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct CompoundAssignmentStatement {
+    target: AssignmentTarget,
+    operator: CompoundAssignmentOperator,
+    value: ExpressionId,
+    span: ByteSpan,
+}
+
+impl CompoundAssignmentStatement {
+    pub(crate) const fn new(
+        target: AssignmentTarget,
+        operator: CompoundAssignmentOperator,
+        value: ExpressionId,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            target,
+            operator,
+            value,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn target(self) -> AssignmentTarget {
+        self.target
+    }
+
+    #[must_use]
+    pub const fn operator(self) -> CompoundAssignmentOperator {
+        self.operator
+    }
+
+    #[must_use]
+    pub const fn value(self) -> ExpressionId {
+        self.value
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct CallStatement {
     call: ExpressionId,
     span: ByteSpan,
@@ -1027,6 +1083,7 @@ pub enum Statement {
     Function(FunctionStatement),
     LocalList(LocalListStatement),
     Assignment(AssignmentStatement),
+    CompoundAssignment(CompoundAssignmentStatement),
     AssignmentList(AssignmentListStatement),
     Call(CallStatement),
     If(IfStatement),
@@ -1049,6 +1106,7 @@ impl Statement {
             Self::Function(statement) => statement.span(),
             Self::LocalList(statement) => statement.span(),
             Self::Assignment(statement) => statement.span(),
+            Self::CompoundAssignment(statement) => statement.span(),
             Self::AssignmentList(statement) => statement.span(),
             Self::Call(statement) => statement.span(),
             Self::If(statement) => statement.span(),

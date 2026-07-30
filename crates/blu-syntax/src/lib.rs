@@ -13,10 +13,11 @@ mod parser;
 
 pub use ast::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
-    BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
-    DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody,
-    FunctionExpression, FunctionId, FunctionStatement, GenericForStatement, Identifier, IfClause,
-    IfStatement, IndexExpression, LocalFunctionStatement, LocalListStatement, LocalStatement,
+    BinaryOperator, Block, BreakStatement, CallExpression, CallStatement,
+    CompoundAssignmentOperator, CompoundAssignmentStatement, ContinueStatement, DoStatement,
+    Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody, FunctionExpression,
+    FunctionId, FunctionStatement, GenericForStatement, Identifier, IfClause, IfStatement,
+    IndexExpression, LocalFunctionStatement, LocalListStatement, LocalStatement,
     MethodCallExpression, NumericForStatement, RepeatStatement, ReturnStatement, Statement,
     TableConstructor, TableField, UnaryExpression, UnaryOperator, WhileStatement,
 };
@@ -181,6 +182,14 @@ pub enum TokenKind {
     Slash,
     Percent,
     Caret,
+    PlusEqual,
+    MinusEqual,
+    StarEqual,
+    SlashEqual,
+    FloorDivideEqual,
+    PercentEqual,
+    CaretEqual,
+    ConcatenateEqual,
     Hash,
     Ellipsis,
     Concatenate,
@@ -357,6 +366,23 @@ pub fn lex(
                 }
                 TokenKind::Comment
             }
+            b'/' if bytes.get(offset + 1) == Some(&b'/')
+                && bytes.get(offset + 2) == Some(&b'=') =>
+            {
+                offset += 3;
+                if !supports_compound_assignment(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "compound assignment is unavailable in this profile",
+                    )?;
+                }
+                TokenKind::FloorDivideEqual
+            }
             b'/' if bytes.get(offset + 1) == Some(&b'/') => {
                 offset += 2;
                 if !supports_floor_division(explicit_profile) {
@@ -375,8 +401,24 @@ pub fn lex(
                 TokenKind::FloorDivide
             }
             b'/' => {
-                offset += 1;
-                TokenKind::Slash
+                let compound = bytes.get(offset + 1) == Some(&b'=');
+                offset += 1 + usize::from(compound);
+                if compound && !supports_compound_assignment(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "compound assignment is unavailable in this profile",
+                    )?;
+                }
+                if compound {
+                    TokenKind::SlashEqual
+                } else {
+                    TokenKind::Slash
+                }
             }
             b'=' if bytes.get(offset + 1) == Some(&b'=') => {
                 offset += 2;
@@ -463,6 +505,28 @@ pub fn lex(
                 offset += 1;
                 TokenKind::Colon
             }
+            byte @ (b'+' | b'-' | b'*' | b'%' | b'^') if bytes.get(offset + 1) == Some(&b'=') => {
+                offset += 2;
+                if !supports_compound_assignment(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "compound assignment is unavailable in this profile",
+                    )?;
+                }
+                match byte {
+                    b'+' => TokenKind::PlusEqual,
+                    b'-' => TokenKind::MinusEqual,
+                    b'*' => TokenKind::StarEqual,
+                    b'%' => TokenKind::PercentEqual,
+                    b'^' => TokenKind::CaretEqual,
+                    _ => unreachable!("compound-assignment guard filters the byte"),
+                }
+            }
             b'+' => {
                 offset += 1;
                 TokenKind::Plus
@@ -528,6 +592,23 @@ pub fn lex(
             b']' => {
                 offset += 1;
                 TokenKind::RightBracket
+            }
+            b'.' if bytes.get(offset + 1) == Some(&b'.')
+                && bytes.get(offset + 2) == Some(&b'=') =>
+            {
+                offset += 3;
+                if !supports_compound_assignment(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "compound assignment is unavailable in this profile",
+                    )?;
+                }
+                TokenKind::ConcatenateEqual
             }
             b'.' if bytes.get(offset + 1) == Some(&b'.')
                 && bytes.get(offset + 2) == Some(&b'.') =>
@@ -1246,6 +1327,10 @@ const fn supports_bitwise_syntax(profile: SemanticProfile) -> bool {
             | SemanticProfile::Lua54
             | SemanticProfile::Lua55
     )
+}
+
+const fn supports_compound_assignment(profile: SemanticProfile) -> bool {
+    matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
 }
 
 const fn supports_continue(profile: SemanticProfile) -> bool {

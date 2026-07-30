@@ -29,11 +29,11 @@ use blu_core::{
 };
 use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryOperator,
-    CallExpression, Expression, ExpressionId, ExpressionKind, FunctionId, FunctionStatement,
-    GenericForStatement, Identifier, IfStatement, LocalListStatement, LocalStatement,
-    MethodCallExpression, NumericForStatement, ParseError, ParseLimits, ParseOutcome, Rejected,
-    RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField, UnaryOperator,
-    WhileStatement, parse,
+    CallExpression, CompoundAssignmentOperator, CompoundAssignmentStatement, Expression,
+    ExpressionId, ExpressionKind, FunctionId, FunctionStatement, GenericForStatement, Identifier,
+    IfStatement, LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement,
+    ParseError, ParseLimits, ParseOutcome, Rejected, RepeatStatement, ReturnStatement, Statement,
+    TableConstructor, TableField, UnaryOperator, WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -771,6 +771,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 }
                 Statement::Assignment(assignment) => {
                     self.lower_assignment(*assignment)?;
+                    false
+                }
+                Statement::CompoundAssignment(assignment) => {
+                    self.lower_compound_assignment(*assignment)?;
                     false
                 }
                 Statement::AssignmentList(assignment) => {
@@ -1722,6 +1726,157 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 )
             }
         }
+    }
+
+    fn lower_compound_assignment(
+        &mut self,
+        statement: CompoundAssignmentStatement,
+    ) -> Result<(), OwnedCompileError> {
+        let (current, destination) = match statement.target() {
+            AssignmentTarget::Identifier(identifier) => {
+                let current = self.lower_identifier(identifier, identifier.span())?;
+                let destination = if let Some(register) = self.resolve_local(identifier.span())? {
+                    AssignmentDestination::Local(register)
+                } else if let Some(upvalue) = self.resolve_upvalue(identifier.span())? {
+                    AssignmentDestination::Upvalue(upvalue)
+                } else {
+                    AssignmentDestination::Global(self.global_name_constant(identifier.span())?)
+                };
+                (current, destination)
+            }
+            AssignmentTarget::Index(index) => {
+                let table = self.lower_expression(index.table())?;
+                let table = self.snapshot_register(table, index.span())?;
+                let key = self.lower_expression(index.key())?;
+                let key = self.snapshot_register(key, index.span())?;
+                let current = self.allocate_register()?;
+                self.emit(
+                    Instruction::GetTable {
+                        destination: current,
+                        table,
+                        key,
+                    },
+                    index.span(),
+                )?;
+                (current, AssignmentDestination::Table { table, key })
+            }
+            AssignmentTarget::Field(field) => {
+                let table = self.lower_expression(field.table())?;
+                let table = self.snapshot_register(table, field.span())?;
+                let key = self.lower_constant(
+                    Constant::String(copy_bytes(
+                        self.source.slice(field.name().span())?,
+                        "compound assignment field name",
+                    )?),
+                    field.name().span(),
+                )?;
+                let current = self.allocate_register()?;
+                self.emit(
+                    Instruction::GetTable {
+                        destination: current,
+                        table,
+                        key,
+                    },
+                    field.span(),
+                )?;
+                (current, AssignmentDestination::Table { table, key })
+            }
+        };
+        let current = self.snapshot_register(current, statement.span())?;
+        let right = self.lower_expression(statement.value())?;
+        let value =
+            self.emit_compound_operation(statement.operator(), current, right, statement.span())?;
+        match destination {
+            AssignmentDestination::Local(destination) => self.emit(
+                Instruction::Move {
+                    destination,
+                    source: value,
+                },
+                statement.span(),
+            ),
+            AssignmentDestination::Upvalue(upvalue) => self.emit(
+                Instruction::SetUpvalue {
+                    upvalue,
+                    source: value,
+                },
+                statement.span(),
+            ),
+            AssignmentDestination::Global(name) => self.emit(
+                Instruction::StoreGlobal {
+                    name,
+                    source: value,
+                },
+                statement.span(),
+            ),
+            AssignmentDestination::Table { table, key } => self.emit(
+                Instruction::SetTable { table, key, value },
+                statement.span(),
+            ),
+        }
+    }
+
+    fn emit_compound_operation(
+        &mut self,
+        operator: CompoundAssignmentOperator,
+        left: u16,
+        right: u16,
+        span: ByteSpan,
+    ) -> Result<u16, OwnedCompileError> {
+        if operator == CompoundAssignmentOperator::FloorDivide
+            && self.profile == SemanticProfile::Blu
+        {
+            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                "BLU-LOWER-0001",
+                Phase::Lower,
+                span,
+                "Blu floor-division semantics are not assigned",
+            )?));
+        }
+        let destination = self.allocate_register()?;
+        let instruction = match operator {
+            CompoundAssignmentOperator::Add => Instruction::Add {
+                destination,
+                left,
+                right,
+            },
+            CompoundAssignmentOperator::Subtract => Instruction::Subtract {
+                destination,
+                left,
+                right,
+            },
+            CompoundAssignmentOperator::Multiply => Instruction::Multiply {
+                destination,
+                left,
+                right,
+            },
+            CompoundAssignmentOperator::Divide => Instruction::Divide {
+                destination,
+                left,
+                right,
+            },
+            CompoundAssignmentOperator::FloorDivide => Instruction::FloorDivide {
+                destination,
+                left,
+                right,
+            },
+            CompoundAssignmentOperator::Modulo => Instruction::Modulo {
+                destination,
+                left,
+                right,
+            },
+            CompoundAssignmentOperator::Power => Instruction::Power {
+                destination,
+                left,
+                right,
+            },
+            CompoundAssignmentOperator::Concatenate => Instruction::Concatenate {
+                destination,
+                left,
+                right,
+            },
+        };
+        self.emit(instruction, span)?;
+        Ok(destination)
     }
 
     fn lower_local_list(
