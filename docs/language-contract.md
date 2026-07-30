@@ -201,7 +201,10 @@ negative directions are lowered explicitly. Literal zero follows the pinned
 split: Lua 5.1–5.3 and Luau classify it with non-positive steps. Lua 5.4–5.5
 reject zero during lowering with `BLU-COMPILE-0004`, preserving their upstream
 "`for` step is zero" failure, and Blu uses the same diagnostic because its
-behavior remains unassigned. Dynamic steps fail with `BLU-COMPILE-0003`.
+behavior remains unassigned. Dynamic steps are evaluated once and select their
+direction at runtime for Luau and Lua 5.1–5.3. Blu and Lua 5.4–5.5 reject
+dynamic steps with `BLU-COMPILE-0003` because they can reach an unassigned or
+erroring zero case.
 The owned generic-for slice accepts
 `for name [, name ...] in expression [, expression ...] do ... end` for Blu,
 Luau, and Lua 5.1–5.3. Its expression list is evaluated once and adjusted to

@@ -990,40 +990,51 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             statement.span(),
         )?;
         let (step, ascending) = if let Some(step_expression) = statement.step() {
-            let Some(sign) = self.numeric_for_step_sign(step_expression, false)? else {
-                return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                    "BLU-COMPILE-0003",
-                    Phase::Lower,
-                    self.expression(step_expression)?.span(),
-                    "numeric for step must currently be a numeric literal",
-                )?));
-            };
-            let ascending = if sign == 0 {
+            let sign = self.numeric_for_step_sign(step_expression, false)?;
+            let ascending = if let Some(sign) = sign {
+                if sign == 0 {
+                    match self.profile {
+                        SemanticProfile::Luau
+                        | SemanticProfile::Lua51
+                        | SemanticProfile::Lua52
+                        | SemanticProfile::Lua53 => Some(false),
+                        SemanticProfile::Blu => {
+                            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                                "BLU-COMPILE-0004",
+                                Phase::Lower,
+                                self.expression(step_expression)?.span(),
+                                "Blu zero numeric for step semantics are not assigned",
+                            )?));
+                        }
+                        SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
+                            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                                "BLU-COMPILE-0004",
+                                Phase::Lower,
+                                self.expression(step_expression)?.span(),
+                                "Lua 5.4-5.5 reject a zero numeric for step",
+                            )?));
+                        }
+                        profile => return Err(OwnedCompileError::UnsupportedProfile(profile)),
+                    }
+                } else {
+                    Some(sign > 0)
+                }
+            } else {
                 match self.profile {
                     SemanticProfile::Luau
                     | SemanticProfile::Lua51
                     | SemanticProfile::Lua52
-                    | SemanticProfile::Lua53 => false,
-                    SemanticProfile::Blu => {
+                    | SemanticProfile::Lua53 => None,
+                    SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
                         return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                            "BLU-COMPILE-0004",
+                            "BLU-COMPILE-0003",
                             Phase::Lower,
                             self.expression(step_expression)?.span(),
-                            "Blu zero numeric for step semantics are not assigned",
-                        )?));
-                    }
-                    SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
-                        return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                            "BLU-COMPILE-0004",
-                            Phase::Lower,
-                            self.expression(step_expression)?.span(),
-                            "Lua 5.4-5.5 reject a zero numeric for step",
+                            "dynamic numeric for steps can reach an unassigned or erroring zero case",
                         )?));
                     }
                     profile => return Err(OwnedCompileError::UnsupportedProfile(profile)),
                 }
-            } else {
-                sign > 0
             };
             let source = self.lower_expression(step_expression)?;
             let snapshot = self.allocate_register()?;
@@ -1044,7 +1055,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             } else {
                 Constant::Number(1.0)
             };
-            (self.lower_constant(step_constant, statement.span())?, true)
+            (
+                self.lower_constant(step_constant, statement.span())?,
+                Some(true),
+            )
         };
 
         let loop_scope = self.bindings.len();
@@ -1078,14 +1092,64 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
 
         let start = self.code.len();
         let condition = self.allocate_register()?;
-        self.emit(
-            Instruction::LessEqual {
-                destination: condition,
-                left: if ascending { index } else { limit },
-                right: if ascending { limit } else { index },
-            },
-            statement.span(),
-        )?;
+        if let Some(ascending) = ascending {
+            self.emit(
+                Instruction::LessEqual {
+                    destination: condition,
+                    left: if ascending { index } else { limit },
+                    right: if ascending { limit } else { index },
+                },
+                statement.span(),
+            )?;
+        } else {
+            let zero = self.lower_constant(
+                if self.profile == SemanticProfile::Lua53 {
+                    Constant::Integer(0)
+                } else {
+                    Constant::Number(0.0)
+                },
+                statement.span(),
+            )?;
+            let positive = self.allocate_register()?;
+            self.emit(
+                Instruction::LessThan {
+                    destination: positive,
+                    left: zero,
+                    right: step,
+                },
+                statement.span(),
+            )?;
+            let descending = self.code.len();
+            self.emit(
+                Instruction::JumpIfFalsy {
+                    condition: positive,
+                    target: 0,
+                },
+                statement.span(),
+            )?;
+            self.emit(
+                Instruction::LessEqual {
+                    destination: condition,
+                    left: index,
+                    right: limit,
+                },
+                statement.span(),
+            )?;
+            let condition_ready = self.code.len();
+            self.emit(Instruction::Jump { target: 0 }, statement.span())?;
+            let descending_target = self.code.len();
+            self.patch_forward_branch(descending, descending_target)?;
+            self.emit(
+                Instruction::LessEqual {
+                    destination: condition,
+                    left: limit,
+                    right: index,
+                },
+                statement.span(),
+            )?;
+            let ready_target = self.code.len();
+            self.patch_forward_branch(condition_ready, ready_target)?;
+        }
         let exit = self.code.len();
         self.emit(
             Instruction::JumpIfFalsy {

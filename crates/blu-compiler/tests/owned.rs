@@ -1351,6 +1351,63 @@ fn numeric_for_accepts_literal_steps_with_profile_specific_zero_direction() {
 }
 
 #[test]
+fn numeric_for_snapshots_dynamic_steps_for_profiles_with_assigned_zero_behavior() {
+    let dynamic = make_source(
+        b"local calls = 0 local function getstep() calls = calls + 1 return -2 end local total = 0 for index = 5, 1, getstep() do total = total + index end return total, calls"
+            .to_vec(),
+    );
+    let zero = make_source(
+        b"local step = 0 local count = 0 for index = 1, 0, step do count = count + 1 if count == 1 then break end end return count"
+            .to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Luau,
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&dynamic, profile, compiler_identity())
+            .expect("profile assigns dynamic step direction");
+        let expected = if profile == SemanticProfile::Lua53 {
+            vec![Value::Integer(9), Value::Integer(1)]
+        } else {
+            vec![Value::Number(9.0), Value::Number(1.0)]
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(expected),
+            "{profile}"
+        );
+
+        let compiled = OwnedCompiler::default()
+            .compile(&zero, profile, compiler_identity())
+            .expect("profile assigns dynamic zero-step direction");
+        let expected = if profile == SemanticProfile::Lua53 {
+            Value::Integer(1)
+        } else {
+            Value::Number(1.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
+    }
+
+    for profile in [
+        SemanticProfile::Blu,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let error = OwnedCompiler::default()
+            .compile(&dynamic, profile, compiler_identity())
+            .expect_err("dynamic zero behavior is not executable for this profile");
+        assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
+    }
+}
+
+#[test]
 fn generic_for_executes_pairs_and_owned_iterators_across_profiles() {
     for (bytes, result) in [
         (

@@ -125,7 +125,9 @@ numeric representation for the implicit positive unit step, and scope the
 index to the loop. Explicit, provably nonzero numeric-literal steps support
 both directions. Literal zero follows the pinned Lua 5.1–5.3 and Luau
 non-positive classification; Blu remains unassigned and Lua 5.4–5.5 reject
-zero explicitly. Dynamic steps still fail during lowering.
+zero explicitly. Dynamic steps execute for Luau and Lua 5.1–5.3 with
+single-evaluation snapshots and runtime direction selection; Blu and Lua
+5.4–5.5 reject them until their possible zero case is executable.
 Generic `for` now executes iterator/state/control triples in Blu, Luau, and
 Lua 5.1–5.3, including bounded final-call adjustment, lexical result
 variables, and nil-only termination. Lua 5.4–5.5 reject this syntax during
