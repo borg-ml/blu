@@ -30,6 +30,8 @@ legacy one-argument Luau/Lua 5.1–5.2 contract or modern Blu/Lua 5.3–5.5
 `math.acos` follow the shared numeric contract. Profile-aware `math.floor` and
 `math.ceil` and the integral result of two-result `math.modf` preserve
 number-only legacy behavior or return modern exact integers when representable.
+`math.abs` preserves modern integer inputs, while `math.log` explicitly
+distinguishes Lua 5.1's ignored extra arguments from modern base selection.
 Byte-oriented `string.find` supports literal searches, relative starts, empty
 needles, nil misses, explicit plain mode, basic anchors, wildcard bytes,
 portable byte classes, class negation, and escaped punctuation under a work

@@ -6206,8 +6206,27 @@ impl Vm {
     }
 
     fn install_math_library(&mut self) -> Result<(), RuntimeError> {
-        let abs = self.register_function(|_, arguments| {
-            let value = number_argument(arguments, 0, "math.abs")?;
+        let abs = self.register_function(|vm, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "math.abs",
+                index: 1,
+            })?;
+            if matches!(
+                vm.active_profile()?,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                if let Value::Integer(value) = value {
+                    return Ok(vec![Value::Integer(value.wrapping_abs())]);
+                }
+            }
+            let value = value.as_number().ok_or(RuntimeError::Type {
+                operation: "math.abs",
+                expected: "number",
+                actual: value.type_name(),
+            })?;
             Ok(vec![Value::Number(value.abs())])
         });
         let floor = self.register_function(|vm, arguments| {
@@ -6234,11 +6253,11 @@ impl Vm {
             let value = number_argument(arguments, 0, "math.exp")?;
             Ok(vec![Value::Number(value.exp())])
         });
-        let log = self.register_function(|_, arguments| {
+        let log = self.register_function(|vm, arguments| {
             let value = number_argument(arguments, 0, "math.log")?;
-            let result = match arguments.get(1) {
-                Some(_) => value.log(number_argument(arguments, 1, "math.log")?),
-                None => value.ln(),
+            let result = match (vm.active_profile()?, arguments.get(1)) {
+                (SemanticProfile::Lua51, _) | (_, None) => value.ln(),
+                (_, Some(_)) => value.log(number_argument(arguments, 1, "math.log")?),
             };
             Ok(vec![Value::Number(result)])
         });

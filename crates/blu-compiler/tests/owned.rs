@@ -3811,6 +3811,37 @@ fn math_modf_rejects_non_numeric_arguments_structurally() {
 }
 
 #[test]
+fn math_abs_and_log_follow_profile_numeric_contracts() {
+    let source = make_source(b"return math.abs(-3),math.abs(-3.5),math.log(8,2)".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let integral = if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            Value::Integer(3)
+        } else {
+            Value::Number(3.0)
+        };
+        let logarithm = if profile == SemanticProfile::Lua51 {
+            8.0_f64.ln()
+        } else {
+            3.0
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![integral, Value::Number(3.5), Value::Number(logarithm)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

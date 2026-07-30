@@ -400,6 +400,10 @@ rounded value fits `i64`, retaining a floating result for finite out-of-range
 values, infinities, and NaN. `math.modf` uses the same profile split for its
 truncation-toward-zero integral result and returns the signed fractional part
 as a number.
+`math.abs` likewise preserves integer inputs in Blu and Lua 5.3–5.5, including
+the upstream wrapping minimum-integer result, and returns numbers elsewhere.
+Lua 5.1 ignores extra `math.log` arguments; Blu, Luau, and Lua 5.2–5.5 use the
+second argument as the logarithm base.
 `string.find` currently implements the common byte-oriented literal-search
 slice: relative start indices, empty needles, nil misses, and explicit
 `plain=true`. Searches without `plain` support search-relative `^`, subject-end
