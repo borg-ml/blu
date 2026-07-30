@@ -29,10 +29,10 @@ use blu_core::{
 };
 use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryOperator,
-    CallExpression, Expression, ExpressionId, ExpressionKind, IfStatement, LocalListStatement,
-    LocalStatement, MethodCallExpression, NumericForStatement, ParseError, ParseLimits,
-    ParseOutcome, Rejected, RepeatStatement, ReturnStatement, Statement, TableConstructor,
-    TableField, UnaryOperator, WhileStatement, parse,
+    CallExpression, Expression, ExpressionId, ExpressionKind, FunctionId, Identifier, IfStatement,
+    LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement, ParseError,
+    ParseLimits, ParseOutcome, Rejected, RepeatStatement, ReturnStatement, Statement,
+    TableConstructor, TableField, UnaryOperator, WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -86,6 +86,8 @@ pub enum OwnedCompileLimit {
     SourceNameBytes,
     DebugNameBytes,
     TotalDebugBytes,
+    Prototypes,
+    Children,
 }
 
 impl fmt::Display for OwnedCompileLimit {
@@ -104,6 +106,8 @@ impl fmt::Display for OwnedCompileLimit {
             Self::SourceNameBytes => formatter.write_str("source identity name bytes"),
             Self::DebugNameBytes => formatter.write_str("local debug name bytes"),
             Self::TotalDebugBytes => formatter.write_str("total local debug name bytes"),
+            Self::Prototypes => formatter.write_str("prototypes"),
+            Self::Children => formatter.write_str("child prototypes"),
         }
     }
 }
@@ -159,7 +163,14 @@ impl OwnedCompiler {
                 return Err(OwnedCompileError::Syntax(rejected));
             }
         };
-        let prototype = Lowerer::new(source, parsed.ast(), self.limits)?.run(parsed.ast())?;
+        let mut prototypes = allocate_vec(1, "artifact prototypes")?;
+        let prototype = Lowerer::new(source, parsed.ast(), self.limits, &mut prototypes, &[], &[])?
+            .run(parsed.ast().statements())?;
+        let main =
+            u32::try_from(prototypes.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "prototype count passed limits but cannot fit BluV1",
+            })?;
+        push_fallible(&mut prototypes, prototype, "artifact prototypes")?;
         let source_name = copy_string(source.identity().name(), "source identity name")?;
         let source_identity = SourceIdentity::new(
             source.identity().id(),
@@ -179,14 +190,12 @@ impl OwnedCompiler {
             byte_len,
             digest,
         });
-        let mut prototypes = allocate_vec(1, "artifact prototypes")?;
-        prototypes.push(prototype);
         let artifact = Artifact {
             format: BytecodeFormat::BluV1,
             compiler: compiler_identity,
             sources,
             prototypes,
-            main: 0,
+            main,
         };
         let validated = ValidatedArtifact::new(artifact, self.limits.artifact)
             .map_err(OwnedCompileError::Validation)?;
@@ -367,13 +376,17 @@ struct Binding {
     end_pc: Option<u32>,
 }
 
-struct Lowerer<'a> {
+struct Lowerer<'a, 'prototypes> {
     source: &'a SourceFile,
+    ast: &'a Ast,
     profile: SemanticProfile,
     expressions: &'a [Expression],
     table_fields: &'a [TableField],
     call_arguments: &'a [ExpressionId],
     limits: OwnedCompileLimits,
+    prototypes: &'prototypes mut Vec<Prototype>,
+    outer_names: Vec<ByteSpan>,
+    parameter_count: usize,
     bindings: Vec<Binding>,
     closed_bindings: Vec<Binding>,
     loop_breaks: Vec<Vec<usize>>,
@@ -383,22 +396,32 @@ struct Lowerer<'a> {
     constant_bytes: usize,
     code: Vec<Instruction>,
     source_map: Vec<ByteSpan>,
+    children: Vec<u32>,
 }
 
-impl<'a> Lowerer<'a> {
+impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     fn new(
         source: &'a SourceFile,
         ast: &'a Ast,
         limits: OwnedCompileLimits,
+        prototypes: &'prototypes mut Vec<Prototype>,
+        parameters: &[Identifier],
+        outer_names: &[ByteSpan],
     ) -> Result<Self, OwnedCompileError> {
         let capacity = ast.node_count().min(4_096);
-        Ok(Self {
+        let mut copied_outer_names = allocate_vec(outer_names.len(), "outer lexical names")?;
+        copied_outer_names.extend_from_slice(outer_names);
+        let mut lowerer = Self {
             source,
+            ast,
             profile: ast.profile(),
             expressions: ast.expressions(),
             table_fields: ast.table_field_arena(),
             call_arguments: ast.call_argument_arena(),
             limits,
+            prototypes,
+            outer_names: copied_outer_names,
+            parameter_count: parameters.len(),
             bindings: allocate_vec(capacity.min(limits.max_bindings), "local bindings")?,
             closed_bindings: allocate_vec(
                 capacity.min(limits.max_bindings),
@@ -411,11 +434,17 @@ impl<'a> Lowerer<'a> {
             constant_bytes: 0,
             code: allocate_vec(capacity.min(limits.max_instructions), "instructions")?,
             source_map: allocate_vec(capacity.min(limits.max_instructions), "source map")?,
-        })
+            children: allocate_vec(4, "prototype children")?,
+        };
+        for parameter in parameters {
+            let register = lowerer.allocate_register()?;
+            lowerer.push_binding(parameter.span(), register, 0)?;
+        }
+        Ok(lowerer)
     }
 
-    fn run(mut self, ast: &Ast) -> Result<Prototype, OwnedCompileError> {
-        if !self.lower_statements(ast.statements())? {
+    fn run(mut self, statements: &[Statement]) -> Result<Prototype, OwnedCompileError> {
+        if !self.lower_statements(statements)? {
             let eof = self.source.span(self.source.len(), self.source.len())?;
             self.emit(Instruction::Return { first: 0, count: 0 }, eof)?;
         }
@@ -538,16 +567,27 @@ impl<'a> Lowerer<'a> {
         {
             required_features = required_features | FeatureBits::FIXED_CALLS;
         }
+        if self
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::NewClosure { .. }))
+        {
+            required_features = required_features | FeatureBits::CLOSURES;
+        }
         Ok(Prototype {
-            profile: ast.profile(),
+            profile: self.profile,
             source: self.source.identity().id(),
             register_count,
-            parameter_count: 0,
+            parameter_count: u16::try_from(self.parameter_count).map_err(|_| {
+                OwnedCompileError::InternalInvariant {
+                    message: "parameter count passed limits but cannot fit BluV1",
+                }
+            })?,
             is_vararg: false,
             required_features,
             constants: self.constants,
             upvalues: Vec::new(),
-            children: Vec::new(),
+            children: self.children,
             code: self.code,
             source_map: self.source_map,
             locals,
@@ -563,12 +603,22 @@ impl<'a> Lowerer<'a> {
                     false
                 }
                 Statement::LocalFunction(function) => {
-                    return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                        "BLU-COMPILE-0005",
-                        Phase::Lower,
+                    let destination = self.allocate_register()?;
+                    let start_pc = u32::try_from(self.code.len()).map_err(|_| {
+                        OwnedCompileError::InternalInvariant {
+                            message: "instruction count passed limits but cannot fit a debug PC",
+                        }
+                    })?;
+                    self.push_binding(function.name().span(), destination, start_pc)?;
+                    let closure = self.lower_function(function.function(), function.span())?;
+                    self.emit(
+                        Instruction::Move {
+                            destination,
+                            source: closure,
+                        },
                         function.span(),
-                        "owned function lowering is not implemented yet",
-                    )?));
+                    )?;
+                    false
                 }
                 Statement::LocalList(local) => {
                     self.lower_local_list(local)?;
@@ -1028,6 +1078,19 @@ impl<'a> Lowerer<'a> {
             Some(value) => self.lower_expression(value)?,
             None => self.lower_constant(Constant::Nil, statement.span())?,
         };
+        let start_pc =
+            u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "instruction count passed limits but cannot fit a debug PC",
+            })?;
+        self.push_binding(statement.name().span(), register, start_pc)
+    }
+
+    fn push_binding(
+        &mut self,
+        name: ByteSpan,
+        register: u16,
+        start_pc: u32,
+    ) -> Result<(), OwnedCompileError> {
         let limit = self
             .limits
             .max_bindings
@@ -1041,20 +1104,78 @@ impl<'a> Lowerer<'a> {
                 .saturating_add(1),
             limit,
         )?;
-        let start_pc =
-            u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
-                message: "instruction count passed limits but cannot fit a debug PC",
-            })?;
         push_fallible(
             &mut self.bindings,
             Binding {
-                name: statement.name().span(),
+                name,
                 register,
                 start_pc,
                 end_pc: None,
             },
             "local bindings",
         )
+    }
+
+    fn lower_function(
+        &mut self,
+        function: FunctionId,
+        span: ByteSpan,
+    ) -> Result<u16, OwnedCompileError> {
+        let body = self
+            .ast
+            .function(function)
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "function expression references an absent AST body",
+            })?;
+        let visible_count = self.outer_names.len().saturating_add(self.bindings.len());
+        let mut outer_names = allocate_vec(visible_count, "child lexical names")?;
+        outer_names.extend_from_slice(&self.outer_names);
+        outer_names.extend(self.bindings.iter().map(|binding| binding.name));
+
+        check_limit(
+            OwnedCompileLimit::Prototypes,
+            self.prototypes.len().saturating_add(1),
+            self.limits.artifact.max_prototypes,
+        )?;
+        let child = Lowerer::new(
+            self.source,
+            self.ast,
+            self.limits,
+            self.prototypes,
+            body.parameters(),
+            &outer_names,
+        )?
+        .run(body.body().statements())?;
+        let child_index = u32::try_from(self.prototypes.len()).map_err(|_| {
+            OwnedCompileError::InternalInvariant {
+                message: "prototype count passed limits but cannot fit BluV1",
+            }
+        })?;
+        push_fallible(self.prototypes, child, "artifact prototypes")?;
+
+        let child_slot = self.children.len();
+        check_limit(
+            OwnedCompileLimit::Children,
+            child_slot.saturating_add(1),
+            self.limits
+                .artifact
+                .max_children_per_prototype
+                .min(u16::MAX as usize),
+        )?;
+        push_fallible(&mut self.children, child_index, "prototype children")?;
+        let destination = self.allocate_register()?;
+        self.emit(
+            Instruction::NewClosure {
+                destination,
+                child: u16::try_from(child_slot).map_err(|_| {
+                    OwnedCompileError::InternalInvariant {
+                        message: "child count passed limits but cannot fit BluV1",
+                    }
+                })?,
+            },
+            span,
+        )?;
+        Ok(destination)
     }
 
     fn lower_assignment(
@@ -1072,6 +1193,13 @@ impl<'a> Lowerer<'a> {
                         },
                         statement.span(),
                     )
+                } else if self.is_outer_name(identifier.span())? {
+                    Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0006",
+                        Phase::Resolve,
+                        identifier.span(),
+                        "owned lexical capture lowering is not implemented yet",
+                    )?))
                 } else {
                     let name = self.global_name_constant(identifier.span())?;
                     self.emit(Instruction::StoreGlobal { name, source }, statement.span())
@@ -1515,6 +1643,13 @@ impl<'a> Lowerer<'a> {
             ExpressionKind::Identifier(identifier) => {
                 if let Some(register) = self.resolve_local(identifier.span())? {
                     Ok(register)
+                } else if self.is_outer_name(identifier.span())? {
+                    Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0006",
+                        Phase::Resolve,
+                        identifier.span(),
+                        "owned lexical capture lowering is not implemented yet",
+                    )?))
                 } else {
                     let name = self.global_name_constant(identifier.span())?;
                     let destination = self.allocate_register()?;
@@ -1563,12 +1698,7 @@ impl<'a> Lowerer<'a> {
             ExpressionKind::Call(call) => self.lower_call(call),
             ExpressionKind::MethodCall(call) => self.lower_method_call(call),
             ExpressionKind::Function(function) => {
-                Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                    "BLU-COMPILE-0005",
-                    Phase::Lower,
-                    function.span(),
-                    "owned function lowering is not implemented yet",
-                )?))
+                self.lower_function(function.function(), function.span())
             }
             ExpressionKind::Unary(unary) => match unary.operator() {
                 UnaryOperator::Not => {
@@ -2179,6 +2309,16 @@ impl<'a> Lowerer<'a> {
             }
         }
         Ok(None)
+    }
+
+    fn is_outer_name(&self, name: ByteSpan) -> Result<bool, OwnedCompileError> {
+        let bytes = self.source.slice(name)?;
+        for outer in self.outer_names.iter().rev() {
+            if self.source.slice(*outer)? == bytes {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     fn global_name_constant(&mut self, name: ByteSpan) -> Result<u32, OwnedCompileError> {

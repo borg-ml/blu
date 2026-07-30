@@ -2056,3 +2056,45 @@ fn noncontiguous_return_values_are_normalized_with_moves() {
         Ok(vec![Value::Number(2.0), Value::Number(1.0)])
     );
 }
+
+#[test]
+fn owned_noncapturing_functions_lower_to_recursive_prototypes_and_execute() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(
+            b"local function add(left, right) return left + right end return add(20, 22)".to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let artifact = compiled.artifact();
+        assert_eq!(artifact.prototypes().len(), 2, "{profile}");
+        assert_eq!(artifact.main().children, [0], "{profile}");
+        assert_eq!(artifact.prototypes()[0].parameter_count, 2, "{profile}");
+        assert!(
+            artifact
+                .main()
+                .required_features
+                .contains(FeatureBits::CLOSURES)
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Number(42.0)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_capture_use_fails_explicitly_until_capture_lowering_is_connected() {
+    let source = make_source(
+        b"local outer = 40 local function add(value) return outer + value end return add(2)"
+            .to_vec(),
+    );
+    let error = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap_err();
+    let diagnostic = error.diagnostic().expect("capture diagnostic");
+    assert_eq!(diagnostic.code().as_str(), "BLU-COMPILE-0006");
+    assert_eq!(diagnostic.phase(), Phase::Resolve);
+    assert_eq!(source.slice(diagnostic.primary().span()).unwrap(), b"outer");
+}
