@@ -7541,6 +7541,17 @@ impl Vm {
                         / (input_maximum - input_minimum),
             )])
         });
+        let noise = self.register_function(|vm, arguments| {
+            require_luau_math(vm, "math.noise")?;
+            let x = number_argument(arguments, 0, "math.noise")?;
+            let optional_coordinate = |index| match arguments.get(index) {
+                None | Some(Value::Nil) => Ok(0.0),
+                Some(_) => number_argument(arguments, index, "math.noise"),
+            };
+            let y = optional_coordinate(1)?;
+            let z = optional_coordinate(2)?;
+            Ok(vec![Value::Number(perlin_noise(x, y, z))])
+        });
         let random = self.register_function(|vm, arguments| {
             if arguments.len() > 2 {
                 return Err(RuntimeError::ArgumentCount {
@@ -7633,7 +7644,7 @@ impl Vm {
             }
         });
 
-        let table = self.heap.allocate_table(0, 41)?;
+        let table = self.heap.allocate_table(0, 42)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -7672,6 +7683,7 @@ impl Vm {
             (&b"isfinite"[..], Value::NativeFunction(is_finite)),
             (&b"lerp"[..], Value::NativeFunction(lerp)),
             (&b"map"[..], Value::NativeFunction(map)),
+            (&b"noise"[..], Value::NativeFunction(noise)),
             (&b"random"[..], Value::NativeFunction(random)),
             (&b"randomseed"[..], Value::NativeFunction(randomseed)),
             (&b"pi"[..], Value::Number(core::f64::consts::PI)),
@@ -7994,6 +8006,107 @@ fn require_luau_math(vm: &Vm, operation: &'static str) -> Result<(), RuntimeErro
     } else {
         Err(RuntimeError::UnsupportedSemanticProfile { operation, profile })
     }
+}
+
+// Ported from Luau's MIT-licensed VM/src/lmathlib.cpp at the pinned revision
+// recorded in UPSTREAM.toml. The f32 intermediates are part of its observable
+// deterministic contract.
+const PERLIN_HASH: [u8; 257] = [
+    151, 160, 137, 91, 90, 15, 131, 13, 201, 95, 96, 53, 194, 233, 7, 225, 140, 36, 103, 30, 69,
+    142, 8, 99, 37, 240, 21, 10, 23, 190, 6, 148, 247, 120, 234, 75, 0, 26, 197, 62, 94, 252, 219,
+    203, 117, 35, 11, 32, 57, 177, 33, 88, 237, 149, 56, 87, 174, 20, 125, 136, 171, 168, 68, 175,
+    74, 165, 71, 134, 139, 48, 27, 166, 77, 146, 158, 231, 83, 111, 229, 122, 60, 211, 133, 230,
+    220, 105, 92, 41, 55, 46, 245, 40, 244, 102, 143, 54, 65, 25, 63, 161, 1, 216, 80, 73, 209, 76,
+    132, 187, 208, 89, 18, 169, 200, 196, 135, 130, 116, 188, 159, 86, 164, 100, 109, 198, 173,
+    186, 3, 64, 52, 217, 226, 250, 124, 123, 5, 202, 38, 147, 118, 126, 255, 82, 85, 212, 207, 206,
+    59, 227, 47, 16, 58, 17, 182, 189, 28, 42, 223, 183, 170, 213, 119, 248, 152, 2, 44, 154, 163,
+    70, 221, 153, 101, 155, 167, 43, 172, 9, 129, 22, 39, 253, 19, 98, 108, 110, 79, 113, 224, 232,
+    178, 185, 112, 104, 218, 246, 97, 228, 251, 34, 242, 193, 238, 210, 144, 12, 191, 179, 162,
+    241, 81, 51, 145, 235, 249, 14, 239, 107, 49, 192, 214, 31, 181, 199, 106, 157, 184, 84, 204,
+    176, 115, 121, 50, 45, 127, 4, 150, 254, 138, 236, 205, 93, 222, 114, 67, 29, 24, 72, 243, 141,
+    128, 195, 78, 66, 215, 61, 156, 180, 151,
+];
+
+const PERLIN_GRADIENTS: [[f32; 3]; 16] = [
+    [1.0, 1.0, 0.0],
+    [-1.0, 1.0, 0.0],
+    [1.0, -1.0, 0.0],
+    [-1.0, -1.0, 0.0],
+    [1.0, 0.0, 1.0],
+    [-1.0, 0.0, 1.0],
+    [1.0, 0.0, -1.0],
+    [-1.0, 0.0, -1.0],
+    [0.0, 1.0, 1.0],
+    [0.0, -1.0, 1.0],
+    [0.0, 1.0, -1.0],
+    [0.0, -1.0, -1.0],
+    [1.0, 1.0, 0.0],
+    [0.0, -1.0, 1.0],
+    [-1.0, 1.0, 0.0],
+    [0.0, -1.0, -1.0],
+];
+
+fn perlin_fade(value: f32) -> f32 {
+    value * value * value * (value * (value * 6.0 - 15.0) + 10.0)
+}
+
+fn perlin_lerp(alpha: f32, start: f32, finish: f32) -> f32 {
+    start + alpha * (finish - start)
+}
+
+fn perlin_gradient(hash: u8, x: f32, y: f32, z: f32) -> f32 {
+    let gradient = PERLIN_GRADIENTS[usize::from(hash & 15)];
+    gradient[0] * x + gradient[1] * y + gradient[2] * z
+}
+
+fn perlin_noise(x: f64, y: f64, z: f64) -> f64 {
+    if !x.is_finite() || !y.is_finite() || !z.is_finite() {
+        return f64::NAN;
+    }
+    let x = (x % 256.0) as f32;
+    let y = (y % 256.0) as f32;
+    let z = (z % 256.0) as f32;
+    let x_floor = x.floor();
+    let y_floor = y.floor();
+    let z_floor = z.floor();
+    let xi = (x_floor as i32 & 255) as usize;
+    let yi = y_floor as i32 & 255;
+    let zi = z_floor as i32 & 255;
+    let xf = x - x_floor;
+    let yf = y - y_floor;
+    let zf = z - z_floor;
+    let u = perlin_fade(xf);
+    let v = perlin_fade(yf);
+    let w = perlin_fade(zf);
+    let a = (i32::from(PERLIN_HASH[xi]) + yi) & 255;
+    let aa = (i32::from(PERLIN_HASH[a as usize]) + zi) & 255;
+    let ab = (i32::from(PERLIN_HASH[a as usize + 1]) + zi) & 255;
+    let b = (i32::from(PERLIN_HASH[xi + 1]) + yi) & 255;
+    let ba = (i32::from(PERLIN_HASH[b as usize]) + zi) & 255;
+    let bb = (i32::from(PERLIN_HASH[b as usize + 1]) + zi) & 255;
+    let gradient =
+        |index: i32, dx, dy, dz| perlin_gradient(PERLIN_HASH[index as usize], dx, dy, dz);
+    let lower_a = perlin_lerp(u, gradient(aa, xf, yf, zf), gradient(ba, xf - 1.0, yf, zf));
+    let lower_b = perlin_lerp(
+        u,
+        gradient(ab, xf, yf - 1.0, zf),
+        gradient(bb, xf - 1.0, yf - 1.0, zf),
+    );
+    let upper_a = perlin_lerp(
+        u,
+        gradient(aa + 1, xf, yf, zf - 1.0),
+        gradient(ba + 1, xf - 1.0, yf, zf - 1.0),
+    );
+    let upper_b = perlin_lerp(
+        u,
+        gradient(ab + 1, xf, yf - 1.0, zf - 1.0),
+        gradient(bb + 1, xf - 1.0, yf - 1.0, zf - 1.0),
+    );
+    f64::from(perlin_lerp(
+        w,
+        perlin_lerp(v, lower_a, lower_b),
+        perlin_lerp(v, upper_a, upper_b),
+    ))
 }
 
 fn split_binary_exponent(value: f64) -> (f64, i32) {

@@ -492,6 +492,10 @@ structurally. `math.lerp` returns its second endpoint exactly when its factor is
 one, preserving the pinned overflow-avoidance behavior. Lua profiles reject
 these functions explicitly because they are absent from the corresponding
 standard libraries.
+`math.noise` ports the pinned Luau three-dimensional Perlin implementation,
+including its `f32` intermediates, optional zero-valued coordinates, 256-unit
+input wrapping, and deterministic outputs. Blu exposes the same contract; Lua
+profiles reject the extension explicitly.
 The `bit32` library exposes `band`, `bor`, `bxor`, `bnot`, `lshift`, `rshift`,
 `arshift`, `lrotate`, `rrotate`, `extract`, and `replace` in Blu, Luau, Lua
 5.2, and Lua 5.3 profiles. Luau truncates numeric inputs toward zero, Lua 5.2

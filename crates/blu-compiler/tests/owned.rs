@@ -5175,6 +5175,47 @@ fn luau_math_classification_and_interpolation_extensions_are_profile_gated() {
 }
 
 #[test]
+fn luau_math_noise_matches_the_pinned_f32_perlin_contract() {
+    let source = make_source(
+        b"return math.noise(0.5),math.noise(0.5,0.5),math.noise(0.5,0.5,-0.5),math.noise(455.7204209769105,340.80410508750134,121.80087666537628),math.noise(0/0)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert!(
+                matches!(
+                    result,
+                    Ok(values)
+                        if values[..4]
+                            == [
+                                Value::Number(0.0),
+                                Value::Number(-0.25),
+                                Value::Number(0.125),
+                                Value::Number(0.501_070_976_257_324_2),
+                            ]
+                            && matches!(values[4], Value::Number(value) if value.is_nan())
+                ),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.noise",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn string_split_matches_luau_byte_and_empty_field_semantics() {
     let source = make_source(
         b"local a=string.split('a,b,,c',',') local b=string.split('a,b') local c=string.split('ab','') local d=string.split('','') local e=string.split('a--b--','--') local f=string.split(123,'2') return #a,a[1],a[2],a[3],a[4],b[1],b[2],c[1],c[2],#d,d[1],e[1],e[2],e[3],f[1],f[2]"
