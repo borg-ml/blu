@@ -390,6 +390,13 @@ impl Heap {
         Ok(self.table(table)?.length())
     }
 
+    pub fn table_clear(&mut self, table: TableId) -> Result<(), HeapError> {
+        let table = self.table_mut(table)?;
+        table.array.fill(Value::Nil);
+        table.hash.clear();
+        Ok(())
+    }
+
     pub fn table_metatable(&self, table: TableId) -> Result<Option<TableId>, HeapError> {
         Ok(self.table(table)?.metatable)
     }

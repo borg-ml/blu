@@ -6404,8 +6404,78 @@ impl Vm {
             }
             Ok(vec![Value::Nil])
         });
+        let clear = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.clear",
+                    profile,
+                });
+            }
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.clear",
+                index: 1,
+            })?;
+            vm.heap.table_clear(table_id(table)?)?;
+            Ok(Vec::new())
+        });
+        let clone_table = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.clone",
+                    profile,
+                });
+            }
+            let source = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.clone",
+                index: 1,
+            })?;
+            let source = table_id(source)?;
+            let metatable = vm.heap.table_metatable(source)?;
+            if let Some(metatable) = metatable
+                && !matches!(
+                    vm.heap
+                        .table_get(metatable, &Value::String(Arc::from(&b"__metatable"[..])))?,
+                    Value::Nil
+                )
+            {
+                return Err(RuntimeError::MetatableProtected);
+            }
+            let mut entries = Vec::new();
+            let mut key = Value::Nil;
+            while let Some((next_key, value)) = vm.heap.table_next(source, &key)? {
+                try_reserve_exact(&mut entries, 1, "table.clone entries")?;
+                key = next_key.clone();
+                entries.push((next_key, value));
+            }
+            let array_capacity = vm.heap.table_length(source)?;
+            if array_capacity > MAX_TABLE_INITIAL_CAPACITY
+                || entries.len() > MAX_TABLE_INITIAL_CAPACITY
+            {
+                return Err(RuntimeError::TableCapacity {
+                    kind: "clone",
+                    requested: array_capacity.max(entries.len()) as u64,
+                    limit: MAX_TABLE_INITIAL_CAPACITY,
+                });
+            }
+            let mut roots = GcRoots::from_values(arguments)?;
+            for (key, value) in &entries {
+                roots.push_value(key.clone())?;
+                roots.push_value(value.clone())?;
+            }
+            if let Some(metatable) = metatable {
+                roots.push_value(Value::Table(metatable))?;
+            }
+            let clone = vm.allocate_table(array_capacity, entries.len(), &roots)?;
+            for (key, value) in entries {
+                vm.table_set(clone, key, value, &roots)?;
+            }
+            vm.heap.set_table_metatable(clone, metatable)?;
+            Ok(vec![Value::Table(clone)])
+        });
 
-        let table = self.heap.allocate_table(0, 9)?;
+        let table = self.heap.allocate_table(0, 11)?;
         for (name, function) in [
             (&b"insert"[..], insert),
             (&b"remove"[..], remove),
@@ -6416,6 +6486,8 @@ impl Vm {
             (&b"sort"[..], sort),
             (&b"create"[..], create),
             (&b"find"[..], find),
+            (&b"clear"[..], clear),
+            (&b"clone"[..], clone_table),
         ] {
             self.heap.table_set(
                 table,

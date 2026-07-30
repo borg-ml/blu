@@ -475,6 +475,10 @@ Blu and Luau also provide bounded `table.create` and `table.find`.
 `table.find` searches the contiguous array sequence from a positive optional
 start and returns a profile-typed index. Lua profiles reject both Luau-only
 functions explicitly.
+`table.clear` removes array and hash entries without reallocating the table.
+`table.clone` performs a bounded shallow copy, so self-references still point
+to the source, and preserves unprotected metatables. Protected metatables
+produce a structured error as in Luau. Both functions are Blu/Luau-only.
 `collectgarbage` supports the shared `collect` and `count` commands. Collection
 traces active frames, globals, threads, upvalues, and host-retained values.
 `count` reports the runtime's accounted GC-heap kibibytes; it is not presented

@@ -4258,6 +4258,70 @@ fn luau_table_create_and_find_are_bounded_and_profile_gated() {
 }
 
 #[test]
+fn luau_table_clear_and_clone_preserve_shallow_structure() {
+    let source = make_source(
+        b"local original={1,2,a=3} original.self=original local metatable={tag=1} setmetatable(original,metatable) local cloned=table.clone(original) local cleared=table.clear(original) return cleared,#original,original[1],original.a,#cloned,cloned[1],cloned[2],cloned.a,cloned.self==original,getmetatable(cloned)==metatable,cloned==original"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let integral = |value| {
+                if profile == SemanticProfile::Blu {
+                    Value::Integer(value)
+                } else {
+                    Value::Number(value as f64)
+                }
+            };
+            assert_eq!(
+                result,
+                Ok(vec![
+                    Value::Nil,
+                    integral(0),
+                    Value::Nil,
+                    Value::Nil,
+                    integral(2),
+                    Value::Number(1.0),
+                    Value::Number(2.0),
+                    Value::Number(3.0),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                ]),
+                "{profile}"
+            );
+
+            let source = make_source(
+                b"local value=setmetatable({x=1},{__metatable='locked'}) return table.clone(value)"
+                    .to_vec(),
+            );
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Err(RuntimeError::MetatableProtected),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.clone",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
     let source = make_source(
         b"return tonumber(' 42 '),tonumber('ff',16),tonumber('0x10'),tonumber(3),tonumber('3.0',10),tonumber('nan'),tonumber('inf'),tonumber('ffffffffffffffff',16),tonumber('0x1.8p1'),tonumber('-0x1p2'),tonumber('x')"
