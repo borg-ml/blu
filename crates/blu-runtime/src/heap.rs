@@ -2,7 +2,7 @@ use crate::{
     MemoryAccount, MemoryConfig, MemoryError, MemoryUsage, Value, checked_hash_bytes,
     checked_vector_bytes,
 };
-use blu_bytecode::Chunk;
+use blu_bytecode::{Chunk, blu::Artifact as BluArtifact};
 use blu_core::SemanticProfile;
 use core::fmt;
 use std::{
@@ -59,6 +59,10 @@ pub enum HeapError {
     Memory(MemoryError),
     StaleTable(TableId),
     StaleClosure(ClosureId),
+    ClosureFormat {
+        closure: ClosureId,
+        expected: &'static str,
+    },
     StaleUpvalue(UpvalueId),
     StaleThread(ThreadId),
     NilKey,
@@ -72,6 +76,9 @@ impl fmt::Display for HeapError {
             Self::Memory(error) => error.fmt(f),
             Self::StaleTable(value) => write!(f, "stale or invalid table handle {value:?}"),
             Self::StaleClosure(value) => write!(f, "stale or invalid closure handle {value:?}"),
+            Self::ClosureFormat { closure, expected } => {
+                write!(f, "closure {closure:?} is not a {expected} closure")
+            }
             Self::StaleUpvalue(value) => write!(f, "stale or invalid upvalue handle {value:?}"),
             Self::StaleThread(value) => write!(f, "stale or invalid thread handle {value:?}"),
             Self::NilKey => f.write_str("table index is nil"),
@@ -228,7 +235,32 @@ impl Heap {
             let mut upvalues = Vec::new();
             try_reserve_vec_exact(&mut upvalues, upvalue_capacity)?;
             Ok(Object::Closure(Closure {
-                chunk,
+                code: ClosureCode::Luau(chunk),
+                prototype,
+                profile,
+                upvalues,
+                upvalue_capacity,
+            }))
+        })?;
+        Ok(ClosureId {
+            index: id.index,
+            generation: id.generation,
+        })
+    }
+
+    pub(crate) fn allocate_blu_closure(
+        &mut self,
+        artifact: Arc<BluArtifact>,
+        prototype: usize,
+        profile: SemanticProfile,
+        upvalue_capacity: usize,
+    ) -> Result<ClosureId, HeapError> {
+        let dynamic_bytes = checked_vector_bytes::<UpvalueId>(upvalue_capacity)?;
+        let id = self.allocate(dynamic_bytes, || {
+            let mut upvalues = Vec::new();
+            try_reserve_vec_exact(&mut upvalues, upvalue_capacity)?;
+            Ok(Object::Closure(Closure {
+                code: ClosureCode::Blu(artifact),
                 prototype,
                 profile,
                 upvalues,
@@ -411,15 +443,44 @@ impl Heap {
 
     pub(crate) fn closure_parts(
         &self,
-        closure: ClosureId,
+        closure_id: ClosureId,
     ) -> Result<(Arc<Chunk>, usize, SemanticProfile, Vec<UpvalueId>), HeapError> {
-        let closure = self.closure(closure)?;
+        let closure = self.closure(closure_id)?;
+        let ClosureCode::Luau(chunk) = &closure.code else {
+            return Err(HeapError::ClosureFormat {
+                closure: closure_id,
+                expected: "Luau",
+            });
+        };
         Ok((
-            closure.chunk.clone(),
+            chunk.clone(),
             closure.prototype,
             closure.profile,
             try_clone_slice(&closure.upvalues)?,
         ))
+    }
+
+    pub(crate) fn blu_closure_parts(
+        &self,
+        closure: ClosureId,
+    ) -> Result<(Arc<BluArtifact>, usize, SemanticProfile, Vec<UpvalueId>), HeapError> {
+        let value = self.closure(closure)?;
+        let ClosureCode::Blu(artifact) = &value.code else {
+            return Err(HeapError::ClosureFormat {
+                closure,
+                expected: "BluV1",
+            });
+        };
+        Ok((
+            artifact.clone(),
+            value.prototype,
+            value.profile,
+            try_clone_slice(&value.upvalues)?,
+        ))
+    }
+
+    pub(crate) fn is_blu_closure(&self, closure: ClosureId) -> Result<bool, HeapError> {
+        Ok(matches!(self.closure(closure)?.code, ClosureCode::Blu(_)))
     }
 
     pub(crate) fn closure_push_upvalue(
@@ -769,11 +830,17 @@ impl Object {
 
 #[derive(Clone, Debug)]
 struct Closure {
-    chunk: Arc<Chunk>,
+    code: ClosureCode,
     prototype: usize,
     profile: SemanticProfile,
     upvalues: Vec<UpvalueId>,
     upvalue_capacity: usize,
+}
+
+#[derive(Clone, Debug)]
+enum ClosureCode {
+    Luau(Arc<Chunk>),
+    Blu(Arc<BluArtifact>),
 }
 
 #[derive(Clone, Debug)]

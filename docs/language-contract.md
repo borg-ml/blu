@@ -226,11 +226,15 @@ feature for canonical `NewClosure`, `GetUpvalue`, and `SetUpvalue`
 instructions. Validation resolves child indices through the parent's declared
 child list, verifies every capture against initialized parent registers or
 declared parent upvalues, and bounds every upvalue access. Encoding and
-decoding preserve this metadata, while bootstrap translation and direct
-execution still reject closure instructions explicitly until the generational
-closure heap and bounded BluV1 frame stack consume them. MULTRET/vararg
-adjustment, owned function syntax, metamethod-aware method lookup, and
-resumable direct-BluV1 calls remain unsupported.
+decoding preserve this metadata. Direct execution stores Blu artifacts in the
+existing generational closure arena, shares mutable captures through
+generational upvalue cells, refreshes suspended parent registers after child
+returns, and uses an explicit caller stack bounded by the VM call limit.
+Registers, active closures, open upvalues, and suspended callers participate
+in allocation roots. Bootstrap translation continues to reject closure
+instructions explicitly. MULTRET/vararg adjustment, owned function syntax,
+metamethod-aware method lookup, and resumable direct-BluV1 calls remain
+unsupported.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

@@ -7,8 +7,9 @@ use blu_bytecode::{
     Chunk, Constant, Instruction, MAX_TABLE_INITIAL_CAPACITY, Opcode, Prototype, ValidatedChunk,
     ValidationError,
     blu::{
-        BluLimits, Constant as BluConstant, Instruction as BluInstruction, TranslatedChunk,
-        ValidatedArtifact as ValidatedBluArtifact, ValidationError as BluValidationError,
+        Artifact as BluArtifact, BluLimits, Constant as BluConstant, Instruction as BluInstruction,
+        TranslatedChunk, ValidatedArtifact as ValidatedBluArtifact,
+        ValidationError as BluValidationError,
     },
 };
 use blu_core::SemanticProfile;
@@ -56,6 +57,18 @@ struct FrameTarget {
 struct GcRoots {
     values: Vec<Value>,
     upvalues: Vec<UpvalueId>,
+}
+
+#[derive(Debug)]
+struct BluCaller {
+    artifact: Arc<BluArtifact>,
+    prototype: usize,
+    constants: Vec<Value>,
+    registers: Vec<Value>,
+    open_upvalues: Vec<Option<UpvalueId>>,
+    closure: Option<ClosureId>,
+    pc: usize,
+    destination: u16,
 }
 
 impl GcRoots {
@@ -641,6 +654,21 @@ impl Vm {
             .allocate_closure(chunk, prototype, profile, upvalue_capacity)?)
     }
 
+    fn allocate_blu_closure(
+        &mut self,
+        artifact: Arc<BluArtifact>,
+        prototype: usize,
+        profile: SemanticProfile,
+        upvalue_capacity: usize,
+        roots: &GcRoots,
+    ) -> Result<ClosureId, RuntimeError> {
+        let requested = self.heap.closure_allocation_bytes(upvalue_capacity)?;
+        self.collect_if_needed(requested, roots, std::iter::empty(), std::iter::empty())?;
+        Ok(self
+            .heap
+            .allocate_blu_closure(artifact, prototype, profile, upvalue_capacity)?)
+    }
+
     fn allocate_thread(
         &mut self,
         thread_roots: &[Value],
@@ -750,28 +778,20 @@ impl Vm {
         let artifact = ValidatedBluArtifact::new(artifact.into_artifact(), execution_limits)
             .map_err(RuntimeError::BluValidation)?
             .into_artifact();
-        if artifact.prototypes.len() != 1 {
-            return Err(RuntimeError::UnsupportedBluV1Structure {
-                what: "multiple prototypes",
-            });
-        }
         let main = usize::try_from(artifact.main)
             .map_err(|_| RuntimeError::InvalidMainPrototype(usize::MAX))?;
         let prototype = artifact
             .prototypes
             .get(main)
             .ok_or(RuntimeError::InvalidMainPrototype(main))?;
-        if !prototype.children.is_empty() {
-            return Err(RuntimeError::UnsupportedBluV1Structure {
-                what: "child prototypes",
-            });
-        }
         if !prototype.upvalues.is_empty() {
-            return Err(RuntimeError::UnsupportedBluV1Structure { what: "upvalues" });
+            return Err(RuntimeError::UnsupportedBluV1Structure {
+                what: "main prototype upvalues",
+            });
         }
 
         let previous_profile = self.active_profile.replace(prototype.profile);
-        let result = self.run_blu_v1_prototype(prototype);
+        let result = self.run_blu_v1_artifact(Arc::new(artifact), main);
         self.active_profile = previous_profile;
         match result {
             Ok(values) => {
@@ -785,54 +805,57 @@ impl Vm {
         }
     }
 
-    fn run_blu_v1_prototype(
+    fn run_blu_v1_artifact(
         &mut self,
-        prototype: &blu_bytecode::blu::Prototype,
+        artifact: Arc<BluArtifact>,
+        main: usize,
     ) -> Result<Vec<Value>, RuntimeError> {
-        let charge = blu_v1_execution_bytes(prototype)?;
+        let charge = artifact
+            .prototypes
+            .iter()
+            .try_fold(0usize, |total, prototype| {
+                total
+                    .checked_add(blu_v1_execution_bytes(prototype)?)
+                    .ok_or_else(|| RuntimeError::from(HeapError::Memory(MemoryError::SizeOverflow)))
+            })?;
         let roots = GcRoots::default();
         self.collect_if_needed(charge, &roots, core::iter::empty(), core::iter::empty())?;
         self.heap.charge_external(charge)?;
-        let result = self.run_charged_blu_v1_prototype(prototype);
+        let result = self.run_charged_blu_v1_artifact(artifact, main);
         self.heap.release_external(charge)?;
         result
     }
 
-    fn run_charged_blu_v1_prototype(
+    fn run_charged_blu_v1_artifact(
         &mut self,
-        prototype: &blu_bytecode::blu::Prototype,
+        artifact: Arc<BluArtifact>,
+        main: usize,
     ) -> Result<Vec<Value>, RuntimeError> {
-        let mut constants =
-            try_vec_with_capacity(prototype.constants.len(), "BluV1 runtime constants")?;
-        for (index, constant) in prototype.constants.iter().enumerate() {
-            constants.push(match constant {
-                BluConstant::Nil => Value::Nil,
-                BluConstant::Boolean(value) => Value::Boolean(*value),
-                BluConstant::Number(value) => Value::Number(*value),
-                BluConstant::Integer(value)
-                    if matches!(
-                        prototype.profile,
-                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
-                    ) =>
-                {
-                    Value::Integer(*value)
-                }
-                BluConstant::Integer(_) => {
-                    return Err(RuntimeError::UnsupportedBluV1Constant {
-                        profile: prototype.profile,
-                        constant: index,
-                        kind: "integer",
-                    });
-                }
-                BluConstant::String(value) => Value::String(Arc::from(value.as_slice())),
-            });
-        }
+        let mut artifact = artifact;
+        let mut prototype_index = main;
+        let mut constants = materialize_blu_constants(&artifact.prototypes[main])?;
+        let prototype = &artifact.prototypes[main];
         let register_count = usize::from(prototype.register_count);
         let mut registers = try_vec_with_capacity(register_count, "BluV1 runtime registers")?;
         registers.resize(register_count, Value::Nil);
+        let mut open_upvalues = try_vec_with_capacity(register_count, "BluV1 open upvalues")?;
+        open_upvalues.resize(register_count, None);
+        let mut closure = None;
+        let mut callers =
+            try_vec_with_capacity(self.call_limit.min(16), "BluV1 caller frame stack")?;
         let mut remaining = self.instruction_limit;
         let mut pc = 0usize;
-        while let Some(instruction) = prototype.code.get(pc).copied() {
+        loop {
+            let prototype = artifact
+                .prototypes
+                .get(prototype_index)
+                .ok_or(RuntimeError::InvalidPrototype(prototype_index))?;
+            let Some(instruction) = prototype.code.get(pc).copied() else {
+                return Err(RuntimeError::InvalidProgramCounter {
+                    pc,
+                    code_words: prototype.code.len(),
+                });
+            };
             if remaining == 0 {
                 return Err(RuntimeError::InstructionLimit {
                     limit: self.instruction_limit,
@@ -850,7 +873,13 @@ impl Vm {
                             count: constants.len(),
                         },
                     )?;
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::LoadGlobal { destination, name } => {
                     let Value::String(name) =
@@ -864,7 +893,13 @@ impl Vm {
                         });
                     };
                     let value = self.globals.get(name).cloned().unwrap_or(Value::Nil);
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::StoreGlobal { name, source } => {
                     let Value::String(name) =
@@ -881,9 +916,15 @@ impl Vm {
                     self.set_global(name.clone(), value);
                 }
                 BluInstruction::NewTable { destination } => {
-                    let roots = GcRoots::from_values(&registers)?;
+                    let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
                     let table = self.allocate_table(0, 0, &roots)?;
-                    set_blu_register(&mut registers, destination, Value::Table(table))?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        Value::Table(table),
+                    )?;
                 }
                 BluInstruction::GetTable {
                     destination,
@@ -901,7 +942,13 @@ impl Vm {
                     let value = self
                         .heap
                         .table_get(*table, blu_register(&registers, key)?)?;
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::SetTable { table, key, value } => {
                     let table_value = blu_register(&registers, table)?;
@@ -915,7 +962,7 @@ impl Vm {
                     let table = *table;
                     let key = blu_register(&registers, key)?.clone();
                     let value = blu_register(&registers, value)?.clone();
-                    let roots = GcRoots::from_values(&registers)?;
+                    let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
                     self.table_set(table, key, value, &roots)?;
                 }
                 BluInstruction::Call {
@@ -936,15 +983,166 @@ impl Vm {
                         register: end.saturating_sub(1),
                         count: registers.len(),
                     })?;
-                    let roots = GcRoots::from_values(&registers)?;
-                    let values = self.call_value(function, arguments, &mut remaining, 0, roots)?;
+                    if let Value::Closure(child_closure) = &function
+                        && self.heap.is_blu_closure(*child_closure)?
+                    {
+                        if callers.len() >= self.call_limit {
+                            return Err(RuntimeError::CallLimit {
+                                limit: self.call_limit,
+                            });
+                        }
+                        let arguments = try_clone_values(arguments, "BluV1 call arguments")?;
+                        let (child_artifact, child, profile, _) =
+                            self.heap.blu_closure_parts(*child_closure)?;
+                        let child_prototype = child_artifact
+                            .prototypes
+                            .get(child)
+                            .ok_or(RuntimeError::InvalidPrototype(child))?;
+                        let child_constants = materialize_blu_constants(child_prototype)?;
+                        let child_register_count = usize::from(child_prototype.register_count);
+                        let mut child_registers =
+                            try_vec_with_capacity(child_register_count, "BluV1 runtime registers")?;
+                        child_registers.resize(child_register_count, Value::Nil);
+                        let copied = arguments
+                            .len()
+                            .min(usize::from(child_prototype.parameter_count));
+                        child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                        let mut child_open_upvalues =
+                            try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
+                        child_open_upvalues.resize(child_register_count, None);
+                        try_reserve_exact(&mut callers, 1, "BluV1 caller frame stack")?;
+                        callers.push(BluCaller {
+                            artifact,
+                            prototype: prototype_index,
+                            constants,
+                            registers,
+                            open_upvalues,
+                            closure,
+                            pc: pc + 1,
+                            destination,
+                        });
+                        artifact = child_artifact;
+                        prototype_index = child;
+                        constants = child_constants;
+                        registers = child_registers;
+                        open_upvalues = child_open_upvalues;
+                        closure = Some(*child_closure);
+                        pc = 0;
+                        self.active_profile = Some(profile);
+                        continue;
+                    }
+                    let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
+                    let values =
+                        self.call_value(function, arguments, &mut remaining, callers.len(), roots)?;
                     let value = values.into_iter().next().unwrap_or(Value::Nil);
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
-                BluInstruction::NewClosure { .. }
-                | BluInstruction::GetUpvalue { .. }
-                | BluInstruction::SetUpvalue { .. } => {
-                    return Err(RuntimeError::UnsupportedBluV1Structure { what: "closures" });
+                BluInstruction::NewClosure { destination, child } => {
+                    let child_index = *prototype
+                        .children
+                        .get(child as usize)
+                        .ok_or(RuntimeError::InvalidPrototype(child as usize))?
+                        as usize;
+                    let child_prototype = artifact
+                        .prototypes
+                        .get(child_index)
+                        .ok_or(RuntimeError::InvalidPrototype(child_index))?;
+                    let mut roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
+                    let child_closure = self.allocate_blu_closure(
+                        artifact.clone(),
+                        child_index,
+                        child_prototype.profile,
+                        child_prototype.upvalues.len(),
+                        &roots,
+                    )?;
+                    roots.push_value(Value::Closure(child_closure))?;
+                    let parent_upvalues = if child_prototype.upvalues.iter().any(|capture| {
+                        matches!(capture, blu_bytecode::blu::Upvalue::ParentUpvalue(_))
+                    }) {
+                        let parent = closure.ok_or(RuntimeError::MissingClosure)?;
+                        self.heap.blu_closure_parts(parent)?.3
+                    } else {
+                        Vec::new()
+                    };
+                    for capture in &child_prototype.upvalues {
+                        let upvalue = match *capture {
+                            blu_bytecode::blu::Upvalue::ParentRegister(register) => {
+                                let slot = open_upvalues.get_mut(register as usize).ok_or(
+                                    RuntimeError::Register {
+                                        register: register as usize,
+                                        count: registers.len(),
+                                    },
+                                )?;
+                                if let Some(upvalue) = *slot {
+                                    upvalue
+                                } else {
+                                    let value = blu_register(&registers, register)?.clone();
+                                    let upvalue = self.allocate_upvalue(value, &roots)?;
+                                    try_reserve_exact(
+                                        &mut roots.upvalues,
+                                        1,
+                                        "BluV1 open upvalue roots",
+                                    )?;
+                                    roots.upvalues.push(upvalue);
+                                    *slot = Some(upvalue);
+                                    upvalue
+                                }
+                            }
+                            blu_bytecode::blu::Upvalue::ParentUpvalue(upvalue) => *parent_upvalues
+                                .get(upvalue as usize)
+                                .ok_or(RuntimeError::Upvalue {
+                                    upvalue: upvalue as usize,
+                                    count: parent_upvalues.len(),
+                                })?,
+                        };
+                        self.closure_push_upvalue(child_closure, upvalue, &roots)?;
+                    }
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        Value::Closure(child_closure),
+                    )?;
+                }
+                BluInstruction::GetUpvalue {
+                    destination,
+                    upvalue,
+                } => {
+                    let closure = closure.ok_or(RuntimeError::MissingClosure)?;
+                    let (_, _, _, upvalues) = self.heap.blu_closure_parts(closure)?;
+                    let upvalue = *upvalues
+                        .get(upvalue as usize)
+                        .ok_or(RuntimeError::Upvalue {
+                            upvalue: upvalue as usize,
+                            count: upvalues.len(),
+                        })?;
+                    let value = self.heap.upvalue_get(upvalue)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
+                }
+                BluInstruction::SetUpvalue { upvalue, source } => {
+                    let closure = closure.ok_or(RuntimeError::MissingClosure)?;
+                    let (_, _, _, upvalues) = self.heap.blu_closure_parts(closure)?;
+                    let upvalue = *upvalues
+                        .get(upvalue as usize)
+                        .ok_or(RuntimeError::Upvalue {
+                            upvalue: upvalue as usize,
+                            count: upvalues.len(),
+                        })?;
+                    let value = blu_register(&registers, source)?.clone();
+                    self.heap.upvalue_set(upvalue, value)?;
                 }
                 BluInstruction::Add {
                     destination,
@@ -956,7 +1154,13 @@ impl Vm {
                         blu_register(&registers, left)?,
                         blu_register(&registers, right)?,
                     )?;
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Subtract {
                     destination,
@@ -968,7 +1172,13 @@ impl Vm {
                         blu_register(&registers, left)?,
                         blu_register(&registers, right)?,
                     )?;
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Multiply {
                     destination,
@@ -980,7 +1190,13 @@ impl Vm {
                         blu_register(&registers, left)?,
                         blu_register(&registers, right)?,
                     )?;
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Divide {
                     destination,
@@ -992,7 +1208,13 @@ impl Vm {
                         blu_register(&registers, left)?,
                         blu_register(&registers, right)?,
                     )?;
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Modulo {
                     destination,
@@ -1007,7 +1229,13 @@ impl Vm {
                     } else {
                         arithmetic(Opcode::Mod, left, right)?
                     };
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Power {
                     destination,
@@ -1019,21 +1247,39 @@ impl Vm {
                         blu_register(&registers, left)?,
                         blu_register(&registers, right)?,
                     )?;
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Move {
                     destination,
                     source,
                 } => {
                     let value = blu_register(&registers, source)?.clone();
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Not {
                     destination,
                     source,
                 } => {
                     let value = Value::Boolean(!blu_register(&registers, source)?.is_truthy());
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Negate {
                     destination,
@@ -1050,7 +1296,13 @@ impl Vm {
                             });
                         }
                     };
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Length {
                     destination,
@@ -1077,7 +1329,13 @@ impl Vm {
                     } else {
                         Value::Number(length as f64)
                     };
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::FloorDivide {
                     destination,
@@ -1089,7 +1347,13 @@ impl Vm {
                         blu_register(&registers, left)?,
                         blu_register(&registers, right)?,
                     )?;
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Concatenate {
                     destination,
@@ -1103,7 +1367,13 @@ impl Vm {
                         right,
                         CallContext::new(&mut remaining, 0, GcRoots::default()),
                     )?;
-                    set_blu_register(&mut registers, destination, value)?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        value,
+                    )?;
                 }
                 BluInstruction::Equal {
                     destination,
@@ -1134,7 +1404,13 @@ impl Vm {
                         right,
                         CallContext::new(&mut remaining, 0, GcRoots::default()),
                     )?;
-                    set_blu_register(&mut registers, destination, Value::Boolean(value))?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        Value::Boolean(value),
+                    )?;
                 }
                 BluInstruction::JumpIfTruthy { condition, target }
                 | BluInstruction::JumpIfFalsy { condition, target } => {
@@ -1191,15 +1467,42 @@ impl Vm {
                         register: end.saturating_sub(1),
                         count: registers.len(),
                     })?;
-                    return try_clone_values(values, "BluV1 return values");
+                    let values = try_clone_values(values, "BluV1 return values")?;
+                    let Some(mut caller) = callers.pop() else {
+                        return Ok(values);
+                    };
+                    refresh_blu_open_upvalues(
+                        &self.heap,
+                        &mut caller.registers,
+                        &caller.open_upvalues,
+                    )?;
+                    let value = values.into_iter().next().unwrap_or(Value::Nil);
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut caller.registers,
+                        &caller.open_upvalues,
+                        caller.destination,
+                        value,
+                    )?;
+                    artifact = caller.artifact;
+                    prototype_index = caller.prototype;
+                    constants = caller.constants;
+                    registers = caller.registers;
+                    open_upvalues = caller.open_upvalues;
+                    closure = caller.closure;
+                    pc = caller.pc;
+                    self.active_profile = Some(
+                        artifact
+                            .prototypes
+                            .get(prototype_index)
+                            .ok_or(RuntimeError::InvalidPrototype(prototype_index))?
+                            .profile,
+                    );
+                    continue;
                 }
             }
             pc += 1;
         }
-        Err(RuntimeError::InvalidProgramCounter {
-            pc,
-            code_words: prototype.code.len(),
-        })
     }
 
     pub fn execute_validated_owned(
@@ -4966,6 +5269,91 @@ fn blu_v1_execution_bytes(prototype: &blu_bytecode::blu::Prototype) -> Result<us
         .ok_or_else(|| RuntimeError::from(HeapError::Memory(MemoryError::SizeOverflow)))
 }
 
+fn materialize_blu_constants(
+    prototype: &blu_bytecode::blu::Prototype,
+) -> Result<Vec<Value>, RuntimeError> {
+    let mut constants =
+        try_vec_with_capacity(prototype.constants.len(), "BluV1 runtime constants")?;
+    for (index, constant) in prototype.constants.iter().enumerate() {
+        constants.push(match constant {
+            BluConstant::Nil => Value::Nil,
+            BluConstant::Boolean(value) => Value::Boolean(*value),
+            BluConstant::Number(value) => Value::Number(*value),
+            BluConstant::Integer(value)
+                if matches!(
+                    prototype.profile,
+                    SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) =>
+            {
+                Value::Integer(*value)
+            }
+            BluConstant::Integer(_) => {
+                return Err(RuntimeError::UnsupportedBluV1Constant {
+                    profile: prototype.profile,
+                    constant: index,
+                    kind: "integer",
+                });
+            }
+            BluConstant::String(value) => Value::String(Arc::from(value.as_slice())),
+        });
+    }
+    Ok(constants)
+}
+
+fn blu_frame_roots(
+    registers: &[Value],
+    open_upvalues: &[Option<UpvalueId>],
+    closure: Option<ClosureId>,
+    callers: &[BluCaller],
+) -> Result<GcRoots, RuntimeError> {
+    let mut roots = GcRoots::from_values(registers)?;
+    try_reserve_exact(
+        &mut roots.upvalues,
+        open_upvalues.iter().flatten().count(),
+        "BluV1 open upvalue roots",
+    )?;
+    roots
+        .upvalues
+        .extend(open_upvalues.iter().copied().flatten());
+    if let Some(closure) = closure {
+        roots.push_value(Value::Closure(closure))?;
+    }
+    for caller in callers {
+        let caller_values = try_clone_values(&caller.registers, "BluV1 caller GC roots")?;
+        try_reserve_exact(
+            &mut roots.values,
+            caller_values.len(),
+            "BluV1 caller GC roots",
+        )?;
+        roots.values.extend(caller_values);
+        try_reserve_exact(
+            &mut roots.upvalues,
+            caller.open_upvalues.iter().flatten().count(),
+            "BluV1 caller upvalue roots",
+        )?;
+        roots
+            .upvalues
+            .extend(caller.open_upvalues.iter().copied().flatten());
+        if let Some(closure) = caller.closure {
+            roots.push_value(Value::Closure(closure))?;
+        }
+    }
+    Ok(roots)
+}
+
+fn refresh_blu_open_upvalues(
+    heap: &Heap,
+    registers: &mut [Value],
+    open_upvalues: &[Option<UpvalueId>],
+) -> Result<(), RuntimeError> {
+    for (register, upvalue) in open_upvalues.iter().copied().enumerate() {
+        if let Some(upvalue) = upvalue {
+            registers[register] = heap.upvalue_get(upvalue)?;
+        }
+    }
+    Ok(())
+}
+
 fn blu_register(registers: &[Value], register: u16) -> Result<&Value, RuntimeError> {
     registers
         .get(usize::from(register))
@@ -4976,7 +5364,9 @@ fn blu_register(registers: &[Value], register: u16) -> Result<&Value, RuntimeErr
 }
 
 fn set_blu_register(
+    heap: &mut Heap,
     registers: &mut [Value],
+    open_upvalues: &[Option<UpvalueId>],
     register: u16,
     value: Value,
 ) -> Result<(), RuntimeError> {
@@ -4987,7 +5377,10 @@ fn set_blu_register(
             register: usize::from(register),
             count,
         })?;
-    *slot = value;
+    *slot = value.clone();
+    if let Some(upvalue) = open_upvalues.get(usize::from(register)).copied().flatten() {
+        heap.upvalue_set(upvalue, value)?;
+    }
     Ok(())
 }
 
@@ -5419,7 +5812,8 @@ mod tests {
         blu::{
             Artifact as BluArtifact, BluLimits, BytecodeFormat, Constant as BluConstant,
             FeatureBits, Instruction as BluInstruction, Prototype as BluPrototype, SourceRecord,
-            TranslatedChunk, ValidatedArtifact, translate_baseline_to_luau,
+            TranslatedChunk, Upvalue as BluUpvalue, ValidatedArtifact, decode_validated, encode,
+            translate_baseline_to_luau,
         },
         load,
     };
@@ -5603,6 +5997,129 @@ mod tests {
                 "{profile}"
             );
         }
+    }
+
+    #[test]
+    fn direct_blu_v1_closures_share_mutable_captures_on_bounded_frames() {
+        let mut validated = validated_blu_program(
+            SemanticProfile::Blu,
+            vec![BluConstant::Number(10.0)],
+            vec![
+                BluInstruction::LoadConstant {
+                    destination: 0,
+                    constant: 0,
+                },
+                BluInstruction::Return { first: 0, count: 1 },
+            ],
+            FeatureBits::BASELINE,
+            4,
+        )
+        .into_artifact();
+        validated.prototypes[0].code = vec![
+            BluInstruction::LoadConstant {
+                destination: 0,
+                constant: 0,
+            },
+            BluInstruction::NewClosure {
+                destination: 1,
+                child: 0,
+            },
+            BluInstruction::Call {
+                destination: 2,
+                function: 1,
+                arguments: 0,
+                argument_count: 0,
+            },
+            BluInstruction::Call {
+                destination: 3,
+                function: 1,
+                arguments: 0,
+                argument_count: 0,
+            },
+            BluInstruction::Return { first: 2, count: 2 },
+        ];
+        validated.prototypes[0].required_features =
+            FeatureBits::BASELINE | FeatureBits::FIXED_CALLS | FeatureBits::CLOSURES;
+        let source = validated.prototypes[0].source;
+        let span = ByteSpan::from_usize(source, 0, 0).unwrap();
+        validated.prototypes[0].source_map = vec![span; 5];
+        validated.prototypes[0].children = vec![1];
+        validated.prototypes.push(BluPrototype {
+            profile: SemanticProfile::Blu,
+            source,
+            register_count: 2,
+            parameter_count: 0,
+            is_vararg: false,
+            required_features: FeatureBits::BASELINE
+                | FeatureBits::CLOSURES
+                | FeatureBits::FIXED_CALLS,
+            constants: Vec::new(),
+            upvalues: vec![BluUpvalue::ParentRegister(0)],
+            children: vec![2],
+            code: vec![
+                BluInstruction::NewClosure {
+                    destination: 0,
+                    child: 0,
+                },
+                BluInstruction::Call {
+                    destination: 1,
+                    function: 0,
+                    arguments: 0,
+                    argument_count: 0,
+                },
+                BluInstruction::Return { first: 1, count: 1 },
+            ],
+            source_map: vec![span; 3],
+            locals: Vec::new(),
+            upvalue_debug: Vec::new(),
+        });
+        validated.prototypes.push(BluPrototype {
+            profile: SemanticProfile::Blu,
+            source,
+            register_count: 2,
+            parameter_count: 0,
+            is_vararg: false,
+            required_features: FeatureBits::BASELINE | FeatureBits::CLOSURES,
+            constants: vec![BluConstant::Number(1.0)],
+            upvalues: vec![BluUpvalue::ParentUpvalue(0)],
+            children: Vec::new(),
+            code: vec![
+                BluInstruction::GetUpvalue {
+                    destination: 0,
+                    upvalue: 0,
+                },
+                BluInstruction::LoadConstant {
+                    destination: 1,
+                    constant: 0,
+                },
+                BluInstruction::Add {
+                    destination: 0,
+                    left: 0,
+                    right: 1,
+                },
+                BluInstruction::SetUpvalue {
+                    upvalue: 0,
+                    source: 0,
+                },
+                BluInstruction::Return { first: 0, count: 1 },
+            ],
+            source_map: vec![span; 5],
+            locals: Vec::new(),
+            upvalue_debug: Vec::new(),
+        });
+        let validated = ValidatedArtifact::new(validated, BluLimits::default()).unwrap();
+        let encoded = encode(&validated, BluLimits::default()).unwrap();
+        assert_eq!(
+            Vm::default().with_call_limit(1).execute_blu_v1(
+                decode_validated(&encoded, BluLimits::default()).unwrap(),
+                BluLimits::default(),
+            ),
+            Err(RuntimeError::CallLimit { limit: 1 })
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(validated, BluLimits::default()),
+            Ok(vec![Value::Number(11.0), Value::Number(12.0)])
+        );
     }
 
     #[test]
