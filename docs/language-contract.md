@@ -438,6 +438,11 @@ dispatch is implemented. Returned indices follow the active profile's
 legacy-number or modern-integer policy.
 `string.find` appends captures after its two indices. `string.match` returns
 captures when present and otherwise returns the full matched byte slice.
+`string.gsub` supports string, numeric, and direct table replacements. Table
+replacement keys use the first capture or the full match, position captures
+use the active profile's numeric subtype, and nil or false values retain the
+original match. Resumable callback replacements and table `__index`
+replacement handlers remain explicit unsupported features.
 Nested substring captures and `()` position captures are bounded to 32 and
 execute through linked capture events rather than recursive host calls.
 `%1` through `%9` match completed substring captures byte-for-byte under the
@@ -453,8 +458,9 @@ support literal bytes, `%%`, `%0`, and `%1` through `%9` substring or
 position-capture expansion. Lua 5.1 preserves its permissive behavior for
 other `%x` replacement escapes by emitting `x`; Blu, Luau, and Lua 5.2–5.5
 reject them. The second result is the profile-typed
-replacement count. Capture references, table replacements, and callback
-replacements fail explicitly.
+replacement count. Direct table replacements select by the first capture or
+full match; callback replacements and table `__index` handlers fail
+explicitly pending resumable calls.
 `collectgarbage` supports the shared `collect` and `count` commands. Collection
 traces active frames, globals, threads, upvalues, and host-retained values.
 `count` reports the runtime's accounted GC-heap kibibytes; it is not presented

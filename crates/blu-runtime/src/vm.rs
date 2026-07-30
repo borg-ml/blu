@@ -5172,23 +5172,24 @@ impl Vm {
                 function: "string.gsub",
                 index: 3,
             })?;
-            let replacement = try_concat_bytes(replacement_value)?.ok_or_else(|| {
-                if matches!(
-                    replacement_value,
-                    Value::Table(_) | Value::Closure(_) | Value::NativeFunction(_)
-                ) {
-                    RuntimeError::UnsupportedLibraryFeature {
+            let replacement = try_concat_bytes(replacement_value)?;
+            let replacement_table = match (replacement.as_ref(), replacement_value) {
+                (Some(_), _) => None,
+                (None, Value::Table(table)) => Some(*table),
+                (None, Value::Closure(_) | Value::NativeFunction(_)) => {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
                         function: "string.gsub",
-                        feature: "table and callback replacements",
-                    }
-                } else {
-                    RuntimeError::Type {
-                        operation: "string.gsub",
-                        expected: "string or number replacement",
-                        actual: replacement_value.type_name(),
-                    }
+                        feature: "callback replacements",
+                    });
                 }
-            })?;
+                (None, other) => {
+                    return Err(RuntimeError::Type {
+                        operation: "string.gsub",
+                        expected: "string, number, table, or function replacement",
+                        actual: other.type_name(),
+                    });
+                }
+            };
             let explicit_limit = arguments.get(3).is_some();
             let replacement_limit = arguments
                 .get(3)
@@ -5222,13 +5223,46 @@ impl Vm {
                 let first = found.start;
                 let end = found.end;
                 append_limited_string(&mut result, &haystack[copied_until..first])?;
-                append_gsub_replacement(
-                    &mut result,
-                    &replacement,
-                    haystack,
-                    &found,
-                    vm.active_profile()?,
-                )?;
+                if let Some(replacement) = replacement.as_ref() {
+                    append_gsub_replacement(
+                        &mut result,
+                        replacement,
+                        haystack,
+                        &found,
+                        vm.active_profile()?,
+                    )?;
+                } else {
+                    let table = replacement_table.expect("replacement kind was validated");
+                    let key = gsub_table_key(vm, haystack, &found)?;
+                    let value = vm.heap.table_get(table, &key)?;
+                    match value {
+                        Value::Nil => {
+                            if vm.metamethod(&Value::Table(table), "__index")?.is_some() {
+                                return Err(RuntimeError::UnsupportedLibraryFeature {
+                                    function: "string.gsub",
+                                    feature: "table replacement __index metamethods",
+                                });
+                            }
+                            append_limited_string(&mut result, &haystack[found.start..found.end])?;
+                        }
+                        Value::Boolean(false) => {
+                            append_limited_string(&mut result, &haystack[found.start..found.end])?
+                        }
+                        Value::String(value) => append_limited_string(&mut result, &value)?,
+                        Value::Integer(_) | Value::Number(_) => {
+                            let value = try_concat_bytes(&value)?
+                                .expect("numeric replacements are concatenable");
+                            append_limited_string(&mut result, &value)?;
+                        }
+                        other => {
+                            return Err(RuntimeError::Type {
+                                operation: "string.gsub table replacement",
+                                expected: "string, number, false, or nil",
+                                actual: other.type_name(),
+                            });
+                        }
+                    }
+                }
                 replacements += 1;
                 if end > first {
                     search_start = end;
@@ -7587,6 +7621,29 @@ fn append_basic_capture_values(
         }
     }
     Ok(())
+}
+
+fn gsub_table_key(
+    vm: &Vm,
+    haystack: &[u8],
+    found: &BasicPatternMatch,
+) -> Result<Value, RuntimeError> {
+    let Some(capture) = found.captures.first().filter(|_| found.capture_count != 0) else {
+        return Ok(Value::String(Arc::from(&haystack[found.start..found.end])));
+    };
+    if !capture.set {
+        return Err(RuntimeError::UnsupportedLibraryFeature {
+            function: "string.gsub",
+            feature: "unfinished Lua pattern captures",
+        });
+    }
+    if capture.position {
+        profiled_integral_math_result(vm, "string.gsub", (capture.start + 1) as f64)
+    } else {
+        Ok(Value::String(Arc::from(
+            &haystack[capture.start..capture.end],
+        )))
+    }
 }
 
 fn append_gsub_replacement(

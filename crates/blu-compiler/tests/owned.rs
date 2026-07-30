@@ -3003,6 +3003,61 @@ fn string_gsub_replacement_escapes_follow_the_lua51_split() {
 }
 
 #[test]
+fn string_gsub_supports_bounded_table_replacements() {
+    let source = make_source(
+        b"local first,n=string.gsub('cat dog bird fox','%a+',{cat='C',dog=false,bird=7}) local second,m=string.gsub('ab','(.)',{a='A',b='B'}) local third,k=string.gsub('a','()a',{[1]='X'}) return first,n,second,m,third,k"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let modern = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        let count = |value| {
+            if modern {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::String(Arc::from(&b"C dog 7 fox"[..])),
+                count(4),
+                Value::String(Arc::from(&b"AB"[..])),
+                count(2),
+                Value::String(Arc::from(&b"X"[..])),
+                count(1),
+            ]),
+            "{profile}"
+        );
+
+        let source = make_source(
+            b"local replacement=setmetatable({}, {__index=function() return 'X' end}) return string.gsub('a','a',replacement)"
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "string.gsub",
+                feature: "table replacement __index metamethods",
+            }),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn string_gsub_rejects_unimplemented_replacements_structurally() {
     for profile in SemanticProfile::ALL {
         for source in [

@@ -53,10 +53,10 @@ All four Lua repetition suffixes are bounded: greedy `*`/`+`/`?` and minimal
 captures from the same byte-pattern engine, including `%1` through `%9`
 backreferences to completed substring captures and bounded `%bxy` nested byte
 pairs. Zero-width `%f[set]` byte frontiers share the bracket-set engine.
-`string.gsub` adds bounded
-string/number replacement, `%0`, `%1`–`%9`, `%%`, empty-match progress,
-replacement counts, profile-specific Lua 5.1 escape handling, and explicit
-callback rejection.
+`string.gsub` adds bounded string, number, and direct-table replacement,
+`%0`, `%1`–`%9`, `%%`, empty-match progress, replacement counts,
+profile-specific Lua 5.1 escape handling, and explicit rejection of callback
+and table-`__index` replacement paths that require resumable calls.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
 `table.sort` provides bounded default ordering for uniform number and byte-string
