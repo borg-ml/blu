@@ -4604,6 +4604,30 @@ impl Vm {
                 number_argument(arguments, 0, "math.tan")?.tan(),
             )])
         });
+        let atan = self.register_function(|vm, arguments| {
+            let y = number_argument(arguments, 0, "math.atan")?;
+            let result = match vm.active_profile()? {
+                SemanticProfile::Luau | SemanticProfile::Lua51 | SemanticProfile::Lua52 => y.atan(),
+                SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55 => {
+                    let x = arguments
+                        .get(1)
+                        .map(|_| number_argument(arguments, 1, "math.atan"))
+                        .transpose()?
+                        .unwrap_or(1.0);
+                    y.atan2(x)
+                }
+                profile => {
+                    return Err(RuntimeError::UnsupportedSemanticProfile {
+                        operation: "math.atan",
+                        profile,
+                    });
+                }
+            };
+            Ok(vec![Value::Number(result)])
+        });
         let rad = self.register_function(|_, arguments| {
             Ok(vec![Value::Number(
                 number_argument(arguments, 0, "math.rad")?.to_radians(),
@@ -4662,7 +4686,7 @@ impl Vm {
             Ok(vec![Value::Number(result)])
         });
 
-        let table = self.heap.allocate_table(0, 16)?;
+        let table = self.heap.allocate_table(0, 17)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -4673,6 +4697,7 @@ impl Vm {
             (&b"sin"[..], Value::NativeFunction(sin)),
             (&b"cos"[..], Value::NativeFunction(cos)),
             (&b"tan"[..], Value::NativeFunction(tan)),
+            (&b"atan"[..], Value::NativeFunction(atan)),
             (&b"rad"[..], Value::NativeFunction(rad)),
             (&b"deg"[..], Value::NativeFunction(deg)),
             (&b"fmod"[..], Value::NativeFunction(fmod)),
@@ -5801,6 +5826,10 @@ pub enum RuntimeError {
     },
     UnsupportedArithmetic(Opcode),
     UnsupportedComparison(Opcode),
+    UnsupportedSemanticProfile {
+        operation: &'static str,
+        profile: SemanticProfile,
+    },
     Type {
         operation: &'static str,
         expected: &'static str,
@@ -5963,6 +5992,9 @@ impl fmt::Display for RuntimeError {
             }
             Self::UnsupportedComparison(opcode) => {
                 write!(f, "{opcode} comparison is not implemented")
+            }
+            Self::UnsupportedSemanticProfile { operation, profile } => {
+                write!(f, "{operation} has no semantics assigned for {profile}")
             }
             Self::Type {
                 operation,

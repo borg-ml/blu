@@ -2301,6 +2301,53 @@ fn mixed_return_prefixes_preserve_all_final_call_results() {
 }
 
 #[test]
+fn math_atan_uses_the_explicit_profile_specific_second_argument_contract() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(b"return math.atan(1, 0)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Luau | SemanticProfile::Lua51 | SemanticProfile::Lua52
+        ) {
+            core::f64::consts::FRAC_PI_4
+        } else {
+            core::f64::consts::FRAC_PI_2
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default(),),
+            Ok(vec![Value::Number(expected)]),
+            "{profile}"
+        );
+
+        let source = make_source(b"return math.atan(1, 'ignored')".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Luau | SemanticProfile::Lua51 | SemanticProfile::Lua52
+        ) {
+            assert_eq!(
+                result,
+                Ok(vec![Value::Number(core::f64::consts::FRAC_PI_4)])
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(blu_runtime::RuntimeError::Type {
+                    operation: "math.atan",
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

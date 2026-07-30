@@ -324,7 +324,10 @@ Implemented profile decisions are recorded when the references conflict. For
 example, pinned Luau ignores the optional separator passed to `string.rep`,
 while the `blu` profile accepts the modern Lua separator form. Blu
 `string.lower` and `string.upper` operate deterministically on ASCII bytes and
-leave all other bytes unchanged.
+leave all other bytes unchanged. Pinned Luau and Lua 5.1–5.2 ignore a second
+argument to `math.atan`; Lua 5.3–5.5 interpret it as the `x` coordinate for
+`atan2(y, x)`. Blu selects the modern two-coordinate form and defaults `x` to
+one when omitted.
 
 ## Authority profiles
 
