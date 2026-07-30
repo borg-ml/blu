@@ -241,9 +241,13 @@ vectors and function-owned lexical blocks. Loop-control scope is reset at
 every function boundary. The owned compiler lowers noncapturing functions to
 recursive BluV1 prototype trees, emits `NEWCLOSURE`, and records fixed
 parameters for bounded child-frame argument copying. This path executes in all
-seven explicit profiles. A reference or assignment to an enclosing lexical
-binding is rejected with `BLU-COMPILE-0006`; lexical capture lowering is not
-yet connected and never silently changes an outer local into a global.
+seven explicit profiles. Lexical resolution emits `GETUPVALUE` and
+`SETUPVALUE` for direct, mutable, self-recursive, and transitively nested
+captures. Intermediate prototypes explicitly forward ancestor cells with
+`ParentUpvalue`; direct parents expose live registers with `ParentRegister`.
+Local-function destinations are initialized before closure construction so
+recursive capture is structurally valid, then synchronized through the shared
+generational upvalue cell when the closure is installed.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

@@ -20,7 +20,7 @@
 
 use blu_bytecode::blu::{
     Artifact, BluLimits, BytecodeFormat, Constant, DecodeError, EncodeError, FeatureBits,
-    Instruction, LocalDebug, Prototype, SourceRecord, ValidatedArtifact, ValidationError,
+    Instruction, LocalDebug, Prototype, SourceRecord, Upvalue, ValidatedArtifact, ValidationError,
     decode_validated, encode,
 };
 use blu_core::{
@@ -88,6 +88,7 @@ pub enum OwnedCompileLimit {
     TotalDebugBytes,
     Prototypes,
     Children,
+    Upvalues,
 }
 
 impl fmt::Display for OwnedCompileLimit {
@@ -108,6 +109,7 @@ impl fmt::Display for OwnedCompileLimit {
             Self::TotalDebugBytes => formatter.write_str("total local debug name bytes"),
             Self::Prototypes => formatter.write_str("prototypes"),
             Self::Children => formatter.write_str("child prototypes"),
+            Self::Upvalues => formatter.write_str("upvalues"),
         }
     }
 }
@@ -376,6 +378,12 @@ struct Binding {
     end_pc: Option<u32>,
 }
 
+#[derive(Clone, Copy)]
+struct OuterBinding {
+    name: ByteSpan,
+    source: Upvalue,
+}
+
 struct Lowerer<'a, 'prototypes> {
     source: &'a SourceFile,
     ast: &'a Ast,
@@ -385,7 +393,8 @@ struct Lowerer<'a, 'prototypes> {
     call_arguments: &'a [ExpressionId],
     limits: OwnedCompileLimits,
     prototypes: &'prototypes mut Vec<Prototype>,
-    outer_names: Vec<ByteSpan>,
+    outer_bindings: Vec<OuterBinding>,
+    upvalues: Vec<OuterBinding>,
     parameter_count: usize,
     bindings: Vec<Binding>,
     closed_bindings: Vec<Binding>,
@@ -406,11 +415,12 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         limits: OwnedCompileLimits,
         prototypes: &'prototypes mut Vec<Prototype>,
         parameters: &[Identifier],
-        outer_names: &[ByteSpan],
+        outer_bindings: &[OuterBinding],
     ) -> Result<Self, OwnedCompileError> {
         let capacity = ast.node_count().min(4_096);
-        let mut copied_outer_names = allocate_vec(outer_names.len(), "outer lexical names")?;
-        copied_outer_names.extend_from_slice(outer_names);
+        let mut copied_outer_bindings =
+            allocate_vec(outer_bindings.len(), "outer lexical bindings")?;
+        copied_outer_bindings.extend_from_slice(outer_bindings);
         let mut lowerer = Self {
             source,
             ast,
@@ -420,7 +430,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             call_arguments: ast.call_argument_arena(),
             limits,
             prototypes,
-            outer_names: copied_outer_names,
+            outer_bindings: copied_outer_bindings,
+            upvalues: allocate_vec(4, "prototype upvalues")?,
             parameter_count: parameters.len(),
             bindings: allocate_vec(capacity.min(limits.max_bindings), "local bindings")?,
             closed_bindings: allocate_vec(
@@ -494,6 +505,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 message: "register count passed limits but cannot fit BluV1",
             }
         })?;
+        let mut upvalues = allocate_vec(self.upvalues.len(), "prototype upvalues")?;
+        upvalues.extend(self.upvalues.iter().map(|binding| binding.source));
         let mut required_features = FeatureBits::BASELINE;
         if self
             .constants
@@ -567,11 +580,14 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         {
             required_features = required_features | FeatureBits::FIXED_CALLS;
         }
-        if self
-            .code
-            .iter()
-            .any(|instruction| matches!(instruction, Instruction::NewClosure { .. }))
-        {
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::NewClosure { .. }
+                    | Instruction::GetUpvalue { .. }
+                    | Instruction::SetUpvalue { .. }
+            )
+        }) {
             required_features = required_features | FeatureBits::CLOSURES;
         }
         Ok(Prototype {
@@ -586,7 +602,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             is_vararg: false,
             required_features,
             constants: self.constants,
-            upvalues: Vec::new(),
+            upvalues,
             children: self.children,
             code: self.code,
             source_map: self.source_map,
@@ -604,6 +620,14 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 }
                 Statement::LocalFunction(function) => {
                     let destination = self.allocate_register()?;
+                    let nil = self.push_constant(Constant::Nil)?;
+                    self.emit(
+                        Instruction::LoadConstant {
+                            destination,
+                            constant: nil,
+                        },
+                        function.name().span(),
+                    )?;
                     let start_pc = u32::try_from(self.code.len()).map_err(|_| {
                         OwnedCompileError::InternalInvariant {
                             message: "instruction count passed limits but cannot fit a debug PC",
@@ -1127,10 +1151,27 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             .ok_or(OwnedCompileError::InternalInvariant {
                 message: "function expression references an absent AST body",
             })?;
-        let visible_count = self.outer_names.len().saturating_add(self.bindings.len());
-        let mut outer_names = allocate_vec(visible_count, "child lexical names")?;
-        outer_names.extend_from_slice(&self.outer_names);
-        outer_names.extend(self.bindings.iter().map(|binding| binding.name));
+        let inherited = self.outer_bindings.len();
+        for index in 0..inherited {
+            let binding = self.outer_bindings[index];
+            self.ensure_upvalue(binding)?;
+        }
+        let visible_count = self.upvalues.len().saturating_add(self.bindings.len());
+        let mut outer_bindings = allocate_vec(visible_count, "child lexical bindings")?;
+        for (upvalue, binding) in self.upvalues.iter().enumerate() {
+            outer_bindings.push(OuterBinding {
+                name: binding.name,
+                source: Upvalue::ParentUpvalue(u16::try_from(upvalue).map_err(|_| {
+                    OwnedCompileError::InternalInvariant {
+                        message: "upvalue count passed limits but cannot fit BluV1",
+                    }
+                })?),
+            });
+        }
+        outer_bindings.extend(self.bindings.iter().map(|binding| OuterBinding {
+            name: binding.name,
+            source: Upvalue::ParentRegister(binding.register),
+        }));
 
         check_limit(
             OwnedCompileLimit::Prototypes,
@@ -1143,7 +1184,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             self.limits,
             self.prototypes,
             body.parameters(),
-            &outer_names,
+            &outer_bindings,
         )?
         .run(body.body().statements())?;
         let child_index = u32::try_from(self.prototypes.len()).map_err(|_| {
@@ -1193,13 +1234,11 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                         },
                         statement.span(),
                     )
-                } else if self.is_outer_name(identifier.span())? {
-                    Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                        "BLU-COMPILE-0006",
-                        Phase::Resolve,
-                        identifier.span(),
-                        "owned lexical capture lowering is not implemented yet",
-                    )?))
+                } else if let Some(upvalue) = self.resolve_upvalue(identifier.span())? {
+                    self.emit(
+                        Instruction::SetUpvalue { upvalue, source },
+                        statement.span(),
+                    )
                 } else {
                     let name = self.global_name_constant(identifier.span())?;
                     self.emit(Instruction::StoreGlobal { name, source }, statement.span())
@@ -1643,13 +1682,16 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             ExpressionKind::Identifier(identifier) => {
                 if let Some(register) = self.resolve_local(identifier.span())? {
                     Ok(register)
-                } else if self.is_outer_name(identifier.span())? {
-                    Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                        "BLU-COMPILE-0006",
-                        Phase::Resolve,
-                        identifier.span(),
-                        "owned lexical capture lowering is not implemented yet",
-                    )?))
+                } else if let Some(upvalue) = self.resolve_upvalue(identifier.span())? {
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::GetUpvalue {
+                            destination,
+                            upvalue,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
                 } else {
                     let name = self.global_name_constant(identifier.span())?;
                     let destination = self.allocate_register()?;
@@ -2311,14 +2353,52 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         Ok(None)
     }
 
-    fn is_outer_name(&self, name: ByteSpan) -> Result<bool, OwnedCompileError> {
+    fn resolve_upvalue(&mut self, name: ByteSpan) -> Result<Option<u16>, OwnedCompileError> {
         let bytes = self.source.slice(name)?;
-        for outer in self.outer_names.iter().rev() {
-            if self.source.slice(*outer)? == bytes {
-                return Ok(true);
+        for (index, binding) in self.upvalues.iter().enumerate().rev() {
+            if self.source.slice(binding.name)? == bytes {
+                return Ok(Some(u16::try_from(index).map_err(|_| {
+                    OwnedCompileError::InternalInvariant {
+                        message: "upvalue count passed limits but cannot fit BluV1",
+                    }
+                })?));
             }
         }
-        Ok(false)
+        for binding in self.outer_bindings.iter().rev() {
+            if self.source.slice(binding.name)? == bytes {
+                let binding = *binding;
+                let index = self.push_upvalue(binding)?;
+                return Ok(Some(index));
+            }
+        }
+        Ok(None)
+    }
+
+    fn push_upvalue(&mut self, binding: OuterBinding) -> Result<u16, OwnedCompileError> {
+        let index = self.upvalues.len();
+        check_limit(
+            OwnedCompileLimit::Upvalues,
+            index.saturating_add(1),
+            self.limits
+                .artifact
+                .max_upvalues_per_prototype
+                .min(u16::MAX as usize),
+        )?;
+        push_fallible(&mut self.upvalues, binding, "prototype upvalues")?;
+        u16::try_from(index).map_err(|_| OwnedCompileError::InternalInvariant {
+            message: "upvalue count passed limits but cannot fit BluV1",
+        })
+    }
+
+    fn ensure_upvalue(&mut self, binding: OuterBinding) -> Result<u16, OwnedCompileError> {
+        if let Some(index) = self.upvalues.iter().position(|candidate| {
+            candidate.name == binding.name && candidate.source == binding.source
+        }) {
+            return u16::try_from(index).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "upvalue count passed limits but cannot fit BluV1",
+            });
+        }
+        self.push_upvalue(binding)
     }
 
     fn global_name_constant(&mut self, name: ByteSpan) -> Result<u32, OwnedCompileError> {

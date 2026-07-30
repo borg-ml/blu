@@ -2085,16 +2085,50 @@ fn owned_noncapturing_functions_lower_to_recursive_prototypes_and_execute() {
 }
 
 #[test]
-fn owned_capture_use_fails_explicitly_until_capture_lowering_is_connected() {
-    let source = make_source(
-        b"local outer = 40 local function add(value) return outer + value end return add(2)"
-            .to_vec(),
-    );
-    let error = OwnedCompiler::default()
-        .compile(&source, SemanticProfile::Blu, compiler_identity())
-        .unwrap_err();
-    let diagnostic = error.diagnostic().expect("capture diagnostic");
-    assert_eq!(diagnostic.code().as_str(), "BLU-COMPILE-0006");
-    assert_eq!(diagnostic.phase(), Phase::Resolve);
-    assert_eq!(source.slice(diagnostic.primary().span()).unwrap(), b"outer");
+fn owned_functions_share_mutable_and_transitive_lexical_captures() {
+    for (bytes, expected) in [
+        (
+            b"local value = 1 local function add(delta) value = value + delta return value end return add(2), add(3)"
+                .as_slice(),
+            vec![Value::Number(3.0), Value::Number(6.0)],
+        ),
+        (
+            b"local value = 40 local function outer() local function inner(extra) return value + extra end return inner end local closure = outer() return closure(2)"
+                .as_slice(),
+            vec![Value::Number(42.0)],
+        ),
+        (
+            b"local function factorial(value) if value <= 1 then return 1 end return value * factorial(value - 1) end return factorial(5)"
+                .as_slice(),
+            vec![Value::Number(120.0)],
+        ),
+        (
+            b"local value = 0 local function increment() value = value + 1 end local function read() return value end increment() return read()"
+                .as_slice(),
+            vec![Value::Number(1.0)],
+        ),
+        (
+            b"local value = 1 local function outer() local value = 42 local function inner() return value end return inner end local closure = outer() return closure()"
+                .as_slice(),
+            vec![Value::Number(42.0)],
+        ),
+        (
+            b"local make = function(left) return function(right) return left + right end end local add = make(40) return add(2)"
+                .as_slice(),
+            vec![Value::Number(42.0)],
+        ),
+    ] {
+        for profile in SemanticProfile::ALL {
+            let source = make_source(bytes.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(expected.clone()),
+                "{profile}"
+            );
+        }
+    }
 }
