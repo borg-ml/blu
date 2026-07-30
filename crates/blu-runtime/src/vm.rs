@@ -5040,6 +5040,37 @@ impl Vm {
                 profiled_integral_math_result(vm, "string.find", last as f64)?,
             ])
         });
+        let string_match = self.register_function(|_, arguments| {
+            let haystack = string_bytes(
+                arguments.first().ok_or(RuntimeError::Argument {
+                    function: "string.match",
+                    index: 1,
+                })?,
+                "string.match",
+            )?;
+            let pattern = string_bytes(
+                arguments.get(1).ok_or(RuntimeError::Argument {
+                    function: "string.match",
+                    index: 2,
+                })?,
+                "string.match",
+            )?;
+            let initial = arguments
+                .get(2)
+                .map(|_| integer_argument(arguments, 2, "string.match"))
+                .transpose()?
+                .unwrap_or(1);
+            let initial = relative_index(initial, haystack.len()).max(1);
+            if initial > haystack.len() as i64 + 1 {
+                return Ok(vec![Value::Nil]);
+            }
+            let Some((first, end)) =
+                find_basic_lua_pattern(haystack, pattern, initial as usize - 1)?
+            else {
+                return Ok(vec![Value::Nil]);
+            };
+            Ok(vec![Value::String(Arc::from(&haystack[first..end]))])
+        });
         let string = self.heap.allocate_table(0, 1)?;
         self.heap.table_set(
             string,
@@ -5050,6 +5081,11 @@ impl Vm {
             string,
             Value::String(Arc::from(&b"find"[..])),
             Value::NativeFunction(string_find),
+        )?;
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"match"[..])),
+            Value::NativeFunction(string_match),
         )?;
         let string_len = self.register_function(|_, arguments| {
             let string = arguments.first().ok_or(RuntimeError::Argument {

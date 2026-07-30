@@ -11,6 +11,7 @@ use blu_core::{
 };
 use blu_runtime::{Dialect, RuntimeError, Value, Vm};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 
 fn make_source(bytes: impl Into<Vec<u8>>) -> SourceFile {
     SourceFile::new(
@@ -2616,6 +2617,54 @@ fn string_find_preflights_pattern_work() {
                 ..
             })
         ));
+    }
+}
+
+#[test]
+fn string_match_returns_bounded_byte_matches_and_nil_misses() {
+    let source = make_source(
+        b"local a=string.match('xxabbbc','a[b]+c') local b=string.match('abc','',2) local c=string.match('abc','%d') local d=string.match('abc','a',5) return a,b,c,d"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::String(Arc::from(&b"abbbc"[..])),
+                Value::String(Arc::from(&b""[..])),
+                Value::Nil,
+                Value::Nil
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn string_match_shares_structured_pattern_and_argument_errors() {
+    for profile in SemanticProfile::ALL {
+        for (source, expected) in [
+            (b"return string.match('abc', '(a)')".as_slice(), "pattern"),
+            (b"return string.match({}, 'a')".as_slice(), "type"),
+        ] {
+            let source = make_source(source.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            let result = Vm::default()
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+            match expected {
+                "pattern" => assert!(matches!(
+                    result,
+                    Err(RuntimeError::UnsupportedLibraryFeature { .. })
+                )),
+                "type" => assert!(matches!(result, Err(RuntimeError::Type { .. }))),
+                _ => unreachable!(),
+            }
+        }
     }
 }
 

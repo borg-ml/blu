@@ -37,6 +37,8 @@ limit. Bracket sets support byte ranges, classes, and negation. Unimplemented
 Lua-pattern syntax fails structurally instead of being treated as literal text.
 All four Lua repetition suffixes are bounded: greedy `*`/`+`/`?` and minimal
 `-`.
+Capture-free `string.match` uses the same byte-pattern engine, limits, and
+structured unsupported-feature behavior.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
 remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,

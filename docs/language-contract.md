@@ -415,6 +415,9 @@ targeted dialects are not reinterpreted as literal text; they fail with a
 structured unsupported-library-feature error until profile-specific pattern
 dispatch is implemented. Returned indices follow the active profile's
 legacy-number or modern-integer policy.
+`string.match` uses the same byte-pattern engine, relative start rules, and
+work limit. Until captures are implemented it returns the full matched byte
+slice, or nil on a miss, and rejects capture syntax structurally.
 
 ## Authority profiles
 
