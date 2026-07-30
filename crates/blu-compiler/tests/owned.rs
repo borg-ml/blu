@@ -2370,35 +2370,21 @@ fn string_find_uses_byte_indices_plain_search_and_profile_subtypes() {
 }
 
 #[test]
-fn string_find_plain_mode_is_literal_and_captures_remain_unsupported() {
-    for (source, expected) in [
-        (b"return string.find('a.c', '.', 1, true)".as_slice(), true),
-        (b"return string.find('abc', '(a)')".as_slice(), false),
-    ] {
-        for profile in SemanticProfile::ALL {
-            let compiled = OwnedCompiler::default()
-                .compile(&make_source(source.to_vec()), profile, compiler_identity())
-                .unwrap();
-            let result = Vm::default()
-                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
-            if expected {
-                assert!(
-                    matches!(result, Ok(values) if values.len() == 2),
-                    "{profile}"
-                );
-            } else {
-                assert!(
-                    matches!(
-                        result,
-                        Err(RuntimeError::UnsupportedLibraryFeature {
-                            function: "string.find",
-                            ..
-                        })
-                    ),
-                    "{profile}"
-                );
-            }
-        }
+fn string_find_plain_mode_remains_literal() {
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(
+                &make_source(b"return string.find('a.c', '.', 1, true)".to_vec()),
+                profile,
+                compiler_identity(),
+            )
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        assert!(
+            matches!(result, Ok(values) if values.len() == 2),
+            "{profile}"
+        );
     }
 }
 
@@ -2454,7 +2440,7 @@ fn string_find_rejects_malformed_repetition_structurally() {
             Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
             Err(RuntimeError::UnsupportedLibraryFeature {
                 function: "string.find",
-                feature: "malformed Lua pattern repetition or captures",
+                feature: "malformed Lua pattern repetition",
             })
         ));
     }
@@ -2647,7 +2633,7 @@ fn string_match_returns_bounded_byte_matches_and_nil_misses() {
 fn string_match_shares_structured_pattern_and_argument_errors() {
     for profile in SemanticProfile::ALL {
         for (source, expected) in [
-            (b"return string.match('abc', '(a)')".as_slice(), "pattern"),
+            (b"return string.match('abc', '%1')".as_slice(), "pattern"),
             (b"return string.match({}, 'a')".as_slice(), "type"),
         ] {
             let source = make_source(source.to_vec());
@@ -2665,6 +2651,48 @@ fn string_match_shares_structured_pattern_and_argument_errors() {
                 _ => unreachable!(),
             }
         }
+    }
+}
+
+#[test]
+fn string_find_and_match_return_nested_and_position_captures() {
+    let source = make_source(
+        b"local a,b,c,d,e=string.find('xxab12','(a(b))(%d+)') local f,g,h=string.match('xxab12','(a(b))(%d+)') local i,j=string.match('abc','()b()') return a,b,c,d,e,f,g,h,i,j"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let index = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                index(3),
+                index(6),
+                Value::String(Arc::from(&b"ab"[..])),
+                Value::String(Arc::from(&b"b"[..])),
+                Value::String(Arc::from(&b"12"[..])),
+                Value::String(Arc::from(&b"ab"[..])),
+                Value::String(Arc::from(&b"b"[..])),
+                Value::String(Arc::from(&b"12"[..])),
+                index(2),
+                index(3)
+            ]),
+            "{profile}"
+        );
     }
 }
 

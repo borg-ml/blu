@@ -415,14 +415,16 @@ targeted dialects are not reinterpreted as literal text; they fail with a
 structured unsupported-library-feature error until profile-specific pattern
 dispatch is implemented. Returned indices follow the active profile's
 legacy-number or modern-integer policy.
-`string.match` uses the same byte-pattern engine, relative start rules, and
-work limit. Until captures are implemented it returns the full matched byte
-slice, or nil on a miss, and rejects capture syntax structurally.
-`string.gsub` uses the same capture-free engine with bounded non-overlapping
-replacement and Lua-compatible empty-match progress. String and numeric
-replacements support literal bytes, `%%`, and `%0`; the second result is the
-profile-typed replacement count. Capture references, table replacements, and
-callback replacements fail explicitly.
+`string.find` appends captures after its two indices. `string.match` returns
+captures when present and otherwise returns the full matched byte slice.
+Nested substring captures and `()` position captures are bounded to 32 and
+execute through linked capture events rather than recursive host calls.
+Backreferences remain explicit unsupported features.
+`string.gsub` uses the same engine with bounded non-overlapping replacement
+and Lua-compatible empty-match progress. String and numeric replacements
+support literal bytes, `%%`, and `%0`; the second result is the profile-typed
+replacement count. Capture references, table replacements, and callback
+replacements fail explicitly.
 `collectgarbage` supports the shared `collect` and `count` commands. Collection
 traces active frames, globals, threads, upvalues, and host-retained values.
 `count` reports the runtime's accounted GC-heap kibibytes; it is not presented

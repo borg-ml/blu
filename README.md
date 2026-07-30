@@ -37,10 +37,10 @@ limit. Bracket sets support byte ranges, classes, and negation. Unimplemented
 Lua-pattern syntax fails structurally instead of being treated as literal text.
 All four Lua repetition suffixes are bounded: greedy `*`/`+`/`?` and minimal
 `-`.
-Capture-free `string.match` uses the same byte-pattern engine, limits, and
-structured unsupported-feature behavior.
-Capture-free `string.gsub` adds bounded string/number replacement, `%0`, `%%`,
-empty-match progress, replacement counts, and explicit callback rejection.
+`string.find` and `string.match` return bounded nested substring and position
+captures from the same byte-pattern engine. `string.gsub` adds bounded
+string/number replacement, `%0`, `%%`, empty-match progress, replacement
+counts, and explicit capture-reference/callback rejection.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
 `table.sort` provides bounded default ordering for uniform number and byte-string

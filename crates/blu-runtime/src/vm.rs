@@ -5058,21 +5058,33 @@ impl Vm {
                         .windows(needle.len())
                         .position(|window| window == needle)
                 };
-                offset.map(|offset| (start + offset, start + offset + needle.len()))
+                offset.map(|offset| BasicPatternMatch {
+                    start: start + offset,
+                    end: start + offset + needle.len(),
+                    captures: [BasicPatternCapture::default(); 32],
+                    capture_count: 0,
+                })
             } else {
-                find_basic_lua_pattern(haystack, needle, start)?
+                find_basic_lua_pattern(haystack, needle, start, "string.find")?
             };
-            let Some((first, end)) = found else {
+            let Some(found) = found else {
                 return Ok(vec![Value::Nil]);
             };
-            let first = first + 1;
-            let last = end;
-            Ok(vec![
-                profiled_integral_math_result(vm, "string.find", first as f64)?,
-                profiled_integral_math_result(vm, "string.find", last as f64)?,
-            ])
+            let mut values = try_vec_with_capacity(2 + found.capture_count, "string.find results")?;
+            values.push(profiled_integral_math_result(
+                vm,
+                "string.find",
+                (found.start + 1) as f64,
+            )?);
+            values.push(profiled_integral_math_result(
+                vm,
+                "string.find",
+                found.end as f64,
+            )?);
+            append_basic_capture_values(&mut values, vm, haystack, &found, "string.find")?;
+            Ok(values)
         });
-        let string_match = self.register_function(|_, arguments| {
+        let string_match = self.register_function(|vm, arguments| {
             let haystack = string_bytes(
                 arguments.first().ok_or(RuntimeError::Argument {
                     function: "string.match",
@@ -5096,12 +5108,21 @@ impl Vm {
             if initial > haystack.len() as i64 + 1 {
                 return Ok(vec![Value::Nil]);
             }
-            let Some((first, end)) =
-                find_basic_lua_pattern(haystack, pattern, initial as usize - 1)?
+            let Some(found) =
+                find_basic_lua_pattern(haystack, pattern, initial as usize - 1, "string.match")?
             else {
                 return Ok(vec![Value::Nil]);
             };
-            Ok(vec![Value::String(Arc::from(&haystack[first..end]))])
+            if found.capture_count == 0 {
+                Ok(vec![Value::String(Arc::from(
+                    &haystack[found.start..found.end],
+                ))])
+            } else {
+                let mut values =
+                    try_vec_with_capacity(found.capture_count, "string.match captures")?;
+                append_basic_capture_values(&mut values, vm, haystack, &found, "string.match")?;
+                Ok(values)
+            }
         });
         let string_gsub = self.register_function(|vm, arguments| {
             let haystack = string_bytes(
@@ -5159,10 +5180,13 @@ impl Vm {
             let mut copied_until = 0;
             let mut replacements = 0;
             while replacements < replacement_limit && search_start <= haystack.len() {
-                let Some((first, end)) = find_basic_lua_pattern(haystack, pattern, search_start)?
+                let Some(found) =
+                    find_basic_lua_pattern(haystack, pattern, search_start, "string.gsub")?
                 else {
                     break;
                 };
+                let first = found.start;
+                let end = found.end;
                 append_limited_string(&mut result, &haystack[copied_until..first])?;
                 append_gsub_replacement(&mut result, &replacement, &haystack[first..end])?;
                 replacements += 1;
@@ -5180,7 +5204,7 @@ impl Vm {
             }
             if !explicit_limit
                 && replacements == MAX_DYNAMIC_REGISTERS
-                && find_basic_lua_pattern(haystack, pattern, search_start)?.is_some()
+                && find_basic_lua_pattern(haystack, pattern, search_start, "string.gsub")?.is_some()
             {
                 return Err(RuntimeError::StackLimit {
                     required: MAX_DYNAMIC_REGISTERS + 1,
@@ -6398,6 +6422,9 @@ enum BasicPatternAtom {
     Any,
     Class(u8),
     Set([u64; 4]),
+    CaptureStart(u8),
+    CaptureEnd(u8),
+    PositionCapture(u8),
 }
 
 #[derive(Clone, Copy)]
@@ -6415,17 +6442,35 @@ struct BasicPatternPiece {
     repetition: BasicPatternRepetition,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct BasicPatternCapture {
+    start: usize,
+    end: usize,
+    position: bool,
+    set: bool,
+}
+
+struct BasicPatternMatch {
+    start: usize,
+    end: usize,
+    captures: [BasicPatternCapture; 32],
+    capture_count: usize,
+}
+
 fn find_basic_lua_pattern(
     haystack: &[u8],
     pattern: &[u8],
     start: usize,
-) -> Result<Option<(usize, usize)>, RuntimeError> {
+    operation: &'static str,
+) -> Result<Option<BasicPatternMatch>, RuntimeError> {
     const MAX_PATTERN_WORK: usize = 10_000_000;
 
     let anchored = pattern.first() == Some(&b'^');
     let mut index = usize::from(anchored);
     let mut end_anchor = false;
     let mut pieces = try_vec_with_capacity(pattern.len(), "string.find pattern pieces")?;
+    let mut open_captures = try_vec_with_capacity(32, "Lua pattern capture stack")?;
+    let mut capture_count = 0usize;
     while index < pattern.len() {
         let byte = pattern[index];
         if byte == b'$' && index + 1 == pattern.len() {
@@ -6433,43 +6478,70 @@ fn find_basic_lua_pattern(
             index += 1;
             continue;
         }
-        let atom =
-            if byte == b'.' {
-                index += 1;
-                BasicPatternAtom::Any
-            } else if byte == b'%' {
-                let escaped = pattern.get(index + 1).copied().ok_or(
-                    RuntimeError::UnsupportedLibraryFeature {
-                        function: "string.find",
+        let atom = if byte == b'.' {
+            index += 1;
+            BasicPatternAtom::Any
+        } else if byte == b'%' {
+            let escaped =
+                pattern
+                    .get(index + 1)
+                    .copied()
+                    .ok_or(RuntimeError::UnsupportedLibraryFeature {
+                        function: operation,
                         feature: "malformed Lua patterns",
-                    },
-                )?;
-                if matches!(
-                    escaped.to_ascii_lowercase(),
-                    b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
-                ) {
-                    BasicPatternAtom::Class(escaped)
-                } else if escaped.is_ascii_alphanumeric() {
-                    return Err(RuntimeError::UnsupportedLibraryFeature {
-                        function: "string.find",
-                        feature: "dialect-specific Lua pattern classes and captures",
-                    });
-                } else {
-                    BasicPatternAtom::Literal(escaped)
-                }
-            } else if byte == b'[' {
-                let (set, next) = parse_basic_pattern_set(pattern, index)?;
-                index = next;
-                BasicPatternAtom::Set(set)
-            } else if b"*+?-]()".contains(&byte) {
+                    })?;
+            if matches!(
+                escaped.to_ascii_lowercase(),
+                b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
+            ) {
+                BasicPatternAtom::Class(escaped)
+            } else if escaped.is_ascii_alphanumeric() {
                 return Err(RuntimeError::UnsupportedLibraryFeature {
-                    function: "string.find",
-                    feature: "malformed Lua pattern repetition or captures",
+                    function: operation,
+                    feature: "dialect-specific Lua pattern classes and captures",
                 });
             } else {
+                BasicPatternAtom::Literal(escaped)
+            }
+        } else if byte == b'[' {
+            let (set, next) = parse_basic_pattern_set(pattern, index, operation)?;
+            index = next;
+            BasicPatternAtom::Set(set)
+        } else if byte == b'(' {
+            if capture_count == 32 {
+                return Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: operation,
+                    feature: "more than 32 Lua pattern captures",
+                });
+            }
+            let capture = capture_count as u8;
+            capture_count += 1;
+            if pattern.get(index + 1) == Some(&b')') {
+                index += 2;
+                BasicPatternAtom::PositionCapture(capture)
+            } else {
                 index += 1;
-                BasicPatternAtom::Literal(byte)
-            };
+                open_captures.push(capture);
+                BasicPatternAtom::CaptureStart(capture)
+            }
+        } else if byte == b')' {
+            let capture = open_captures
+                .pop()
+                .ok_or(RuntimeError::UnsupportedLibraryFeature {
+                    function: operation,
+                    feature: "malformed Lua pattern captures",
+                })?;
+            index += 1;
+            BasicPatternAtom::CaptureEnd(capture)
+        } else if b"*+?-]".contains(&byte) {
+            return Err(RuntimeError::UnsupportedLibraryFeature {
+                function: operation,
+                feature: "malformed Lua pattern repetition",
+            });
+        } else {
+            index += 1;
+            BasicPatternAtom::Literal(byte)
+        };
         if byte == b'%' {
             index += 2;
         }
@@ -6482,6 +6554,12 @@ fn find_basic_lua_pattern(
         };
         index += usize::from(!matches!(repetition, BasicPatternRepetition::One));
         pieces.push(BasicPatternPiece { atom, repetition });
+    }
+    if !open_captures.is_empty() {
+        return Err(RuntimeError::UnsupportedLibraryFeature {
+            function: operation,
+            feature: "malformed Lua pattern captures",
+        });
     }
 
     let candidates = if anchored {
@@ -6498,15 +6576,21 @@ fn find_basic_lua_pattern(
     }
     let mut work = 0;
     for position in start..start.saturating_add(candidates) {
-        if let Some(end) = match_basic_pattern_at(
+        if let Some((end, captures)) = match_basic_pattern_at(
             haystack,
             &pieces,
             position,
             end_anchor,
             &mut work,
             MAX_PATTERN_WORK,
+            operation,
         )? {
-            return Ok(Some((position, end)));
+            return Ok(Some(BasicPatternMatch {
+                start: position,
+                end,
+                captures,
+                capture_count,
+            }));
         }
     }
     Ok(None)
@@ -6517,6 +6601,7 @@ enum BasicPatternState {
     Match {
         piece: usize,
         position: usize,
+        event: Option<usize>,
     },
     Repeat {
         piece: usize,
@@ -6524,7 +6609,22 @@ enum BasicPatternState {
         count: usize,
         bound: usize,
         ascending: bool,
+        event: Option<usize>,
     },
+}
+
+#[derive(Clone, Copy)]
+enum BasicCaptureEventKind {
+    Start,
+    End,
+    Position,
+}
+
+struct BasicCaptureEvent {
+    parent: Option<usize>,
+    capture: u8,
+    position: usize,
+    kind: BasicCaptureEventKind,
 }
 
 fn match_basic_pattern_at(
@@ -6534,23 +6634,70 @@ fn match_basic_pattern_at(
     end_anchor: bool,
     work: &mut usize,
     work_limit: usize,
-) -> Result<Option<usize>, RuntimeError> {
+    operation: &'static str,
+) -> Result<Option<(usize, [BasicPatternCapture; 32])>, RuntimeError> {
     let capacity = pieces.len().saturating_add(1);
     let mut states = try_vec_with_capacity(capacity, "string.find backtracking states")?;
+    let mut events = try_vec_with_capacity(pieces.len().min(32), "string.find capture events")?;
     states.push(BasicPatternState::Match {
         piece: 0,
         position: start,
+        event: None,
     });
     while let Some(state) = states.pop() {
         charge_pattern_work(work, 1, work_limit)?;
         match state {
-            BasicPatternState::Match { piece, position } => {
+            BasicPatternState::Match {
+                piece,
+                position,
+                event,
+            } => {
                 let Some(current) = pieces.get(piece) else {
                     if !end_anchor || position == haystack.len() {
-                        return Ok(Some(position));
+                        return Ok(Some((position, materialize_basic_captures(&events, event))));
                     }
                     continue;
                 };
+                let capture_event = match current.atom {
+                    BasicPatternAtom::CaptureStart(capture) => {
+                        Some((capture, BasicCaptureEventKind::Start))
+                    }
+                    BasicPatternAtom::CaptureEnd(capture) => {
+                        Some((capture, BasicCaptureEventKind::End))
+                    }
+                    BasicPatternAtom::PositionCapture(capture) => {
+                        Some((capture, BasicCaptureEventKind::Position))
+                    }
+                    _ => None,
+                };
+                if let Some((capture, kind)) = capture_event {
+                    if !matches!(current.repetition, BasicPatternRepetition::One) {
+                        return Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: operation,
+                            feature: "repetition applied to Lua pattern captures",
+                        });
+                    }
+                    if events.len() >= 100_000 {
+                        return Err(RuntimeError::PatternWorkLimit {
+                            required: events.len() + 1,
+                            limit: 100_000,
+                        });
+                    }
+                    try_reserve_exact(&mut events, 1, "string.find capture events")?;
+                    let next_event = events.len();
+                    events.push(BasicCaptureEvent {
+                        parent: event,
+                        capture,
+                        position,
+                        kind,
+                    });
+                    states.push(BasicPatternState::Match {
+                        piece: piece + 1,
+                        position,
+                        event: Some(next_event),
+                    });
+                    continue;
+                }
                 if matches!(current.repetition, BasicPatternRepetition::One) {
                     let Some(byte) = haystack.get(position) else {
                         continue;
@@ -6560,6 +6707,7 @@ fn match_basic_pattern_at(
                         states.push(BasicPatternState::Match {
                             piece: piece + 1,
                             position: position + 1,
+                            event,
                         });
                     }
                     continue;
@@ -6590,6 +6738,7 @@ fn match_basic_pattern_at(
                     count: if ascending { minimum } else { maximum },
                     bound: if ascending { maximum } else { minimum },
                     ascending,
+                    event,
                 });
             }
             BasicPatternState::Repeat {
@@ -6598,6 +6747,7 @@ fn match_basic_pattern_at(
                 count,
                 bound,
                 ascending,
+                event,
             } => {
                 if ascending && count < bound {
                     states.push(BasicPatternState::Repeat {
@@ -6606,6 +6756,7 @@ fn match_basic_pattern_at(
                         count: count + 1,
                         bound,
                         ascending,
+                        event,
                     });
                 } else if !ascending && count > bound {
                     states.push(BasicPatternState::Repeat {
@@ -6614,16 +6765,49 @@ fn match_basic_pattern_at(
                         count: count - 1,
                         bound,
                         ascending,
+                        event,
                     });
                 }
                 states.push(BasicPatternState::Match {
                     piece: piece + 1,
                     position: position + count,
+                    event,
                 });
             }
         }
     }
     Ok(None)
+}
+
+fn materialize_basic_captures(
+    events: &[BasicCaptureEvent],
+    mut event: Option<usize>,
+) -> [BasicPatternCapture; 32] {
+    let mut captures = [BasicPatternCapture::default(); 32];
+    while let Some(index) = event {
+        let current = &events[index];
+        let capture = &mut captures[usize::from(current.capture)];
+        match current.kind {
+            BasicCaptureEventKind::Position if !capture.set => {
+                *capture = BasicPatternCapture {
+                    start: current.position,
+                    end: current.position,
+                    position: true,
+                    set: true,
+                };
+            }
+            BasicCaptureEventKind::End if !capture.set => {
+                capture.end = current.position;
+                capture.set = true;
+            }
+            BasicCaptureEventKind::Start if capture.set && !capture.position => {
+                capture.start = current.position;
+            }
+            _ => {}
+        }
+        event = current.parent;
+    }
+    captures
 }
 
 fn charge_pattern_work(work: &mut usize, amount: usize, limit: usize) -> Result<(), RuntimeError> {
@@ -6644,12 +6828,16 @@ fn basic_pattern_atom_matches(atom: &BasicPatternAtom, byte: u8) -> bool {
         BasicPatternAtom::Any => true,
         BasicPatternAtom::Class(class) => byte_matches_pattern_class(byte, *class),
         BasicPatternAtom::Set(set) => pattern_set_contains(set, byte),
+        BasicPatternAtom::CaptureStart(_)
+        | BasicPatternAtom::CaptureEnd(_)
+        | BasicPatternAtom::PositionCapture(_) => false,
     }
 }
 
 fn parse_basic_pattern_set(
     pattern: &[u8],
     start: usize,
+    operation: &'static str,
 ) -> Result<([u64; 4], usize), RuntimeError> {
     let mut cursor = start + 1;
     let negated = pattern.get(cursor) == Some(&b'^');
@@ -6667,7 +6855,7 @@ fn parse_basic_pattern_set(
         cursor = cursor.saturating_add(1);
     }
     let closing = closing.ok_or(RuntimeError::UnsupportedLibraryFeature {
-        function: "string.find",
+        function: operation,
         feature: "malformed Lua pattern sets",
     })?;
 
@@ -6678,7 +6866,7 @@ fn parse_basic_pattern_set(
         if byte == b'%' {
             let escaped = pattern.get(cursor + 1).copied().ok_or(
                 RuntimeError::UnsupportedLibraryFeature {
-                    function: "string.find",
+                    function: operation,
                     feature: "malformed Lua pattern sets",
                 },
             )?;
@@ -6693,7 +6881,7 @@ fn parse_basic_pattern_set(
                 }
             } else if escaped.is_ascii_alphanumeric() {
                 return Err(RuntimeError::UnsupportedLibraryFeature {
-                    function: "string.find",
+                    function: operation,
                     feature: "dialect-specific Lua pattern classes and captures",
                 });
             } else {
@@ -6763,6 +6951,35 @@ fn append_limited_string(result: &mut Vec<u8>, bytes: &[u8]) -> Result<(), Runti
     }
     try_reserve_exact(result, bytes.len(), "string result")?;
     result.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn append_basic_capture_values(
+    values: &mut Vec<Value>,
+    vm: &Vm,
+    haystack: &[u8],
+    found: &BasicPatternMatch,
+    operation: &'static str,
+) -> Result<(), RuntimeError> {
+    for capture in found.captures.iter().take(found.capture_count) {
+        if !capture.set {
+            return Err(RuntimeError::UnsupportedLibraryFeature {
+                function: operation,
+                feature: "unfinished Lua pattern captures",
+            });
+        }
+        if capture.position {
+            values.push(profiled_integral_math_result(
+                vm,
+                operation,
+                (capture.start + 1) as f64,
+            )?);
+        } else {
+            values.push(Value::String(Arc::from(
+                &haystack[capture.start..capture.end],
+            )));
+        }
+    }
     Ok(())
 }
 
