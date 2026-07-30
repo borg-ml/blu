@@ -5107,6 +5107,45 @@ fn luau_math_extensions_are_profile_gated_and_edge_compatible() {
 }
 
 #[test]
+fn luau_math_classification_and_interpolation_extensions_are_profile_gated() {
+    let source = make_source(
+        b"local nan=0/0 return math.isnan(nan),math.isinf(math.huge),math.isfinite(1),math.isfinite(math.huge),math.lerp(10,20,0.25),math.lerp(math.huge,-math.huge,1),math.map(5,0,10,0,100)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert_eq!(
+                result,
+                Ok(vec![
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Number(12.5),
+                    Value::Number(f64::NEG_INFINITY),
+                    Value::Number(50.0),
+                ]),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.isnan",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn string_split_matches_luau_byte_and_empty_field_semantics() {
     let source = make_source(
         b"local a=string.split('a,b,,c',',') local b=string.split('a,b') local c=string.split('ab','') local d=string.split('','') local e=string.split('a--b--','--') local f=string.split(123,'2') return #a,a[1],a[2],a[3],a[4],b[1],b[2],c[1],c[2],#d,d[1],e[1],e[2],e[3],f[1],f[2]"

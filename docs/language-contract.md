@@ -479,11 +479,14 @@ values, while Blu and Lua 5.4–5.5 require integer-representable seeds. Blu's
 generator is deterministic and non-cryptographic: equal explicit seeds
 produce equal streams, but the exact stream is not promised to match any
 upstream implementation or remain a portable language guarantee.
-Blu and Luau expose the Luau numeric extensions `math.clamp`, `math.sign`, and
-`math.round`. They return numbers, preserve Luau NaN behavior, use
-ties-away-from-zero rounding, and reject inverted clamp bounds structurally.
-Lua profiles reject these functions explicitly because they are absent from
-the corresponding standard libraries.
+Blu and Luau expose the Luau numeric extensions `math.clamp`, `math.sign`,
+`math.round`, `math.isnan`, `math.isinf`, `math.isfinite`, `math.lerp`, and
+`math.map`. The arithmetic helpers return numbers, preserve Luau NaN behavior,
+use ties-away-from-zero rounding, and reject inverted clamp bounds
+structurally. `math.lerp` returns its second endpoint exactly when its factor is
+one, preserving the pinned overflow-avoidance behavior. Lua profiles reject
+these functions explicitly because they are absent from the corresponding
+standard libraries.
 The `bit32` library exposes `band`, `bor`, `bxor`, `bnot`, `lshift`, `rshift`,
 `arshift`, `lrotate`, `rrotate`, `extract`, and `replace` in Blu, Luau, Lua
 5.2, and Lua 5.3 profiles. Luau truncates numeric inputs toward zero, Lua 5.2

@@ -48,7 +48,8 @@ non-cryptographic generator with explicit legacy coercion, result-subtype,
 zero-bound, seed-arity, and seed-return contracts; seeded reproducibility is
 guaranteed, but upstream implementations' exact random sequences are not.
 Blu/Luau profiles also expose `math.clamp`, `math.sign`, and `math.round` with
-the pinned Luau edge behavior.
+the pinned Luau edge behavior, plus numeric classification and
+`math.lerp`/`math.map` interpolation helpers.
 The `bit32` library provides variadic AND/OR/XOR, NOT, shifts, rotates, field
 extraction, and field replacement in Blu, Luau, Lua 5.2, and Lua 5.3 profiles,
 with explicit profile-specific input conversion and result subtypes.

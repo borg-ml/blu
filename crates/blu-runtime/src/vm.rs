@@ -7435,6 +7435,48 @@ impl Vm {
                 number_argument(arguments, 0, "math.round")?.round(),
             )])
         });
+        let is_nan = self.register_function(|vm, arguments| {
+            require_luau_math(vm, "math.isnan")?;
+            Ok(vec![Value::Boolean(
+                number_argument(arguments, 0, "math.isnan")?.is_nan(),
+            )])
+        });
+        let is_inf = self.register_function(|vm, arguments| {
+            require_luau_math(vm, "math.isinf")?;
+            Ok(vec![Value::Boolean(
+                number_argument(arguments, 0, "math.isinf")?.is_infinite(),
+            )])
+        });
+        let is_finite = self.register_function(|vm, arguments| {
+            require_luau_math(vm, "math.isfinite")?;
+            Ok(vec![Value::Boolean(
+                number_argument(arguments, 0, "math.isfinite")?.is_finite(),
+            )])
+        });
+        let lerp = self.register_function(|vm, arguments| {
+            require_luau_math(vm, "math.lerp")?;
+            let start = number_argument(arguments, 0, "math.lerp")?;
+            let finish = number_argument(arguments, 1, "math.lerp")?;
+            let alpha = number_argument(arguments, 2, "math.lerp")?;
+            Ok(vec![Value::Number(if alpha == 1.0 {
+                finish
+            } else {
+                start + (finish - start) * alpha
+            })])
+        });
+        let map = self.register_function(|vm, arguments| {
+            require_luau_math(vm, "math.map")?;
+            let value = number_argument(arguments, 0, "math.map")?;
+            let input_minimum = number_argument(arguments, 1, "math.map")?;
+            let input_maximum = number_argument(arguments, 2, "math.map")?;
+            let output_minimum = number_argument(arguments, 3, "math.map")?;
+            let output_maximum = number_argument(arguments, 4, "math.map")?;
+            Ok(vec![Value::Number(
+                output_minimum
+                    + (value - input_minimum) * (output_maximum - output_minimum)
+                        / (input_maximum - input_minimum),
+            )])
+        });
         let random = self.register_function(|vm, arguments| {
             if arguments.len() > 2 {
                 return Err(RuntimeError::ArgumentCount {
@@ -7527,7 +7569,7 @@ impl Vm {
             }
         });
 
-        let table = self.heap.allocate_table(0, 36)?;
+        let table = self.heap.allocate_table(0, 41)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -7561,6 +7603,11 @@ impl Vm {
             (&b"clamp"[..], Value::NativeFunction(clamp)),
             (&b"sign"[..], Value::NativeFunction(sign)),
             (&b"round"[..], Value::NativeFunction(round)),
+            (&b"isnan"[..], Value::NativeFunction(is_nan)),
+            (&b"isinf"[..], Value::NativeFunction(is_inf)),
+            (&b"isfinite"[..], Value::NativeFunction(is_finite)),
+            (&b"lerp"[..], Value::NativeFunction(lerp)),
+            (&b"map"[..], Value::NativeFunction(map)),
             (&b"random"[..], Value::NativeFunction(random)),
             (&b"randomseed"[..], Value::NativeFunction(randomseed)),
             (&b"pi"[..], Value::Number(core::f64::consts::PI)),
@@ -7873,6 +7920,15 @@ fn reject_lua55_compat_math(vm: &Vm, function: &'static str) -> Result<(), Runti
         })
     } else {
         Ok(())
+    }
+}
+
+fn require_luau_math(vm: &Vm, operation: &'static str) -> Result<(), RuntimeError> {
+    let profile = vm.active_profile()?;
+    if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+        Ok(())
+    } else {
+        Err(RuntimeError::UnsupportedSemanticProfile { operation, profile })
     }
 }
 
