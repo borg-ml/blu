@@ -1246,6 +1246,35 @@ fn owned_empty_tables_support_indexed_reads_writes_and_missing_keys() {
 }
 
 #[test]
+fn owned_table_fields_and_dot_sugar_preserve_source_order() {
+    let source = make_source(
+        br#"local values = {10, answer = 20, ["other"] = 30, answer = 21}; values.other = 31; return values[1], values.answer, values.other"#
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .expect("table fields should compile");
+        let integer_profile = matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        );
+        let value = |integer, number| {
+            if integer_profile {
+                Value::Integer(integer)
+            } else {
+                Value::Number(number)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![value(10, 10.0), value(21, 21.0), value(31, 31.0)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_indexing_non_tables_returns_structured_type_errors() {
     for bytes in [
         br#"local value = 1; return value["key"]"#.as_slice(),

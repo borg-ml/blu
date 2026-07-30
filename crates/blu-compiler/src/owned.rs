@@ -31,7 +31,7 @@ use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryOperator,
     Expression, ExpressionId, ExpressionKind, IfStatement, LocalListStatement, LocalStatement,
     NumericForStatement, ParseError, ParseLimits, ParseOutcome, Rejected, RepeatStatement,
-    ReturnStatement, Statement, UnaryOperator, WhileStatement, parse,
+    ReturnStatement, Statement, TableConstructor, TableField, UnaryOperator, WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -368,6 +368,7 @@ struct Lowerer<'a> {
     source: &'a SourceFile,
     profile: SemanticProfile,
     expressions: &'a [Expression],
+    table_fields: &'a [TableField],
     limits: OwnedCompileLimits,
     bindings: Vec<Binding>,
     closed_bindings: Vec<Binding>,
@@ -391,6 +392,7 @@ impl<'a> Lowerer<'a> {
             source,
             profile: ast.profile(),
             expressions: ast.expressions(),
+            table_fields: ast.table_field_arena(),
             limits,
             bindings: allocate_vec(capacity.min(limits.max_bindings), "local bindings")?,
             closed_bindings: allocate_vec(
@@ -1060,6 +1062,21 @@ impl<'a> Lowerer<'a> {
                     statement.span(),
                 )
             }
+            AssignmentTarget::Field(field) => {
+                let table = self.lower_expression(field.table())?;
+                let key = self.lower_constant(
+                    Constant::String(copy_bytes(
+                        self.source.slice(field.name().span())?,
+                        "field name",
+                    )?),
+                    field.name().span(),
+                )?;
+                let value = self.lower_expression(statement.value())?;
+                self.emit(
+                    Instruction::SetTable { table, key, value },
+                    statement.span(),
+                )
+            }
         }
     }
 
@@ -1216,6 +1233,66 @@ impl<'a> Lowerer<'a> {
         })
     }
 
+    fn lower_table_fields(
+        &mut self,
+        table: u16,
+        constructor: TableConstructor,
+    ) -> Result<(), OwnedCompileError> {
+        let end = constructor
+            .first_field()
+            .checked_add(constructor.field_count())
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "table constructor field range overflows",
+            })?;
+        if end > self.table_fields.len() {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "table constructor field range is out of bounds",
+            });
+        }
+        let mut array_index = 1_i64;
+        for index in constructor.first_field()..end {
+            let field = self.table_fields[index];
+            let (key, value, span) = match field {
+                TableField::Array(value) => {
+                    let span = self.expression(value)?.span();
+                    let constant = if matches!(
+                        self.profile,
+                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) {
+                        Constant::Integer(array_index)
+                    } else {
+                        Constant::Number(array_index as f64)
+                    };
+                    array_index =
+                        array_index
+                            .checked_add(1)
+                            .ok_or(OwnedCompileError::InternalInvariant {
+                                message: "table array field index overflows i64",
+                            })?;
+                    (self.lower_constant(constant, span)?, value, span)
+                }
+                TableField::Named { name, value } => {
+                    let span = self.expression(value)?.span();
+                    let key = self.lower_constant(
+                        Constant::String(copy_bytes(
+                            self.source.slice(name.span())?,
+                            "table field name",
+                        )?),
+                        name.span(),
+                    )?;
+                    (key, value, span)
+                }
+                TableField::Indexed { key, value } => {
+                    let span = self.expression(value)?.span();
+                    (self.lower_expression(key)?, value, span)
+                }
+            };
+            let value = self.lower_expression(value)?;
+            self.emit(Instruction::SetTable { table, key, value }, span)?;
+        }
+        Ok(())
+    }
+
     fn lower_expression(&mut self, id: ExpressionId) -> Result<u16, OwnedCompileError> {
         let expression = *self.expression(id)?;
         match expression.kind() {
@@ -1292,9 +1369,10 @@ impl<'a> Lowerer<'a> {
                 let constant = self.string_constant(expression.span())?;
                 self.lower_constant(constant, expression.span())
             }
-            ExpressionKind::EmptyTable => {
+            ExpressionKind::Table(constructor) => {
                 let destination = self.allocate_register()?;
                 self.emit(Instruction::NewTable { destination }, expression.span())?;
+                self.lower_table_fields(destination, constructor)?;
                 Ok(destination)
             }
             ExpressionKind::Identifier(identifier) => {
@@ -1314,6 +1392,26 @@ impl<'a> Lowerer<'a> {
             ExpressionKind::Index(index) => {
                 let table = self.lower_expression(index.table())?;
                 let key = self.lower_expression(index.key())?;
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::GetTable {
+                        destination,
+                        table,
+                        key,
+                    },
+                    expression.span(),
+                )?;
+                Ok(destination)
+            }
+            ExpressionKind::Field(field) => {
+                let table = self.lower_expression(field.table())?;
+                let key = self.lower_constant(
+                    Constant::String(copy_bytes(
+                        self.source.slice(field.name().span())?,
+                        "field name",
+                    )?),
+                    field.name().span(),
+                )?;
                 let destination = self.allocate_register()?;
                 self.emit(
                     Instruction::GetTable {

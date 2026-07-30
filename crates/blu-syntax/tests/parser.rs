@@ -119,7 +119,7 @@ fn empty_table_constructors_and_indexing_preserve_structure() {
             .expression(local.value().unwrap())
             .unwrap()
             .kind(),
-        ExpressionKind::EmptyTable
+        ExpressionKind::Table(constructor) if constructor.field_count() == 0
     ));
 
     let Statement::Assignment(assignment) = parsed.ast().statements()[1] else {
@@ -140,6 +140,55 @@ fn empty_table_constructors_and_indexing_preserve_structure() {
             .unwrap()
             .kind(),
         ExpressionKind::Index(_)
+    ));
+}
+
+#[test]
+fn table_fields_and_dot_access_use_bounded_arenas() {
+    let source = source(
+        br#"local values = {10, answer = 20, ["other"] = 30}; values.answer = 21; return values[1], values.answer, values.other"#
+            .to_vec(),
+    );
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Local(local) = parsed.ast().statements()[0] else {
+        panic!("expected local table");
+    };
+    let ExpressionKind::Table(constructor) = parsed
+        .ast()
+        .expression(local.value().unwrap())
+        .unwrap()
+        .kind()
+    else {
+        panic!("expected table constructor");
+    };
+    assert_eq!(constructor.field_count(), 3);
+    assert_eq!(parsed.ast().table_fields(constructor).unwrap().len(), 3);
+    assert!(matches!(
+        parsed.ast().table_fields(constructor).unwrap(),
+        [
+            blu_syntax::TableField::Array(_),
+            blu_syntax::TableField::Named { .. },
+            blu_syntax::TableField::Indexed { .. }
+        ]
+    ));
+
+    let Statement::Assignment(assignment) = parsed.ast().statements()[1] else {
+        panic!("expected field assignment");
+    };
+    assert!(matches!(
+        assignment.target(),
+        blu_syntax::AssignmentTarget::Field(_)
+    ));
+    let Statement::Return(returned) = &parsed.ast().statements()[2] else {
+        panic!("expected return");
+    };
+    assert!(matches!(
+        parsed
+            .ast()
+            .expression(returned.values()[1])
+            .unwrap()
+            .kind(),
+        ExpressionKind::Field(_)
     ));
 }
 

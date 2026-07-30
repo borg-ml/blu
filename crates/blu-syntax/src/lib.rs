@@ -14,9 +14,10 @@ mod parser;
 pub use ast::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
     BinaryOperator, Block, BreakStatement, ContinueStatement, DoStatement, Expression,
-    ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement, IndexExpression,
-    LocalListStatement, LocalStatement, NumericForStatement, RepeatStatement, ReturnStatement,
-    Statement, UnaryExpression, UnaryOperator, WhileStatement,
+    ExpressionId, ExpressionKind, FieldExpression, Identifier, IfClause, IfStatement,
+    IndexExpression, LocalListStatement, LocalStatement, NumericForStatement, RepeatStatement,
+    ReturnStatement, Statement, TableConstructor, TableField, UnaryExpression, UnaryOperator,
+    WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
@@ -173,6 +174,7 @@ pub enum TokenKind {
     Caret,
     Hash,
     Concatenate,
+    Dot,
     FloorDivide,
     LeftParenthesis,
     RightParenthesis,
@@ -841,6 +843,10 @@ pub fn lex(
                     )?;
                 }
                 TokenKind::DecimalNumber
+            }
+            b'.' => {
+                offset += 1;
+                TokenKind::Dot
             }
             byte if is_identifier_start(byte) => {
                 offset += 1;

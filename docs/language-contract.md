@@ -198,13 +198,19 @@ frontend resolves lexical locals first and otherwise lowers scalar identifier
 reads and single-target assignments as globals. Global list assignment and
 versioned `_ENV`/`getfenv`/`setfenv` behavior remain unsupported.
 BluV1 table construction and indexed access require the `TABLES` feature bit.
-The initial owned grammar accepts empty `{}` constructors and bracket-indexed
-reads or single-target writes. Direct execution allocates through the
-generational heap, roots the complete active register file before allocation or
-growth, performs raw value-keyed access, and returns `nil` for absent keys.
-Indexing a non-table and invalid table keys return structured runtime errors.
-Constructor fields, dot syntax, indexed assignment lists, and metamethod-aware
-owned table access remain unsupported rather than silently approximated.
+The owned grammar accepts bounded constructors with sequential array fields,
+identifier-keyed fields, and bracket-keyed fields, plus bracket or dot-name
+reads and single-target writes. Array fields receive consecutive keys starting
+at one in the selected profile's numeric representation. The owned lowering
+evaluates each key before its value and emits field assignments in source
+order. This operational order is explicit; Lua 5.3–5.5 document constructor
+assignment order as undefined, so it is not presented as a stronger Lua
+compatibility guarantee. Direct execution allocates through the generational
+heap, roots the complete active register file before allocation or growth,
+performs raw value-keyed access, and returns `nil` for absent keys. Indexing a
+non-table and invalid table keys return structured runtime errors. Indexed
+assignment lists, final-field MULTRET expansion, and metamethod-aware owned
+table access remain unsupported rather than silently approximated.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

@@ -538,7 +538,7 @@ return value"#
         let tables = SourceFile::new(
             SourceId::new(32),
             "tables.blu",
-            br#"local values = {}; values["answer"] = 42; return values["answer"], values["missing"]"#
+            br#"local values = {40, answer = 41}; values.answer = 42; return values[1], values.answer, values["missing"]"#
                 .to_vec(),
             SourceLimits::default(),
         )
@@ -566,7 +566,18 @@ return value"#
             assert_eq!(
                 Engine::default()
                     .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
-                Ok(vec![expected, Value::Nil]),
+                Ok(vec![
+                    if matches!(
+                        profile,
+                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) {
+                        Value::Integer(40)
+                    } else {
+                        Value::Number(40.0)
+                    },
+                    expected,
+                    Value::Nil,
+                ]),
                 "{profile}"
             );
             let compiled = OwnedCompiler::default()

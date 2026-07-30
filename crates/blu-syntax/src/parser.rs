@@ -1,10 +1,10 @@
 use crate::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
     BinaryOperator, Block, BreakStatement, ContinueStatement, DialectDirective, DoStatement,
-    Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement, IndexExpression,
-    LexError, Lexed, LexerLimits, LocalListStatement, LocalStatement, NumericForStatement,
-    RepeatStatement, ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator,
-    WhileStatement, lex,
+    Expression, ExpressionId, ExpressionKind, FieldExpression, Identifier, IfClause, IfStatement,
+    IndexExpression, LexError, Lexed, LexerLimits, LocalListStatement, LocalStatement,
+    NumericForStatement, RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField,
+    Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -288,6 +288,8 @@ struct Parser<'a> {
     block_depth: usize,
     loop_depth: usize,
     expressions: Vec<Expression>,
+    table_fields: Vec<TableField>,
+    table_field_count: usize,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -309,6 +311,8 @@ impl<'a> Parser<'a> {
             block_depth: 0,
             loop_depth: 0,
             expressions: allocate_vec(ast_capacity, "AST expressions")?,
+            table_fields: allocate_vec(ast_capacity, "AST table fields")?,
+            table_field_count: 0,
             diagnostics: allocate_vec(diagnostic_capacity, "parser diagnostics")?,
         })
     }
@@ -328,6 +332,7 @@ impl<'a> Parser<'a> {
             span,
             self.statements,
             self.expressions,
+            self.table_fields,
         );
         Ok((Some(ast), self.diagnostics))
     }
@@ -861,43 +866,15 @@ impl<'a> Parser<'a> {
         };
         let mut targets = allocate_vec(1, "assignment target list")?;
         let identifier = Identifier::new(target.span());
-        let mut target_expression = self.push_expression(
+        let target_expression = self.push_expression(
             Expression::new(ExpressionKind::Identifier(identifier), target.span()),
             1,
         )?;
-        while self.at(TokenKind::LeftBracket) {
-            self.bump();
-            let Some(key) = self.parse_expression(0)? else {
-                return Ok(());
-            };
-            let Some(close) = self
-                .current()
-                .filter(|token| token.kind() == TokenKind::RightBracket)
-            else {
-                self.report_current_or_eof(
-                    "BLU-PARSE-0024",
-                    "expected `]` after table key",
-                    &["]"],
-                )?;
-                return Ok(());
-            };
-            self.bump();
-            let depth = target_expression.depth.max(key.depth).saturating_add(1);
-            let span = self
-                .expression(target_expression.id)?
-                .span()
-                .merge(close.span())?;
-            target_expression = self.push_expression(
-                Expression::new(
-                    ExpressionKind::Index(IndexExpression::new(target_expression.id, key.id, span)),
-                    span,
-                ),
-                depth,
-            )?;
-        }
+        let target_expression = self.parse_postfix(target_expression)?;
         let first_target = match self.expression(target_expression.id)?.kind() {
             ExpressionKind::Identifier(identifier) => AssignmentTarget::Identifier(identifier),
             ExpressionKind::Index(index) => AssignmentTarget::Index(index),
+            ExpressionKind::Field(field) => AssignmentTarget::Field(field),
             _ => {
                 return Err(ParseError::InternalInvariant {
                     message: "assignment target parser produced a non-target expression",
@@ -905,7 +882,7 @@ impl<'a> Parser<'a> {
             }
         };
         targets.push(first_target);
-        if matches!(first_target, AssignmentTarget::Index(_)) && self.at(TokenKind::Comma) {
+        if !matches!(first_target, AssignmentTarget::Identifier(_)) && self.at(TokenKind::Comma) {
             self.report_current(
                 "BLU-PARSE-0026",
                 "indexed targets are not yet supported in assignment lists",
@@ -1084,22 +1061,7 @@ impl<'a> Parser<'a> {
             TokenKind::StringLiteral => ExpressionKind::StringLiteral,
             TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
             TokenKind::LeftBrace => {
-                self.bump();
-                let Some(close) = self
-                    .current()
-                    .filter(|token| token.kind() == TokenKind::RightBrace)
-                else {
-                    self.report_current_or_eof(
-                        "BLU-PARSE-0025",
-                        "only empty table constructors are currently supported",
-                        &["}"],
-                    )?;
-                    return Ok(None);
-                };
-                self.bump();
-                let span = token.span().merge(close.span())?;
-                let table =
-                    self.push_expression(Expression::new(ExpressionKind::EmptyTable, span), 1)?;
+                let table = self.parse_table_constructor(token)?;
                 return self.parse_postfix(table).map(Some);
             }
             TokenKind::LeftParenthesis => {
@@ -1152,34 +1114,183 @@ impl<'a> Parser<'a> {
         &mut self,
         mut expression: BuiltExpression,
     ) -> Result<BuiltExpression, ParseError> {
-        while self.at(TokenKind::LeftBracket) {
-            self.bump();
-            let Some(key) = self.parse_expression(0)? else {
-                return Ok(expression);
-            };
-            let Some(close) = self
-                .current()
-                .filter(|token| token.kind() == TokenKind::RightBracket)
-            else {
-                self.report_current_or_eof(
-                    "BLU-PARSE-0024",
-                    "expected `]` after table key",
-                    &["]"],
+        loop {
+            if self.at(TokenKind::LeftBracket) {
+                self.bump();
+                let Some(key) = self.parse_expression(0)? else {
+                    return Ok(expression);
+                };
+                let Some(close) = self
+                    .current()
+                    .filter(|token| token.kind() == TokenKind::RightBracket)
+                else {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0024",
+                        "expected `]` after table key",
+                        &["]"],
+                    )?;
+                    return Ok(expression);
+                };
+                self.bump();
+                let depth = expression.depth.max(key.depth).saturating_add(1);
+                let span = self.expression(expression.id)?.span().merge(close.span())?;
+                expression = self.push_expression(
+                    Expression::new(
+                        ExpressionKind::Index(IndexExpression::new(expression.id, key.id, span)),
+                        span,
+                    ),
+                    depth,
                 )?;
-                return Ok(expression);
-            };
-            self.bump();
-            let depth = expression.depth.max(key.depth).saturating_add(1);
-            let span = self.expression(expression.id)?.span().merge(close.span())?;
-            expression = self.push_expression(
-                Expression::new(
-                    ExpressionKind::Index(IndexExpression::new(expression.id, key.id, span)),
-                    span,
-                ),
-                depth,
-            )?;
+            } else if self.at(TokenKind::Dot) {
+                self.bump();
+                let Some(name) = self
+                    .current()
+                    .filter(|token| token.kind() == TokenKind::Identifier)
+                else {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0027",
+                        "expected a field name after `.`",
+                        &["identifier"],
+                    )?;
+                    return Ok(expression);
+                };
+                self.bump();
+                let span = self.expression(expression.id)?.span().merge(name.span())?;
+                expression = self.push_expression(
+                    Expression::new(
+                        ExpressionKind::Field(FieldExpression::new(
+                            expression.id,
+                            Identifier::new(name.span()),
+                            span,
+                        )),
+                        span,
+                    ),
+                    expression.depth.saturating_add(1),
+                )?;
+            } else {
+                break;
+            }
         }
         Ok(expression)
+    }
+
+    fn parse_table_constructor(&mut self, open: Token) -> Result<BuiltExpression, ParseError> {
+        self.bump();
+        let mut fields = allocate_vec(4, "table constructor fields")?;
+        let mut depth = 0usize;
+        while !self.at(TokenKind::RightBrace) {
+            if self.current().is_none() {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0025",
+                    "expected `}` after table constructor",
+                    &["}"],
+                )?;
+                break;
+            }
+            let (field, field_depth) = if self.at(TokenKind::LeftBracket) {
+                self.bump();
+                let Some(key) = self.parse_expression(0)? else {
+                    break;
+                };
+                if !self.at(TokenKind::RightBracket) {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0024",
+                        "expected `]` after table key",
+                        &["]"],
+                    )?;
+                    break;
+                }
+                self.bump();
+                if !self.at(TokenKind::Equal) {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0028",
+                        "expected `=` after indexed table field",
+                        &["="],
+                    )?;
+                    break;
+                }
+                self.bump();
+                let Some(value) = self.parse_expression(0)? else {
+                    break;
+                };
+                (
+                    TableField::Indexed {
+                        key: key.id,
+                        value: value.id,
+                    },
+                    key.depth.max(value.depth),
+                )
+            } else {
+                let Some(value_or_name) = self.parse_expression(0)? else {
+                    break;
+                };
+                if self.at(TokenKind::Equal) {
+                    let ExpressionKind::Identifier(name) =
+                        self.expression(value_or_name.id)?.kind()
+                    else {
+                        self.report_current(
+                            "BLU-PARSE-0029",
+                            "named table field must be an identifier",
+                            &["identifier"],
+                        )?;
+                        break;
+                    };
+                    self.bump();
+                    let Some(value) = self.parse_expression(0)? else {
+                        break;
+                    };
+                    (
+                        TableField::Named {
+                            name,
+                            value: value.id,
+                        },
+                        value_or_name.depth.max(value.depth),
+                    )
+                } else {
+                    (TableField::Array(value_or_name.id), value_or_name.depth)
+                }
+            };
+            self.check_ast_limit()?;
+            self.table_field_count = self.table_field_count.saturating_add(1);
+            push_fallible(&mut fields, field, "table constructor fields")?;
+            depth = depth.max(field_depth);
+            if self.at(TokenKind::Comma) || self.at(TokenKind::Semicolon) {
+                self.bump();
+            } else if !self.at(TokenKind::RightBrace) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0030",
+                    "expected a table field separator",
+                    &[",", ";", "}"],
+                )?;
+                break;
+            }
+        }
+        let Some(close) = self
+            .current()
+            .filter(|token| token.kind() == TokenKind::RightBrace)
+        else {
+            return self.push_expression(
+                Expression::new(
+                    ExpressionKind::Table(TableConstructor::new(self.table_fields.len(), 0)),
+                    open.span(),
+                ),
+                1,
+            );
+        };
+        self.bump();
+        let first_field = self.table_fields.len();
+        let field_count = fields.len();
+        for field in fields {
+            push_fallible(&mut self.table_fields, field, "AST table fields")?;
+        }
+        let span = open.span().merge(close.span())?;
+        self.push_expression(
+            Expression::new(
+                ExpressionKind::Table(TableConstructor::new(first_field, field_count)),
+                span,
+            ),
+            depth.saturating_add(1),
+        )
     }
 
     fn push_expression(
@@ -1211,6 +1322,7 @@ impl<'a> Parser<'a> {
         let required = self
             .statement_count
             .saturating_add(self.expressions.len())
+            .saturating_add(self.table_field_count)
             .saturating_add(1);
         if required > self.limits.max_ast_nodes {
             Err(ParseError::Limit {

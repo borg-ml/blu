@@ -146,6 +146,72 @@ pub struct IndexExpression {
     span: ByteSpan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FieldExpression {
+    table: ExpressionId,
+    name: Identifier,
+    span: ByteSpan,
+}
+
+impl FieldExpression {
+    pub(crate) const fn new(table: ExpressionId, name: Identifier, span: ByteSpan) -> Self {
+        Self { table, name, span }
+    }
+
+    #[must_use]
+    pub const fn table(self) -> ExpressionId {
+        self.table
+    }
+
+    #[must_use]
+    pub const fn name(self) -> Identifier {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct TableConstructor {
+    first_field: usize,
+    field_count: usize,
+}
+
+impl TableConstructor {
+    pub(crate) const fn new(first_field: usize, field_count: usize) -> Self {
+        Self {
+            first_field,
+            field_count,
+        }
+    }
+
+    #[must_use]
+    pub const fn first_field(self) -> usize {
+        self.first_field
+    }
+
+    #[must_use]
+    pub const fn field_count(self) -> usize {
+        self.field_count
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum TableField {
+    Array(ExpressionId),
+    Named {
+        name: Identifier,
+        value: ExpressionId,
+    },
+    Indexed {
+        key: ExpressionId,
+        value: ExpressionId,
+    },
+}
+
 impl IndexExpression {
     pub(crate) const fn new(table: ExpressionId, key: ExpressionId, span: ByteSpan) -> Self {
         Self { table, key, span }
@@ -177,10 +243,11 @@ pub enum ExpressionKind {
     HexNumber,
     BinaryInteger,
     StringLiteral,
-    EmptyTable,
+    Table(TableConstructor),
     Identifier(Identifier),
     Group(ExpressionId),
     Index(IndexExpression),
+    Field(FieldExpression),
     Unary(UnaryExpression),
     Binary(BinaryExpression),
 }
@@ -250,6 +317,7 @@ impl AssignmentStatement {
 pub enum AssignmentTarget {
     Identifier(Identifier),
     Index(IndexExpression),
+    Field(FieldExpression),
 }
 
 impl AssignmentTarget {
@@ -258,6 +326,7 @@ impl AssignmentTarget {
         match self {
             Self::Identifier(identifier) => identifier.span(),
             Self::Index(index) => index.span(),
+            Self::Field(field) => field.span(),
         }
     }
 }
@@ -710,6 +779,7 @@ pub struct Ast {
     span: ByteSpan,
     block: Block,
     expressions: Vec<Expression>,
+    table_fields: Vec<TableField>,
 }
 
 impl Ast {
@@ -718,12 +788,14 @@ impl Ast {
         span: ByteSpan,
         statements: Vec<Statement>,
         expressions: Vec<Expression>,
+        table_fields: Vec<TableField>,
     ) -> Self {
         Self {
             profile,
             span,
             block: Block::new(statements),
             expressions,
+            table_fields,
         }
     }
 
@@ -758,9 +830,23 @@ impl Ast {
     }
 
     #[must_use]
+    pub fn table_fields(&self, constructor: TableConstructor) -> Option<&[TableField]> {
+        let end = constructor
+            .first_field()
+            .checked_add(constructor.field_count())?;
+        self.table_fields.get(constructor.first_field()..end)
+    }
+
+    #[must_use]
+    pub fn table_field_arena(&self) -> &[TableField] {
+        &self.table_fields
+    }
+
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.block
             .node_count()
             .saturating_add(self.expressions.len())
+            .saturating_add(self.table_fields.len())
     }
 }
