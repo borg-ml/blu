@@ -421,6 +421,7 @@ enum AssignmentDestination {
     Local(u16),
     Upvalue(u16),
     Global(u32),
+    Table { table: u16, key: u16 },
 }
 
 struct Lowerer<'a, 'prototypes> {
@@ -1306,7 +1307,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
 
     fn lower_local(&mut self, statement: LocalStatement) -> Result<(), OwnedCompileError> {
         let register = match statement.value() {
-            Some(value) => self.lower_expression(value)?,
+            Some(value) => {
+                let source = self.lower_expression(value)?;
+                self.snapshot_if_bound(source, statement.span())?
+            }
             None => self.lower_constant(Constant::Nil, statement.span())?,
         };
         let start_pc =
@@ -1618,16 +1622,16 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             };
             registers.push(self.lower_constant(Constant::Nil, name.span())?);
         }
+        let mut binding_registers =
+            allocate_vec(statement.names().len(), "local binding registers")?;
+        for source in registers.iter().copied().take(statement.names().len()) {
+            binding_registers.push(self.snapshot_if_bound(source, statement.span())?);
+        }
         let start_pc =
             u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "instruction count passed limits but cannot fit a debug PC",
             })?;
-        for (name, register) in statement
-            .names()
-            .iter()
-            .copied()
-            .zip(registers.iter().copied())
-        {
+        for (name, register) in statement.names().iter().copied().zip(binding_registers) {
             push_fallible(
                 &mut self.bindings,
                 Binding {
@@ -1648,17 +1652,35 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     ) -> Result<(), OwnedCompileError> {
         let mut destinations = allocate_vec(statement.targets().len(), "assignment destinations")?;
         for target in statement.targets() {
-            let AssignmentTarget::Identifier(target) = target else {
-                return Err(OwnedCompileError::InternalInvariant {
-                    message: "indexed assignment reached list lowering",
-                });
-            };
-            let destination = if let Some(register) = self.resolve_local(target.span())? {
-                AssignmentDestination::Local(register)
-            } else if let Some(upvalue) = self.resolve_upvalue(target.span())? {
-                AssignmentDestination::Upvalue(upvalue)
-            } else {
-                AssignmentDestination::Global(self.global_name_constant(target.span())?)
+            let destination = match *target {
+                AssignmentTarget::Identifier(target) => {
+                    if let Some(register) = self.resolve_local(target.span())? {
+                        AssignmentDestination::Local(register)
+                    } else if let Some(upvalue) = self.resolve_upvalue(target.span())? {
+                        AssignmentDestination::Upvalue(upvalue)
+                    } else {
+                        AssignmentDestination::Global(self.global_name_constant(target.span())?)
+                    }
+                }
+                AssignmentTarget::Index(index) => {
+                    let table = self.lower_expression(index.table())?;
+                    let table = self.snapshot_register(table, index.span())?;
+                    let key = self.lower_expression(index.key())?;
+                    let key = self.snapshot_register(key, index.span())?;
+                    AssignmentDestination::Table { table, key }
+                }
+                AssignmentTarget::Field(field) => {
+                    let table = self.lower_expression(field.table())?;
+                    let table = self.snapshot_register(table, field.span())?;
+                    let key = self.lower_constant(
+                        Constant::String(copy_bytes(
+                            self.source.slice(field.name().span())?,
+                            "assignment field name",
+                        )?),
+                        field.name().span(),
+                    )?;
+                    AssignmentDestination::Table { table, key }
+                }
             };
             destinations.push(destination);
         }
@@ -1712,9 +1734,41 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 AssignmentDestination::Global(name) => {
                     self.emit(Instruction::StoreGlobal { name, source }, statement.span())?
                 }
+                AssignmentDestination::Table { table, key } => self.emit(
+                    Instruction::SetTable {
+                        table,
+                        key,
+                        value: source,
+                    },
+                    statement.span(),
+                )?,
             }
         }
         Ok(())
+    }
+
+    fn snapshot_register(&mut self, source: u16, span: ByteSpan) -> Result<u16, OwnedCompileError> {
+        let destination = self.allocate_register()?;
+        self.emit(
+            Instruction::Move {
+                destination,
+                source,
+            },
+            span,
+        )?;
+        Ok(destination)
+    }
+
+    fn snapshot_if_bound(&mut self, source: u16, span: ByteSpan) -> Result<u16, OwnedCompileError> {
+        if self
+            .bindings
+            .iter()
+            .any(|binding| binding.register == source)
+        {
+            self.snapshot_register(source, span)
+        } else {
+            Ok(source)
+        }
     }
 
     fn lower_return(&mut self, statement: &ReturnStatement) -> Result<(), OwnedCompileError> {

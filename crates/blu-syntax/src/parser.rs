@@ -1185,14 +1185,6 @@ impl<'a> Parser<'a> {
             }
         };
         targets.push(first_target);
-        if !matches!(first_target, AssignmentTarget::Identifier(_)) && self.at(TokenKind::Comma) {
-            self.report_current(
-                "BLU-PARSE-0026",
-                "indexed targets are not yet supported in assignment lists",
-                &["="],
-            )?;
-            return Ok(());
-        }
         while self.at(TokenKind::Comma) {
             self.bump();
             if !self.at(TokenKind::Identifier) {
@@ -1208,11 +1200,26 @@ impl<'a> Parser<'a> {
                     message: "assignment target check succeeded without a current token",
                 });
             };
-            push_fallible(
-                &mut targets,
-                AssignmentTarget::Identifier(Identifier::new(target.span())),
-                "assignment target list",
+            let identifier = Identifier::new(target.span());
+            let expression = self.push_expression(
+                Expression::new(ExpressionKind::Identifier(identifier), target.span()),
+                1,
             )?;
+            let expression = self.parse_postfix(expression)?;
+            let target = match self.expression(expression.id)?.kind() {
+                ExpressionKind::Identifier(identifier) => AssignmentTarget::Identifier(identifier),
+                ExpressionKind::Index(index) => AssignmentTarget::Index(index),
+                ExpressionKind::Field(field) => AssignmentTarget::Field(field),
+                _ => {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0046",
+                        "expected an assignable identifier, index, or field",
+                        &["identifier", "index", "field"],
+                    )?;
+                    return Ok(());
+                }
+            };
+            push_fallible(&mut targets, target, "assignment target list")?;
         }
         if !self.at(TokenKind::Equal) {
             self.report_current_or_eof(

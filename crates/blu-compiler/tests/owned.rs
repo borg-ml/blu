@@ -161,8 +161,10 @@ fn local_resolution_is_sequential_and_shadow_aware() {
         .compile(&source, SemanticProfile::Luau, compiler_identity())
         .unwrap();
     assert_eq!(compiled.artifact().main().locals.len(), 2);
-    assert_eq!(compiled.artifact().main().locals[0].register, 0);
-    assert_eq!(compiled.artifact().main().locals[1].register, 0);
+    assert_ne!(
+        compiled.artifact().main().locals[0].register,
+        compiled.artifact().main().locals[1].register
+    );
 
     let shadowed = make_source(b"local answer = 1\nlocal answer = 40\nreturn answer + 2".to_vec());
     let compiled = OwnedCompiler::default()
@@ -285,15 +287,10 @@ fn local_assignment_mutates_the_active_shadowed_binding_for_every_profile() {
         let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
             .unwrap();
-        assert!(compiled.artifact().main().code.iter().any(|instruction| {
-            matches!(
-                instruction,
-                Instruction::Move {
-                    destination: 1,
-                    source: 3,
-                }
-            )
-        }));
+        let destination = compiled.artifact().main().locals[1].register;
+        assert!(compiled.artifact().main().code.iter().any(
+            |instruction| matches!(instruction, Instruction::Move { destination: register, .. } if *register == destination)
+        ));
         assert_eq!(
             Vm::new(Dialect::Blu)
                 .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
@@ -764,6 +761,52 @@ fn comparisons_are_canonical_profile_neutral_and_directly_executable() {
             ]),
             "{profile}"
         );
+    }
+}
+
+#[test]
+fn indexed_assignment_lists_snapshot_targets_and_rhs_before_committing() {
+    let source = make_source(
+        b"local left = {10} local right = {20} local index = 1 left[index], index, right[index] = right[index], 2, left[index] return left[1], right[1], index"
+            .to_vec(),
+    );
+    let rebound = make_source(
+        b"local value = {1} local original = value local other = {2} value[1], value = 9, other return original[1], value[1]"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let modern = matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        );
+        for (source, expected) in [
+            (
+                &source,
+                if modern {
+                    vec![Value::Integer(20), Value::Integer(10), Value::Integer(2)]
+                } else {
+                    vec![Value::Number(20.0), Value::Number(10.0), Value::Number(2.0)]
+                },
+            ),
+            (
+                &rebound,
+                if modern {
+                    vec![Value::Integer(9), Value::Integer(2)]
+                } else {
+                    vec![Value::Number(9.0), Value::Number(2.0)]
+                },
+            ),
+        ] {
+            let compiled = OwnedCompiler::default()
+                .compile(source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(expected),
+                "{profile}"
+            );
+        }
     }
 }
 

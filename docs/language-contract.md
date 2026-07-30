@@ -226,9 +226,16 @@ assignment order as undefined, so it is not presented as a stronger Lua
 compatibility guarantee. Direct execution allocates through the generational
 heap, roots the complete active register file before allocation or growth,
 performs raw value-keyed access, and returns `nil` for absent keys. Indexing a
-non-table and invalid table keys return structured runtime errors. Indexed
-assignment lists, final-field MULTRET expansion, and metamethod-aware owned
-table access remain unsupported rather than silently approximated.
+non-table and invalid table keys return structured runtime errors. Assignment
+lists may mix identifier, bracket-index, and dot-field targets. Every
+table/key target is evaluated left-to-right and snapshotted before any
+right-hand side is evaluated; every right-hand side is then snapshotted before
+source-order commits begin. This preserves simultaneous assignment and the
+pinned `value[1], value = replacement, other` behavior. Local declarations
+likewise allocate a distinct binding register when initialized from an
+existing local, so later rebinding does not alias the two names. Final-field
+MULTRET expansion and metamethod-aware owned table access remain unsupported
+rather than silently approximated.
 Owned unary `#` measures the raw sequence length of tables without a `__len`
 handler, using the same profile-specific integer/number result subtype as
 string length. Lua 5.1 ignores table `__len` and therefore remains raw. Blu,

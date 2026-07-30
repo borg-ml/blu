@@ -131,8 +131,10 @@ The owned frontend also supports bounded table constructors with sequential
 array, identifier-keyed, and bracket-keyed fields, plus bracket and dot-name
 reads and single-target writes. These execute directly through the generational
 heap, return `nil` for absent keys, and retain active registers as GC roots
-during allocation and table growth. Metamethod dispatch, indexed assignment
-lists, and final-field MULTRET expansion remain explicit later work.
+during allocation and table growth. Mixed identifier/index/field assignment
+lists snapshot every target and right-hand side before committing writes.
+Metamethod dispatch and final-field MULTRET expansion remain explicit later
+work.
 Unary `#` also measures raw table sequences. Lua 5.1 explicitly ignores
 `__len`; profiles that require a present handler fail structurally until the
 yieldable metamethod continuation is implemented.

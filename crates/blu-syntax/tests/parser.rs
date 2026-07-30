@@ -431,6 +431,24 @@ fn assignment_target_and_value_lists_preserve_order_and_full_span() {
             b"first, second = second, first"
         );
     }
+
+    let source = source(b"values[index], object.field, name = 1, 2, 3".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::AssignmentList(assignment) = &parsed.ast().statements()[0] else {
+        panic!("expected mixed assignment-list statement");
+    };
+    assert!(matches!(
+        assignment.targets()[0],
+        blu_syntax::AssignmentTarget::Index(_)
+    ));
+    assert!(matches!(
+        assignment.targets()[1],
+        blu_syntax::AssignmentTarget::Field(_)
+    ));
+    assert!(matches!(
+        assignment.targets()[2],
+        blu_syntax::AssignmentTarget::Identifier(_)
+    ));
 }
 
 #[test]
