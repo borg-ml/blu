@@ -411,6 +411,11 @@ selection so NaN does not silently replace or get replaced by another operand.
 follow the Lua 5.3–5.5 contracts in those profiles and Blu. They fail with an
 explicit unsupported-profile error in Luau and Lua 5.1–5.2, where the
 functions do not exist upstream.
+Blu and Luau expose the Luau numeric extensions `math.clamp`, `math.sign`, and
+`math.round`. They return numbers, preserve Luau NaN behavior, use
+ties-away-from-zero rounding, and reject inverted clamp bounds structurally.
+Lua profiles reject these functions explicitly because they are absent from
+the corresponding standard libraries.
 `tonumber` preserves existing numeric subtypes and integer string conversions
 for Blu and Lua 5.3–5.5, returns numbers for legacy profiles, accepts ordinary
 hexadecimal integer and floating strings, and follows profile-specific explicit-base parsing,

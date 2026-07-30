@@ -6583,8 +6583,61 @@ impl Vm {
             })?;
             Ok(vec![Value::Boolean((left as u64) < right as u64)])
         });
+        let clamp = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.clamp",
+                    profile,
+                });
+            }
+            let value = number_argument(arguments, 0, "math.clamp")?;
+            let minimum = number_argument(arguments, 1, "math.clamp")?;
+            let maximum = number_argument(arguments, 2, "math.clamp")?;
+            if maximum < minimum {
+                return Err(RuntimeError::InvalidRange {
+                    operation: "math.clamp",
+                });
+            }
+            Ok(vec![Value::Number(if value < minimum {
+                minimum
+            } else if value > maximum {
+                maximum
+            } else {
+                value
+            })])
+        });
+        let sign = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.sign",
+                    profile,
+                });
+            }
+            let value = number_argument(arguments, 0, "math.sign")?;
+            Ok(vec![Value::Number(if value < 0.0 {
+                -1.0
+            } else if value > 0.0 {
+                1.0
+            } else {
+                0.0
+            })])
+        });
+        let round = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.round",
+                    profile,
+                });
+            }
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.round")?.round(),
+            )])
+        });
 
-        let table = self.heap.allocate_table(0, 23)?;
+        let table = self.heap.allocate_table(0, 26)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -6607,6 +6660,9 @@ impl Vm {
             (&b"type"[..], Value::NativeFunction(math_type)),
             (&b"tointeger"[..], Value::NativeFunction(to_integer)),
             (&b"ult"[..], Value::NativeFunction(unsigned_less)),
+            (&b"clamp"[..], Value::NativeFunction(clamp)),
+            (&b"sign"[..], Value::NativeFunction(sign)),
+            (&b"round"[..], Value::NativeFunction(round)),
             (&b"pi"[..], Value::Number(core::f64::consts::PI)),
             (&b"huge"[..], Value::Number(f64::INFINITY)),
         ] {
@@ -8817,6 +8873,9 @@ pub enum RuntimeError {
         expected: &'static str,
         actual: &'static str,
     },
+    InvalidRange {
+        operation: &'static str,
+    },
     NativeFunction(u32),
     Argument {
         function: &'static str,
@@ -8992,6 +9051,9 @@ impl fmt::Display for RuntimeError {
                 expected,
                 actual,
             } => write!(f, "{operation} expected {expected}, received {actual}"),
+            Self::InvalidRange { operation } => {
+                write!(f, "{operation} received an invalid range")
+            }
             Self::NativeFunction(index) => write!(f, "invalid native function {index}"),
             Self::Argument { function, index } => {
                 write!(f, "{function} requires argument {index}")

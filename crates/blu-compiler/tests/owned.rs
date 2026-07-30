@@ -4075,6 +4075,71 @@ fn math_type_and_tointeger_follow_modern_profile_contracts() {
 }
 
 #[test]
+fn luau_math_extensions_are_profile_gated_and_edge_compatible() {
+    let source = make_source(
+        b"return math.clamp(5,1,3),math.clamp(-1,1,3),math.sign(-3),math.sign(0),math.sign(0/0),math.round(1.5),math.round(-1.5),math.round(1.49)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert_eq!(
+                result,
+                Ok(vec![
+                    Value::Number(3.0),
+                    Value::Number(1.0),
+                    Value::Number(-1.0),
+                    Value::Number(0.0),
+                    Value::Number(0.0),
+                    Value::Number(2.0),
+                    Value::Number(-2.0),
+                    Value::Number(1.0),
+                ]),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.clamp",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+
+        let source = make_source(b"return math.clamp(2,3,1)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert_eq!(
+                result,
+                Err(RuntimeError::InvalidRange {
+                    operation: "math.clamp",
+                }),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.clamp",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
     let source = make_source(
         b"return tonumber(' 42 '),tonumber('ff',16),tonumber('0x10'),tonumber(3),tonumber('3.0',10),tonumber('nan'),tonumber('inf'),tonumber('ffffffffffffffff',16),tonumber('0x1.8p1'),tonumber('-0x1p2'),tonumber('x')"
