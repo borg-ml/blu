@@ -15,8 +15,8 @@ pub use ast::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
     DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody,
-    FunctionExpression, FunctionId, FunctionStatement, Identifier, IfClause, IfStatement,
-    IndexExpression, LocalFunctionStatement, LocalListStatement, LocalStatement,
+    FunctionExpression, FunctionId, FunctionStatement, GenericForStatement, Identifier, IfClause,
+    IfStatement, IndexExpression, LocalFunctionStatement, LocalListStatement, LocalStatement,
     MethodCallExpression, NumericForStatement, RepeatStatement, ReturnStatement, Statement,
     TableConstructor, TableField, UnaryExpression, UnaryOperator, WhileStatement,
 };
@@ -147,6 +147,7 @@ pub enum TokenKind {
     Repeat,
     Until,
     For,
+    In,
     Break,
     Continue,
     Nil,
@@ -877,6 +878,7 @@ pub fn lex(
                     b"repeat" => TokenKind::Repeat,
                     b"until" => TokenKind::Until,
                     b"for" => TokenKind::For,
+                    b"in" => TokenKind::In,
                     b"break" => TokenKind::Break,
                     b"continue" => {
                         if !supports_continue(explicit_profile) {

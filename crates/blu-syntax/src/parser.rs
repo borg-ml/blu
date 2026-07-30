@@ -2,11 +2,11 @@ use crate::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
     DialectDirective, DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression,
-    FunctionBody, FunctionExpression, FunctionId, FunctionStatement, Identifier, IfClause,
-    IfStatement, IndexExpression, LexError, Lexed, LexerLimits, LocalFunctionStatement,
-    LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement, RepeatStatement,
-    ReturnStatement, Statement, TableConstructor, TableField, Token, TokenKind, UnaryExpression,
-    UnaryOperator, WhileStatement, lex,
+    FunctionBody, FunctionExpression, FunctionId, FunctionStatement, GenericForStatement,
+    Identifier, IfClause, IfStatement, IndexExpression, LexError, Lexed, LexerLimits,
+    LocalFunctionStatement, LocalListStatement, LocalStatement, MethodCallExpression,
+    NumericForStatement, RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField,
+    Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -365,7 +365,7 @@ impl<'a> Parser<'a> {
                 TokenKind::While => self.parse_while()?,
                 TokenKind::Repeat => self.parse_repeat()?,
                 TokenKind::Do => self.parse_do()?,
-                TokenKind::For => self.parse_numeric_for()?,
+                TokenKind::For => self.parse_for()?,
                 TokenKind::Break | TokenKind::Continue => {
                     let Some(keyword) = self.bump() else {
                         return Err(ParseError::InternalInvariant {
@@ -634,7 +634,7 @@ impl<'a> Parser<'a> {
         )))
     }
 
-    fn parse_numeric_for(&mut self) -> Result<(), ParseError> {
+    fn parse_for(&mut self) -> Result<(), ParseError> {
         let Some(keyword) = self.bump() else {
             return Err(ParseError::InternalInvariant {
                 message: "for parser entered without a current token",
@@ -655,12 +655,7 @@ impl<'a> Parser<'a> {
         };
         let name = Identifier::new(name.span());
         if !self.at(TokenKind::Equal) {
-            self.report_current_or_eof(
-                "BLU-PARSE-0027",
-                "only numeric `for name = initial, limit do` is currently supported",
-                &["="],
-            )?;
-            return Ok(());
+            return self.parse_generic_for(keyword, name);
         }
         self.bump();
         let Some(initial) = self.parse_expression(0)? else {
@@ -715,6 +710,89 @@ impl<'a> Parser<'a> {
             initial.id,
             limit.id,
             step,
+            body,
+            keyword.span().merge(end.span())?,
+        )))
+    }
+
+    fn parse_generic_for(
+        &mut self,
+        keyword: Token,
+        first_name: Identifier,
+    ) -> Result<(), ParseError> {
+        let mut names = allocate_vec(2, "generic for names")?;
+        push_fallible(&mut names, first_name, "generic for names")?;
+        while self.at(TokenKind::Comma) {
+            self.bump();
+            if !self.at(TokenKind::Identifier) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0042",
+                    "expected loop variable after `,`",
+                    &["identifier"],
+                )?;
+                return Ok(());
+            }
+            let Some(name) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "identifier check succeeded without a current token",
+                });
+            };
+            push_fallible(
+                &mut names,
+                Identifier::new(name.span()),
+                "generic for names",
+            )?;
+        }
+        if !self.at(TokenKind::In) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0043",
+                "expected `in` after generic for variables",
+                &["in"],
+            )?;
+            return Ok(());
+        }
+        self.bump();
+        let mut values = allocate_vec(2, "generic for values")?;
+        let Some(first) = self.parse_expression(0)? else {
+            return Ok(());
+        };
+        push_fallible(&mut values, first.id, "generic for values")?;
+        while self.at(TokenKind::Comma) {
+            self.bump();
+            let Some(value) = self.parse_expression(0)? else {
+                return Ok(());
+            };
+            push_fallible(&mut values, value.id, "generic for values")?;
+        }
+        if !self.at(TokenKind::Do) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0044",
+                "expected `do` after generic for values",
+                &["do"],
+            )?;
+            return Ok(());
+        }
+        self.bump();
+        self.loop_depth += 1;
+        let parsed_body = self.parse_nested_block(&[TokenKind::End]);
+        self.loop_depth -= 1;
+        let body = parsed_body?;
+        if !self.at(TokenKind::End) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0045",
+                "expected `end` to close generic for statement",
+                &["end"],
+            )?;
+            return Ok(());
+        }
+        let Some(end) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "end check succeeded without a current token",
+            });
+        };
+        self.push_statement(Statement::GenericFor(GenericForStatement::new(
+            names,
+            values,
             body,
             keyword.span().merge(end.span())?,
         )))

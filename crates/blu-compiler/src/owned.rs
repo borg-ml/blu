@@ -30,9 +30,10 @@ use blu_core::{
 use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryOperator,
     CallExpression, Expression, ExpressionId, ExpressionKind, FunctionId, FunctionStatement,
-    Identifier, IfStatement, LocalListStatement, LocalStatement, MethodCallExpression,
-    NumericForStatement, ParseError, ParseLimits, ParseOutcome, Rejected, RepeatStatement,
-    ReturnStatement, Statement, TableConstructor, TableField, UnaryOperator, WhileStatement, parse,
+    GenericForStatement, Identifier, IfStatement, LocalListStatement, LocalStatement,
+    MethodCallExpression, NumericForStatement, ParseError, ParseLimits, ParseOutcome, Rejected,
+    RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField, UnaryOperator,
+    WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -746,6 +747,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     self.lower_numeric_for(statement)?;
                     false
                 }
+                Statement::GenericFor(statement) => {
+                    self.lower_generic_for(statement)?;
+                    false
+                }
                 Statement::Break(statement) => {
                     self.lower_break(statement.span())?;
                     true
@@ -1068,6 +1073,141 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             },
             statement.span(),
         )?;
+        let target = u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
+            message: "loop target passed limits but cannot fit BluV1",
+        })?;
+        self.emit(Instruction::Jump { target }, statement.span())?;
+        let end = self.code.len();
+        self.patch_forward_branch(exit, end)?;
+        for branch in breaks {
+            self.patch_forward_branch(branch, end)?;
+        }
+        self.close_scope(loop_scope)
+    }
+
+    fn lower_generic_for(
+        &mut self,
+        statement: &GenericForStatement,
+    ) -> Result<(), OwnedCompileError> {
+        if matches!(
+            self.profile,
+            SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                "BLU-COMPILE-0005",
+                Phase::Lower,
+                statement.span(),
+                "Lua 5.4-5.5 generic for requires an unimplemented to-be-closed fourth control",
+            )?));
+        }
+        let mut controls = allocate_vec(3, "generic for controls")?;
+        for (index, value) in statement.values().iter().copied().enumerate() {
+            let remaining = 3usize.saturating_sub(index);
+            let is_last = index + 1 == statement.values().len();
+            let mut lowered = if is_last && remaining > 1 {
+                self.lower_call_expression_results(value, remaining)?
+                    .unwrap_or_else(Vec::new)
+            } else {
+                Vec::new()
+            };
+            if lowered.is_empty() {
+                lowered.push(self.lower_expression(value)?);
+            }
+            for source in lowered.into_iter().take(remaining) {
+                let snapshot = self.allocate_register()?;
+                self.emit(
+                    Instruction::Move {
+                        destination: snapshot,
+                        source,
+                    },
+                    self.expression(value)?.span(),
+                )?;
+                controls.push(snapshot);
+            }
+        }
+        while controls.len() < 3 {
+            controls.push(self.lower_constant(Constant::Nil, statement.span())?);
+        }
+        let iterator = controls[0];
+        let state = controls[1];
+        let control = controls[2];
+
+        let loop_scope = self.bindings.len();
+        let start = self.code.len();
+        let results = self.emit_fixed_call_results(
+            iterator,
+            &[state, control],
+            statement.names().len(),
+            statement.span(),
+        )?;
+        self.emit(
+            Instruction::Move {
+                destination: control,
+                source: results[0],
+            },
+            statement.span(),
+        )?;
+        let nil = self.lower_constant(Constant::Nil, statement.span())?;
+        let finished = self.allocate_register()?;
+        self.emit(
+            Instruction::Equal {
+                destination: finished,
+                left: results[0],
+                right: nil,
+            },
+            statement.span(),
+        )?;
+        let exit = self.code.len();
+        self.emit(
+            Instruction::JumpIfTruthy {
+                condition: finished,
+                target: 0,
+            },
+            statement.span(),
+        )?;
+
+        let start_pc =
+            u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "instruction count passed limits but cannot fit a debug PC",
+            })?;
+        for (name, register) in statement
+            .names()
+            .iter()
+            .copied()
+            .zip(results.iter().copied())
+        {
+            self.push_binding(BindingName::Source(name.span()), register, start_pc)?;
+        }
+        push_fallible(
+            &mut self.loop_breaks,
+            allocate_vec(2, "loop break branches")?,
+            "loop control stack",
+        )?;
+        push_fallible(
+            &mut self.loop_continues,
+            allocate_vec(2, "loop continue branches")?,
+            "loop continue stack",
+        )?;
+        let body_scope = self.bindings.len();
+        let lowered = self.lower_statements(statement.body().statements());
+        let continues = self
+            .loop_continues
+            .pop()
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "loop continue stack became empty during lowering",
+            })?;
+        let breaks = self
+            .loop_breaks
+            .pop()
+            .ok_or(OwnedCompileError::InternalInvariant {
+                message: "loop control stack became empty during lowering",
+            })?;
+        lowered?;
+        self.close_scope(body_scope)?;
+        let continue_target = self.code.len();
+        for branch in continues {
+            self.patch_forward_branch(branch, continue_target)?;
+        }
         let target = u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
             message: "loop target passed limits but cannot fit BluV1",
         })?;

@@ -118,6 +118,10 @@ numeric representation for the implicit positive unit step, and scope the
 index to the loop. Explicit, provably nonzero numeric-literal steps support
 both directions. Zero or dynamic steps fail during lowering until their
 conflicting profile-specific runtime behavior can be represented directly.
+Generic `for` now executes iterator/state/control triples in Blu, Luau, and
+Lua 5.1–5.3, including bounded final-call adjustment, lexical result
+variables, and nil-only termination. Lua 5.4–5.5 reject this syntax during
+lowering until their fourth to-be-closed control has real `__close` unwinding.
 Canonical BluV1 global loads and stores connect the owned frontend to the VM's
 embedding registry. Unknown scalar reads produce `nil`, and scalar writes
 persist in the VM; identifier assignment lists can mix locals, captures, and

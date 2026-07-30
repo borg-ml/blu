@@ -1175,6 +1175,87 @@ fn numeric_for_accepts_nonzero_literal_steps_and_rejects_unresolved_zero_behavio
 }
 
 #[test]
+fn generic_for_executes_pairs_and_owned_iterators_across_profiles() {
+    for (bytes, result) in [
+        (
+            b"local total = 0 for key, value in pairs({ left = 2, right = 3 }) do total = total + value end return total"
+                .as_slice(),
+            5,
+        ),
+        (
+            b"local function iterator(limit, control) local value = control + 1 if value <= limit then return value, value * 2 end end local total = 0 for key, value in iterator, 3, 0 do total = total + key + value end return total"
+                .as_slice(),
+            18,
+        ),
+        (
+            b"local count = 0 local function iterator() count = count + 1 if count == 1 then return false, 42 end end local total = 0 for key, value in iterator do total = total + value end return total"
+                .as_slice(),
+            42,
+        ),
+    ] {
+        let source = make_source(bytes.to_vec());
+        for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+            if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55) {
+                assert!(
+                    matches!(compiled, Err(OwnedCompileError::Diagnostic(_))),
+                    "{profile}"
+                );
+                continue;
+            }
+            let result = if profile == SemanticProfile::Lua53 {
+                Value::Integer(result)
+            } else {
+                Value::Number(result as f64)
+            };
+            assert_eq!(
+                Vm::default().execute_blu_v1(
+                    compiled.unwrap().into_validated_artifact(),
+                    BluLimits::default()
+                ),
+                Ok(vec![result]),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
+fn generic_for_adjusts_the_final_control_call_exactly_once() {
+    let source = make_source(
+        b"local calls = 0 local function iterator(limit, control) local value = control + 1 if value <= limit then return value, value end end local function controls() calls = calls + 1 return iterator, 3, 0 end local total = 0 for key, value in controls() do total = total + value end return total, calls"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+        if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55) {
+            assert!(matches!(compiled, Err(OwnedCompileError::Diagnostic(_))));
+            continue;
+        }
+        let integer_profile = profile == SemanticProfile::Lua53;
+        assert_eq!(
+            Vm::default().execute_blu_v1(
+                compiled.unwrap().into_validated_artifact(),
+                BluLimits::default()
+            ),
+            Ok(vec![
+                if integer_profile {
+                    Value::Integer(6)
+                } else {
+                    Value::Number(6.0)
+                },
+                if integer_profile {
+                    Value::Integer(1)
+                } else {
+                    Value::Number(1.0)
+                },
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_scalar_globals_round_trip_and_persist_in_the_vm_registry() {
     let source = make_source(b"answer = 40\nanswer = answer + 2\nreturn answer, missing".to_vec());
     for profile in SemanticProfile::ALL {

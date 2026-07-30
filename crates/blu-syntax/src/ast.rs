@@ -834,6 +834,50 @@ pub struct NumericForStatement {
     span: ByteSpan,
 }
 
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GenericForStatement {
+    names: Vec<Identifier>,
+    values: Vec<ExpressionId>,
+    body: Block,
+    span: ByteSpan,
+}
+
+impl GenericForStatement {
+    pub(crate) const fn new(
+        names: Vec<Identifier>,
+        values: Vec<ExpressionId>,
+        body: Block,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            names,
+            values,
+            body,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub fn names(&self) -> &[Identifier] {
+        &self.names
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[ExpressionId] {
+        &self.values
+    }
+
+    #[must_use]
+    pub const fn body(&self) -> &Block {
+        &self.body
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl NumericForStatement {
     pub(crate) const fn new(
         name: Identifier,
@@ -971,6 +1015,7 @@ pub enum Statement {
     Repeat(RepeatStatement),
     Do(DoStatement),
     NumericFor(NumericForStatement),
+    GenericFor(GenericForStatement),
     Break(BreakStatement),
     Continue(ContinueStatement),
     Return(ReturnStatement),
@@ -992,6 +1037,7 @@ impl Statement {
             Self::Repeat(statement) => statement.span(),
             Self::Do(statement) => statement.span(),
             Self::NumericFor(statement) => statement.span(),
+            Self::GenericFor(statement) => statement.span(),
             Self::Break(statement) => statement.span(),
             Self::Continue(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
@@ -1033,6 +1079,7 @@ impl Block {
                 Statement::Repeat(statement) => statement.body().node_count(),
                 Statement::Do(statement) => statement.body().node_count(),
                 Statement::NumericFor(statement) => statement.body().node_count(),
+                Statement::GenericFor(statement) => statement.body().node_count(),
                 Statement::LocalFunction(_) => 0,
                 Statement::Function(_) => 0,
                 _ => 0,

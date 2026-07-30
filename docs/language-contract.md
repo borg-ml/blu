@@ -196,6 +196,17 @@ This restriction preserves an upstream conflict: pinned Lua 5.1–5.3 classify
 zero with non-negative steps, Lua 5.4–5.5 raise "`for` step is zero", and
 pinned Luau classifies zero with non-positive steps. Blu's zero-step behavior
 remains unassigned.
+The owned generic-for slice accepts
+`for name [, name ...] in expression [, expression ...] do ... end` for Blu,
+Luau, and Lua 5.1–5.3. Its expression list is evaluated once and adjusted to
+the iterator, state, and control triplet; the final call supplies remaining
+controls through bounded fixed MULTRET. Each step calls the iterator with
+state and control, binds its fixed results, and terminates only when the first
+result is `nil`. `break` and profile-available `continue` use the same
+structured loop scopes as numeric `for`. Blu deliberately selects this
+triplet contract. Lua 5.4–5.5 generic loops are rejected with
+`BLU-COMPILE-0005` until their fourth to-be-closed control and `__close`
+unwinding are implemented; it is not silently discarded.
 BluV1 global load/store instructions use byte-string constants as names and
 require the `GLOBALS` feature bit. Validation rejects non-string name
 references and reads from uninitialized registers. Direct execution reads and

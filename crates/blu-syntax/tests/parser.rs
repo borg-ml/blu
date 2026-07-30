@@ -722,6 +722,28 @@ fn numeric_for_retains_controls_body_and_optional_step() {
 }
 
 #[test]
+fn generic_for_retains_variable_and_value_lists() {
+    for profile in SemanticProfile::ALL {
+        let source_file =
+            source(b"for key, value in iterator, state, control do break end".to_vec());
+        let parsed = accepted(&source_file, profile, ParseLimits::default());
+        let Statement::GenericFor(statement) = &parsed.ast().statements()[0] else {
+            panic!("expected generic for statement");
+        };
+        assert_eq!(statement.names().len(), 2);
+        assert_eq!(statement.values().len(), 3);
+        assert_eq!(
+            source_file.slice(statement.names()[0].span()).unwrap(),
+            b"key"
+        );
+        assert!(matches!(
+            statement.body().statements()[0],
+            Statement::Break(_)
+        ));
+    }
+}
+
+#[test]
 fn break_is_scoped_to_loop_bodies_and_terminates_its_block() {
     let source_file = source(b"while true do if ready then break end end".to_vec());
     let parsed = accepted(&source_file, SemanticProfile::Blu, ParseLimits::default());
