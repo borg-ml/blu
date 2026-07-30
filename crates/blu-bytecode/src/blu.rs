@@ -75,6 +75,8 @@ impl FeatureBits {
     pub const RETURN_CALLS: Self = Self(1 << 12);
     /// Fixed-width access to a function frame's variadic arguments.
     pub const VARARGS: Self = Self(1 << 13);
+    /// Calls whose complete result vector is consumed by a bounded continuation.
+    pub const DYNAMIC_CALL_RESULTS: Self = Self(1 << 14);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -89,7 +91,8 @@ impl FeatureBits {
             | Self::CLOSURES.0
             | Self::FIXED_MULTI_RESULTS.0
             | Self::RETURN_CALLS.0
-            | Self::VARARGS.0,
+            | Self::VARARGS.0
+            | Self::DYNAMIC_CALL_RESULTS.0,
     );
 
     #[must_use]
@@ -286,6 +289,20 @@ pub enum Instruction {
         table: u16,
         start: u32,
     },
+    SetListCall {
+        table: u16,
+        start: u32,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
+    SetListCallVarargs {
+        table: u16,
+        start: u32,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
     Call {
         destination: u16,
         function: u16,
@@ -461,6 +478,8 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::GetTable { .. }
             | Instruction::SetTable { .. }
             | Instruction::SetListVarargs { .. }
+            | Instruction::SetListCall { .. }
+            | Instruction::SetListCallVarargs { .. }
             | Instruction::Call { .. }
             | Instruction::CallResults { .. }
             | Instruction::CallVarargsResults { .. }
@@ -502,6 +521,8 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::GetTable { .. }
                 | Instruction::SetTable { .. }
                 | Instruction::SetListVarargs { .. }
+                | Instruction::SetListCall { .. }
+                | Instruction::SetListCallVarargs { .. }
                 | Instruction::Call { .. }
                 | Instruction::CallResults { .. }
                 | Instruction::CallVarargsResults { .. }
@@ -1289,6 +1310,7 @@ fn validate_prototype(
                 | Instruction::ReturnCallVarargs { .. }
                 | Instruction::ReturnCallVarargsPrefix { .. }
                 | Instruction::SetListVarargs { .. }
+                | Instruction::SetListCallVarargs { .. }
         )
     }) {
         if !prototype.required_features.contains(FeatureBits::VARARGS) {
@@ -1303,6 +1325,20 @@ fn validate_prototype(
                 what: "vararg instruction in fixed-argument prototype",
             });
         }
+    }
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::SetListCall { .. } | Instruction::SetListCallVarargs { .. }
+        )
+    }) && !prototype
+        .required_features
+        .contains(FeatureBits::DYNAMIC_CALL_RESULTS)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "dynamic call results",
+        });
     }
     if prototype
         .constants
@@ -1363,6 +1399,8 @@ fn validate_prototype(
                 | Instruction::GetTable { .. }
                 | Instruction::SetTable { .. }
                 | Instruction::SetListVarargs { .. }
+                | Instruction::SetListCall { .. }
+                | Instruction::SetListCallVarargs { .. }
         )
     }) && !prototype.required_features.contains(FeatureBits::TABLES)
     {
@@ -1630,6 +1668,47 @@ fn validate_prototype(
                         pc,
                         what: "vararg table-list start must be positive",
                     });
+                }
+            }
+            Instruction::SetListCall {
+                table,
+                start,
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::SetListCallVarargs {
+                table,
+                start,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                check_read(index, pc, table, &initialized)?;
+                check_read(index, pc, function, &initialized)?;
+                if start == 0 {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "call table-list start must be positive",
+                    });
+                }
+                let end = usize::from(arguments)
+                    .checked_add(usize::from(argument_count))
+                    .ok_or(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "call table-list argument register range overflows",
+                    })?;
+                if end > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "call table-list argument register range is invalid",
+                    });
+                }
+                for register in usize::from(arguments)..end {
+                    check_read(index, pc, register as u16, &initialized)?;
                 }
             }
             Instruction::Call {
@@ -2398,6 +2477,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     Instruction::ReturnCall { .. } | Instruction::ReturnCallVarargs { .. } => 7,
                     Instruction::ReturnCallPrefix { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. } => 11,
+                    Instruction::SetListCall { .. } | Instruction::SetListCallVarargs { .. } => 13,
                     Instruction::NewTable { .. } => 3,
                     Instruction::NewClosure { .. }
                     | Instruction::GetUpvalue { .. }
@@ -2542,6 +2622,34 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 out.push(37);
                 put_u16(out, *table);
                 put_u32(out, *start);
+            }
+            Instruction::SetListCall {
+                table,
+                start,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(38);
+                put_u16(out, *table);
+                put_u32(out, *start);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
+            Instruction::SetListCallVarargs {
+                table,
+                start,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(39);
+                put_u16(out, *table);
+                put_u32(out, *start);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
             }
             Instruction::Call {
                 destination,
@@ -3555,6 +3663,20 @@ fn read_prototype(
             37 => Instruction::SetListVarargs {
                 table: reader.u16()?,
                 start: reader.u32()?,
+            },
+            38 => Instruction::SetListCall {
+                table: reader.u16()?,
+                start: reader.u32()?,
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+            },
+            39 => Instruction::SetListCallVarargs {
+                table: reader.u16()?,
+                start: reader.u32()?,
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

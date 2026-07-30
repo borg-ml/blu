@@ -527,6 +527,75 @@ fn dynamic_vararg_table_lists_round_trip_with_validated_starts() {
 }
 
 #[test]
+fn dynamic_call_table_lists_round_trip_and_require_their_feature() {
+    let artifact_with = |instruction, required_features, is_vararg| {
+        let mut artifact = fixture();
+        let prototype = &mut artifact.prototypes[0];
+        prototype.register_count = 2;
+        prototype.is_vararg = is_vararg;
+        prototype.required_features = required_features;
+        prototype.code = vec![
+            Instruction::NewTable { destination: 0 },
+            Instruction::LoadConstant {
+                destination: 1,
+                constant: 0,
+            },
+            instruction,
+            Instruction::Return { first: 0, count: 1 },
+        ];
+        prototype.source_map.truncate(4);
+        prototype.locals.clear();
+        artifact
+    };
+    let plain = Instruction::SetListCall {
+        table: 0,
+        start: 1,
+        function: 1,
+        arguments: 0,
+        argument_count: 0,
+    };
+    let expanded = Instruction::SetListCallVarargs {
+        table: 0,
+        start: 1,
+        function: 1,
+        arguments: 0,
+        argument_count: 0,
+    };
+    let limits = BluLimits::default();
+    for (instruction, features, is_vararg) in [
+        (
+            plain,
+            FeatureBits::BASELINE | FeatureBits::TABLES | FeatureBits::DYNAMIC_CALL_RESULTS,
+            false,
+        ),
+        (
+            expanded,
+            FeatureBits::BASELINE
+                | FeatureBits::TABLES
+                | FeatureBits::VARARGS
+                | FeatureBits::DYNAMIC_CALL_RESULTS,
+            true,
+        ),
+    ] {
+        let validated =
+            ValidatedArtifact::new(artifact_with(instruction, features, is_vararg), limits)
+                .unwrap();
+        let bytes = encode(&validated, limits).unwrap();
+        assert_eq!(decode_validated(&bytes, limits).unwrap(), validated);
+    }
+    assert_eq!(
+        ValidatedArtifact::new(
+            artifact_with(plain, FeatureBits::BASELINE | FeatureBits::TABLES, false),
+            limits
+        ),
+        Err(ValidationError::MissingFeature {
+            prototype: 0,
+            feature: "dynamic call results",
+        })
+    );
+}
+
+#[test]
 fn closure_instructions_round_trip_with_validated_capture_metadata() {
     let limits = BluLimits::default();
     let validated = ValidatedArtifact::new(closure_fixture(), limits).unwrap();

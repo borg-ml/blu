@@ -153,8 +153,8 @@ explicit later work. Owned variadic functions support scalar and fixed-width
 `...` reads with nil padding, dynamic return forwarding, and dynamic final
 call arguments, and final table-constructor expansion, including fixed
 prefixes and method receivers; active and suspended varargs remain GC roots.
-Final call-result expansion inside table constructors remains explicit later
-work.
+Final calls in table constructors expand every result through a GC-rooted
+resumable table-fill continuation for both Blu closures and native functions.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

@@ -288,9 +288,12 @@ arguments such as `target(prefix, ...)` and `receiver:method(...)` preserve
 their fixed prefix and append the complete vararg vector for fixed-result and
 tail-return calls. Final constructor fields such as `{head, ...}` append every
 vararg at consecutive one-based array indices with a validated positive start.
-Active and saved-frame vararg vectors are GC roots. Final dynamic call-result
-expansion inside constructors remains unsupported. Metamethod-aware method
-lookup and resumable direct-BluV1 calls also remain unsupported.
+A final call field likewise consumes every result through a resumable
+`DYNAMIC_CALL_RESULTS` table-fill continuation; suspended frames, outer
+callers, the destination table, and not-yet-inserted return values remain GC
+roots during growth. Active and saved-frame vararg vectors are GC roots.
+Metamethod-aware method lookup and general resumable direct-BluV1 callbacks
+remain unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions
 and both `local function name(...) ... end` and simple
 `function name(...) ... end` declarations with bounded parameter vectors and

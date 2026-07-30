@@ -76,6 +76,7 @@ struct BluCaller {
 enum BluCallResult {
     Fixed { destination: u16, count: u16 },
     ReturnPrefix { first: u16, count: u16 },
+    TableList { table: TableId, start: u32 },
 }
 
 enum BluReturnDisposition {
@@ -1046,6 +1047,129 @@ impl Vm {
                         self.table_set(table, key, value, &roots)?;
                     }
                 }
+                BluInstruction::SetListCall {
+                    table,
+                    start,
+                    function,
+                    arguments,
+                    argument_count,
+                }
+                | BluInstruction::SetListCallVarargs {
+                    table,
+                    start,
+                    function,
+                    arguments,
+                    argument_count,
+                } => {
+                    let expands_varargs =
+                        matches!(instruction, BluInstruction::SetListCallVarargs { .. });
+                    let table_value = blu_register(&registers, table)?;
+                    let Value::Table(table) = table_value else {
+                        return Err(RuntimeError::Type {
+                            operation: "table assignment",
+                            expected: "table",
+                            actual: table_value.type_name(),
+                        });
+                    };
+                    let table = *table;
+                    let function = blu_register(&registers, function)?.clone();
+                    let argument_start = usize::from(arguments);
+                    let argument_end = argument_start
+                        .checked_add(usize::from(argument_count))
+                        .ok_or(RuntimeError::Register {
+                            register: usize::MAX,
+                            count: registers.len(),
+                        })?;
+                    let fixed_arguments = registers.get(argument_start..argument_end).ok_or(
+                        RuntimeError::Register {
+                            register: argument_end.saturating_sub(1),
+                            count: registers.len(),
+                        },
+                    )?;
+                    let arguments = if expands_varargs {
+                        append_blu_varargs(
+                            fixed_arguments,
+                            &varargs,
+                            "BluV1 dynamic table call arguments",
+                        )?
+                    } else {
+                        try_clone_values(fixed_arguments, "BluV1 table call arguments")?
+                    };
+                    if let Value::Closure(child_closure) = &function
+                        && self.heap.is_blu_closure(*child_closure)?
+                    {
+                        if callers.len() >= self.call_limit {
+                            return Err(RuntimeError::CallLimit {
+                                limit: self.call_limit,
+                            });
+                        }
+                        let (child_artifact, child, profile, _) =
+                            self.heap.blu_closure_parts(*child_closure)?;
+                        let child_prototype = child_artifact
+                            .prototypes
+                            .get(child)
+                            .ok_or(RuntimeError::InvalidPrototype(child))?;
+                        let child_constants = materialize_blu_constants(child_prototype)?;
+                        let child_register_count = usize::from(child_prototype.register_count);
+                        let mut child_registers =
+                            try_vec_with_capacity(child_register_count, "BluV1 runtime registers")?;
+                        child_registers.resize(child_register_count, Value::Nil);
+                        let copied = arguments
+                            .len()
+                            .min(usize::from(child_prototype.parameter_count));
+                        child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                        let child_varargs = if child_prototype.is_vararg {
+                            try_clone_values(
+                                arguments
+                                    .get(usize::from(child_prototype.parameter_count)..)
+                                    .unwrap_or_default(),
+                                "BluV1 frame varargs",
+                            )?
+                        } else {
+                            Vec::new()
+                        };
+                        let mut child_open_upvalues =
+                            try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
+                        child_open_upvalues.resize(child_register_count, None);
+                        try_reserve_exact(&mut callers, 1, "BluV1 table-list caller frame")?;
+                        callers.push(BluCaller {
+                            artifact,
+                            prototype: prototype_index,
+                            constants,
+                            registers,
+                            varargs,
+                            open_upvalues,
+                            closure,
+                            pc: pc + 1,
+                            result: BluCallResult::TableList { table, start },
+                        });
+                        artifact = child_artifact;
+                        prototype_index = child;
+                        constants = child_constants;
+                        registers = child_registers;
+                        varargs = child_varargs;
+                        open_upvalues = child_open_upvalues;
+                        closure = Some(*child_closure);
+                        pc = 0;
+                        self.active_profile = Some(profile);
+                        continue;
+                    }
+                    let roots =
+                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
+                    let values = self.call_value(
+                        function,
+                        &arguments,
+                        &mut remaining,
+                        callers.len(),
+                        roots,
+                    )?;
+                    let mut roots =
+                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
+                    for value in &values {
+                        roots.push_value(value.clone())?;
+                    }
+                    self.set_blu_table_list(table, start, values, prototype.profile, &roots)?;
+                }
                 BluInstruction::Call {
                     destination,
                     function,
@@ -1438,7 +1562,7 @@ impl Vm {
                         let Some(caller) = callers.pop() else {
                             return Ok(values);
                         };
-                        match self.apply_blu_return(caller, values)? {
+                        match self.apply_blu_return(caller, values, &callers)? {
                             BluReturnDisposition::Resume(caller) => break caller,
                             BluReturnDisposition::Propagate(next) => values = next,
                         }
@@ -1905,7 +2029,7 @@ impl Vm {
                         let Some(caller) = callers.pop() else {
                             return Ok(values);
                         };
-                        match self.apply_blu_return(caller, values)? {
+                        match self.apply_blu_return(caller, values, &callers)? {
                             BluReturnDisposition::Resume(caller) => break caller,
                             BluReturnDisposition::Propagate(next) => values = next,
                         }
@@ -1947,7 +2071,7 @@ impl Vm {
                         let Some(caller) = callers.pop() else {
                             return Ok(values);
                         };
-                        match self.apply_blu_return(caller, values)? {
+                        match self.apply_blu_return(caller, values, &callers)? {
                             BluReturnDisposition::Resume(caller) => break caller,
                             BluReturnDisposition::Propagate(next) => values = next,
                         }
@@ -1978,6 +2102,7 @@ impl Vm {
         &mut self,
         mut caller: BluCaller,
         values: Vec<Value>,
+        outer_callers: &[BluCaller],
     ) -> Result<BluReturnDisposition, RuntimeError> {
         refresh_blu_open_upvalues(&self.heap, &mut caller.registers, &caller.open_upvalues)?;
         match caller.result {
@@ -2021,7 +2146,62 @@ impl Vm {
                 combined.extend(values);
                 Ok(BluReturnDisposition::Propagate(combined))
             }
+            BluCallResult::TableList { table, start } => {
+                let profile = caller
+                    .artifact
+                    .prototypes
+                    .get(caller.prototype)
+                    .ok_or(RuntimeError::InvalidPrototype(caller.prototype))?
+                    .profile;
+                let mut roots = blu_frame_roots(
+                    &caller.registers,
+                    &caller.varargs,
+                    &caller.open_upvalues,
+                    caller.closure,
+                    outer_callers,
+                )?;
+                for value in &values {
+                    roots.push_value(value.clone())?;
+                }
+                self.set_blu_table_list(table, start, values, profile, &roots)?;
+                Ok(BluReturnDisposition::Resume(caller))
+            }
         }
+    }
+
+    fn set_blu_table_list(
+        &mut self,
+        table: TableId,
+        start: u32,
+        values: Vec<Value>,
+        profile: SemanticProfile,
+        roots: &GcRoots,
+    ) -> Result<(), RuntimeError> {
+        if values.len() > MAX_DYNAMIC_REGISTERS {
+            return Err(RuntimeError::StackLimit {
+                required: values.len(),
+                limit: MAX_DYNAMIC_REGISTERS,
+            });
+        }
+        for (offset, value) in values.into_iter().enumerate() {
+            let index =
+                u64::from(start)
+                    .checked_add(offset as u64)
+                    .ok_or(RuntimeError::StackLimit {
+                        required: usize::MAX,
+                        limit: MAX_DYNAMIC_REGISTERS,
+                    })?;
+            let key = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(index as i64)
+            } else {
+                Value::Number(index as f64)
+            };
+            self.table_set(table, key, value, roots)?;
+        }
+        Ok(())
     }
 
     pub fn execute_validated_owned(

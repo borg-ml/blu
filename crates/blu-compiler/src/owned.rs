@@ -625,6 +625,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     | Instruction::GetTable { .. }
                     | Instruction::SetTable { .. }
                     | Instruction::SetListVarargs { .. }
+                    | Instruction::SetListCall { .. }
+                    | Instruction::SetListCallVarargs { .. }
             )
         }) {
             required_features = required_features | FeatureBits::TABLES;
@@ -651,7 +653,6 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     | Instruction::ReturnCallPrefix { .. }
                     | Instruction::ReturnCallVarargs { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. }
-                    | Instruction::SetListVarargs { .. }
             )
         }) {
             required_features = required_features | FeatureBits::RETURN_CALLS;
@@ -675,9 +676,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     | Instruction::ReturnCallVarargs { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. }
                     | Instruction::SetListVarargs { .. }
+                    | Instruction::SetListCallVarargs { .. }
             )
         }) {
             required_features = required_features | FeatureBits::VARARGS;
+        }
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::SetListCall { .. } | Instruction::SetListCallVarargs { .. }
+            )
+        }) {
+            required_features = required_features | FeatureBits::DYNAMIC_CALL_RESULTS;
         }
         Ok(Prototype {
             profile: self.profile,
@@ -1932,6 +1942,118 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         let mut array_index = 1_i64;
         for index in constructor.first_field()..end {
             let field = self.table_fields[index];
+            if index + 1 == end
+                && let TableField::Array(value) = field
+            {
+                let expression = *self.expression(value)?;
+                let call = match expression.kind() {
+                    ExpressionKind::Call(call) => {
+                        let argument_end =
+                            self.call_argument_end(call.first_argument(), call.argument_count())?;
+                        let expands_varargs = argument_end > call.first_argument()
+                            && matches!(
+                                self.expression(self.call_arguments[argument_end - 1])?
+                                    .kind(),
+                                ExpressionKind::Vararg
+                            );
+                        if expands_varargs && !self.is_vararg {
+                            return Err(OwnedCompileError::Diagnostic(
+                                self.source_diagnostic(
+                                    "BLU-COMPILE-0006",
+                                    Phase::Lower,
+                                    self.expression(self.call_arguments[argument_end - 1])?
+                                        .span(),
+                                    "vararg expression is outside a variadic function",
+                                )?,
+                            ));
+                        }
+                        let function = self.lower_expression(call.function())?;
+                        let fixed_end = argument_end - usize::from(expands_varargs);
+                        let mut sources =
+                            allocate_vec(call.argument_count(), "table call argument registers")?;
+                        for argument in call.first_argument()..fixed_end {
+                            sources.push(self.lower_expression(self.call_arguments[argument])?);
+                        }
+                        Some((function, sources, expands_varargs, call.span()))
+                    }
+                    ExpressionKind::MethodCall(call) => {
+                        let argument_end =
+                            self.call_argument_end(call.first_argument(), call.argument_count())?;
+                        let expands_varargs = argument_end > call.first_argument()
+                            && matches!(
+                                self.expression(self.call_arguments[argument_end - 1])?
+                                    .kind(),
+                                ExpressionKind::Vararg
+                            );
+                        if expands_varargs && !self.is_vararg {
+                            return Err(OwnedCompileError::Diagnostic(
+                                self.source_diagnostic(
+                                    "BLU-COMPILE-0006",
+                                    Phase::Lower,
+                                    self.expression(self.call_arguments[argument_end - 1])?
+                                        .span(),
+                                    "vararg expression is outside a variadic function",
+                                )?,
+                            ));
+                        }
+                        let receiver = self.lower_expression(call.receiver())?;
+                        let key = self.lower_constant(
+                            Constant::String(copy_bytes(
+                                self.source.slice(call.method().span())?,
+                                "method name",
+                            )?),
+                            call.method().span(),
+                        )?;
+                        let function = self.allocate_register()?;
+                        self.emit(
+                            Instruction::GetTable {
+                                destination: function,
+                                table: receiver,
+                                key,
+                            },
+                            call.span(),
+                        )?;
+                        let fixed_end = argument_end - usize::from(expands_varargs);
+                        let mut sources = allocate_vec(
+                            call.argument_count().saturating_add(1),
+                            "table method argument registers",
+                        )?;
+                        sources.push(receiver);
+                        for argument in call.first_argument()..fixed_end {
+                            sources.push(self.lower_expression(self.call_arguments[argument])?);
+                        }
+                        Some((function, sources, expands_varargs, call.span()))
+                    }
+                    _ => None,
+                };
+                if let Some((function, sources, expands_varargs, span)) = call {
+                    let start = u32::try_from(array_index).map_err(|_| {
+                        OwnedCompileError::InternalInvariant {
+                            message: "call table-list start passed limits but cannot fit BluV1",
+                        }
+                    })?;
+                    let (arguments, argument_count) = self.copy_call_arguments(&sources, span)?;
+                    let instruction = if expands_varargs {
+                        Instruction::SetListCallVarargs {
+                            table,
+                            start,
+                            function,
+                            arguments,
+                            argument_count,
+                        }
+                    } else {
+                        Instruction::SetListCall {
+                            table,
+                            start,
+                            function,
+                            arguments,
+                            argument_count,
+                        }
+                    };
+                    self.emit(instruction, span)?;
+                    continue;
+                }
+            }
             if index + 1 == end
                 && matches!(
                     field,

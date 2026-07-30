@@ -402,9 +402,16 @@ fn translate_instruction(
         | BluInstruction::CallVarargsResults { .. }
         | BluInstruction::ReturnCallVarargs { .. }
         | BluInstruction::ReturnCallVarargsPrefix { .. }
-        | BluInstruction::SetListVarargs { .. } => Err(TranslationError::UnsupportedInstruction {
+        | BluInstruction::SetListVarargs { .. }
+        | BluInstruction::SetListCallVarargs { .. } => {
+            Err(TranslationError::UnsupportedInstruction {
+                prototype,
+                instruction: "varargs",
+            })
+        }
+        BluInstruction::SetListCall { .. } => Err(TranslationError::UnsupportedInstruction {
             prototype,
-            instruction: "varargs",
+            instruction: "dynamic call results",
         }),
         BluInstruction::Return { first, count } => {
             let result_field = count
