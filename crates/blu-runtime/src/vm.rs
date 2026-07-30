@@ -22,6 +22,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, Ordering},
     },
+    time::Instant,
 };
 
 const MAX_DYNAMIC_REGISTERS: usize = 1_000_000;
@@ -190,6 +191,7 @@ pub struct Vm {
     active_profile: Option<SemanticProfile>,
     instruction_limit: u64,
     interrupted: Arc<AtomicBool>,
+    deadline: Option<Instant>,
     call_limit: usize,
     heap_object_limit: usize,
     heap: Heap,
@@ -250,6 +252,7 @@ impl Vm {
             active_profile: None,
             instruction_limit: 10_000_000,
             interrupted: Arc::new(AtomicBool::new(false)),
+            deadline: None,
             call_limit: 1_000,
             heap_object_limit: 1_000_000,
             heap,
@@ -314,12 +317,35 @@ impl Vm {
         }
     }
 
-    fn check_interrupted(&self) -> Result<(), RuntimeError> {
+    /// Configures an absolute wall-clock deadline for subsequent execution.
+    #[must_use]
+    pub fn with_deadline(mut self, deadline: Instant) -> Self {
+        self.deadline = Some(deadline);
+        self
+    }
+
+    /// Replaces or clears the absolute wall-clock execution deadline.
+    pub fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
+    /// Returns the currently configured absolute execution deadline.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+
+    fn check_interruption(&self) -> Result<(), RuntimeError> {
         if self.interrupted.load(Ordering::Acquire) {
-            Err(RuntimeError::Interrupted)
-        } else {
-            Ok(())
+            return Err(RuntimeError::Interrupted);
         }
+        if self
+            .deadline
+            .is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            return Err(RuntimeError::DeadlineExceeded);
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -950,7 +976,7 @@ impl Vm {
         let mut remaining = self.instruction_limit;
         let mut pc = 0usize;
         loop {
-            self.check_interrupted()?;
+            self.check_interruption()?;
             let prototype = artifact
                 .prototypes
                 .get(prototype_index)
@@ -3551,7 +3577,7 @@ impl Vm {
         depth: usize,
     ) -> Result<Vec<Value>, RuntimeError> {
         loop {
-            self.check_interrupted()?;
+            self.check_interruption()?;
             self.active_profile = Some(frame.profile);
             let depth = depth + callers.len();
             if *remaining == 0 {
@@ -9745,6 +9771,7 @@ impl fmt::Debug for Vm {
             .field("dialect", &self.dialect)
             .field("instruction_limit", &self.instruction_limit)
             .field("interrupted", &self.interrupted.load(Ordering::Acquire))
+            .field("deadline", &self.deadline)
             .field("call_limit", &self.call_limit)
             .field("heap_object_limit", &self.heap_object_limit)
             .field("output_limit", &self.output_limit)
@@ -10676,6 +10703,7 @@ pub enum RuntimeError {
         limit: u64,
     },
     Interrupted,
+    DeadlineExceeded,
     CallLimit {
         limit: usize,
     },
@@ -10860,6 +10888,7 @@ impl fmt::Display for RuntimeError {
                 write!(f, "instruction limit {limit} exceeded")
             }
             Self::Interrupted => f.write_str("execution interrupted"),
+            Self::DeadlineExceeded => f.write_str("execution deadline exceeded"),
             Self::CallLimit { limit } => write!(f, "call depth limit {limit} exceeded"),
             Self::StackLimit { required, limit } => {
                 write!(
@@ -11743,6 +11772,39 @@ mod tests {
 
         interrupt.reset();
         assert!(!interrupt.is_interrupted());
+        assert_eq!(vm.execute(&chunk), Ok(vec![Value::Number(3.0)]));
+    }
+
+    #[test]
+    fn expired_deadline_stops_both_engines_and_can_be_cleared() {
+        let deadline = Instant::now();
+        let mut vm = Vm::default().with_deadline(deadline);
+        assert_eq!(vm.deadline(), Some(deadline));
+
+        let chunk = load(RETURN_THREE_V12, LoadLimits::default()).unwrap();
+        assert_eq!(vm.execute(&chunk), Err(RuntimeError::DeadlineExceeded));
+        assert_eq!(
+            vm.execute_blu_v1(
+                validated_blu_program(
+                    SemanticProfile::Blu,
+                    vec![BluConstant::Number(42.0)],
+                    vec![
+                        BluInstruction::LoadConstant {
+                            destination: 0,
+                            constant: 0,
+                        },
+                        BluInstruction::Return { first: 0, count: 1 },
+                    ],
+                    FeatureBits::BASELINE,
+                    1,
+                ),
+                BluLimits::default(),
+            ),
+            Err(RuntimeError::DeadlineExceeded)
+        );
+
+        vm.set_deadline(None);
+        assert_eq!(vm.deadline(), None);
         assert_eq!(vm.execute(&chunk), Ok(vec![Value::Number(3.0)]));
     }
 

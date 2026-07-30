@@ -656,6 +656,9 @@ a structured limit error. Embedders can clone `Vm::interrupt_handle` and
 request interruption safely from another thread. Both bytecode engines observe
 the persistent signal at instruction boundaries and return
 `RuntimeError::Interrupted`; resetting the handle permits later execution.
+An absolute `std::time::Instant` deadline can independently be installed with
+`Vm::with_deadline` or `Vm::set_deadline`; expiration returns
+`RuntimeError::DeadlineExceeded`, and clearing it permits later execution.
 This is cooperative VM interruption, not preemption of a currently running
 native callback. Blocking or long-running host functions must honor
 cancellation through their own declared contract.

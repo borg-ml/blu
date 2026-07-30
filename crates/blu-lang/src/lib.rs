@@ -58,6 +58,17 @@ impl Engine {
         self.vm.interrupt_handle()
     }
 
+    /// Replaces or clears the absolute wall-clock execution deadline.
+    pub fn set_deadline(&mut self, deadline: Option<std::time::Instant>) {
+        self.vm.set_deadline(deadline);
+    }
+
+    /// Returns the currently configured absolute execution deadline.
+    #[must_use]
+    pub const fn deadline(&self) -> Option<std::time::Instant> {
+        self.vm.deadline()
+    }
+
     #[must_use]
     pub fn for_dialect(dialect: Dialect) -> Self {
         Self {
