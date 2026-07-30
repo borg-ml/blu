@@ -151,9 +151,10 @@ after the call completes. Dynamic argument and table-constructor tails,
 metamethod-aware method lookup, and resumable direct-BluV1 calls remain
 explicit later work. Owned variadic functions support scalar and fixed-width
 `...` reads with nil padding, dynamic return forwarding, and dynamic final
-call arguments, including fixed prefixes and method receivers; active and
-suspended varargs remain GC roots. Dynamic `{...}` constructor fields reject
-explicitly rather than truncating.
+call arguments, and final table-constructor expansion, including fixed
+prefixes and method receivers; active and suspended varargs remain GC roots.
+Final call-result expansion inside table constructors remains explicit later
+work.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

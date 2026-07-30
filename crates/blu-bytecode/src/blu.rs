@@ -282,6 +282,10 @@ pub enum Instruction {
         key: u16,
         value: u16,
     },
+    SetListVarargs {
+        table: u16,
+        start: u32,
+    },
     Call {
         destination: u16,
         function: u16,
@@ -456,6 +460,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::NewTable { .. }
             | Instruction::GetTable { .. }
             | Instruction::SetTable { .. }
+            | Instruction::SetListVarargs { .. }
             | Instruction::Call { .. }
             | Instruction::CallResults { .. }
             | Instruction::CallVarargsResults { .. }
@@ -496,6 +501,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::NewTable { .. }
                 | Instruction::GetTable { .. }
                 | Instruction::SetTable { .. }
+                | Instruction::SetListVarargs { .. }
                 | Instruction::Call { .. }
                 | Instruction::CallResults { .. }
                 | Instruction::CallVarargsResults { .. }
@@ -1282,6 +1288,7 @@ fn validate_prototype(
                 | Instruction::CallVarargsResults { .. }
                 | Instruction::ReturnCallVarargs { .. }
                 | Instruction::ReturnCallVarargsPrefix { .. }
+                | Instruction::SetListVarargs { .. }
         )
     }) {
         if !prototype.required_features.contains(FeatureBits::VARARGS) {
@@ -1355,6 +1362,7 @@ fn validate_prototype(
             Instruction::NewTable { .. }
                 | Instruction::GetTable { .. }
                 | Instruction::SetTable { .. }
+                | Instruction::SetListVarargs { .. }
         )
     }) && !prototype.required_features.contains(FeatureBits::TABLES)
     {
@@ -1613,6 +1621,16 @@ fn validate_prototype(
                 check_read(index, pc, table, &initialized)?;
                 check_read(index, pc, key, &initialized)?;
                 check_read(index, pc, value, &initialized)?;
+            }
+            Instruction::SetListVarargs { table, start } => {
+                check_read(index, pc, table, &initialized)?;
+                if start == 0 {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "vararg table-list start must be positive",
+                    });
+                }
             }
             Instruction::Call {
                 destination,
@@ -2363,6 +2381,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::StoreGlobal { .. }
                     | Instruction::GetTable { .. }
                     | Instruction::SetTable { .. }
+                    | Instruction::SetListVarargs { .. }
                     | Instruction::Add { .. }
                     | Instruction::Subtract { .. }
                     | Instruction::Multiply { .. }
@@ -2518,6 +2537,11 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 put_u16(out, *table);
                 put_u16(out, *key);
                 put_u16(out, *value);
+            }
+            Instruction::SetListVarargs { table, start } => {
+                out.push(37);
+                put_u16(out, *table);
+                put_u32(out, *start);
             }
             Instruction::Call {
                 destination,
@@ -3527,6 +3551,10 @@ fn read_prototype(
                 function: reader.u16()?,
                 arguments: reader.u16()?,
                 argument_count: reader.u16()?,
+            },
+            37 => Instruction::SetListVarargs {
+                table: reader.u16()?,
+                start: reader.u32()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

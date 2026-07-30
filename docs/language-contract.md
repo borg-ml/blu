@@ -286,11 +286,11 @@ destination range, truncate excess arguments, and pad missing arguments with
 forward every vararg through bounded caller continuations. Final call
 arguments such as `target(prefix, ...)` and `receiver:method(...)` preserve
 their fixed prefix and append the complete vararg vector for fixed-result and
-tail-return calls. Active and saved-frame vararg vectors are GC roots. Dynamic
-final constructor fields `{...}` fail with `BLU-COMPILE-0007` until their
-array expansion is encoded canonically; they are never silently reduced to
-one value. Metamethod-aware method lookup and resumable direct-BluV1 calls
-remain unsupported.
+tail-return calls. Final constructor fields such as `{head, ...}` append every
+vararg at consecutive one-based array indices with a validated positive start.
+Active and saved-frame vararg vectors are GC roots. Final dynamic call-result
+expansion inside constructors remains unsupported. Metamethod-aware method
+lookup and resumable direct-BluV1 calls also remain unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions
 and both `local function name(...) ... end` and simple
 `function name(...) ... end` declarations with bounded parameter vectors and

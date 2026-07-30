@@ -1009,6 +1009,43 @@ impl Vm {
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
                     self.table_set(table, key, value, &roots)?;
                 }
+                BluInstruction::SetListVarargs { table, start } => {
+                    let table_value = blu_register(&registers, table)?;
+                    let Value::Table(table) = table_value else {
+                        return Err(RuntimeError::Type {
+                            operation: "table assignment",
+                            expected: "table",
+                            actual: table_value.type_name(),
+                        });
+                    };
+                    let table = *table;
+                    for (offset, value) in varargs.iter().cloned().enumerate() {
+                        let index = u64::from(start).checked_add(offset as u64).ok_or(
+                            RuntimeError::StackLimit {
+                                required: usize::MAX,
+                                limit: MAX_DYNAMIC_REGISTERS,
+                            },
+                        )?;
+                        let key = if matches!(
+                            prototype.profile,
+                            SemanticProfile::Lua53
+                                | SemanticProfile::Lua54
+                                | SemanticProfile::Lua55
+                        ) {
+                            Value::Integer(index as i64)
+                        } else {
+                            Value::Number(index as f64)
+                        };
+                        let roots = blu_frame_roots(
+                            &registers,
+                            &varargs,
+                            &open_upvalues,
+                            closure,
+                            &callers,
+                        )?;
+                        self.table_set(table, key, value, &roots)?;
+                    }
+                }
                 BluInstruction::Call {
                     destination,
                     function,

@@ -401,12 +401,11 @@ fn translate_instruction(
         | BluInstruction::ReturnVarargs { .. }
         | BluInstruction::CallVarargsResults { .. }
         | BluInstruction::ReturnCallVarargs { .. }
-        | BluInstruction::ReturnCallVarargsPrefix { .. } => {
-            Err(TranslationError::UnsupportedInstruction {
-                prototype,
-                instruction: "varargs",
-            })
-        }
+        | BluInstruction::ReturnCallVarargsPrefix { .. }
+        | BluInstruction::SetListVarargs { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "varargs",
+        }),
         BluInstruction::Return { first, count } => {
             let result_field = count
                 .checked_add(1)

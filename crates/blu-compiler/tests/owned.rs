@@ -2849,12 +2849,57 @@ fn dynamic_vararg_call_statements_reach_native_functions() {
 }
 
 #[test]
-fn remaining_dynamic_vararg_table_position_fails_explicitly() {
-    let source = make_source(b"local function pack(...) return {...} end".to_vec());
-    let error = OwnedCompiler::default()
-        .compile(&source, SemanticProfile::Blu, compiler_identity())
-        .expect_err("dynamic vararg use must not silently truncate");
-    assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
+fn owned_variadic_functions_expand_final_table_fields() {
+    for (bytes, modern_expected, legacy_expected) in [
+        (
+            b"local function pack(...) return {0, ...} end local result = pack(1, 2) return result[1], result[2], result[3], #result"
+                .as_slice(),
+            vec![
+                Value::Integer(0),
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+            ],
+            vec![
+                Value::Number(0.0),
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+            ],
+        ),
+        (
+            b"local function pack(...) return {named = 9, ...} end local result = pack(1, 2) return result.named, result[1], result[2]"
+                .as_slice(),
+            vec![Value::Integer(9), Value::Integer(1), Value::Integer(2)],
+            vec![Value::Number(9.0), Value::Number(1.0), Value::Number(2.0)],
+        ),
+        (
+            b"local function pack(...) return {...} end return #pack()".as_slice(),
+            vec![Value::Integer(0)],
+            vec![Value::Number(0.0)],
+        ),
+    ] {
+        for profile in SemanticProfile::ALL {
+            let source = make_source(bytes.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .expect("dynamic final table varargs should compile");
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                modern_expected.clone()
+            } else {
+                legacy_expected.clone()
+            };
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(expected),
+                "{profile}"
+            );
+        }
+    }
 }
 
 #[test]

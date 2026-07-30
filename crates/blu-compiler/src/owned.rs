@@ -624,6 +624,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 Instruction::NewTable { .. }
                     | Instruction::GetTable { .. }
                     | Instruction::SetTable { .. }
+                    | Instruction::SetListVarargs { .. }
             )
         }) {
             required_features = required_features | FeatureBits::TABLES;
@@ -650,6 +651,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     | Instruction::ReturnCallPrefix { .. }
                     | Instruction::ReturnCallVarargs { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. }
+                    | Instruction::SetListVarargs { .. }
             )
         }) {
             required_features = required_features | FeatureBits::RETURN_CALLS;
@@ -672,6 +674,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     | Instruction::CallVarargsResults { .. }
                     | Instruction::ReturnCallVarargs { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. }
+                    | Instruction::SetListVarargs { .. }
             )
         }) {
             required_features = required_features | FeatureBits::VARARGS;
@@ -1936,18 +1939,27 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                         if matches!(self.expression(value)?.kind(), ExpressionKind::Vararg)
                 )
             {
-                return Err(OwnedCompileError::Diagnostic(
-                    self.source_diagnostic(
-                        "BLU-COMPILE-0007",
+                let TableField::Array(value) = field else {
+                    unreachable!()
+                };
+                if !self.is_vararg {
+                    return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0006",
                         Phase::Lower,
-                        self.expression(match field {
-                            TableField::Array(value) => value,
-                            _ => unreachable!(),
-                        })?
-                        .span(),
-                        "dynamic final-field vararg expansion is not yet implemented",
-                    )?,
-                ));
+                        self.expression(value)?.span(),
+                        "vararg expression is outside a variadic function",
+                    )?));
+                }
+                let start = u32::try_from(array_index).map_err(|_| {
+                    OwnedCompileError::InternalInvariant {
+                        message: "vararg table-list start passed limits but cannot fit BluV1",
+                    }
+                })?;
+                self.emit(
+                    Instruction::SetListVarargs { table, start },
+                    self.expression(value)?.span(),
+                )?;
+                continue;
             }
             let (key, value, span) = match field {
                 TableField::Array(value) => {

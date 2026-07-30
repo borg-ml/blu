@@ -494,6 +494,39 @@ fn dynamic_vararg_calls_round_trip_canonically() {
 }
 
 #[test]
+fn dynamic_vararg_table_lists_round_trip_with_validated_starts() {
+    let artifact_with_start = |start| {
+        let mut artifact = fixture();
+        let prototype = &mut artifact.prototypes[0];
+        prototype.register_count = 1;
+        prototype.is_vararg = true;
+        prototype.required_features =
+            FeatureBits::BASELINE | FeatureBits::TABLES | FeatureBits::VARARGS;
+        prototype.code = vec![
+            Instruction::NewTable { destination: 0 },
+            Instruction::SetListVarargs { table: 0, start },
+            Instruction::Return { first: 0, count: 1 },
+        ];
+        prototype.source_map.truncate(3);
+        prototype.locals.clear();
+        artifact
+    };
+
+    let limits = BluLimits::default();
+    let validated = ValidatedArtifact::new(artifact_with_start(1), limits).unwrap();
+    let bytes = encode(&validated, limits).unwrap();
+    assert_eq!(decode_validated(&bytes, limits).unwrap(), validated);
+    assert_eq!(
+        ValidatedArtifact::new(artifact_with_start(0), limits),
+        Err(ValidationError::InvalidInstruction {
+            prototype: 0,
+            pc: 1,
+            what: "vararg table-list start must be positive",
+        })
+    );
+}
+
+#[test]
 fn closure_instructions_round_trip_with_validated_capture_metadata() {
     let limits = BluLimits::default();
     let validated = ValidatedArtifact::new(closure_fixture(), limits).unwrap();
