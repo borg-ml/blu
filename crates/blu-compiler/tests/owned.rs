@@ -3090,6 +3090,83 @@ fn owned_table_index_invokes_native_handlers_and_propagates_errors() {
 }
 
 #[test]
+fn owned_binary_arithmetic_invokes_resumable_metamethods() {
+    let source = make_source(
+        b"local mt = {__add = function() return 1 end, __sub = function() return 2 end, __mul = function() return 3 end, __div = function() return 4 end, __mod = function() return 5 end, __pow = function() return 6 end} local left = setmetatable({}, mt) local right = {} return left + right, left - right, left * right, left / right, left % right, left ^ right"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .expect("arithmetic metamethod source should compile");
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            (1..=6).map(Value::Integer).collect()
+        } else {
+            (1..=6)
+                .map(|value| Value::Number(f64::from(value)))
+                .collect()
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(expected),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_arithmetic_uses_the_right_handler_when_the_left_has_none() {
+    let source = make_source(
+        b"local left = {} local right right = setmetatable({}, {__add = function(a, b) return a == left and b == right end}) return left + right"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_floor_division_invokes_idiv_in_profiles_that_define_it() {
+    let source = make_source(
+        b"local left = setmetatable({}, {__idiv = function() return 7 end}) return left // {}"
+            .to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Luau,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Value::Integer(7)
+        } else {
+            Value::Number(7.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn active_and_suspended_blu_varargs_remain_gc_roots() {
     for bytes in [
         b"local function keep(...) collect() return (...).value end return keep({value = 42})"

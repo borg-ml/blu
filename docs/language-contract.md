@@ -240,6 +240,13 @@ the bounded caller continuation stack; missing writes do the same for
 snapshotted before invocation, and method lookup uses the same resumable read.
 Luau, Blu, Lua 5.1, and Lua 5.2 bound a chain at 100 steps; Lua 5.3–5.5 use
 their pinned 2,000-step limit.
+Owned binary arithmetic keeps its direct integer/number fast path. When either
+operand is nonnumeric, it selects the left then right `__add`, `__sub`,
+`__mul`, `__div`, `__mod`, or `__pow` handler and invokes it with the two
+snapshotted operands through the bounded caller continuation. `__idiv` follows
+the same rule only in Luau and Lua 5.3–5.5, matching the profiles where `//`
+is currently legal. Blu floor-division semantics remain deliberately
+unassigned. Unary and bitwise metamethod events remain later work.
 Owned unary `#` measures the raw sequence length of tables without a `__len`
 handler, using the same profile-specific integer/number result subtype as
 string length. Lua 5.1 ignores table `__len` and therefore remains raw. Blu,
