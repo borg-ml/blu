@@ -470,6 +470,11 @@ Blu and Luau provide `string.split` with a default comma separator,
 non-overlapping byte-string separators, retained empty fields, and byte-wise
 splitting for an empty separator. Its output table capacity is checked before
 allocation. Lua profiles reject the Luau-only function explicitly.
+Blu and Luau also provide bounded `table.create` and `table.find`.
+`table.create` preflights its array capacity and optionally fills every slot;
+`table.find` searches the contiguous array sequence from a positive optional
+start and returns a profile-typed index. Lua profiles reject both Luau-only
+functions explicitly.
 `collectgarbage` supports the shared `collect` and `count` commands. Collection
 traces active frames, globals, threads, upvalues, and host-retained values.
 `count` reports the runtime's accounted GC-heap kibibytes; it is not presented

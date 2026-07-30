@@ -4195,6 +4195,69 @@ fn string_split_matches_luau_byte_and_empty_field_semantics() {
 }
 
 #[test]
+fn luau_table_create_and_find_are_bounded_and_profile_gated() {
+    let source = make_source(
+        b"local filled=table.create(3,'x') local empty=table.create(3) local fractional=table.create(1.5,'y') return #filled,filled[1],filled[3],filled[4],#empty,empty[1],#fractional,table.find({1,2,1},1),table.find({1,2,1},1,2),table.find({[3]='x'},'x')"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let integral = |value| {
+                if profile == SemanticProfile::Blu {
+                    Value::Integer(value)
+                } else {
+                    Value::Number(value as f64)
+                }
+            };
+            assert_eq!(
+                result,
+                Ok(vec![
+                    integral(3),
+                    Value::String(Arc::from(&b"x"[..])),
+                    Value::String(Arc::from(&b"x"[..])),
+                    Value::Nil,
+                    integral(0),
+                    Value::Nil,
+                    integral(1),
+                    integral(1),
+                    integral(3),
+                    Value::Nil,
+                ]),
+                "{profile}"
+            );
+            for (source, operation) in [
+                (b"return table.create(-1)".as_slice(), "table.create"),
+                (b"return table.find({1},1,0)".as_slice(), "table.find"),
+            ] {
+                let compiled = OwnedCompiler::default()
+                    .compile(&make_source(source.to_vec()), profile, compiler_identity())
+                    .unwrap();
+                assert_eq!(
+                    Vm::default()
+                        .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                    Err(RuntimeError::InvalidRange { operation }),
+                    "{profile}"
+                );
+            }
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.create",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
     let source = make_source(
         b"return tonumber(' 42 '),tonumber('ff',16),tonumber('0x10'),tonumber(3),tonumber('3.0',10),tonumber('nan'),tonumber('inf'),tonumber('ffffffffffffffff',16),tonumber('0x1.8p1'),tonumber('-0x1p2'),tonumber('x')"

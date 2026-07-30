@@ -6329,8 +6329,83 @@ impl Vm {
             }
             Ok(Vec::new())
         });
+        let create = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.create",
+                    profile,
+                });
+            }
+            let count = integer_argument(arguments, 0, "table.create")?;
+            if count < 0 {
+                return Err(RuntimeError::InvalidRange {
+                    operation: "table.create",
+                });
+            }
+            let count = usize::try_from(count).map_err(|_| RuntimeError::TableCapacity {
+                kind: "array",
+                requested: u64::MAX,
+                limit: MAX_TABLE_INITIAL_CAPACITY,
+            })?;
+            if count > MAX_TABLE_INITIAL_CAPACITY {
+                return Err(RuntimeError::TableCapacity {
+                    kind: "array",
+                    requested: count as u64,
+                    limit: MAX_TABLE_INITIAL_CAPACITY,
+                });
+            }
+            let fill = arguments.get(1).cloned().unwrap_or(Value::Nil);
+            let roots = GcRoots::from_values(arguments)?;
+            let table = vm.allocate_table(count, 0, &roots)?;
+            if !matches!(fill, Value::Nil) {
+                for index in 1..=count {
+                    vm.table_set(table, Value::Integer(index as i64), fill.clone(), &roots)?;
+                }
+            }
+            Ok(vec![Value::Table(table)])
+        });
+        let find = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.find",
+                    profile,
+                });
+            }
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.find",
+                index: 1,
+            })?;
+            let table = table_id(table)?;
+            let needle = arguments.get(1).ok_or(RuntimeError::Argument {
+                function: "table.find",
+                index: 2,
+            })?;
+            let start = arguments
+                .get(2)
+                .map(|_| integer_argument(arguments, 2, "table.find"))
+                .transpose()?
+                .unwrap_or(1);
+            if start < 1 {
+                return Err(RuntimeError::InvalidRange {
+                    operation: "table.find",
+                });
+            }
+            let length = vm.heap.table_length(table)? as i64;
+            for index in start..=length {
+                if vm.heap.table_get(table, &Value::Integer(index))? == *needle {
+                    return Ok(vec![profiled_integral_math_result(
+                        vm,
+                        "table.find",
+                        index as f64,
+                    )?]);
+                }
+            }
+            Ok(vec![Value::Nil])
+        });
 
-        let table = self.heap.allocate_table(0, 7)?;
+        let table = self.heap.allocate_table(0, 9)?;
         for (name, function) in [
             (&b"insert"[..], insert),
             (&b"remove"[..], remove),
@@ -6339,6 +6414,8 @@ impl Vm {
             (&b"unpack"[..], unpack),
             (&b"move"[..], move_values),
             (&b"sort"[..], sort),
+            (&b"create"[..], create),
+            (&b"find"[..], find),
         ] {
             self.heap.table_set(
                 table,
