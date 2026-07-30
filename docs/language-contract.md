@@ -274,12 +274,20 @@ operand is nonnumeric, it selects the left then right `__add`, `__sub`,
 `__mul`, `__div`, `__mod`, or `__pow` handler and invokes it with the two
 snapshotted operands through the bounded caller continuation. `__idiv` follows
 the same rule in Blu, Luau, and Lua 5.3–5.5, matching the profiles where `//`
-is legal. Blu adopts Lua 5.3+ floor division: integer operands preserve an
-integer result, while mixed or floating operands produce a floored number.
+is legal. Blu integer addition, subtraction, and multiplication wrap through
+64 bits; integer modulo uses floor semantics. Mixed integer/number arithmetic
+promotes to a number, and `/` and exponentiation always produce numbers. Blu
+adopts Lua 5.3+ floor division: integer operands preserve an integer result,
+while mixed or floating operands produce a floored number.
 Integer division by zero is a structured error; floating division follows
-IEEE behavior before flooring. Unary negation invokes `__unm` with the operand in both argument
-positions, matching the pinned Lua and Luau implementations. Bitwise
-metamethod events use the same resumable handler path.
+IEEE behavior before flooring. Arithmetic operands also accept
+whitespace-trimmed decimal and hexadecimal numeric strings. Blu and Lua
+5.4–5.5 preserve an exact parsed integer, while Luau and Lua 5.1–5.3 convert
+string operands to numbers; invalid numeric strings continue to metamethod
+selection and then fail structurally when no handler exists. Unary negation
+invokes `__unm` with the operand in both argument positions, matching the
+pinned Lua and Luau implementations. Bitwise metamethod events use the same
+resumable handler path.
 Arithmetic, unary, concatenation, length, and comparison event values may
 themselves be callable tables. The runtime resolves their bounded `__call`
 chains before invocation, prepends every callable-table receiver, and keeps a

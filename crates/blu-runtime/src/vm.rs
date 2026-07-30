@@ -1959,13 +1959,17 @@ impl Vm {
                         };
                     let left = blu_register(&registers, left_register)?.clone();
                     let right = blu_register(&registers, right_register)?.clone();
-                    if left.as_number().is_some() && right.as_number().is_some() {
+                    let numeric_left = arithmetic_numeric_value(&left, prototype.profile);
+                    let numeric_right = arithmetic_numeric_value(&right, prototype.profile);
+                    if let (Some(numeric_left), Some(numeric_right)) = (numeric_left, numeric_right)
+                    {
                         let value = if opcode == Opcode::Mod
-                            && let (Value::Integer(left), Value::Integer(right)) = (&left, &right)
+                            && let (Value::Integer(left), Value::Integer(right)) =
+                                (&numeric_left, &numeric_right)
                         {
                             Value::Integer(integer_floor_mod(*left, *right)?)
                         } else {
-                            arithmetic(opcode, &left, &right)?
+                            arithmetic(opcode, &numeric_left, &numeric_right)?
                         };
                         set_blu_register(
                             &mut self.heap,
@@ -4441,7 +4445,11 @@ impl Vm {
         right: Value,
         context: CallContext<'_>,
     ) -> Result<Value, RuntimeError> {
-        if left.as_number().is_some() && right.as_number().is_some() {
+        let profile = self.active_profile()?;
+        if let (Some(left), Some(right)) = (
+            arithmetic_numeric_value(&left, profile),
+            arithmetic_numeric_value(&right, profile),
+        ) {
             return arithmetic(opcode, &left, &right);
         }
         let name = match opcode {
@@ -9533,6 +9541,22 @@ fn arithmetic(opcode: Opcode, left: &Value, right: &Value) -> Result<Value, Runt
         actual: right.type_name(),
     })?;
     numeric_arithmetic(opcode, left, right)
+}
+
+fn arithmetic_numeric_value(value: &Value, profile: SemanticProfile) -> Option<Value> {
+    match value {
+        Value::Integer(_) | Value::Number(_) => Some(value.clone()),
+        Value::String(bytes) => {
+            let parsed = parse_default_number(trim_ascii_bytes(bytes), profile)?;
+            match (profile, parsed) {
+                (SemanticProfile::Lua53, Value::Integer(value)) => {
+                    Some(Value::Number(value as f64))
+                }
+                (_, parsed) => Some(parsed),
+            }
+        }
+        _ => None,
+    }
 }
 
 fn numeric_arithmetic(opcode: Opcode, left: f64, right: f64) -> Result<Value, RuntimeError> {

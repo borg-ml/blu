@@ -2086,6 +2086,95 @@ fn decimal_constants_follow_each_profile_numeric_policy() {
 }
 
 #[test]
+fn blu_integer_arithmetic_wraps_and_mixed_arithmetic_promotes() {
+    let source = make_source(
+        b"return 0x7fffffffffffffff+1,0x8000000000000000-1,0x4000000000000000*4,5+0.5,5/2,-7%3"
+            .to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![
+            Value::Integer(i64::MIN),
+            Value::Integer(i64::MAX),
+            Value::Integer(0),
+            Value::Number(5.5),
+            Value::Number(2.5),
+            Value::Integer(2),
+        ])
+    );
+}
+
+#[test]
+fn arithmetic_numeric_string_coercion_is_profile_typed() {
+    let shared = make_source(b"return '3'+1,'0x10'+1,' 5 '*2".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&shared, profile, compiler_identity())
+            .unwrap();
+        let integer = matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        );
+        let value = |integer_value, number_value| {
+            if integer {
+                Value::Integer(integer_value)
+            } else {
+                Value::Number(number_value)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![value(4, 4.0), value(17, 17.0), value(10, 10.0)]),
+            "{profile}"
+        );
+    }
+
+    let floor = make_source(b"return '7'//3".to_vec());
+    for profile in [
+        SemanticProfile::Blu,
+        SemanticProfile::Luau,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&floor, profile, compiler_identity())
+            .unwrap();
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Value::Integer(2)
+        } else {
+            Value::Number(2.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
+    }
+
+    let invalid = make_source(b"return 'not-a-number'+1".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&invalid, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::Type {
+                operation: "arithmetic",
+                actual: "string",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn fractional_and_exponent_numbers_lower_for_every_profile() {
     let source = make_source(b"return 1.5, .25, 1., 1.e2, 2e3, 4.5E-2".to_vec());
     for profile in SemanticProfile::ALL {

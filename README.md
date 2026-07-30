@@ -124,6 +124,9 @@ Blu fitting decimal integers and Blu-only binary integers are likewise exact
 Binary integers are also available only in Blu and Luau. Hexadecimal floats and
 their profile matrix are supported: exponent-only forms work in Blu and Lua
 5.1–5.5, fractional forms work in Blu and Lua 5.2–5.5, and Luau rejects both.
+Arithmetic accepts whitespace-trimmed decimal and hexadecimal numeric strings
+under every profile. Blu and Lua 5.4–5.5 preserve exact parsed integers;
+Luau and Lua 5.1–5.3 produce numbers from string operands.
 Other profile-specific numeral extensions remain explicitly unsupported.
 Quoted strings support decimal byte escapes in every profile. Two-digit
 hexadecimal byte escapes are available in Blu, Luau, and Lua 5.2–5.5; malformed
