@@ -405,12 +405,14 @@ slice: relative start indices, empty needles, nil misses, and explicit
 limit. The common byte classes `%a`, `%c`, `%d`, `%l`, `%p`, `%s`, `%u`, `%w`,
 `%x`, and `%z` are supported, with uppercase class letters selecting their
 complements. Bracket sets support byte literals, ranges, the common classes,
-leading `^` negation, and a leading literal `]`. Repetition, captures, malformed
-escapes or sets, and classes that differ between targeted dialects are not
-reinterpreted as literal text; they fail with a structured
-unsupported-library-feature error until profile-specific pattern dispatch is
-implemented. Returned indices follow the active profile's legacy-number or
-modern-integer policy.
+leading `^` negation, and a leading literal `]`. Greedy `*`, `+`, and `?`
+repetition and minimal `-` repetition execute through an explicit,
+non-recursive backtracking state machine under the same work limit. Captures,
+malformed escapes, sets, or repetition, and classes that differ between
+targeted dialects are not reinterpreted as literal text; they fail with a
+structured unsupported-library-feature error until profile-specific pattern
+dispatch is implemented. Returned indices follow the active profile's
+legacy-number or modern-integer policy.
 
 ## Authority profiles
 

@@ -6165,6 +6165,21 @@ enum BasicPatternAtom {
     Set([u64; 4]),
 }
 
+#[derive(Clone, Copy)]
+enum BasicPatternRepetition {
+    One,
+    ZeroOrMore,
+    OneOrMore,
+    Optional,
+    Minimal,
+}
+
+#[derive(Clone, Copy)]
+struct BasicPatternPiece {
+    atom: BasicPatternAtom,
+    repetition: BasicPatternRepetition,
+}
+
 fn find_basic_lua_pattern(
     haystack: &[u8],
     pattern: &[u8],
@@ -6175,51 +6190,63 @@ fn find_basic_lua_pattern(
     let anchored = pattern.first() == Some(&b'^');
     let mut index = usize::from(anchored);
     let mut end_anchor = false;
-    let mut atoms = try_vec_with_capacity(pattern.len(), "string.find pattern atoms")?;
+    let mut pieces = try_vec_with_capacity(pattern.len(), "string.find pattern pieces")?;
     while index < pattern.len() {
         let byte = pattern[index];
         if byte == b'$' && index + 1 == pattern.len() {
             end_anchor = true;
             index += 1;
-        } else if byte == b'.' {
-            atoms.push(BasicPatternAtom::Any);
-            index += 1;
-        } else if byte == b'%' {
-            let escaped =
-                pattern
-                    .get(index + 1)
-                    .copied()
-                    .ok_or(RuntimeError::UnsupportedLibraryFeature {
+            continue;
+        }
+        let atom =
+            if byte == b'.' {
+                index += 1;
+                BasicPatternAtom::Any
+            } else if byte == b'%' {
+                let escaped = pattern.get(index + 1).copied().ok_or(
+                    RuntimeError::UnsupportedLibraryFeature {
                         function: "string.find",
                         feature: "malformed Lua patterns",
-                    })?;
-            if matches!(
-                escaped.to_ascii_lowercase(),
-                b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
-            ) {
-                atoms.push(BasicPatternAtom::Class(escaped));
-            } else if escaped.is_ascii_alphanumeric() {
+                    },
+                )?;
+                if matches!(
+                    escaped.to_ascii_lowercase(),
+                    b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
+                ) {
+                    BasicPatternAtom::Class(escaped)
+                } else if escaped.is_ascii_alphanumeric() {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "string.find",
+                        feature: "dialect-specific Lua pattern classes and captures",
+                    });
+                } else {
+                    BasicPatternAtom::Literal(escaped)
+                }
+            } else if byte == b'[' {
+                let (set, next) = parse_basic_pattern_set(pattern, index)?;
+                index = next;
+                BasicPatternAtom::Set(set)
+            } else if b"*+?-]()".contains(&byte) {
                 return Err(RuntimeError::UnsupportedLibraryFeature {
                     function: "string.find",
-                    feature: "dialect-specific Lua pattern classes and captures",
+                    feature: "malformed Lua pattern repetition or captures",
                 });
             } else {
-                atoms.push(BasicPatternAtom::Literal(escaped));
-            }
+                index += 1;
+                BasicPatternAtom::Literal(byte)
+            };
+        if byte == b'%' {
             index += 2;
-        } else if byte == b'[' {
-            let (set, next) = parse_basic_pattern_set(pattern, index)?;
-            atoms.push(BasicPatternAtom::Set(set));
-            index = next;
-        } else if b"*+?-]()".contains(&byte) {
-            return Err(RuntimeError::UnsupportedLibraryFeature {
-                function: "string.find",
-                feature: "Lua pattern repetition and captures",
-            });
-        } else {
-            atoms.push(BasicPatternAtom::Literal(byte));
-            index += 1;
         }
+        let repetition = match pattern.get(index) {
+            Some(b'*') => BasicPatternRepetition::ZeroOrMore,
+            Some(b'+') => BasicPatternRepetition::OneOrMore,
+            Some(b'?') => BasicPatternRepetition::Optional,
+            Some(b'-') => BasicPatternRepetition::Minimal,
+            _ => BasicPatternRepetition::One,
+        };
+        index += usize::from(!matches!(repetition, BasicPatternRepetition::One));
+        pieces.push(BasicPatternPiece { atom, repetition });
     }
 
     let candidates = if anchored {
@@ -6227,34 +6254,162 @@ fn find_basic_lua_pattern(
     } else {
         haystack.len().saturating_sub(start).saturating_add(1)
     };
-    let required = candidates.saturating_mul(atoms.len().max(1));
+    let required = candidates.saturating_mul(pieces.len().max(1));
     if required > MAX_PATTERN_WORK {
         return Err(RuntimeError::PatternWorkLimit {
             required,
             limit: MAX_PATTERN_WORK,
         });
     }
+    let mut work = 0;
     for position in start..start.saturating_add(candidates) {
-        let Some(end) = position.checked_add(atoms.len()) else {
-            continue;
-        };
-        if end > haystack.len() || end_anchor && end != haystack.len() {
-            continue;
-        }
-        if atoms
-            .iter()
-            .zip(&haystack[position..end])
-            .all(|(atom, byte)| match atom {
-                BasicPatternAtom::Literal(expected) => expected == byte,
-                BasicPatternAtom::Any => true,
-                BasicPatternAtom::Class(class) => byte_matches_pattern_class(*byte, *class),
-                BasicPatternAtom::Set(set) => pattern_set_contains(set, *byte),
-            })
-        {
+        if let Some(end) = match_basic_pattern_at(
+            haystack,
+            &pieces,
+            position,
+            end_anchor,
+            &mut work,
+            MAX_PATTERN_WORK,
+        )? {
             return Ok(Some((position, end)));
         }
     }
     Ok(None)
+}
+
+#[derive(Clone, Copy)]
+enum BasicPatternState {
+    Match {
+        piece: usize,
+        position: usize,
+    },
+    Repeat {
+        piece: usize,
+        position: usize,
+        count: usize,
+        bound: usize,
+        ascending: bool,
+    },
+}
+
+fn match_basic_pattern_at(
+    haystack: &[u8],
+    pieces: &[BasicPatternPiece],
+    start: usize,
+    end_anchor: bool,
+    work: &mut usize,
+    work_limit: usize,
+) -> Result<Option<usize>, RuntimeError> {
+    let capacity = pieces.len().saturating_add(1);
+    let mut states = try_vec_with_capacity(capacity, "string.find backtracking states")?;
+    states.push(BasicPatternState::Match {
+        piece: 0,
+        position: start,
+    });
+    while let Some(state) = states.pop() {
+        charge_pattern_work(work, 1, work_limit)?;
+        match state {
+            BasicPatternState::Match { piece, position } => {
+                let Some(current) = pieces.get(piece) else {
+                    if !end_anchor || position == haystack.len() {
+                        return Ok(Some(position));
+                    }
+                    continue;
+                };
+                if matches!(current.repetition, BasicPatternRepetition::One) {
+                    let Some(byte) = haystack.get(position) else {
+                        continue;
+                    };
+                    charge_pattern_work(work, 1, work_limit)?;
+                    if basic_pattern_atom_matches(&current.atom, *byte) {
+                        states.push(BasicPatternState::Match {
+                            piece: piece + 1,
+                            position: position + 1,
+                        });
+                    }
+                    continue;
+                }
+
+                let mut maximum = 0;
+                while let Some(byte) = haystack.get(position + maximum) {
+                    charge_pattern_work(work, 1, work_limit)?;
+                    if !basic_pattern_atom_matches(&current.atom, *byte) {
+                        break;
+                    }
+                    maximum += 1;
+                    if matches!(current.repetition, BasicPatternRepetition::Optional) {
+                        break;
+                    }
+                }
+                let minimum = usize::from(matches!(
+                    current.repetition,
+                    BasicPatternRepetition::OneOrMore
+                ));
+                if maximum < minimum {
+                    continue;
+                }
+                let ascending = matches!(current.repetition, BasicPatternRepetition::Minimal);
+                states.push(BasicPatternState::Repeat {
+                    piece,
+                    position,
+                    count: if ascending { minimum } else { maximum },
+                    bound: if ascending { maximum } else { minimum },
+                    ascending,
+                });
+            }
+            BasicPatternState::Repeat {
+                piece,
+                position,
+                count,
+                bound,
+                ascending,
+            } => {
+                if ascending && count < bound {
+                    states.push(BasicPatternState::Repeat {
+                        piece,
+                        position,
+                        count: count + 1,
+                        bound,
+                        ascending,
+                    });
+                } else if !ascending && count > bound {
+                    states.push(BasicPatternState::Repeat {
+                        piece,
+                        position,
+                        count: count - 1,
+                        bound,
+                        ascending,
+                    });
+                }
+                states.push(BasicPatternState::Match {
+                    piece: piece + 1,
+                    position: position + count,
+                });
+            }
+        }
+    }
+    Ok(None)
+}
+
+fn charge_pattern_work(work: &mut usize, amount: usize, limit: usize) -> Result<(), RuntimeError> {
+    *work = work.saturating_add(amount);
+    if *work > limit {
+        Err(RuntimeError::PatternWorkLimit {
+            required: *work,
+            limit,
+        })
+    } else {
+        Ok(())
+    }
+}
+
+fn basic_pattern_atom_matches(atom: &BasicPatternAtom, byte: u8) -> bool {
+    match atom {
+        BasicPatternAtom::Literal(expected) => *expected == byte,
+        BasicPatternAtom::Any => true,
+        BasicPatternAtom::Class(class) => byte_matches_pattern_class(byte, *class),
+        BasicPatternAtom::Set(set) => pattern_set_contains(set, byte),
+    }
 }
 
 fn parse_basic_pattern_set(

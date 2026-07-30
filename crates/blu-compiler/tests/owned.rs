@@ -2285,10 +2285,10 @@ fn string_find_uses_byte_indices_plain_search_and_profile_subtypes() {
 }
 
 #[test]
-fn string_find_rejects_patterns_unless_plain_is_explicit() {
+fn string_find_plain_mode_is_literal_and_captures_remain_unsupported() {
     for (source, expected) in [
         (b"return string.find('a.c', '.', 1, true)".as_slice(), true),
-        (b"return string.find('abc', 'a*')".as_slice(), false),
+        (b"return string.find('abc', '(a)')".as_slice(), false),
     ] {
         for profile in SemanticProfile::ALL {
             let compiled = OwnedCompiler::default()
@@ -2314,6 +2314,64 @@ fn string_find_rejects_patterns_unless_plain_is_explicit() {
                 );
             }
         }
+    }
+}
+
+#[test]
+fn string_find_supports_greedy_optional_and_minimal_repetition() {
+    let source = make_source(
+        b"local a,b=string.find('xxaaab','a*b') local c,d=string.find('xxb','a?b') local e,f=string.find('aaaa','a*a') local g,h=string.find('aaaa','a-a') local missing=string.find('xxb','a+b') return a,b,c,d,e,f,g,h,missing"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let index = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                index(3),
+                index(6),
+                index(3),
+                index(3),
+                index(1),
+                index(4),
+                index(1),
+                index(1),
+                Value::Nil
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn string_find_rejects_malformed_repetition_structurally() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(b"return string.find('abc', '*a')".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "string.find",
+                feature: "malformed Lua pattern repetition or captures",
+            })
+        ));
     }
 }
 
