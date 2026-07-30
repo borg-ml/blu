@@ -852,6 +852,34 @@ impl Vm {
                     )?;
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::LoadGlobal { destination, name } => {
+                    let Value::String(name) =
+                        constants.get(name as usize).ok_or(RuntimeError::Constant {
+                            constant: name as usize,
+                            count: constants.len(),
+                        })?
+                    else {
+                        return Err(RuntimeError::UnsupportedBluV1Structure {
+                            what: "validated global name is not a string",
+                        });
+                    };
+                    let value = self.globals.get(name).cloned().unwrap_or(Value::Nil);
+                    set_blu_register(&mut registers, destination, value)?;
+                }
+                BluInstruction::StoreGlobal { name, source } => {
+                    let Value::String(name) =
+                        constants.get(name as usize).ok_or(RuntimeError::Constant {
+                            constant: name as usize,
+                            count: constants.len(),
+                        })?
+                    else {
+                        return Err(RuntimeError::UnsupportedBluV1Structure {
+                            what: "validated global name is not a string",
+                        });
+                    };
+                    let value = blu_register(&registers, source)?.clone();
+                    self.set_global(name.clone(), value);
+                }
                 BluInstruction::Add {
                     destination,
                     left,

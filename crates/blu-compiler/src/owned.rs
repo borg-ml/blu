@@ -506,6 +506,14 @@ impl<'a> Lowerer<'a> {
         }) {
             required_features = required_features | FeatureBits::BACKWARD_BRANCHES;
         }
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::LoadGlobal { .. } | Instruction::StoreGlobal { .. }
+            )
+        }) {
+            required_features = required_features | FeatureBits::GLOBALS;
+        }
         Ok(Prototype {
             profile: ast.profile(),
             source: self.source.identity().id(),
@@ -1017,15 +1025,19 @@ impl<'a> Lowerer<'a> {
         &mut self,
         statement: AssignmentStatement,
     ) -> Result<(), OwnedCompileError> {
-        let destination = self.resolve(statement.target().span())?;
         let source = self.lower_expression(statement.value())?;
-        self.emit(
-            Instruction::Move {
-                destination,
-                source,
-            },
-            statement.span(),
-        )
+        if let Some(destination) = self.resolve_local(statement.target().span())? {
+            self.emit(
+                Instruction::Move {
+                    destination,
+                    source,
+                },
+                statement.span(),
+            )
+        } else {
+            let name = self.global_name_constant(statement.target().span())?;
+            self.emit(Instruction::StoreGlobal { name, source }, statement.span())
+        }
     }
 
     fn lower_local_list(
@@ -1252,7 +1264,19 @@ impl<'a> Lowerer<'a> {
                 let constant = self.string_constant(expression.span())?;
                 self.lower_constant(constant, expression.span())
             }
-            ExpressionKind::Identifier(identifier) => self.resolve(identifier.span()),
+            ExpressionKind::Identifier(identifier) => {
+                if let Some(register) = self.resolve_local(identifier.span())? {
+                    Ok(register)
+                } else {
+                    let name = self.global_name_constant(identifier.span())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::LoadGlobal { destination, name },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
+                }
+            }
             ExpressionKind::Group(inner) => self.lower_expression(inner),
             ExpressionKind::Unary(unary) => match unary.operator() {
                 UnaryOperator::Not => {
@@ -1843,18 +1867,31 @@ impl<'a> Lowerer<'a> {
     }
 
     fn resolve(&self, name: ByteSpan) -> Result<u16, OwnedCompileError> {
+        if let Some(register) = self.resolve_local(name)? {
+            Ok(register)
+        } else {
+            Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                "BLU-RESOLVE-0001",
+                Phase::Resolve,
+                name,
+                "local name is unresolved",
+            )?))
+        }
+    }
+
+    fn resolve_local(&self, name: ByteSpan) -> Result<Option<u16>, OwnedCompileError> {
         let bytes = self.source.slice(name)?;
         for binding in self.bindings.iter().rev() {
             if self.source.slice(binding.name)? == bytes {
-                return Ok(binding.register);
+                return Ok(Some(binding.register));
             }
         }
-        Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-            "BLU-RESOLVE-0001",
-            Phase::Resolve,
-            name,
-            "local name is unresolved",
-        )?))
+        Ok(None)
+    }
+
+    fn global_name_constant(&mut self, name: ByteSpan) -> Result<u32, OwnedCompileError> {
+        let bytes = copy_bytes(self.source.slice(name)?, "global name")?;
+        self.push_constant(Constant::String(bytes))
     }
 
     fn allocate_register(&mut self) -> Result<u16, OwnedCompileError> {

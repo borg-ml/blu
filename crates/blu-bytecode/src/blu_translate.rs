@@ -365,6 +365,12 @@ fn translate_instruction(
             prototype,
             instruction: "forward branches",
         }),
+        BluInstruction::LoadGlobal { .. } | BluInstruction::StoreGlobal { .. } => {
+            Err(TranslationError::UnsupportedInstruction {
+                prototype,
+                instruction: "globals",
+            })
+        }
         BluInstruction::Return { first, count } => {
             let result_field = count
                 .checked_add(1)

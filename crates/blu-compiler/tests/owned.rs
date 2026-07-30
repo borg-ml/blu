@@ -7,7 +7,7 @@ use blu_compiler::owned::{
 };
 use blu_core::{
     CompilerId, CompilerIdentity, DiagnosticError, DiagnosticLimit, IdentityLimits, Phase,
-    SemanticProfile, Severity, SourceFile, SourceId, SourceLimits,
+    SemanticProfile, SourceFile, SourceId, SourceLimits,
 };
 use blu_runtime::{Dialect, Value, Vm};
 use sha2::{Digest, Sha256};
@@ -180,17 +180,13 @@ fn local_resolution_is_sequential_and_shadow_aware() {
     );
 
     let unresolved = make_source(b"return missing + 2".to_vec());
-    let error = OwnedCompiler::default()
+    let compiled = OwnedCompiler::default()
         .compile(&unresolved, SemanticProfile::Blu, compiler_identity())
-        .unwrap_err();
-    let diagnostic = error.diagnostic().expect("resolve diagnostic");
-    assert_eq!(diagnostic.code().as_str(), "BLU-RESOLVE-0001");
-    assert_eq!(diagnostic.phase(), Phase::Resolve);
-    assert_eq!(diagnostic.profile(), SemanticProfile::Blu);
-    assert_eq!(diagnostic.severity(), Severity::Error);
-    assert_eq!(
-        unresolved.slice(diagnostic.primary().span()).unwrap(),
-        b"missing"
+        .expect("unresolved reads are globals");
+    assert!(
+        Vm::default()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .is_err()
     );
 }
 
@@ -314,16 +310,15 @@ fn local_assignment_mutates_the_active_shadowed_binding_for_every_profile() {
     }
 
     let source = make_source(b"missing = 1".to_vec());
-    let error = OwnedCompiler::default()
+    let compiled = OwnedCompiler::default()
         .compile(&source, SemanticProfile::Blu, compiler_identity())
-        .unwrap_err();
-    let diagnostic = error.diagnostic().unwrap();
-    assert_eq!(diagnostic.code().as_str(), "BLU-RESOLVE-0001");
-    assert_eq!(diagnostic.phase(), Phase::Resolve);
+        .expect("unresolved assignment is global");
+    let mut vm = Vm::default();
     assert_eq!(
-        source.slice(diagnostic.primary().span()).unwrap(),
-        b"missing"
+        vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(Vec::new())
     );
+    assert_eq!(vm.global(b"missing"), Some(&Value::Number(1.0)));
 }
 
 #[test]
@@ -501,7 +496,7 @@ fn syntax_failures_are_structured_and_implicit_returns_execute() {
         }
     }
 
-    let unresolved = make_source(b"return missing".to_vec());
+    let unresolved = make_source(b"local step = 1\nfor index = 1, 3, step do end".to_vec());
     let mut limits = OwnedCompileLimits::default();
     limits.parse.lexer.diagnostic_limits.max_label_message_bytes = 1;
     assert!(matches!(
@@ -1158,6 +1153,38 @@ fn numeric_for_accepts_nonzero_literal_steps_and_rejects_unresolved_zero_behavio
             .compile(&source, SemanticProfile::Blu, compiler_identity())
             .expect_err("unassigned step semantics should fail explicitly");
         assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
+    }
+}
+
+#[test]
+fn owned_scalar_globals_round_trip_and_persist_in_the_vm_registry() {
+    let source = make_source(b"answer = 40\nanswer = answer + 2\nreturn answer, missing".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .expect("global source should compile");
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .required_features
+                .contains(FeatureBits::GLOBALS)
+        );
+        let mut vm = Vm::default();
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Value::Integer(42)
+        } else {
+            Value::Number(42.0)
+        };
+        assert_eq!(
+            vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected.clone(), Value::Nil]),
+            "{profile}"
+        );
+        assert_eq!(vm.global(b"answer"), Some(&expected));
     }
 }
 

@@ -113,6 +113,10 @@ numeric representation for the implicit positive unit step, and scope the
 index to the loop. Explicit, provably nonzero numeric-literal steps support
 both directions. Zero or dynamic steps fail during lowering until their
 conflicting profile-specific runtime behavior can be represented directly.
+Canonical BluV1 global loads and stores connect the owned frontend to the VM's
+embedding registry. Unknown scalar reads produce `nil`, and scalar writes
+persist in the VM; global list assignment and environment-rebinding APIs remain
+explicitly unsupported.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

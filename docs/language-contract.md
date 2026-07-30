@@ -190,6 +190,13 @@ This restriction preserves an upstream conflict: pinned Lua 5.1–5.3 classify
 zero with non-negative steps, Lua 5.4–5.5 raise "`for` step is zero", and
 pinned Luau classifies zero with non-positive steps. Blu's zero-step behavior
 remains unassigned.
+BluV1 global load/store instructions use byte-string constants as names and
+require the `GLOBALS` feature bit. Validation rejects non-string name
+references and reads from uninitialized registers. Direct execution reads and
+writes the VM embedding registry; an absent name produces `nil`. The owned
+frontend resolves lexical locals first and otherwise lowers scalar identifier
+reads and single-target assignments as globals. Global list assignment and
+versioned `_ENV`/`getfenv`/`setfenv` behavior remain unsupported.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

@@ -61,6 +61,8 @@ impl FeatureBits {
     pub const FORWARD_BRANCHES: Self = Self(1 << 5);
     /// Backward unconditional branches validated against target entry state.
     pub const BACKWARD_BRANCHES: Self = Self(1 << 6);
+    /// Global environment access using byte-string constant names.
+    pub const GLOBALS: Self = Self(1 << 7);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -68,7 +70,8 @@ impl FeatureBits {
             | Self::CONCATENATION.0
             | Self::COMPARISONS.0
             | Self::FORWARD_BRANCHES.0
-            | Self::BACKWARD_BRANCHES.0,
+            | Self::BACKWARD_BRANCHES.0
+            | Self::GLOBALS.0,
     );
 
     #[must_use]
@@ -240,6 +243,14 @@ pub enum Instruction {
         destination: u16,
         constant: u32,
     },
+    LoadGlobal {
+        destination: u16,
+        name: u32,
+    },
+    StoreGlobal {
+        name: u32,
+        source: u16,
+    },
     Move {
         destination: u16,
         source: u16,
@@ -345,6 +356,8 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
         | SemanticProfile::Lua54
         | SemanticProfile::Lua55 => match instruction {
             Instruction::LoadConstant { .. }
+            | Instruction::LoadGlobal { .. }
+            | Instruction::StoreGlobal { .. }
             | Instruction::Move { .. }
             | Instruction::Not { .. }
             | Instruction::Negate { .. }
@@ -368,6 +381,8 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
         SemanticProfile::Blu | SemanticProfile::Lua51 | SemanticProfile::Lua52 => matches!(
             instruction,
             Instruction::LoadConstant { .. }
+                | Instruction::LoadGlobal { .. }
+                | Instruction::StoreGlobal { .. }
                 | Instruction::Move { .. }
                 | Instruction::Not { .. }
                 | Instruction::Negate { .. }
@@ -1115,6 +1130,18 @@ fn validate_prototype(
             feature: "integer constants",
         });
     }
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::LoadGlobal { .. } | Instruction::StoreGlobal { .. }
+        )
+    }) && !prototype.required_features.contains(FeatureBits::GLOBALS)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "globals",
+        });
+    }
     if prototype
         .code
         .iter()
@@ -1317,6 +1344,35 @@ fn validate_prototype(
                     });
                 }
                 initialized[destination as usize] = true;
+            }
+            Instruction::LoadGlobal { destination, name } => {
+                check_register(index, pc, destination, registers)?;
+                if !matches!(
+                    prototype.constants.get(name as usize),
+                    Some(Constant::String(_))
+                ) {
+                    return Err(ValidationError::InvalidReference {
+                        prototype: Some(index),
+                        what: "global name string constant",
+                        index: name as usize,
+                        count: prototype.constants.len(),
+                    });
+                }
+                initialized[destination as usize] = true;
+            }
+            Instruction::StoreGlobal { name, source } => {
+                check_read(index, pc, source, &initialized)?;
+                if !matches!(
+                    prototype.constants.get(name as usize),
+                    Some(Constant::String(_))
+                ) {
+                    return Err(ValidationError::InvalidReference {
+                        prototype: Some(index),
+                        what: "global name string constant",
+                        index: name as usize,
+                        count: prototype.constants.len(),
+                    });
+                }
             }
             Instruction::Move {
                 destination,
@@ -1789,6 +1845,8 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                 &mut size,
                 match instruction {
                     Instruction::LoadConstant { .. }
+                    | Instruction::LoadGlobal { .. }
+                    | Instruction::StoreGlobal { .. }
                     | Instruction::Add { .. }
                     | Instruction::Subtract { .. }
                     | Instruction::Multiply { .. }
@@ -1903,6 +1961,16 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 out.push(0);
                 put_u16(out, *destination);
                 put_u32(out, *constant);
+            }
+            Instruction::LoadGlobal { destination, name } => {
+                out.push(20);
+                put_u16(out, *destination);
+                put_u32(out, *name);
+            }
+            Instruction::StoreGlobal { name, source } => {
+                out.push(21);
+                put_u32(out, *name);
+                put_u16(out, *source);
             }
             Instruction::Add {
                 destination,
@@ -2711,6 +2779,14 @@ fn read_prototype(
             },
             19 => Instruction::Jump {
                 target: reader.u32()?,
+            },
+            20 => Instruction::LoadGlobal {
+                destination: reader.u16()?,
+                name: reader.u32()?,
+            },
+            21 => Instruction::StoreGlobal {
+                name: reader.u32()?,
+                source: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {
