@@ -39,6 +39,8 @@ All four Lua repetition suffixes are bounded: greedy `*`/`+`/`?` and minimal
 `-`.
 Capture-free `string.match` uses the same byte-pattern engine, limits, and
 structured unsupported-feature behavior.
+Capture-free `string.gsub` adds bounded string/number replacement, `%0`, `%%`,
+empty-match progress, replacement counts, and explicit callback rejection.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
 `table.sort` provides bounded default ordering for uniform number and byte-string

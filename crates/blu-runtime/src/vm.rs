@@ -5103,6 +5103,96 @@ impl Vm {
             };
             Ok(vec![Value::String(Arc::from(&haystack[first..end]))])
         });
+        let string_gsub = self.register_function(|vm, arguments| {
+            let haystack = string_bytes(
+                arguments.first().ok_or(RuntimeError::Argument {
+                    function: "string.gsub",
+                    index: 1,
+                })?,
+                "string.gsub",
+            )?;
+            let pattern = string_bytes(
+                arguments.get(1).ok_or(RuntimeError::Argument {
+                    function: "string.gsub",
+                    index: 2,
+                })?,
+                "string.gsub",
+            )?;
+            let replacement_value = arguments.get(2).ok_or(RuntimeError::Argument {
+                function: "string.gsub",
+                index: 3,
+            })?;
+            let replacement = try_concat_bytes(replacement_value)?.ok_or_else(|| {
+                if matches!(
+                    replacement_value,
+                    Value::Table(_) | Value::Closure(_) | Value::NativeFunction(_)
+                ) {
+                    RuntimeError::UnsupportedLibraryFeature {
+                        function: "string.gsub",
+                        feature: "table and callback replacements",
+                    }
+                } else {
+                    RuntimeError::Type {
+                        operation: "string.gsub",
+                        expected: "string or number replacement",
+                        actual: replacement_value.type_name(),
+                    }
+                }
+            })?;
+            let explicit_limit = arguments.get(3).is_some();
+            let replacement_limit = arguments
+                .get(3)
+                .map(|_| integer_argument(arguments, 3, "string.gsub"))
+                .transpose()?
+                .map_or(MAX_DYNAMIC_REGISTERS, |limit| {
+                    usize::try_from(limit.max(0)).unwrap_or(usize::MAX)
+                });
+            if replacement_limit > MAX_DYNAMIC_REGISTERS {
+                return Err(RuntimeError::StackLimit {
+                    required: replacement_limit,
+                    limit: MAX_DYNAMIC_REGISTERS,
+                });
+            }
+
+            let mut result = try_vec_with_capacity(haystack.len(), "string.gsub result")?;
+            let mut search_start = 0;
+            let mut copied_until = 0;
+            let mut replacements = 0;
+            while replacements < replacement_limit && search_start <= haystack.len() {
+                let Some((first, end)) = find_basic_lua_pattern(haystack, pattern, search_start)?
+                else {
+                    break;
+                };
+                append_limited_string(&mut result, &haystack[copied_until..first])?;
+                append_gsub_replacement(&mut result, &replacement, &haystack[first..end])?;
+                replacements += 1;
+                if end > first {
+                    search_start = end;
+                    copied_until = end;
+                } else if first < haystack.len() {
+                    append_limited_string(&mut result, &haystack[first..first + 1])?;
+                    search_start = first + 1;
+                    copied_until = search_start;
+                } else {
+                    search_start = haystack.len() + 1;
+                    copied_until = haystack.len();
+                }
+            }
+            if !explicit_limit
+                && replacements == MAX_DYNAMIC_REGISTERS
+                && find_basic_lua_pattern(haystack, pattern, search_start)?.is_some()
+            {
+                return Err(RuntimeError::StackLimit {
+                    required: MAX_DYNAMIC_REGISTERS + 1,
+                    limit: MAX_DYNAMIC_REGISTERS,
+                });
+            }
+            append_limited_string(&mut result, &haystack[copied_until..])?;
+            Ok(vec![
+                Value::String(Arc::from(result)),
+                profiled_integral_math_result(vm, "string.gsub", replacements as f64)?,
+            ])
+        });
         let string = self.heap.allocate_table(0, 1)?;
         self.heap.table_set(
             string,
@@ -5118,6 +5208,11 @@ impl Vm {
             string,
             Value::String(Arc::from(&b"match"[..])),
             Value::NativeFunction(string_match),
+        )?;
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"gsub"[..])),
+            Value::NativeFunction(string_gsub),
         )?;
         let string_len = self.register_function(|_, arguments| {
             let string = arguments.first().ok_or(RuntimeError::Argument {
@@ -6650,6 +6745,66 @@ fn byte_matches_pattern_class(byte: u8, class: u8) -> bool {
     } else {
         !matches
     }
+}
+
+fn append_limited_string(result: &mut Vec<u8>, bytes: &[u8]) -> Result<(), RuntimeError> {
+    let required = result
+        .len()
+        .checked_add(bytes.len())
+        .ok_or(RuntimeError::StringLimit {
+            required: usize::MAX,
+            limit: MAX_STRING_BYTES,
+        })?;
+    if required > MAX_STRING_BYTES {
+        return Err(RuntimeError::StringLimit {
+            required,
+            limit: MAX_STRING_BYTES,
+        });
+    }
+    try_reserve_exact(result, bytes.len(), "string result")?;
+    result.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn append_gsub_replacement(
+    result: &mut Vec<u8>,
+    replacement: &[u8],
+    matched: &[u8],
+) -> Result<(), RuntimeError> {
+    let mut index = 0;
+    while index < replacement.len() {
+        if replacement[index] != b'%' {
+            append_limited_string(result, &replacement[index..index + 1])?;
+            index += 1;
+            continue;
+        }
+        let escaped =
+            replacement
+                .get(index + 1)
+                .copied()
+                .ok_or(RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.gsub",
+                    feature: "malformed replacement escapes",
+                })?;
+        match escaped {
+            b'0' => append_limited_string(result, matched)?,
+            b'%' => append_limited_string(result, b"%")?,
+            b'1'..=b'9' => {
+                return Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.gsub",
+                    feature: "capture replacement references",
+                });
+            }
+            _ => {
+                return Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.gsub",
+                    feature: "nonportable replacement escapes",
+                });
+            }
+        }
+        index += 2;
+    }
+    Ok(())
 }
 
 fn try_concat_bytes(value: &Value) -> Result<Option<Cow<'_, [u8]>>, RuntimeError> {

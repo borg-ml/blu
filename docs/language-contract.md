@@ -418,6 +418,11 @@ legacy-number or modern-integer policy.
 `string.match` uses the same byte-pattern engine, relative start rules, and
 work limit. Until captures are implemented it returns the full matched byte
 slice, or nil on a miss, and rejects capture syntax structurally.
+`string.gsub` uses the same capture-free engine with bounded non-overlapping
+replacement and Lua-compatible empty-match progress. String and numeric
+replacements support literal bytes, `%%`, and `%0`; the second result is the
+profile-typed replacement count. Capture references, table replacements, and
+callback replacements fail explicitly.
 `collectgarbage` supports the shared `collect` and `count` commands. Collection
 traces active frames, globals, threads, upvalues, and host-retained values.
 `count` reports the runtime's accounted GC-heap kibibytes; it is not presented
