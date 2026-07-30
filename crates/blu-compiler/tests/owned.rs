@@ -5336,11 +5336,13 @@ fn string_split_matches_luau_byte_and_empty_field_semantics() {
 #[test]
 fn string_format_executes_the_profile_common_conversion_core() {
     let source = make_source(
-        b"return string.format('%s:%d:%i:%u:%x:%X:%o:%c:%f:%e:%E:%.3s:%.2f:%.1e:%.3E:%%','ok',12,-2,-1,255,255,9,65,1.25,1.25,0.00125,'abcdef',1.25,1.25,0.00125)"
+        b"return string.format('%s:%d:%i:%u:%x:%X:%o:%c:%f:%e:%E:%.3s:%.2f:%.1e:%.3E:%5s:%4d:%8.2f:%%','ok',12,-2,-1,255,255,9,65,1.25,1.25,0.00125,'abcdef',1.25,1.25,0.00125,'xy',7,1.25)"
             .to_vec(),
     );
     let fractional = make_source(b"return string.format('%d',12.9)".to_vec());
     let unsupported = make_source(b"return string.format('%02d',7)".to_vec());
+    let wide = make_source(b"return string.format('%100s','x')".to_vec());
+    let dangling_width = make_source(b"return string.format('%12','x')".to_vec());
     for profile in SemanticProfile::ALL {
         let compile = |source: &SourceFile| {
             OwnedCompiler::default()
@@ -5353,7 +5355,7 @@ fn string_format_executes_the_profile_common_conversion_core() {
                 BluLimits::default(),
             ),
             Ok(vec![Value::String(Arc::from(
-                &b"ok:12:-2:18446744073709551615:ff:FF:11:A:1.250000:1.250000e+00:1.250000E-03:abc:1.25:1.2e+00:1.250E-03:%"[..]
+                &b"ok:12:-2:18446744073709551615:ff:FF:11:A:1.250000:1.250000e+00:1.250000E-03:abc:1.25:1.2e+00:1.250E-03:   xy:   7:    1.25:%"[..]
             ))]),
             "{profile}"
         );
@@ -5390,7 +5392,29 @@ fn string_format_executes_the_profile_common_conversion_core() {
             ),
             Err(RuntimeError::UnsupportedLibraryFeature {
                 function: "string.format",
-                feature: "flags and field widths",
+                feature: "format flags",
+            }),
+            "{profile}"
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(
+                compile(&wide).into_validated_artifact(),
+                BluLimits::default(),
+            ),
+            Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "string.format",
+                feature: "field widths wider than two digits",
+            }),
+            "{profile}"
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(
+                compile(&dangling_width).into_validated_artifact(),
+                BluLimits::default(),
+            ),
+            Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "string.format",
+                feature: "a field width without a conversion specifier",
             }),
             "{profile}"
         );
