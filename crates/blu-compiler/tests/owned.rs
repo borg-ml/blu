@@ -2758,6 +2758,59 @@ fn string_patterns_reject_invalid_backreferences_structurally() {
 }
 
 #[test]
+fn string_patterns_match_balanced_byte_pairs() {
+    let source = make_source(
+        b"local a,b=string.find('x(a(b)c)y','%b()') local c=string.match('x<a<b>c>y','%b<>') local d=string.match('(abc','%b()') return a,b,c,d"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let index = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                index(2),
+                index(8),
+                Value::String(Arc::from(&b"<a<b>c>"[..])),
+                Value::Nil,
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn string_patterns_reject_malformed_balanced_atoms_structurally() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(b"return string.match('abc', '%b(')".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "string.match",
+                feature: "malformed Lua balanced patterns",
+            })
+        ));
+    }
+}
+
+#[test]
 fn string_gsub_replaces_bounded_matches_and_reports_profile_typed_counts() {
     let source = make_source(
         b"local a,b=string.gsub('abc123','%d','[%0]') local c,d=string.gsub('abc','','-') local e,f=string.gsub('aaaa','a',7,2) return a,b,c,d,e,f"

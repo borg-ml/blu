@@ -6423,6 +6423,7 @@ enum BasicPatternAtom {
     Class(u8),
     Set([u64; 4]),
     Backreference(u8),
+    Balanced(u8, u8),
     CaptureStart(u8),
     CaptureEnd(u8),
     PositionCapture(u8),
@@ -6491,7 +6492,22 @@ fn find_basic_lua_pattern(
                         function: operation,
                         feature: "malformed Lua patterns",
                     })?;
-            if matches!(
+            if escaped == b'b' {
+                let open = pattern.get(index + 2).copied().ok_or(
+                    RuntimeError::UnsupportedLibraryFeature {
+                        function: operation,
+                        feature: "malformed Lua balanced patterns",
+                    },
+                )?;
+                let close = pattern.get(index + 3).copied().ok_or(
+                    RuntimeError::UnsupportedLibraryFeature {
+                        function: operation,
+                        feature: "malformed Lua balanced patterns",
+                    },
+                )?;
+                index += 2;
+                BasicPatternAtom::Balanced(open, close)
+            } else if matches!(
                 escaped.to_ascii_lowercase(),
                 b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
             ) {
@@ -6701,6 +6717,38 @@ fn match_basic_pattern_at(
                     });
                     continue;
                 }
+                if let BasicPatternAtom::Balanced(open, close) = current.atom {
+                    if !matches!(current.repetition, BasicPatternRepetition::One) {
+                        return Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: operation,
+                            feature: "repetition applied to Lua balanced patterns",
+                        });
+                    }
+                    charge_pattern_work(work, 1, work_limit)?;
+                    if haystack.get(position) != Some(&open) {
+                        continue;
+                    }
+                    let mut depth = 1usize;
+                    let mut end = position + 1;
+                    while let Some(byte) = haystack.get(end) {
+                        charge_pattern_work(work, 1, work_limit)?;
+                        end += 1;
+                        if *byte == open {
+                            depth += 1;
+                        } else if *byte == close {
+                            depth -= 1;
+                            if depth == 0 {
+                                states.push(BasicPatternState::Match {
+                                    piece: piece + 1,
+                                    position: end,
+                                    event,
+                                });
+                                break;
+                            }
+                        }
+                    }
+                    continue;
+                }
                 if let BasicPatternAtom::Backreference(capture) = current.atom {
                     if !matches!(current.repetition, BasicPatternRepetition::One) {
                         return Err(RuntimeError::UnsupportedLibraryFeature {
@@ -6864,6 +6912,7 @@ fn basic_pattern_atom_matches(atom: &BasicPatternAtom, byte: u8) -> bool {
         BasicPatternAtom::Class(class) => byte_matches_pattern_class(byte, *class),
         BasicPatternAtom::Set(set) => pattern_set_contains(set, byte),
         BasicPatternAtom::Backreference(_)
+        | BasicPatternAtom::Balanced(_, _)
         | BasicPatternAtom::CaptureStart(_)
         | BasicPatternAtom::CaptureEnd(_)
         | BasicPatternAtom::PositionCapture(_) => false,

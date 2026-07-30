@@ -422,6 +422,8 @@ execute through linked capture events rather than recursive host calls.
 `%1` through `%9` match completed substring captures byte-for-byte under the
 same work limit. References to absent or unfinished captures fail structurally,
 while position-capture references follow the upstream non-match behavior.
+`%bxy` matches nested byte pairs without host recursion and charges every
+scanned byte against the pattern-work limit.
 `string.gsub` uses the same engine with bounded non-overlapping replacement
 and Lua-compatible empty-match progress. String and numeric replacements
 support literal bytes, `%%`, and `%0`; the second result is the profile-typed
