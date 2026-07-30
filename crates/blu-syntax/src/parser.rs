@@ -1326,11 +1326,12 @@ impl<'a> Parser<'a> {
         let unary_operator = match operator.kind() {
             TokenKind::Not => UnaryOperator::Not,
             TokenKind::Minus => UnaryOperator::Negate,
+            TokenKind::BitwiseExclusiveOr => UnaryOperator::BitwiseNot,
             TokenKind::Hash => UnaryOperator::Length,
             _ => return self.parse_primary(),
         };
         self.bump();
-        let Some(operand) = self.parse_expression(7)? else {
+        let Some(operand) = self.parse_expression(11)? else {
             return Ok(None);
         };
         let span = operator.span().merge(self.expression(operand.id)?.span())?;
@@ -1900,14 +1901,19 @@ fn binary_operator(kind: TokenKind) -> Option<(BinaryOperator, u8, u8)> {
         TokenKind::LessEqual => Some((BinaryOperator::LessEqual, 3, 4)),
         TokenKind::GreaterThan => Some((BinaryOperator::GreaterThan, 3, 4)),
         TokenKind::GreaterEqual => Some((BinaryOperator::GreaterEqual, 3, 4)),
-        TokenKind::Concatenate => Some((BinaryOperator::Concatenate, 4, 4)),
-        TokenKind::Plus => Some((BinaryOperator::Add, 5, 6)),
-        TokenKind::Minus => Some((BinaryOperator::Subtract, 5, 6)),
-        TokenKind::Star => Some((BinaryOperator::Multiply, 6, 7)),
-        TokenKind::Slash => Some((BinaryOperator::Divide, 6, 7)),
-        TokenKind::Percent => Some((BinaryOperator::Modulo, 6, 7)),
-        TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 6, 7)),
-        TokenKind::Caret => Some((BinaryOperator::Power, 8, 8)),
+        TokenKind::BitwiseOr => Some((BinaryOperator::BitwiseOr, 4, 5)),
+        TokenKind::BitwiseExclusiveOr => Some((BinaryOperator::BitwiseExclusiveOr, 5, 6)),
+        TokenKind::BitwiseAnd => Some((BinaryOperator::BitwiseAnd, 6, 7)),
+        TokenKind::ShiftLeft => Some((BinaryOperator::ShiftLeft, 7, 8)),
+        TokenKind::ShiftRight => Some((BinaryOperator::ShiftRight, 7, 8)),
+        TokenKind::Concatenate => Some((BinaryOperator::Concatenate, 8, 8)),
+        TokenKind::Plus => Some((BinaryOperator::Add, 9, 10)),
+        TokenKind::Minus => Some((BinaryOperator::Subtract, 9, 10)),
+        TokenKind::Star => Some((BinaryOperator::Multiply, 10, 11)),
+        TokenKind::Slash => Some((BinaryOperator::Divide, 10, 11)),
+        TokenKind::Percent => Some((BinaryOperator::Modulo, 10, 11)),
+        TokenKind::FloorDivide => Some((BinaryOperator::FloorDivide, 10, 11)),
+        TokenKind::Caret => Some((BinaryOperator::Power, 12, 12)),
         _ => None,
     }
 }

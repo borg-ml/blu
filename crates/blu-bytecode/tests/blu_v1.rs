@@ -181,6 +181,14 @@ fn floor_division_fixture(profile: SemanticProfile) -> Artifact {
     artifact
 }
 
+fn bitwise_fixture(profile: SemanticProfile, instruction: Instruction) -> Artifact {
+    let mut artifact = baseline_fixture(profile);
+    artifact.prototypes[0].required_features =
+        FeatureBits::BASELINE | FeatureBits::BITWISE_OPERATORS;
+    artifact.prototypes[0].code[2] = instruction;
+    artifact
+}
+
 fn concatenation_fixture(profile: SemanticProfile) -> Artifact {
     let mut artifact = baseline_fixture(profile);
     artifact.prototypes[0].required_features = FeatureBits::BASELINE | FeatureBits::CONCATENATION;
@@ -1459,6 +1467,100 @@ fn floor_division_wire_feature_and_profile_legality_are_explicit() {
             );
         }
     }
+}
+
+#[test]
+fn bitwise_wire_feature_profile_legality_and_tags_are_explicit() {
+    let limits = BluLimits::default();
+    let instructions = [
+        Instruction::BitwiseAnd {
+            destination: 2,
+            left: 0,
+            right: 1,
+        },
+        Instruction::BitwiseOr {
+            destination: 2,
+            left: 0,
+            right: 1,
+        },
+        Instruction::BitwiseExclusiveOr {
+            destination: 2,
+            left: 0,
+            right: 1,
+        },
+        Instruction::ShiftLeft {
+            destination: 2,
+            left: 0,
+            right: 1,
+        },
+        Instruction::ShiftRight {
+            destination: 2,
+            left: 0,
+            right: 1,
+        },
+        Instruction::BitwiseNot {
+            destination: 2,
+            source: 0,
+        },
+    ];
+    for profile in SemanticProfile::ALL {
+        let legal = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        for (offset, instruction) in instructions.into_iter().enumerate() {
+            assert_eq!(
+                instruction_is_legal(profile, instruction),
+                legal,
+                "{profile}: {instruction:?}"
+            );
+            let fixture = bitwise_fixture(profile, instruction);
+            if legal {
+                let validated = ValidatedArtifact::new(fixture, limits).unwrap();
+                let bytes = encode(&validated, limits).unwrap();
+                let decoded = decode_validated(&bytes, limits).unwrap();
+                assert_eq!(decoded.main().code[2], instruction);
+                let (_, first_instruction) = first_constant_and_instruction_offsets(&bytes);
+                assert_eq!(bytes[first_instruction + 14], 40 + offset as u8);
+                assert_eq!(encode(&decoded, limits).unwrap(), bytes);
+            } else {
+                assert_eq!(
+                    ValidatedArtifact::new(fixture, limits),
+                    Err(ValidationError::FeatureNotLegal {
+                        prototype: 0,
+                        feature: "bitwise operators",
+                        profile,
+                    })
+                );
+            }
+        }
+    }
+
+    let mut missing = bitwise_fixture(SemanticProfile::Blu, instructions[0]);
+    missing.prototypes[0].required_features = FeatureBits::BASELINE;
+    assert_eq!(
+        ValidatedArtifact::new(missing, limits),
+        Err(ValidationError::MissingFeature {
+            prototype: 0,
+            feature: "bitwise operators",
+        })
+    );
+
+    let artifact = ValidatedArtifact::new(
+        bitwise_fixture(SemanticProfile::Blu, instructions[0]),
+        limits,
+    )
+    .unwrap();
+    assert_eq!(
+        translate_baseline_to_luau(artifact, SemanticProfile::Blu, limits),
+        Err(TranslationError::UnsupportedInstruction {
+            prototype: 0,
+            instruction: "64-bit bitwise operators",
+        })
+    );
 }
 
 #[test]

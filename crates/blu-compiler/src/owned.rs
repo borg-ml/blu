@@ -689,6 +689,19 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         }) {
             required_features = required_features | FeatureBits::DYNAMIC_CALL_RESULTS;
         }
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::BitwiseAnd { .. }
+                    | Instruction::BitwiseOr { .. }
+                    | Instruction::BitwiseExclusiveOr { .. }
+                    | Instruction::ShiftLeft { .. }
+                    | Instruction::ShiftRight { .. }
+                    | Instruction::BitwiseNot { .. }
+            )
+        }) {
+            required_features = required_features | FeatureBits::BITWISE_OPERATORS;
+        }
         Ok(Prototype {
             profile: self.profile,
             source: self.source.identity().id(),
@@ -2779,6 +2792,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     )?;
                     Ok(destination)
                 }
+                UnaryOperator::BitwiseNot => {
+                    let source = self.lower_expression(unary.operand())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::BitwiseNot {
+                            destination,
+                            source,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
+                }
                 UnaryOperator::Length => {
                     let source = self.lower_expression(unary.operand())?;
                     let destination = self.allocate_register()?;
@@ -2931,6 +2956,45 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                         },
                         expression.span(),
                     )?;
+                    Ok(destination)
+                }
+                BinaryOperator::BitwiseAnd
+                | BinaryOperator::BitwiseOr
+                | BinaryOperator::BitwiseExclusiveOr
+                | BinaryOperator::ShiftLeft
+                | BinaryOperator::ShiftRight => {
+                    let left = self.lower_expression(binary.left())?;
+                    let right = self.lower_expression(binary.right())?;
+                    let destination = self.allocate_register()?;
+                    let instruction = match binary.operator() {
+                        BinaryOperator::BitwiseAnd => Instruction::BitwiseAnd {
+                            destination,
+                            left,
+                            right,
+                        },
+                        BinaryOperator::BitwiseOr => Instruction::BitwiseOr {
+                            destination,
+                            left,
+                            right,
+                        },
+                        BinaryOperator::BitwiseExclusiveOr => Instruction::BitwiseExclusiveOr {
+                            destination,
+                            left,
+                            right,
+                        },
+                        BinaryOperator::ShiftLeft => Instruction::ShiftLeft {
+                            destination,
+                            left,
+                            right,
+                        },
+                        BinaryOperator::ShiftRight => Instruction::ShiftRight {
+                            destination,
+                            left,
+                            right,
+                        },
+                        _ => unreachable!("bitwise lowering arm filters the operator"),
+                    };
+                    self.emit(instruction, expression.span())?;
                     Ok(destination)
                 }
                 BinaryOperator::Concatenate => {

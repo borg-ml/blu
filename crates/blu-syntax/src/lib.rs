@@ -167,6 +167,11 @@ pub enum TokenKind {
     LessEqual,
     GreaterThan,
     GreaterEqual,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseExclusiveOr,
+    ShiftLeft,
+    ShiftRight,
     Comma,
     Semicolon,
     Colon,
@@ -385,6 +390,36 @@ pub fn lex(
                 offset += 2;
                 TokenKind::NotEqual
             }
+            b'~' => {
+                offset += 1;
+                if !supports_bitwise_syntax(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "bitwise syntax is unavailable in this profile",
+                    )?;
+                }
+                TokenKind::BitwiseExclusiveOr
+            }
+            b'<' if bytes.get(offset + 1) == Some(&b'<') => {
+                offset += 2;
+                if !supports_bitwise_syntax(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "bitwise syntax is unavailable in this profile",
+                    )?;
+                }
+                TokenKind::ShiftLeft
+            }
             b'<' if bytes.get(offset + 1) == Some(&b'=') => {
                 offset += 2;
                 TokenKind::LessEqual
@@ -392,6 +427,21 @@ pub fn lex(
             b'<' => {
                 offset += 1;
                 TokenKind::LessThan
+            }
+            b'>' if bytes.get(offset + 1) == Some(&b'>') => {
+                offset += 2;
+                if !supports_bitwise_syntax(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "bitwise syntax is unavailable in this profile",
+                    )?;
+                }
+                TokenKind::ShiftRight
             }
             b'>' if bytes.get(offset + 1) == Some(&b'=') => {
                 offset += 2;
@@ -428,6 +478,36 @@ pub fn lex(
             b'%' => {
                 offset += 1;
                 TokenKind::Percent
+            }
+            b'&' => {
+                offset += 1;
+                if !supports_bitwise_syntax(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "bitwise syntax is unavailable in this profile",
+                    )?;
+                }
+                TokenKind::BitwiseAnd
+            }
+            b'|' => {
+                offset += 1;
+                if !supports_bitwise_syntax(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "bitwise syntax is unavailable in this profile",
+                    )?;
+                }
+                TokenKind::BitwiseOr
             }
             b'^' => {
                 offset += 1;
@@ -1158,6 +1238,16 @@ fn supports_floor_division(profile: SemanticProfile) -> bool {
     }
 }
 
+const fn supports_bitwise_syntax(profile: SemanticProfile) -> bool {
+    matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    )
+}
+
 const fn supports_continue(profile: SemanticProfile) -> bool {
     matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
 }
@@ -1325,6 +1415,28 @@ fn push_diagnostic(
         limit,
         "lexer diagnostics",
     )
+}
+
+fn push_unavailable_syntax_diagnostic(
+    source: &SourceFile,
+    diagnostics: &mut Vec<Diagnostic>,
+    limits: LexerLimits,
+    profile: SemanticProfile,
+    start: usize,
+    end: usize,
+    message: &'static str,
+) -> Result<(), LexError> {
+    let span = source.span(start, end)?;
+    let diagnostic = diagnostic(
+        "BLU-LEX-0002",
+        profile,
+        span,
+        message,
+        limits.diagnostic_limits,
+    )?
+    .try_with_found(&source.bytes()[start..end])?
+    .try_with_note_parts(&["selected profile: ", profile.as_str()])?;
+    push_diagnostic(diagnostics, diagnostic, limits.max_diagnostics)
 }
 
 fn push_limited<T>(

@@ -413,6 +413,15 @@ fn translate_instruction(
             prototype,
             instruction: "dynamic call results",
         }),
+        BluInstruction::BitwiseAnd { .. }
+        | BluInstruction::BitwiseOr { .. }
+        | BluInstruction::BitwiseExclusiveOr { .. }
+        | BluInstruction::ShiftLeft { .. }
+        | BluInstruction::ShiftRight { .. }
+        | BluInstruction::BitwiseNot { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "64-bit bitwise operators",
+        }),
         BluInstruction::Return { first, count } => {
             let result_field = count
                 .checked_add(1)

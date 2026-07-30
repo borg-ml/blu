@@ -1019,3 +1019,48 @@ fn only_a_byte_zero_directive_participates_in_reconciliation() {
         1
     );
 }
+
+#[test]
+fn bitwise_tokens_are_lexed_only_for_blu_and_modern_lua_profiles() {
+    let source = source(b"return ~a & b | c ~ d << e >> f".to_vec());
+    for profile in SemanticProfile::ALL {
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        let supported = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        assert_eq!(lexed.has_errors(), !supported, "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::Return,
+                TokenKind::BitwiseExclusiveOr,
+                TokenKind::Identifier,
+                TokenKind::BitwiseAnd,
+                TokenKind::Identifier,
+                TokenKind::BitwiseOr,
+                TokenKind::Identifier,
+                TokenKind::BitwiseExclusiveOr,
+                TokenKind::Identifier,
+                TokenKind::ShiftLeft,
+                TokenKind::Identifier,
+                TokenKind::ShiftRight,
+                TokenKind::Identifier,
+            ],
+            "{profile}"
+        );
+        if !supported {
+            assert_eq!(lexed.diagnostics().len(), 6, "{profile}");
+            assert!(
+                lexed
+                    .diagnostics()
+                    .iter()
+                    .all(|diagnostic| diagnostic.code().as_str() == "BLU-LEX-0002"),
+                "{profile}"
+            );
+        }
+    }
+}

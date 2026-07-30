@@ -77,6 +77,8 @@ impl FeatureBits {
     pub const VARARGS: Self = Self(1 << 13);
     /// Calls whose complete result vector is consumed by a bounded continuation.
     pub const DYNAMIC_CALL_RESULTS: Self = Self(1 << 14);
+    /// Profile-gated 64-bit integer bitwise operators.
+    pub const BITWISE_OPERATORS: Self = Self(1 << 15);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -92,7 +94,8 @@ impl FeatureBits {
             | Self::FIXED_MULTI_RESULTS.0
             | Self::RETURN_CALLS.0
             | Self::VARARGS.0
-            | Self::DYNAMIC_CALL_RESULTS.0,
+            | Self::DYNAMIC_CALL_RESULTS.0
+            | Self::BITWISE_OPERATORS.0,
     );
 
     #[must_use]
@@ -418,6 +421,35 @@ pub enum Instruction {
         left: u16,
         right: u16,
     },
+    BitwiseAnd {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
+    BitwiseOr {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
+    BitwiseExclusiveOr {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
+    ShiftLeft {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
+    ShiftRight {
+        destination: u16,
+        left: u16,
+        right: u16,
+    },
+    BitwiseNot {
+        destination: u16,
+        source: u16,
+    },
     Concatenate {
         destination: u16,
         left: u16,
@@ -466,6 +498,23 @@ pub enum Instruction {
 /// explicit policy.
 #[must_use]
 pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruction) -> bool {
+    if matches!(
+        instruction,
+        Instruction::BitwiseAnd { .. }
+            | Instruction::BitwiseOr { .. }
+            | Instruction::BitwiseExclusiveOr { .. }
+            | Instruction::ShiftLeft { .. }
+            | Instruction::ShiftRight { .. }
+            | Instruction::BitwiseNot { .. }
+    ) {
+        return matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+    }
     match profile {
         SemanticProfile::Luau
         | SemanticProfile::Lua53
@@ -503,6 +552,12 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::Modulo { .. }
             | Instruction::Power { .. }
             | Instruction::FloorDivide { .. }
+            | Instruction::BitwiseAnd { .. }
+            | Instruction::BitwiseOr { .. }
+            | Instruction::BitwiseExclusiveOr { .. }
+            | Instruction::ShiftLeft { .. }
+            | Instruction::ShiftRight { .. }
+            | Instruction::BitwiseNot { .. }
             | Instruction::Concatenate { .. }
             | Instruction::Equal { .. }
             | Instruction::LessThan { .. }
@@ -545,6 +600,12 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::Divide { .. }
                 | Instruction::Modulo { .. }
                 | Instruction::Power { .. }
+                | Instruction::BitwiseAnd { .. }
+                | Instruction::BitwiseOr { .. }
+                | Instruction::BitwiseExclusiveOr { .. }
+                | Instruction::ShiftLeft { .. }
+                | Instruction::ShiftRight { .. }
+                | Instruction::BitwiseNot { .. }
                 | Instruction::Concatenate { .. }
                 | Instruction::Equal { .. }
                 | Instruction::LessThan { .. }
@@ -562,6 +623,16 @@ const fn floor_division_is_legal(profile: SemanticProfile) -> bool {
     matches!(
         profile,
         SemanticProfile::Luau
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    )
+}
+
+const fn bitwise_operators_are_legal(profile: SemanticProfile) -> bool {
+    matches!(
+        profile,
+        SemanticProfile::Blu
             | SemanticProfile::Lua53
             | SemanticProfile::Lua54
             | SemanticProfile::Lua55
@@ -1270,6 +1341,17 @@ fn validate_prototype(
             profile: prototype.profile,
         });
     }
+    if prototype
+        .required_features
+        .contains(FeatureBits::BITWISE_OPERATORS)
+        && !bitwise_operators_are_legal(prototype.profile)
+    {
+        return Err(ValidationError::FeatureNotLegal {
+            prototype: index,
+            feature: "bitwise operators",
+            profile: prototype.profile,
+        });
+    }
     if prototype.code.iter().any(|instruction| {
         matches!(
             instruction,
@@ -1420,6 +1502,25 @@ fn validate_prototype(
         return Err(ValidationError::MissingFeature {
             prototype: index,
             feature: "floor division",
+        });
+    }
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::BitwiseAnd { .. }
+                | Instruction::BitwiseOr { .. }
+                | Instruction::BitwiseExclusiveOr { .. }
+                | Instruction::ShiftLeft { .. }
+                | Instruction::ShiftRight { .. }
+                | Instruction::BitwiseNot { .. }
+        )
+    }) && !prototype
+        .required_features
+        .contains(FeatureBits::BITWISE_OPERATORS)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "bitwise operators",
         });
     }
     if prototype
@@ -2002,6 +2103,10 @@ fn validate_prototype(
             Instruction::Length {
                 destination,
                 source,
+            }
+            | Instruction::BitwiseNot {
+                destination,
+                source,
             } => {
                 check_register(index, pc, destination, registers)?;
                 check_read(index, pc, source, &initialized)?;
@@ -2038,6 +2143,31 @@ fn validate_prototype(
                 right,
             }
             | Instruction::FloorDivide {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::BitwiseAnd {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::BitwiseOr {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::BitwiseExclusiveOr {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::ShiftLeft {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::ShiftRight {
                 destination,
                 left,
                 right,
@@ -2468,6 +2598,11 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::Modulo { .. }
                     | Instruction::Power { .. }
                     | Instruction::FloorDivide { .. }
+                    | Instruction::BitwiseAnd { .. }
+                    | Instruction::BitwiseOr { .. }
+                    | Instruction::BitwiseExclusiveOr { .. }
+                    | Instruction::ShiftLeft { .. }
+                    | Instruction::ShiftRight { .. }
                     | Instruction::Concatenate { .. }
                     | Instruction::Equal { .. }
                     | Instruction::LessThan { .. }
@@ -2489,6 +2624,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     Instruction::Move { .. }
                     | Instruction::Not { .. }
                     | Instruction::Negate { .. }
+                    | Instruction::BitwiseNot { .. }
                     | Instruction::Length { .. }
                     | Instruction::Return { .. } => 5,
                 },
@@ -2868,6 +3004,64 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 put_u16(out, *destination);
                 put_u16(out, *left);
                 put_u16(out, *right);
+            }
+            Instruction::BitwiseAnd {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(40);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::BitwiseOr {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(41);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::BitwiseExclusiveOr {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(42);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::ShiftLeft {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(43);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::ShiftRight {
+                destination,
+                left,
+                right,
+            } => {
+                out.push(44);
+                put_u16(out, *destination);
+                put_u16(out, *left);
+                put_u16(out, *right);
+            }
+            Instruction::BitwiseNot {
+                destination,
+                source,
+            } => {
+                out.push(45);
+                put_u16(out, *destination);
+                put_u16(out, *source);
             }
             Instruction::Concatenate {
                 destination,
@@ -3677,6 +3871,35 @@ fn read_prototype(
                 function: reader.u16()?,
                 arguments: reader.u16()?,
                 argument_count: reader.u16()?,
+            },
+            40 => Instruction::BitwiseAnd {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
+            },
+            41 => Instruction::BitwiseOr {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
+            },
+            42 => Instruction::BitwiseExclusiveOr {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
+            },
+            43 => Instruction::ShiftLeft {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
+            },
+            44 => Instruction::ShiftRight {
+                destination: reader.u16()?,
+                left: reader.u16()?,
+                right: reader.u16()?,
+            },
+            45 => Instruction::BitwiseNot {
+                destination: reader.u16()?,
+                source: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

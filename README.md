@@ -108,9 +108,12 @@ reconciliation. Unary `not`
 follows common Lua truthiness and produces a boolean under every profile;
 unary `-` preserves integers in Lua 5.3–5.5 and negates numbers in the other
 profiles. Unary `#` measures byte strings, returning an integer for Lua
-5.3–5.5 and a number elsewhere; table length remains outside this frontend
-slice. Exponentiation follows the shared right-associative precedence above
-unary operators and always produces a number.
+5.3–5.5 and a number elsewhere, and executes raw or resumable metamethod-aware
+table length. Exponentiation follows the shared right-associative precedence
+above unary operators and always produces a number.
+Blu and Lua 5.3–5.5 source profiles support 64-bit integer `&`, `|`, binary
+and unary `~`, `<<`, and `>>`, including Lua precedence and reversed negative
+shifts. Luau and Lua 5.1–5.2 reject this syntax during lexing.
 Hexadecimal integers are accepted in every profile. Lua 5.3–5.5 use their
 wrapping 64-bit integer representation; Blu, Luau, Lua 5.1, and Lua 5.2 use
 numbers. Internal numeric separators are accepted only by Blu and Luau.

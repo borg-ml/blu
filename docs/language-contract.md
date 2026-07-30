@@ -145,6 +145,16 @@ continuation and contribute only their first result.
 The Luau bootstrap translator rejects it explicitly because Luau's range-form
 opcode requires verified contiguous operands; it does not silently rewrite
 canonical register semantics.
+Canonical 64-bit integer bitwise instructions cover `&`, `|`, binary and unary
+`~`, `<<`, and `>>` for Blu and Lua 5.3–5.5. Shifts are logical over the
+64-bit representation, negative displacements reverse direction, and
+magnitudes of at least 64 yield zero. Lua 5.3 retains its upstream
+numeric-string conversion; Lua 5.4–5.5 reject strings. Blu selects the Lua
+5.4+ conversion rule. Luau and Lua 5.1–5.2 reject the syntax during lexing.
+Bitwise metamethod dispatch remains an explicit unsupported operand path until
+it uses the resumable operation machinery. The Luau bootstrap translator
+rejects these canonical 64-bit instructions rather than narrowing them to
+32-bit operations.
 Canonical comparison instructions likewise name independent operands and
 produce Boolean values. `Equal`, `LessThan`, and `LessEqual` are the artifact
 primitives; the compiler derives `~=`, `>`, and `>=` with Boolean negation or

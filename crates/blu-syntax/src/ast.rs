@@ -79,6 +79,11 @@ pub enum BinaryOperator {
     Modulo,
     Power,
     FloorDivide,
+    BitwiseAnd,
+    BitwiseOr,
+    BitwiseExclusiveOr,
+    ShiftLeft,
+    ShiftRight,
     Concatenate,
     Equal,
     NotEqual,
@@ -92,6 +97,7 @@ pub enum BinaryOperator {
 pub enum UnaryOperator {
     Not,
     Negate,
+    BitwiseNot,
     Length,
 }
 

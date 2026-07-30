@@ -2078,6 +2078,76 @@ impl Vm {
                         )?;
                     }
                 }
+                BluInstruction::BitwiseAnd {
+                    destination,
+                    left,
+                    right,
+                }
+                | BluInstruction::BitwiseOr {
+                    destination,
+                    left,
+                    right,
+                }
+                | BluInstruction::BitwiseExclusiveOr {
+                    destination,
+                    left,
+                    right,
+                }
+                | BluInstruction::ShiftLeft {
+                    destination,
+                    left,
+                    right,
+                }
+                | BluInstruction::ShiftRight {
+                    destination,
+                    left,
+                    right,
+                } => {
+                    let left = blu_bitwise_integer(
+                        blu_register(&registers, left)?,
+                        prototype.profile,
+                        "bitwise operation",
+                    )?;
+                    let right = blu_bitwise_integer(
+                        blu_register(&registers, right)?,
+                        prototype.profile,
+                        "bitwise operation",
+                    )?;
+                    let result = match instruction {
+                        BluInstruction::BitwiseAnd { .. } => left & right,
+                        BluInstruction::BitwiseOr { .. } => left | right,
+                        BluInstruction::BitwiseExclusiveOr { .. } => left ^ right,
+                        BluInstruction::ShiftLeft { .. } => lua_shift_left(left, right),
+                        BluInstruction::ShiftRight { .. } => {
+                            lua_shift_left(left, right.wrapping_neg())
+                        }
+                        _ => unreachable!("bitwise execution arm filters the instruction"),
+                    };
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        Value::Integer(result),
+                    )?;
+                }
+                BluInstruction::BitwiseNot {
+                    destination,
+                    source,
+                } => {
+                    let source = blu_bitwise_integer(
+                        blu_register(&registers, source)?,
+                        prototype.profile,
+                        "bitwise not",
+                    )?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        destination,
+                        Value::Integer(!source),
+                    )?;
+                }
                 BluInstruction::Move {
                     destination,
                     source,
@@ -7400,6 +7470,43 @@ fn exact_integer_conversion(value: &Value, profile: SemanticProfile) -> Option<i
             Some(*value as i64)
         }
         _ => None,
+    }
+}
+
+fn blu_bitwise_integer(
+    value: &Value,
+    profile: SemanticProfile,
+    operation: &'static str,
+) -> Result<i64, RuntimeError> {
+    let parsed;
+    let value = if let Value::String(bytes) = value {
+        if profile == SemanticProfile::Lua53 {
+            parsed = parse_default_number(trim_ascii_bytes(bytes), profile);
+            parsed.as_ref().unwrap_or(value)
+        } else {
+            return Err(RuntimeError::Type {
+                operation,
+                expected: "integer-representable number",
+                actual: "string",
+            });
+        }
+    } else {
+        value
+    };
+    exact_integer_conversion(value, profile).ok_or(RuntimeError::Type {
+        operation,
+        expected: "integer-representable number",
+        actual: value.type_name(),
+    })
+}
+
+fn lua_shift_left(value: i64, displacement: i64) -> i64 {
+    if displacement >= i64::from(i64::BITS) || displacement <= -i64::from(i64::BITS) {
+        0
+    } else if displacement >= 0 {
+        ((value as u64) << displacement) as i64
+    } else {
+        ((value as u64) >> displacement.unsigned_abs()) as i64
     }
 }
 

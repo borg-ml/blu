@@ -4231,6 +4231,70 @@ fn bit32_core_follows_profile_specific_conversion_and_result_rules() {
 }
 
 #[test]
+fn modern_bitwise_syntax_uses_64_bit_integer_semantics_and_profile_gates() {
+    let source = make_source(
+        b"return 0xf0&0x3c,0xf0|0x0f,0xaa~0xff,1<<63,-1>>1,1<<-1,~0,1|2~3&6<<1+1,3.0&1".to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+        if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            let compiled = compiled.unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(vec![
+                    Value::Integer(0x30),
+                    Value::Integer(0xff),
+                    Value::Integer(0x55),
+                    Value::Integer(i64::MIN),
+                    Value::Integer(i64::MAX),
+                    Value::Integer(0),
+                    Value::Integer(-1),
+                    Value::Integer(3),
+                    Value::Integer(1),
+                ]),
+                "{profile}"
+            );
+        } else {
+            assert!(compiled.is_err(), "{profile}: {compiled:?}");
+        }
+    }
+
+    for (profile, expected) in [
+        (SemanticProfile::Blu, false),
+        (SemanticProfile::Lua53, true),
+        (SemanticProfile::Lua54, false),
+        (SemanticProfile::Lua55, false),
+    ] {
+        let string_source = make_source(b"return '3'&1".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&string_source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if expected {
+            assert_eq!(result, Ok(vec![Value::Integer(1)]), "{profile}");
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::Type {
+                    operation: "bitwise operation",
+                    expected: "integer-representable number",
+                    actual: "string",
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn luau_math_extensions_are_profile_gated_and_edge_compatible() {
     let source = make_source(
         b"return math.clamp(5,1,3),math.clamp(-1,1,3),math.sign(-3),math.sign(0),math.sign(0/0),math.round(1.5),math.round(-1.5),math.round(1.49)"
