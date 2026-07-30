@@ -10383,16 +10383,19 @@ mod tests {
             )
         };
 
-        assert_eq!(
-            Vm::new(Dialect::Blu).execute_blu_v1(
-                floor_program(
-                    SemanticProfile::Luau,
-                    vec![BluConstant::Number(-7.0), BluConstant::Number(3.0)]
+        for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+            assert_eq!(
+                Vm::new(Dialect::Blu).execute_blu_v1(
+                    floor_program(
+                        profile,
+                        vec![BluConstant::Number(-7.0), BluConstant::Number(3.0)]
+                    ),
+                    BluLimits::default()
                 ),
-                BluLimits::default()
-            ),
-            Ok(vec![Value::Number(-3.0)])
-        );
+                Ok(vec![Value::Number(-3.0)]),
+                "{profile}"
+            );
+        }
         for profile in [
             SemanticProfile::Lua53,
             SemanticProfile::Lua54,

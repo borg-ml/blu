@@ -399,6 +399,7 @@ fn assignment_lists_snapshot_rhs_and_adjust_fixed_scalar_values() {
 #[test]
 fn floor_division_lowers_only_for_assigned_profiles_and_bootstrap_translation_rejects_it() {
     for profile in [
+        SemanticProfile::Blu,
         SemanticProfile::Luau,
         SemanticProfile::Lua53,
         SemanticProfile::Lua54,
@@ -439,7 +440,7 @@ fn floor_division_lowers_only_for_assigned_profiles_and_bootstrap_translation_re
             source.span(7, source.len()).unwrap()
         );
 
-        if profile == SemanticProfile::Luau {
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
             assert_eq!(
                 translate_baseline_to_luau(
                     compiled.into_validated_artifact(),
@@ -454,16 +455,6 @@ fn floor_division_lowers_only_for_assigned_profiles_and_bootstrap_translation_re
         }
     }
 
-    let source = make_source(b"return 40 // 2".to_vec());
-    let error = OwnedCompiler::default()
-        .compile(&source, SemanticProfile::Blu, compiler_identity())
-        .unwrap_err();
-    let diagnostic = error.diagnostic().expect("lowering diagnostic");
-    assert_eq!(diagnostic.code().as_str(), "BLU-LOWER-0001");
-    assert_eq!(diagnostic.phase(), Phase::Lower);
-    assert_eq!(diagnostic.profile(), SemanticProfile::Blu);
-    assert_eq!(source.slice(diagnostic.primary().span()).unwrap(), b"//");
-
     for profile in [SemanticProfile::Lua51, SemanticProfile::Lua52] {
         let source = make_source(b"return 40 // 2".to_vec());
         let error = OwnedCompiler::default()
@@ -476,6 +467,37 @@ fn floor_division_lowers_only_for_assigned_profiles_and_bootstrap_translation_re
         assert_eq!(diagnostic.profile(), profile);
         assert_eq!(source.slice(diagnostic.primary().span()).unwrap(), b"//");
     }
+}
+
+#[test]
+fn blu_floor_division_uses_modern_integer_and_float_semantics() {
+    let source = make_source(
+        b"return math.floor(7)//math.floor(3),7.0//3,-math.floor(7)//math.floor(3),1.0//0.0"
+            .to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    let values =
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+    assert_eq!(
+        values,
+        Ok(vec![
+            Value::Integer(2),
+            Value::Number(2.0),
+            Value::Integer(-3),
+            Value::Number(f64::INFINITY),
+        ])
+    );
+
+    let zero = make_source(b"return math.floor(1)//math.floor(0)".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&zero, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Err(RuntimeError::DivideByZero)
+    );
 }
 
 #[test]
@@ -4361,17 +4383,19 @@ fn compound_assignments_evaluate_targets_once_and_use_luau_operators() {
     }
 
     let floor = make_source(b"local x=5 x//=2 return x".to_vec());
-    let compiled = OwnedCompiler::default()
-        .compile(&floor, SemanticProfile::Luau, compiler_identity())
-        .unwrap();
-    assert_eq!(
-        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-        Ok(vec![Value::Number(2.0)])
-    );
-    assert!(matches!(
-        OwnedCompiler::default().compile(&floor, SemanticProfile::Blu, compiler_identity()),
-        Err(OwnedCompileError::Diagnostic(_))
-    ));
+    for (profile, expected) in [
+        (SemanticProfile::Blu, Value::Integer(2)),
+        (SemanticProfile::Luau, Value::Number(2.0)),
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&floor, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
+    }
 
     let snapshot = make_source(
         b"local x=10 local function rhs() x=100 return 5 end x+=rhs() return x".to_vec(),

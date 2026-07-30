@@ -183,9 +183,9 @@ Blu and Luau source profiles support the compound-assignment statements `+=`,
 tokens lexically. Lowering snapshots an indexed receiver, key, and previous
 value before evaluating the right-hand expression, then uses the same
 arithmetic, concatenation, and resumable metamethod instructions as the
-corresponding binary operator. Blu `//=` remains a structured lowering error
-while Blu floor-division semantics are unassigned; the other seven operators
-are assigned. Compound assignment accepts exactly one target.
+corresponding binary operator. Blu `//=` uses Blu's modern integer-preserving
+floor-division rule, while Luau `//=` uses Luau number semantics. Compound
+assignment accepts exactly one target.
 An unconditional forward `Jump` completes the structured substrate used by
 owned `if`/`elseif`/`else` statements. Nested blocks own their statement lists,
 branch locals leave resolver scope at the block boundary, and local debug
@@ -273,11 +273,13 @@ Owned binary arithmetic keeps its direct integer/number fast path. When either
 operand is nonnumeric, it selects the left then right `__add`, `__sub`,
 `__mul`, `__div`, `__mod`, or `__pow` handler and invokes it with the two
 snapshotted operands through the bounded caller continuation. `__idiv` follows
-the same rule only in Luau and Lua 5.3–5.5, matching the profiles where `//`
-is currently legal. Blu floor-division semantics remain deliberately
-unassigned. Unary negation invokes `__unm` with the operand in both argument
+the same rule in Blu, Luau, and Lua 5.3–5.5, matching the profiles where `//`
+is legal. Blu adopts Lua 5.3+ floor division: integer operands preserve an
+integer result, while mixed or floating operands produce a floored number.
+Integer division by zero is a structured error; floating division follows
+IEEE behavior before flooring. Unary negation invokes `__unm` with the operand in both argument
 positions, matching the pinned Lua and Luau implementations. Bitwise
-metamethod events remain later work.
+metamethod events use the same resumable handler path.
 Arithmetic, unary, concatenation, length, and comparison event values may
 themselves be callable tables. The runtime resolves their bounded `__call`
 chains before invocation, prepends every callable-table receiver, and keeps a
@@ -369,7 +371,7 @@ against the VM memory configuration, then releases that charge on both success
 and structured failure. This does not yet imply that every legacy Luau frame,
 native-owned allocation, or GC work buffer is VM-accounted.
 It also executes floor division where the dialect matrix assigns it: Luau
-numbers and Lua 5.3--5.5 integers or numbers. Integer constants remain a
+numbers and Blu/Lua 5.3--5.5 integers or numbers. Integer constants remain a
 lossless storage feature, so the executor rejects them explicitly for profiles
 whose integer execution semantics are not assigned. Nested prototypes,
 upvalues, and the rest of the language remain explicit unsupported structure,

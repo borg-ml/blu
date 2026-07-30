@@ -1822,16 +1822,6 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         right: u16,
         span: ByteSpan,
     ) -> Result<u16, OwnedCompileError> {
-        if operator == CompoundAssignmentOperator::FloorDivide
-            && self.profile == SemanticProfile::Blu
-        {
-            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                "BLU-LOWER-0001",
-                Phase::Lower,
-                span,
-                "Blu floor-division semantics are not assigned",
-            )?));
-        }
         let destination = self.allocate_register()?;
         let instruction = match operator {
             CompoundAssignmentOperator::Add => Instruction::Add {
@@ -3092,14 +3082,6 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     Ok(destination)
                 }
                 BinaryOperator::FloorDivide => {
-                    if self.profile == SemanticProfile::Blu {
-                        return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                            "BLU-LOWER-0001",
-                            Phase::Lower,
-                            binary.operator_span(),
-                            "Blu floor-division semantics are not assigned",
-                        )?));
-                    }
                     let left = self.lower_expression(binary.left())?;
                     let right = self.lower_expression(binary.right())?;
                     let destination = self.allocate_register()?;

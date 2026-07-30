@@ -1421,7 +1421,8 @@ fn floor_division_wire_feature_and_profile_legality_are_explicit() {
     for profile in SemanticProfile::ALL {
         let legal = matches!(
             profile,
-            SemanticProfile::Luau
+            SemanticProfile::Blu
+                | SemanticProfile::Luau
                 | SemanticProfile::Lua53
                 | SemanticProfile::Lua54
                 | SemanticProfile::Lua55

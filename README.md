@@ -145,8 +145,8 @@ the single-prototype scalar baseline slice for every declared profile without th
 Luau compiler or bytecode translator. It revalidates the consumed artifact
 under caller-supplied execution limits. Canonical register moves preserve
 arbitrary scalar return lists without numeric coercion. BluV1 floor division
-executes with Luau number semantics and Lua 5.3–5.5 integer/number semantics; Blu lowering
-still rejects it until Blu numeric and metamethod semantics are assigned.
+executes with Luau number semantics and Blu/Lua 5.3–5.5 integer-preserving
+modern semantics.
 The owned path also directly executes profile-neutral `==`, `~=`, `<`, `<=`,
 `>`, and `>=`; ordered comparisons accept only compatible numbers or byte
 strings, while equality between unlike scalar types is false.

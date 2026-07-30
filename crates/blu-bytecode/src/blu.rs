@@ -498,6 +498,9 @@ pub enum Instruction {
 /// explicit policy.
 #[must_use]
 pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruction) -> bool {
+    if matches!(instruction, Instruction::FloorDivide { .. }) {
+        return floor_division_is_legal(profile);
+    }
     if matches!(
         instruction,
         Instruction::BitwiseAnd { .. }
@@ -622,7 +625,8 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
 const fn floor_division_is_legal(profile: SemanticProfile) -> bool {
     matches!(
         profile,
-        SemanticProfile::Luau
+        SemanticProfile::Blu
+            | SemanticProfile::Luau
             | SemanticProfile::Lua53
             | SemanticProfile::Lua54
             | SemanticProfile::Lua55
