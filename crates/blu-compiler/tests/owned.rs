@@ -2254,6 +2254,70 @@ fn common_string_escapes_decode_to_bytes_for_every_profile() {
 }
 
 #[test]
+fn string_find_uses_byte_indices_plain_search_and_profile_subtypes() {
+    let source = make_source(
+        b"local a, b = string.find('a\\000bc\\000b', '\\000b', -4, true) local c, d = string.find('abc', '', 2) local missing = string.find('abc', 'z') return a, b, c, d, missing"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let index = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![index(5), index(6), index(2), index(1), Value::Nil]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn string_find_rejects_patterns_unless_plain_is_explicit() {
+    for (source, expected) in [
+        (b"return string.find('a.c', '.', 1, true)".as_slice(), true),
+        (b"return string.find('abc', '.')".as_slice(), false),
+    ] {
+        for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&make_source(source.to_vec()), profile, compiler_identity())
+                .unwrap();
+            let result = Vm::default()
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+            if expected {
+                assert!(
+                    matches!(result, Ok(values) if values.len() == 2),
+                    "{profile}"
+                );
+            } else {
+                assert!(
+                    matches!(
+                        result,
+                        Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: "string.find",
+                            feature: "Lua patterns",
+                        })
+                    ),
+                    "{profile}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn decimal_and_hexadecimal_byte_escapes_decode_by_profile() {
     let decimal = make_source(br#"return "\0\7\65\255""#.to_vec());
     for profile in SemanticProfile::ALL {

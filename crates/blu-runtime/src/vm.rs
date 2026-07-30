@@ -4992,11 +4992,65 @@ impl Vm {
             };
             Ok(vec![Value::String(Arc::from(result))])
         });
+        let string_find = self.register_function(|vm, arguments| {
+            let haystack = string_bytes(
+                arguments.first().ok_or(RuntimeError::Argument {
+                    function: "string.find",
+                    index: 1,
+                })?,
+                "string.find",
+            )?;
+            let needle = string_bytes(
+                arguments.get(1).ok_or(RuntimeError::Argument {
+                    function: "string.find",
+                    index: 2,
+                })?,
+                "string.find",
+            )?;
+            let initial = arguments
+                .get(2)
+                .map(|_| integer_argument(arguments, 2, "string.find"))
+                .transpose()?
+                .unwrap_or(1);
+            let initial = relative_index(initial, haystack.len()).max(1);
+            if initial > haystack.len() as i64 + 1 {
+                return Ok(vec![Value::Nil]);
+            }
+            let plain = arguments.get(3).is_some_and(Value::is_truthy);
+            if !plain && needle.iter().any(|byte| b"^$*+?.([%-".contains(byte)) {
+                return Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.find",
+                    feature: "Lua patterns",
+                });
+            }
+            let start = initial as usize - 1;
+            let offset = if needle.is_empty() {
+                Some(0)
+            } else {
+                haystack[start..]
+                    .windows(needle.len())
+                    .position(|window| window == needle)
+            };
+            let Some(offset) = offset else {
+                return Ok(vec![Value::Nil]);
+            };
+            let first = start + offset + 1;
+            let last = first + needle.len() - 1;
+            Ok(vec![
+                profiled_integral_math_result(vm, "string.find", first as f64)?,
+                profiled_integral_math_result(vm, "string.find", last as f64)?,
+            ])
+        });
         let string = self.heap.allocate_table(0, 1)?;
         self.heap.table_set(
             string,
             Value::String(Arc::from(&b"sub"[..])),
             Value::NativeFunction(string_sub),
+        )?;
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"find"[..])),
+            Value::NativeFunction(string_find),
         )?;
         let string_len = self.register_function(|_, arguments| {
             let string = arguments.first().ok_or(RuntimeError::Argument {
@@ -7185,6 +7239,10 @@ pub enum RuntimeError {
         operation: &'static str,
         profile: SemanticProfile,
     },
+    UnsupportedLibraryFeature {
+        function: &'static str,
+        feature: &'static str,
+    },
     Type {
         operation: &'static str,
         expected: &'static str,
@@ -7350,6 +7408,9 @@ impl fmt::Display for RuntimeError {
             }
             Self::UnsupportedSemanticProfile { operation, profile } => {
                 write!(f, "{operation} has no semantics assigned for {profile}")
+            }
+            Self::UnsupportedLibraryFeature { function, feature } => {
+                write!(f, "{function} does not yet support {feature}")
             }
             Self::Type {
                 operation,
