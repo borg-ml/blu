@@ -4,10 +4,10 @@ use crate::{
     CompoundAssignmentOperator, CompoundAssignmentStatement, ContinueStatement, DialectDirective,
     DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody,
     FunctionExpression, FunctionId, FunctionStatement, GenericForStatement, Identifier, IfClause,
-    IfStatement, IndexExpression, LexError, Lexed, LexerLimits, LocalFunctionStatement,
-    LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement, RepeatStatement,
-    ReturnStatement, Statement, TableConstructor, TableField, Token, TokenKind, UnaryExpression,
-    UnaryOperator, WhileStatement, lex,
+    IfExpression, IfStatement, IndexExpression, LexError, Lexed, LexerLimits,
+    LocalFunctionStatement, LocalListStatement, LocalStatement, MethodCallExpression,
+    NumericForStatement, RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField,
+    Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -1394,6 +1394,25 @@ impl<'a> Parser<'a> {
             TokenKind::BinaryInteger => ExpressionKind::BinaryInteger,
             TokenKind::StringLiteral => ExpressionKind::StringLiteral,
             TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
+            TokenKind::If => {
+                if !matches!(
+                    self.lexed.profile(),
+                    SemanticProfile::Blu | SemanticProfile::Luau
+                ) {
+                    self.report_current(
+                        "BLU-PARSE-0046",
+                        "if-expressions are available only in Blu and Luau",
+                        &["expression"],
+                    )?;
+                    self.bump();
+                    return Ok(None);
+                }
+                self.bump();
+                let Some(expression) = self.parse_if_expression(token)? else {
+                    return Ok(None);
+                };
+                return self.parse_postfix(expression).map(Some);
+            }
             TokenKind::Function => {
                 self.bump();
                 let Some(function) = self.parse_function_body(token)? else {
@@ -1461,6 +1480,72 @@ impl<'a> Parser<'a> {
         self.bump();
         let primary = self.push_expression(Expression::new(kind, token.span()), 1)?;
         self.parse_postfix(primary).map(Some)
+    }
+
+    fn parse_if_expression(
+        &mut self,
+        keyword: Token,
+    ) -> Result<Option<BuiltExpression>, ParseError> {
+        let Some(condition) = self.parse_expression(0)? else {
+            return Ok(None);
+        };
+        if !self.at(TokenKind::Then) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0047",
+                "expected `then` after if-expression condition",
+                &["then"],
+            )?;
+            return Ok(None);
+        }
+        self.bump();
+        let Some(then_value) = self.parse_expression(0)? else {
+            return Ok(None);
+        };
+        let else_value = if self.at(TokenKind::ElseIf) {
+            let Some(elseif) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "elseif check succeeded without a current token",
+                });
+            };
+            let Some(value) = self.parse_if_expression(elseif)? else {
+                return Ok(None);
+            };
+            value
+        } else {
+            if !self.at(TokenKind::Else) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0048",
+                    "expected `else` in if-expression",
+                    &["elseif", "else"],
+                )?;
+                return Ok(None);
+            }
+            self.bump();
+            let Some(value) = self.parse_expression(0)? else {
+                return Ok(None);
+            };
+            value
+        };
+        let depth = condition
+            .depth
+            .max(then_value.depth)
+            .max(else_value.depth)
+            .saturating_add(1);
+        let span = keyword
+            .span()
+            .merge(self.expression(else_value.id)?.span())?;
+        self.push_expression(
+            Expression::new(
+                ExpressionKind::If(IfExpression::new(
+                    condition.id,
+                    then_value.id,
+                    else_value.id,
+                )),
+                span,
+            ),
+            depth,
+        )
+        .map(Some)
     }
 
     fn parse_postfix(

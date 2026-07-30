@@ -3171,6 +3171,39 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             ExpressionKind::Function(function) => {
                 self.lower_function(function.function(), function.span(), false)
             }
+            ExpressionKind::If(if_expression) => {
+                let condition = self.lower_expression(if_expression.condition())?;
+                let destination = self.allocate_register()?;
+                let false_branch = self.code.len();
+                self.emit(
+                    Instruction::JumpIfFalsy {
+                        condition,
+                        target: 0,
+                    },
+                    expression.span(),
+                )?;
+                let then_value = self.lower_expression(if_expression.then_value())?;
+                self.emit(
+                    Instruction::Move {
+                        destination,
+                        source: then_value,
+                    },
+                    expression.span(),
+                )?;
+                let end_branch = self.code.len();
+                self.emit(Instruction::Jump { target: 0 }, expression.span())?;
+                self.patch_forward_branch(false_branch, self.code.len())?;
+                let else_value = self.lower_expression(if_expression.else_value())?;
+                self.emit(
+                    Instruction::Move {
+                        destination,
+                        source: else_value,
+                    },
+                    expression.span(),
+                )?;
+                self.patch_forward_branch(end_branch, self.code.len())?;
+                Ok(destination)
+            }
             ExpressionKind::Unary(unary) => match unary.operator() {
                 UnaryOperator::Not => {
                     let source = self.lower_expression(unary.operand())?;

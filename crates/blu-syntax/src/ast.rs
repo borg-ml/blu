@@ -372,6 +372,42 @@ impl IndexExpression {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IfExpression {
+    condition: ExpressionId,
+    then_value: ExpressionId,
+    else_value: ExpressionId,
+}
+
+impl IfExpression {
+    pub(crate) const fn new(
+        condition: ExpressionId,
+        then_value: ExpressionId,
+        else_value: ExpressionId,
+    ) -> Self {
+        Self {
+            condition,
+            then_value,
+            else_value,
+        }
+    }
+
+    #[must_use]
+    pub const fn condition(self) -> ExpressionId {
+        self.condition
+    }
+
+    #[must_use]
+    pub const fn then_value(self) -> ExpressionId {
+        self.then_value
+    }
+
+    #[must_use]
+    pub const fn else_value(self) -> ExpressionId {
+        self.else_value
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ExpressionKind {
     Nil,
     Vararg,
@@ -390,6 +426,7 @@ pub enum ExpressionKind {
     Call(CallExpression),
     MethodCall(MethodCallExpression),
     Function(FunctionExpression),
+    If(IfExpression),
     Unary(UnaryExpression),
     Binary(BinaryExpression),
 }

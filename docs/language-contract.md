@@ -138,6 +138,11 @@ lone CR bytes; Lua 5.1–5.5 normalize them to LF, and Blu explicitly chooses th
 Lua normalization rule. Per-constant and aggregate payload limits are checked
 before allocation. A bare return uses a zero-width validated register
 range and produces no values.
+Blu and Luau accept value-selecting `if condition then value elseif ...
+else value` expressions. An `else` value is mandatory, only the selected arm
+executes, and chained `elseif` arms lower to validated forward branches. Lua
+5.1–5.5 reject this Luau-derived expression syntax during parsing; ordinary
+statement-form conditionals remain shared.
 The canonical concatenation instruction names independent left and right
 registers and executes string/number coercion directly for every profile.
 When coercion is unavailable, the runtime selects the left then right

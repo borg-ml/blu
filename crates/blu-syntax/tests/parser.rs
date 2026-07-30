@@ -1312,6 +1312,45 @@ fn diagnostic_value_limits_map_through_parse_error() {
 }
 
 #[test]
+fn if_expressions_are_nested_and_profile_gated() {
+    let input = source(b"return if true then 1 elseif false then 2 else 3".to_vec());
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let parsed = accepted(&input, profile, ParseLimits::default());
+        assert_eq!(
+            parsed
+                .ast()
+                .expressions()
+                .iter()
+                .filter(|expression| matches!(expression.kind(), ExpressionKind::If(_)))
+                .count(),
+            2,
+            "{profile}"
+        );
+        assert!(matches!(
+            parsed.ast().statements(),
+            [Statement::Return(statement)]
+                if statement.values().len() == 1
+                    && matches!(
+                        parsed.ast().expression(statement.values()[0]).unwrap().kind(),
+                        ExpressionKind::If(_)
+                    )
+        ));
+    }
+
+    for profile in [
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let outcome = parse(&input, profile, ParseLimits::default()).unwrap();
+        let rejected = outcome.rejected().unwrap();
+        assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0046");
+    }
+}
+
+#[test]
 fn lua51_and_lua52_floor_divide_rejection_is_inherited_from_lexing() {
     for profile in [SemanticProfile::Lua51, SemanticProfile::Lua52] {
         let source = source(b"return 7 // 2".to_vec());

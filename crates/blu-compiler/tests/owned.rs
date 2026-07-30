@@ -1220,6 +1220,35 @@ fn repeat_until_executes_once_scopes_locals_and_tests_after_continue() {
 }
 
 #[test]
+fn blu_and_luau_if_expressions_short_circuit_and_select_values() {
+    let source = make_source(
+        b"return if true then 10 else error('unreachable'),if false then error('unreachable') else 20,if false then 1 elseif true then 30 else 3"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default().compile(&source, profile, compiler_identity());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            let compiled = compiled.unwrap();
+            let number = |value| {
+                if profile == SemanticProfile::Blu {
+                    Value::Integer(value)
+                } else {
+                    Value::Number(value as f64)
+                }
+            };
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(vec![number(10), number(20), number(30)]),
+                "{profile}"
+            );
+        } else {
+            assert!(matches!(compiled, Err(OwnedCompileError::Syntax(_))));
+        }
+    }
+}
+
+#[test]
 fn do_blocks_restore_shadowed_bindings_and_propagate_returns() {
     let scoped = make_source(
         b"local value = 1\ndo\nlocal value = 2\nvalue = value + 3\nend\nreturn value".to_vec(),

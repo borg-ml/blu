@@ -23,6 +23,9 @@ and table operations, numeric and generic loops, closures and mutable upvalues,
 variadic and multiple-return calls, globals and imports, Rust native functions,
 protected calls, `pairs`/`ipairs`/`next`, string method dispatch, core
 metamethods, an initial standard library, and host-configured cached `require`.
+The owned Blu/Luau frontend also lowers value-selecting
+`if ... then ... elseif ... else ...` expressions with short-circuit branches;
+Lua profiles reject that Luau syntax explicitly.
 The math slice includes shared truncating `math.fmod`; unlike floor-based `%`,
 its remainder preserves the dividend's sign, with modern integer preservation
 and zero-divisor errors. Shared `math.pow` provides the library form of

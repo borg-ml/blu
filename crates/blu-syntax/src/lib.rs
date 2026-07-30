@@ -16,8 +16,8 @@ pub use ast::{
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement,
     CompoundAssignmentOperator, CompoundAssignmentStatement, ContinueStatement, DoStatement,
     Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody, FunctionExpression,
-    FunctionId, FunctionStatement, GenericForStatement, Identifier, IfClause, IfStatement,
-    IndexExpression, LocalFunctionStatement, LocalListStatement, LocalStatement,
+    FunctionId, FunctionStatement, GenericForStatement, Identifier, IfClause, IfExpression,
+    IfStatement, IndexExpression, LocalFunctionStatement, LocalListStatement, LocalStatement,
     MethodCallExpression, NumericForStatement, RepeatStatement, ReturnStatement, Statement,
     TableConstructor, TableField, UnaryExpression, UnaryOperator, WhileStatement,
 };
