@@ -395,7 +395,9 @@ in every profile, return NaN outside their real domains, and reject non-number
 arguments structurally. `math.floor` and `math.ceil` return numbers for Luau
 and Lua 5.1–5.2. Blu follows Lua 5.3–5.5 by returning exact integers when the
 rounded value fits `i64`, retaining a floating result for finite out-of-range
-values, infinities, and NaN.
+values, infinities, and NaN. `math.modf` uses the same profile split for its
+truncation-toward-zero integral result and returns the signed fractional part
+as a number.
 
 ## Authority profiles
 
@@ -418,9 +420,10 @@ Blu plugin is active.
 
 ## Resource limits
 
-The initial shared math library includes `math.fmod`. It requires two numeric
-arguments and uses truncating remainder semantics, so the result follows the
-dividend's sign and is intentionally distinct from the language `%` operator.
+The initial shared math library includes `math.fmod` and `math.modf`.
+`math.fmod` requires two numeric arguments and uses truncating remainder
+semantics, so the result follows the dividend's sign and is intentionally
+distinct from the language `%` operator.
 
 Serialized bytecode and mutable embedding inputs are checked again at the
 execution boundary. Loaders, compiler artifacts, and portable packages also

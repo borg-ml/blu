@@ -5907,6 +5907,26 @@ impl Vm {
             let divisor = number_argument(arguments, 1, "math.fmod")?;
             Ok(vec![Value::Number(dividend % divisor)])
         });
+        let modf = self.register_function(|vm, arguments| {
+            let value = number_argument(arguments, 0, "math.modf")?;
+            let integral = value.trunc();
+            let modern = matches!(
+                vm.active_profile()?,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            );
+            let fractional = if value == integral {
+                if modern { 0.0 } else { 0.0_f64.copysign(value) }
+            } else {
+                value - integral
+            };
+            Ok(vec![
+                profiled_integral_math_result(vm, "math.modf", integral)?,
+                Value::Number(fractional),
+            ])
+        });
         let min = self.register_function(|_, arguments| {
             let mut values = arguments.iter();
             let first = values.next().ok_or(RuntimeError::Argument {
@@ -5950,7 +5970,7 @@ impl Vm {
             Ok(vec![Value::Number(result)])
         });
 
-        let table = self.heap.allocate_table(0, 19)?;
+        let table = self.heap.allocate_table(0, 20)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -5967,6 +5987,7 @@ impl Vm {
             (&b"rad"[..], Value::NativeFunction(rad)),
             (&b"deg"[..], Value::NativeFunction(deg)),
             (&b"fmod"[..], Value::NativeFunction(fmod)),
+            (&b"modf"[..], Value::NativeFunction(modf)),
             (&b"min"[..], Value::NativeFunction(min)),
             (&b"max"[..], Value::NativeFunction(max)),
             (&b"pi"[..], Value::Number(core::f64::consts::PI)),

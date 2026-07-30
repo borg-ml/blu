@@ -2775,6 +2775,60 @@ fn math_floor_and_ceil_return_profile_appropriate_numeric_subtypes() {
 }
 
 #[test]
+fn math_modf_preserves_profile_numeric_subtypes_and_two_results() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(
+            b"local a, b = math.modf(-3.25) local c, d = math.modf(4) return a, b, c, d".to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let modern = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                if modern {
+                    Value::Integer(-3)
+                } else {
+                    Value::Number(-3.0)
+                },
+                Value::Number(-0.25),
+                if modern {
+                    Value::Integer(4)
+                } else {
+                    Value::Number(4.0)
+                },
+                Value::Number(0.0),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn math_modf_rejects_non_numeric_arguments_structurally() {
+    let source = make_source(b"return math.modf('x')".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::Type {
+                operation: "math.modf",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(
