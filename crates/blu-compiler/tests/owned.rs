@@ -3926,7 +3926,7 @@ fn math_fmod_preserves_modern_integer_semantics_and_zero_split() {
 #[test]
 fn math_type_and_tointeger_follow_modern_profile_contracts() {
     let source = make_source(
-        b"return math.type(math.floor(3)),math.type(3.5),math.type('3'),math.tointeger('3'),math.tointeger(3.2),math.tointeger(-9223372036854775808.0),math.tointeger(9223372036854775808.0)"
+        b"return math.type(math.floor(3)),math.type(3.5),math.type('3'),math.tointeger('3'),math.tointeger(3.2),math.tointeger(-9223372036854775808.0),math.tointeger(9223372036854775808.0),math.tointeger('0x1.8p1'),math.tointeger('0x1.1p1')"
             .to_vec(),
     );
     for profile in SemanticProfile::ALL {
@@ -3951,6 +3951,8 @@ fn math_type_and_tointeger_follow_modern_profile_contracts() {
                     Value::Integer(3),
                     Value::Nil,
                     Value::Integer(i64::MIN),
+                    Value::Nil,
+                    Value::Integer(3),
                     Value::Nil,
                 ]),
                 "{profile}"
@@ -3984,7 +3986,7 @@ fn math_type_and_tointeger_follow_modern_profile_contracts() {
 #[test]
 fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
     let source = make_source(
-        b"return tonumber(' 42 '),tonumber('ff',16),tonumber('0x10'),tonumber(3),tonumber('3.0',10),tonumber('nan'),tonumber('inf'),tonumber('ffffffffffffffff',16),tonumber('x')"
+        b"return tonumber(' 42 '),tonumber('ff',16),tonumber('0x10'),tonumber(3),tonumber('3.0',10),tonumber('nan'),tonumber('inf'),tonumber('ffffffffffffffff',16),tonumber('0x1.8p1'),tonumber('-0x1p2'),tonumber('x')"
             .to_vec(),
     );
     for profile in SemanticProfile::ALL {
@@ -4032,7 +4034,9 @@ fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
             },
             "{profile}"
         );
-        assert_eq!(values[8], Value::Nil, "{profile}");
+        assert_eq!(values[8], Value::Number(3.0), "{profile}");
+        assert_eq!(values[9], Value::Number(-4.0), "{profile}");
+        assert_eq!(values[10], Value::Nil, "{profile}");
     }
 }
 

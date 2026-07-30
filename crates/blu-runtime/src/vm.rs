@@ -6664,6 +6664,82 @@ fn parse_unsigned_based_integer(digits: &[u8], base: u32) -> Option<u64> {
     Some(value)
 }
 
+fn parse_hex_float(bytes: &[u8], negative: bool) -> Option<f64> {
+    let exponent_at = bytes.iter().position(|byte| matches!(*byte, b'p' | b'P'));
+    let (mantissa, exponent) = match exponent_at {
+        Some(index) => {
+            let exponent = bytes.get(index + 1..)?;
+            if exponent.is_empty()
+                || bytes[index + 1..]
+                    .iter()
+                    .any(|byte| matches!(*byte, b'p' | b'P'))
+            {
+                return None;
+            }
+            (
+                &bytes[..index],
+                parse_saturating_decimal_exponent(exponent)?,
+            )
+        }
+        None => (bytes, 0),
+    };
+    if mantissa.is_empty() {
+        return None;
+    }
+    let mut value = 0.0;
+    let mut fractional_scale = None;
+    let mut digits = 0usize;
+    for byte in mantissa {
+        if *byte == b'.' {
+            if fractional_scale.is_some() {
+                return None;
+            }
+            fractional_scale = Some(1.0 / 16.0);
+            continue;
+        }
+        let digit = match *byte {
+            b'0'..=b'9' => u32::from(*byte - b'0'),
+            b'a'..=b'f' => u32::from(*byte - b'a') + 10,
+            b'A'..=b'F' => u32::from(*byte - b'A') + 10,
+            _ => return None,
+        };
+        digits += 1;
+        if let Some(scale) = fractional_scale.as_mut() {
+            value += f64::from(digit) * *scale;
+            *scale /= 16.0;
+        } else {
+            value = value * 16.0 + f64::from(digit);
+        }
+    }
+    if digits == 0 {
+        return None;
+    }
+    value *= 2.0f64.powi(exponent);
+    Some(if negative { -value } else { value })
+}
+
+fn parse_saturating_decimal_exponent(bytes: &[u8]) -> Option<i32> {
+    let (negative, digits) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() || digits.iter().any(|byte| !byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut value = 0i32;
+    for byte in digits {
+        value = value
+            .saturating_mul(10)
+            .saturating_add(i32::from(*byte - b'0'));
+    }
+    Some(if negative {
+        value.saturating_neg()
+    } else {
+        value
+    })
+}
+
 fn parse_default_number(bytes: &[u8], profile: SemanticProfile) -> Option<Value> {
     let modern = matches!(
         profile,
@@ -6681,6 +6757,9 @@ fn parse_default_number(bytes: &[u8], profile: SemanticProfile) -> Option<Value>
         .strip_prefix(b"0x")
         .or_else(|| unsigned.strip_prefix(b"0X"))
     {
+        if hex.iter().any(|byte| matches!(*byte, b'.' | b'p' | b'P')) {
+            return parse_hex_float(hex, negative).map(Value::Number);
+        }
         let magnitude = parse_unsigned_based_integer(hex, 16)?;
         return Some(if modern {
             let integer = magnitude as i64;

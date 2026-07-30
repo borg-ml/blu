@@ -412,7 +412,7 @@ profiles and Blu. They fail with an explicit unsupported-profile error in
 Luau and Lua 5.1–5.2, where the functions do not exist upstream.
 `tonumber` preserves existing numeric subtypes and integer string conversions
 for Blu and Lua 5.3–5.5, returns numbers for legacy profiles, accepts ordinary
-hexadecimal strings, and follows profile-specific explicit-base parsing,
+hexadecimal integer and floating strings, and follows profile-specific explicit-base parsing,
 non-finite spelling acceptance, and overflow behavior.
 Integral counts and bytes returned by `rawlen`, `select("#", ...)`,
 `string.len`, `string.byte`, and `table.pack.n` likewise use integers in Blu
