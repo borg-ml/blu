@@ -79,10 +79,12 @@ fn owned_vertical_slice_round_trips_and_executes_for_blu_and_luau() {
         );
         assert_eq!(artifact.main().profile, profile);
         assert_eq!(artifact.main().register_count, 3);
-        assert_eq!(
-            artifact.main().constants,
+        let expected_constants = if profile == SemanticProfile::Blu {
+            [Constant::Integer(40), Constant::Integer(2)]
+        } else {
             [Constant::Number(40.0), Constant::Number(2.0)]
-        );
+        };
+        assert_eq!(artifact.main().constants, expected_constants);
         assert_eq!(
             artifact.main().code,
             [
@@ -232,7 +234,10 @@ fn local_lists_evaluate_before_binding_and_fill_missing_values_with_nil() {
             .unwrap();
         let numeric = matches!(
             profile,
-            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
         );
         assert_eq!(
             Vm::new(Dialect::Blu)
@@ -260,12 +265,12 @@ fn local_lists_evaluate_before_binding_and_fill_missing_values_with_nil() {
         .unwrap();
     assert_eq!(
         compiled.artifact().main().constants,
-        [Constant::Number(1.0), Constant::Number(2.0)]
+        [Constant::Integer(1), Constant::Integer(2)]
     );
     assert_eq!(
         Vm::new(Dialect::Blu)
             .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-        Ok(vec![Value::Number(1.0)])
+        Ok(vec![Value::Integer(1)])
     );
 
     let source = make_source(b"local value\nvalue, value = 1, 2\nreturn value".to_vec());
@@ -331,7 +336,10 @@ fn assignment_lists_snapshot_rhs_and_adjust_fixed_scalar_values() {
             .unwrap();
         let numeric = matches!(
             profile,
-            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
         );
         assert_eq!(
             Vm::new(Dialect::Blu)
@@ -360,7 +368,7 @@ fn assignment_lists_snapshot_rhs_and_adjust_fixed_scalar_values() {
     assert_eq!(
         Vm::new(Dialect::Blu)
             .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-        Ok(vec![Value::Number(9.0), Value::Nil])
+        Ok(vec![Value::Integer(9), Value::Nil])
     );
 
     let source = make_source(b"local kept\nkept = 1, 2\nreturn kept".to_vec());
@@ -369,12 +377,12 @@ fn assignment_lists_snapshot_rhs_and_adjust_fixed_scalar_values() {
         .unwrap();
     assert_eq!(
         compiled.artifact().main().constants,
-        [Constant::Nil, Constant::Number(1.0), Constant::Number(2.0)]
+        [Constant::Nil, Constant::Integer(1), Constant::Integer(2)]
     );
     assert_eq!(
         Vm::new(Dialect::Blu)
             .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-        Ok(vec![Value::Number(1.0)])
+        Ok(vec![Value::Integer(1)])
     );
 
     for bytes in [
@@ -617,7 +625,10 @@ fn shared_baseline_artifacts_round_trip_for_all_seven_profiles() {
         assert_eq!(compiled.artifact().main().profile, profile);
         let integer_profile = matches!(
             profile,
-            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
         );
         if integer_profile {
             assert_eq!(
@@ -1996,7 +2007,6 @@ fn decimal_constants_follow_each_profile_numeric_policy() {
         SemanticProfile::Lua51,
         SemanticProfile::Lua52,
         SemanticProfile::Luau,
-        SemanticProfile::Blu,
     ] {
         let compiled = OwnedCompiler::default()
             .compile(&number_source, profile, compiler_identity())
@@ -2017,6 +2027,7 @@ fn decimal_constants_follow_each_profile_numeric_policy() {
     let integer_then_float =
         make_source(b"return 9223372036854775807, 9223372036854775808".to_vec());
     for profile in [
+        SemanticProfile::Blu,
         SemanticProfile::Lua53,
         SemanticProfile::Lua54,
         SemanticProfile::Lua55,
@@ -2124,7 +2135,10 @@ fn hexadecimal_integers_follow_each_profile_numeric_policy() {
         let constants = compiled.artifact().prototypes()[0].constants.as_slice();
         if matches!(
             profile,
-            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
         ) {
             assert_eq!(
                 constants,
@@ -2158,12 +2172,21 @@ fn numeric_separators_lower_only_for_blu_and_luau() {
         let result = OwnedCompiler::default().compile(&source, profile, compiler_identity());
         if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
             let compiled = result.unwrap();
+            let integer = profile == SemanticProfile::Blu;
             assert_eq!(
                 compiled.artifact().prototypes()[0].constants.as_slice(),
                 [
-                    Constant::Number(1_000.0),
+                    if integer {
+                        Constant::Integer(1_000)
+                    } else {
+                        Constant::Number(1_000.0)
+                    },
                     Constant::Number(12_345.125),
-                    Constant::Number(65_535.0),
+                    if integer {
+                        Constant::Integer(65_535)
+                    } else {
+                        Constant::Number(65_535.0)
+                    },
                 ],
                 "{profile}"
             );
@@ -2181,14 +2204,19 @@ fn numeric_separators_lower_only_for_blu_and_luau() {
 
 #[test]
 fn binary_integers_lower_only_for_blu_and_luau() {
-    let source = make_source(b"return 0b101010, 0B1111_0000".to_vec());
+    let source = make_source(b"return 0b101010,0B1111_0000".to_vec());
     for profile in SemanticProfile::ALL {
         let result = OwnedCompiler::default().compile(&source, profile, compiler_identity());
         if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
             let compiled = result.unwrap();
+            let constants = if profile == SemanticProfile::Blu {
+                [Constant::Integer(42), Constant::Integer(240)]
+            } else {
+                [Constant::Number(42.0), Constant::Number(240.0)]
+            };
             assert_eq!(
                 compiled.artifact().prototypes()[0].constants.as_slice(),
-                [Constant::Number(42.0), Constant::Number(240.0)],
+                constants,
                 "{profile}"
             );
         } else {
@@ -2200,6 +2228,32 @@ fn binary_integers_lower_only_for_blu_and_luau() {
                 "{profile}"
             );
         }
+    }
+}
+
+#[test]
+fn binary_integer_boundaries_are_explicit_for_blu_and_luau() {
+    let source = make_source(
+        b"return 0b11111111_11111111_11111111_11111111_11111111_11111111_11111111_11111111,0b1_00000000_00000000_00000000_00000000_00000000_00000000_00000000_00000000"
+            .to_vec(),
+    );
+    for (profile, expected) in [
+        (
+            SemanticProfile::Blu,
+            [Constant::Integer(-1), Constant::Integer(0)],
+        ),
+        (
+            SemanticProfile::Luau,
+            [
+                Constant::Number(18_446_744_073_709_551_615.0),
+                Constant::Number(18_446_744_073_709_551_616.0),
+            ],
+        ),
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(compiled.artifact().main().constants, expected, "{profile}");
     }
 }
 

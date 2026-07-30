@@ -9397,7 +9397,10 @@ fn materialize_blu_constants(
             BluConstant::Integer(value)
                 if matches!(
                     prototype.profile,
-                    SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    SemanticProfile::Blu
+                        | SemanticProfile::Lua53
+                        | SemanticProfile::Lua54
+                        | SemanticProfile::Lua55
                 ) =>
             {
                 Value::Integer(*value)
@@ -10508,7 +10511,25 @@ mod tests {
     }
 
     #[test]
-    fn direct_blu_v1_rejects_integer_semantics_not_assigned_to_profile() {
+    fn direct_blu_v1_accepts_assigned_blu_integers_and_rejects_luau_integers() {
+        let blu = validated_blu_program(
+            SemanticProfile::Blu,
+            vec![BluConstant::Integer(1)],
+            vec![
+                BluInstruction::LoadConstant {
+                    destination: 0,
+                    constant: 0,
+                },
+                BluInstruction::Return { first: 0, count: 1 },
+            ],
+            FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS,
+            1,
+        );
+        assert_eq!(
+            Vm::new(Dialect::Blu).execute_blu_v1(blu, BluLimits::default()),
+            Ok(vec![Value::Integer(1)])
+        );
+
         let artifact = validated_blu_program(
             SemanticProfile::Luau,
             vec![BluConstant::Integer(1)],

@@ -3258,7 +3258,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
 
         if matches!(
             self.profile,
-            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
         ) {
             let mut integer = 0_i64;
             let mut fits_integer = true;
@@ -3346,7 +3349,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
 
         if matches!(
             self.profile,
-            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
         ) {
             let integer = digits
                 .iter()
@@ -3391,13 +3397,23 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 message: "binary-integer AST contains an invalid digit",
             });
         }
-        let number = digits
-            .iter()
-            .filter(|byte| **byte != b'_')
-            .fold(0.0_f64, |value, byte| {
-                value.mul_add(2.0, f64::from(*byte - b'0'))
-            });
-        Ok(Constant::Number(number))
+        if self.profile == SemanticProfile::Blu {
+            let integer = digits
+                .iter()
+                .filter(|byte| **byte != b'_')
+                .fold(0_u64, |value, byte| {
+                    value.wrapping_mul(2).wrapping_add(u64::from(*byte - b'0'))
+                });
+            Ok(Constant::Integer(integer as i64))
+        } else {
+            let number = digits
+                .iter()
+                .filter(|byte| **byte != b'_')
+                .fold(0.0_f64, |value, byte| {
+                    value.mul_add(2.0, f64::from(*byte - b'0'))
+                });
+            Ok(Constant::Number(number))
+        }
     }
 
     fn hex_number_constant(&self, span: ByteSpan) -> Result<Constant, OwnedCompileError> {

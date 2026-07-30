@@ -51,7 +51,7 @@ retained trivia, the documented `//` profile gate, `local name = expression`,
 bare or expression-list `return`, nil/boolean/identifier expressions, shared
 decimal integers plus the digit-bearing fraction/exponent subset (`1.5`, `.25`,
 `1.`, `1.e2`, `2e3`, and `4.5e-2`), hexadecimal integers with explicit
-Lua 5.3–5.5 wrapping-integer versus number-profile lowering, and internal
+Blu/Lua 5.3–5.5 wrapping-integer versus number-profile lowering, and internal
 numeric separators plus binary integers in the Blu and Luau profiles,
 hexadecimal exponent forms for Blu and Lua 5.1–5.5, and fractional hexadecimal
 forms for Blu and Lua 5.2–5.5,
@@ -372,8 +372,9 @@ and structured failure. This does not yet imply that every legacy Luau frame,
 native-owned allocation, or GC work buffer is VM-accounted.
 It also executes floor division where the dialect matrix assigns it: Luau
 numbers and Blu/Lua 5.3--5.5 integers or numbers. Integer constants remain a
-lossless storage feature, so the executor rejects them explicitly for profiles
-whose integer execution semantics are not assigned. Nested prototypes,
+lossless storage feature. Blu and Lua 5.3–5.5 materialize them exactly, while
+profiles whose integer execution semantics are not assigned reject them.
+Nested prototypes,
 upvalues, and the rest of the language remain explicit unsupported structure,
 not an implicit compatibility claim.
 
