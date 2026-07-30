@@ -418,6 +418,12 @@ legacy-number or modern-integer policy.
 `string.match` uses the same byte-pattern engine, relative start rules, and
 work limit. Until captures are implemented it returns the full matched byte
 slice, or nil on a miss, and rejects capture syntax structurally.
+`collectgarbage` supports the shared `collect` and `count` commands. Collection
+traces active frames, globals, threads, upvalues, and host-retained values.
+`count` reports the runtime's accounted GC-heap kibibytes; it is not presented
+as whole-process memory. Pinned Luau returns no values from `collect`; Lua
+profiles return zero using their legacy-number or modern-integer policy. Other
+commands differ by upstream version and fail explicitly until profile-dispatched.
 
 ## Authority profiles
 

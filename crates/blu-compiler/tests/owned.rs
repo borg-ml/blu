@@ -2669,6 +2669,77 @@ fn string_match_shares_structured_pattern_and_argument_errors() {
 }
 
 #[test]
+fn collectgarbage_collect_preserves_active_roots_and_count_is_numeric() {
+    let source = make_source(
+        b"local value = { answer = 42 } local result = collectgarbage('collect') local count = collectgarbage('count') return value.answer, result, type(count)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let answer = if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            Value::Integer(42)
+        } else {
+            Value::Number(42.0)
+        };
+        let collected = match profile {
+            SemanticProfile::Luau => Value::Nil,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
+                Value::Integer(0)
+            }
+            _ => Value::Number(0.0),
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                answer,
+                collected,
+                Value::String(Arc::from(&b"number"[..]))
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn collectgarbage_rejects_unassigned_commands_and_wrong_types() {
+    for profile in SemanticProfile::ALL {
+        for (source, expected) in [
+            (
+                b"return collectgarbage('restart')".as_slice(),
+                "unsupported",
+            ),
+            (b"return collectgarbage({})".as_slice(), "type"),
+        ] {
+            let source = make_source(source.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            let result = Vm::default()
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+            match expected {
+                "unsupported" => assert!(matches!(
+                    result,
+                    Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "collectgarbage",
+                        ..
+                    })
+                )),
+                "type" => assert!(matches!(result, Err(RuntimeError::Type { .. }))),
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+#[test]
 fn decimal_and_hexadecimal_byte_escapes_decode_by_profile() {
     let decimal = make_source(br#"return "\0\7\65\255""#.to_vec());
     for profile in SemanticProfile::ALL {

@@ -4926,6 +4926,38 @@ impl Vm {
         });
         self.set_global(&b"select"[..], Value::NativeFunction(select));
 
+        let collectgarbage = self.register_function(|vm, arguments| {
+            let command = match arguments.first() {
+                None => &b"collect"[..],
+                Some(value) => string_bytes(value, "collectgarbage")?,
+            };
+            match command {
+                b"collect" => {
+                    vm.collect(std::iter::empty())?;
+                    if vm.active_profile()? == SemanticProfile::Luau {
+                        Ok(Vec::new())
+                    } else {
+                        Ok(vec![profiled_integral_math_result(
+                            vm,
+                            "collectgarbage",
+                            0.0,
+                        )?])
+                    }
+                }
+                b"count" => Ok(vec![Value::Number(
+                    vm.memory_usage().current_bytes as f64 / 1024.0,
+                )]),
+                _ => Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "collectgarbage",
+                    feature: "this profile-specific command",
+                }),
+            }
+        });
+        self.set_global(
+            &b"collectgarbage"[..],
+            Value::NativeFunction(collectgarbage),
+        );
+
         let pcall = self.register_function(|_, _| Err(RuntimeError::NativeFunction(u32::MAX)));
         self.protected_call = Some(pcall);
         self.set_global(&b"pcall"[..], Value::NativeFunction(pcall));
