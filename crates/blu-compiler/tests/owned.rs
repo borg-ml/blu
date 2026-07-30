@@ -1274,7 +1274,7 @@ fn numeric_for_snapshots_bounds_scopes_index_and_supports_loop_control() {
 }
 
 #[test]
-fn numeric_for_accepts_nonzero_literal_steps_and_rejects_unresolved_zero_behavior() {
+fn numeric_for_accepts_literal_steps_with_profile_specific_zero_direction() {
     let descending = make_source(
         b"local total = 0\nfor index = 5, 1, -2 do total = total + index end\nreturn total"
             .to_vec(),
@@ -1311,16 +1311,43 @@ fn numeric_for_accepts_nonzero_literal_steps_and_rejects_unresolved_zero_behavio
         );
     }
 
-    for bytes in [
-        b"for index = 1, 3, 0 do end".as_slice(),
-        b"local step = 1\nfor index = 1, 3, step do end".as_slice(),
+    let zero = make_source(
+        b"local count = 0 for index = 1, 0, 0 do count = count + 1 if count == 1 then break end end return count"
+            .to_vec(),
+    );
+    for (profile, expected) in [
+        (SemanticProfile::Luau, Value::Number(1.0)),
+        (SemanticProfile::Lua51, Value::Number(1.0)),
+        (SemanticProfile::Lua52, Value::Number(1.0)),
+        (SemanticProfile::Lua53, Value::Integer(1)),
     ] {
-        let source = make_source(bytes.to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&zero, profile, compiler_identity())
+            .expect("profile assigns zero-step direction");
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
+    }
+
+    for profile in [
+        SemanticProfile::Blu,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let source = make_source(b"for index = 1, 3, 0 do end".to_vec());
         let error = OwnedCompiler::default()
-            .compile(&source, SemanticProfile::Blu, compiler_identity())
-            .expect_err("unassigned step semantics should fail explicitly");
+            .compile(&source, profile, compiler_identity())
+            .expect_err("rejected zero-step semantics should fail explicitly");
         assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
     }
+
+    let dynamic = make_source(b"local step = 1\nfor index = 1, 3, step do end".to_vec());
+    let error = OwnedCompiler::default()
+        .compile(&dynamic, SemanticProfile::Blu, compiler_identity())
+        .expect_err("dynamic step direction should fail explicitly");
+    assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
 }
 
 #[test]

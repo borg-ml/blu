@@ -196,13 +196,12 @@ The shared numeric-for slice accepts
 `for name = initial, limit [, step] do ... end`. Controls are evaluated exactly
 once and copied into hidden registers before the loop variable enters scope.
 The implicit step is positive one in the profile's number representation.
-Explicit steps must currently be provably nonzero numeric literals; positive
-and negative directions are lowered explicitly. Dynamic steps fail with
-`BLU-COMPILE-0003`, and literal zero fails with `BLU-COMPILE-0004`.
-This restriction preserves an upstream conflict: pinned Lua 5.1–5.3 classify
-zero with non-negative steps, Lua 5.4–5.5 raise "`for` step is zero", and
-pinned Luau classifies zero with non-positive steps. Blu's zero-step behavior
-remains unassigned.
+Explicit steps must currently be provable numeric literals; positive and
+negative directions are lowered explicitly. Literal zero follows the pinned
+split: Lua 5.1–5.3 and Luau classify it with non-positive steps. Lua 5.4–5.5
+reject zero during lowering with `BLU-COMPILE-0004`, preserving their upstream
+"`for` step is zero" failure, and Blu uses the same diagnostic because its
+behavior remains unassigned. Dynamic steps fail with `BLU-COMPILE-0003`.
 The owned generic-for slice accepts
 `for name [, name ...] in expression [, expression ...] do ... end` for Blu,
 Luau, and Lua 5.1–5.3. Its expression list is evaluated once and adjusted to

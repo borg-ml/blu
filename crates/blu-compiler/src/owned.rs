@@ -995,17 +995,36 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     "BLU-COMPILE-0003",
                     Phase::Lower,
                     self.expression(step_expression)?.span(),
-                    "numeric for step must currently be a nonzero numeric literal",
+                    "numeric for step must currently be a numeric literal",
                 )?));
             };
-            if sign == 0 {
-                return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                    "BLU-COMPILE-0004",
-                    Phase::Lower,
-                    self.expression(step_expression)?.span(),
-                    "zero numeric for step is profile-specific and not yet executable",
-                )?));
-            }
+            let ascending = if sign == 0 {
+                match self.profile {
+                    SemanticProfile::Luau
+                    | SemanticProfile::Lua51
+                    | SemanticProfile::Lua52
+                    | SemanticProfile::Lua53 => false,
+                    SemanticProfile::Blu => {
+                        return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                            "BLU-COMPILE-0004",
+                            Phase::Lower,
+                            self.expression(step_expression)?.span(),
+                            "Blu zero numeric for step semantics are not assigned",
+                        )?));
+                    }
+                    SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
+                        return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                            "BLU-COMPILE-0004",
+                            Phase::Lower,
+                            self.expression(step_expression)?.span(),
+                            "Lua 5.4-5.5 reject a zero numeric for step",
+                        )?));
+                    }
+                    profile => return Err(OwnedCompileError::UnsupportedProfile(profile)),
+                }
+            } else {
+                sign > 0
+            };
             let source = self.lower_expression(step_expression)?;
             let snapshot = self.allocate_register()?;
             self.emit(
@@ -1015,7 +1034,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 },
                 statement.span(),
             )?;
-            (snapshot, sign > 0)
+            (snapshot, ascending)
         } else {
             let step_constant = if matches!(
                 self.profile,

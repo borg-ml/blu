@@ -123,8 +123,9 @@ in a repeat loop transfers to that trailing condition.
 Shared numeric `for` loops snapshot their controls once, use the profile's
 numeric representation for the implicit positive unit step, and scope the
 index to the loop. Explicit, provably nonzero numeric-literal steps support
-both directions. Zero or dynamic steps fail during lowering until their
-conflicting profile-specific runtime behavior can be represented directly.
+both directions. Literal zero follows the pinned Lua 5.1–5.3 and Luau
+non-positive classification; Blu remains unassigned and Lua 5.4–5.5 reject
+zero explicitly. Dynamic steps still fail during lowering.
 Generic `for` now executes iterator/state/control triples in Blu, Luau, and
 Lua 5.1–5.3, including bounded final-call adjustment, lexical result
 variables, and nil-only termination. Lua 5.4–5.5 reject this syntax during
