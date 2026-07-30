@@ -6128,7 +6128,7 @@ impl Vm {
                 };
                 let percent = cursor + relative;
                 append_limited_string(&mut result, &format[cursor..percent])?;
-                let specifier = format.get(percent + 1).copied().ok_or(
+                let mut specifier = format.get(percent + 1).copied().ok_or(
                     RuntimeError::UnsupportedLibraryFeature {
                         function: "string.format",
                         feature: "a trailing percent sign",
@@ -6139,13 +6139,34 @@ impl Vm {
                     append_limited_string(&mut result, b"%")?;
                     continue;
                 }
-                if matches!(
-                    specifier,
-                    b'-' | b'+' | b' ' | b'#' | b'0' | b'.' | b'1'..=b'9'
-                ) {
+                let mut precision = None;
+                if specifier == b'.' {
+                    let precision_start = cursor;
+                    while format.get(cursor).is_some_and(u8::is_ascii_digit) {
+                        cursor += 1;
+                    }
+                    let digits = &format[precision_start..cursor];
+                    if digits.len() > 2 {
+                        return Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: "string.format",
+                            feature: "precisions wider than two digits",
+                        });
+                    }
+                    precision = Some(digits.iter().fold(0usize, |value, digit| {
+                        value * 10 + usize::from(*digit - b'0')
+                    }));
+                    specifier = format.get(cursor).copied().ok_or(
+                        RuntimeError::UnsupportedLibraryFeature {
+                            function: "string.format",
+                            feature: "a precision without a conversion specifier",
+                        },
+                    )?;
+                    cursor += 1;
+                }
+                if matches!(specifier, b'-' | b'+' | b' ' | b'#' | b'0' | b'1'..=b'9') {
                     return Err(RuntimeError::UnsupportedLibraryFeature {
                         function: "string.format",
-                        feature: "flags, widths, and precisions",
+                        feature: "flags and field widths",
                     });
                 }
                 let value = arguments.get(argument).ok_or(RuntimeError::Argument {
@@ -6153,6 +6174,12 @@ impl Vm {
                     index: argument + 1,
                 })?;
                 argument += 1;
+                if precision.is_some() && !matches!(specifier, b's' | b'f' | b'e' | b'E') {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "string.format",
+                        feature: "precision for this conversion specifier",
+                    });
+                }
                 match specifier {
                     b's' => {
                         let bytes = try_concat_bytes(value)?.ok_or(
@@ -6161,7 +6188,10 @@ impl Vm {
                                 feature: "%s conversion of non-string and non-number values",
                             },
                         )?;
-                        append_limited_string(&mut result, &bytes)?;
+                        let bytes = precision.map_or(bytes.as_ref(), |precision| {
+                            &bytes[..bytes.len().min(precision)]
+                        });
+                        append_limited_string(&mut result, bytes)?;
                     }
                     b'd' | b'i' => append_formatted_string(
                         &mut result,
@@ -6204,9 +6234,16 @@ impl Vm {
                         }
                         append_limited_string(&mut result, &[value as u8])?;
                     }
-                    b'f' => append_formatted_string(
+                    b'f' => {
+                        let value = string_format_number(vm, value, "string.format")?;
+                        let precision = precision.unwrap_or(6);
+                        append_formatted_string(&mut result, format_args!("{value:.precision$}"))?;
+                    }
+                    b'e' | b'E' => append_scientific_string(
                         &mut result,
-                        format_args!("{:.6}", string_format_number(vm, value, "string.format")?),
+                        string_format_number(vm, value, "string.format")?,
+                        specifier == b'E',
+                        precision.unwrap_or(6),
                     )?,
                     _ => {
                         return Err(RuntimeError::UnsupportedLibraryFeature {
@@ -9694,6 +9731,39 @@ fn append_formatted_string(
     fmt::write(&mut ByteWriter(result), arguments)
         .expect("preflighted byte formatting cannot fail");
     Ok(())
+}
+
+fn append_scientific_string(
+    result: &mut Vec<u8>,
+    value: f64,
+    uppercase: bool,
+    precision: usize,
+) -> Result<(), RuntimeError> {
+    let arguments = format_args!("{value:.precision$e}");
+    let length = formatted_len(arguments);
+    let mut raw = try_vec_with_capacity(length, "scientific string")?;
+    fmt::write(&mut ByteWriter(&mut raw), arguments)
+        .expect("preflighted scientific formatting cannot fail");
+    let Some(marker) = raw.iter().rposition(|byte| *byte == b'e') else {
+        if uppercase {
+            raw.make_ascii_uppercase();
+        }
+        return append_limited_string(result, &raw);
+    };
+
+    append_limited_string(result, &raw[..marker])?;
+    append_limited_string(result, if uppercase { b"E" } else { b"e" })?;
+    let exponent = &raw[marker + 1..];
+    let (sign, digits) = match exponent.first() {
+        Some(b'-') => (b'-', &exponent[1..]),
+        Some(b'+') => (b'+', &exponent[1..]),
+        _ => (b'+', exponent),
+    };
+    append_limited_string(result, &[sign])?;
+    if digits.len() < 2 {
+        append_limited_string(result, b"0")?;
+    }
+    append_limited_string(result, digits)
 }
 
 fn append_basic_capture_values(

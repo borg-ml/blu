@@ -565,12 +565,16 @@ full match; callback replacements and table `__index` handlers fail
 explicitly pending resumable calls.
 `string.format` implements the profile-common unmodified conversion core:
 `%%`, `%s` for string or numeric values, `%d`, `%i`, `%u`, `%x`, `%X`, `%o`,
-`%c`, and default-precision `%f`. Integer conversions truncate in Luau and Lua
-5.1–5.2 and require an exact integer representation in Blu and Lua 5.3–5.5.
-Output growth is fallible and enforces the hard string limit. Flags, field
-widths, explicit precisions, `%e`/`%E`, `%g`/`%G`, `%a`/`%A`, `%q`, and
-non-scalar `%s` behavior remain structured unsupported features rather than
-being approximated.
+`%c`, and default-precision `%f`, `%e`, and `%E`. Scientific exponents use an
+explicit sign and at least two digits as required by the reference runtimes.
+One- or two-digit explicit precisions are supported for `%s`, `%f`, `%e`, and
+`%E`; `%.s` selects zero precision as in the reference grammars.
+Integer conversions truncate in Luau and Lua 5.1–5.2 and require an exact
+integer representation in Blu and Lua 5.3–5.5. Output growth is fallible and
+enforces the hard string limit. Flags, field widths, integer precisions,
+precisions wider than two digits, `%g`/`%G`, `%a`/`%A`, `%q`, and non-scalar
+`%s` behavior remain structured unsupported features rather than being
+approximated.
 Blu and Luau provide `string.split` with a default comma separator,
 non-overlapping byte-string separators, retained empty fields, and byte-wise
 splitting for an empty separator. Its output table capacity is checked before

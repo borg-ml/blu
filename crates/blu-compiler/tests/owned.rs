@@ -5336,7 +5336,7 @@ fn string_split_matches_luau_byte_and_empty_field_semantics() {
 #[test]
 fn string_format_executes_the_profile_common_conversion_core() {
     let source = make_source(
-        b"return string.format('%s:%d:%i:%u:%x:%X:%o:%c:%f:%%','ok',12,-2,-1,255,255,9,65,1.25)"
+        b"return string.format('%s:%d:%i:%u:%x:%X:%o:%c:%f:%e:%E:%.3s:%.2f:%.1e:%.3E:%%','ok',12,-2,-1,255,255,9,65,1.25,1.25,0.00125,'abcdef',1.25,1.25,0.00125)"
             .to_vec(),
     );
     let fractional = make_source(b"return string.format('%d',12.9)".to_vec());
@@ -5353,7 +5353,7 @@ fn string_format_executes_the_profile_common_conversion_core() {
                 BluLimits::default(),
             ),
             Ok(vec![Value::String(Arc::from(
-                &b"ok:12:-2:18446744073709551615:ff:FF:11:A:1.250000:%"[..]
+                &b"ok:12:-2:18446744073709551615:ff:FF:11:A:1.250000:1.250000e+00:1.250000E-03:abc:1.25:1.2e+00:1.250E-03:%"[..]
             ))]),
             "{profile}"
         );
@@ -5390,7 +5390,7 @@ fn string_format_executes_the_profile_common_conversion_core() {
             ),
             Err(RuntimeError::UnsupportedLibraryFeature {
                 function: "string.format",
-                feature: "flags, widths, and precisions",
+                feature: "flags and field widths",
             }),
             "{profile}"
         );
