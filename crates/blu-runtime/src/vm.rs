@@ -6111,6 +6111,118 @@ impl Vm {
             Value::String(Arc::from(&b"upper"[..])),
             Value::NativeFunction(string_upper),
         )?;
+        let string_format = self.register_function(|vm, arguments| {
+            let format = arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.format",
+                index: 1,
+            })?;
+            let format = string_bytes(format, "string.format")?;
+            ensure_string_result_length(format.len())?;
+            let mut result = try_vec_with_capacity(format.len(), "formatted string")?;
+            let mut cursor = 0usize;
+            let mut argument = 1usize;
+            while cursor < format.len() {
+                let Some(relative) = format[cursor..].iter().position(|byte| *byte == b'%') else {
+                    append_limited_string(&mut result, &format[cursor..])?;
+                    break;
+                };
+                let percent = cursor + relative;
+                append_limited_string(&mut result, &format[cursor..percent])?;
+                let specifier = format.get(percent + 1).copied().ok_or(
+                    RuntimeError::UnsupportedLibraryFeature {
+                        function: "string.format",
+                        feature: "a trailing percent sign",
+                    },
+                )?;
+                cursor = percent + 2;
+                if specifier == b'%' {
+                    append_limited_string(&mut result, b"%")?;
+                    continue;
+                }
+                if matches!(
+                    specifier,
+                    b'-' | b'+' | b' ' | b'#' | b'0' | b'.' | b'1'..=b'9'
+                ) {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "string.format",
+                        feature: "flags, widths, and precisions",
+                    });
+                }
+                let value = arguments.get(argument).ok_or(RuntimeError::Argument {
+                    function: "string.format",
+                    index: argument + 1,
+                })?;
+                argument += 1;
+                match specifier {
+                    b's' => {
+                        let bytes = try_concat_bytes(value)?.ok_or(
+                            RuntimeError::UnsupportedLibraryFeature {
+                                function: "string.format",
+                                feature: "%s conversion of non-string and non-number values",
+                            },
+                        )?;
+                        append_limited_string(&mut result, &bytes)?;
+                    }
+                    b'd' | b'i' => append_formatted_string(
+                        &mut result,
+                        format_args!("{}", string_format_integer(vm, value, "string.format")?),
+                    )?,
+                    b'u' => append_formatted_string(
+                        &mut result,
+                        format_args!(
+                            "{}",
+                            string_format_integer(vm, value, "string.format")? as u64
+                        ),
+                    )?,
+                    b'x' => append_formatted_string(
+                        &mut result,
+                        format_args!(
+                            "{:x}",
+                            string_format_integer(vm, value, "string.format")? as u64
+                        ),
+                    )?,
+                    b'X' => append_formatted_string(
+                        &mut result,
+                        format_args!(
+                            "{:X}",
+                            string_format_integer(vm, value, "string.format")? as u64
+                        ),
+                    )?,
+                    b'o' => append_formatted_string(
+                        &mut result,
+                        format_args!(
+                            "{:o}",
+                            string_format_integer(vm, value, "string.format")? as u64
+                        ),
+                    )?,
+                    b'c' => {
+                        let value = string_format_integer(vm, value, "string.format")?;
+                        if !(0..=255).contains(&value) {
+                            return Err(RuntimeError::InvalidRange {
+                                operation: "string.format %c",
+                            });
+                        }
+                        append_limited_string(&mut result, &[value as u8])?;
+                    }
+                    b'f' => append_formatted_string(
+                        &mut result,
+                        format_args!("{:.6}", string_format_number(vm, value, "string.format")?),
+                    )?,
+                    _ => {
+                        return Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: "string.format",
+                            feature: "this conversion specifier",
+                        });
+                    }
+                }
+            }
+            Ok(vec![Value::String(Arc::from(result))])
+        });
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"format"[..])),
+            Value::NativeFunction(string_format),
+        )?;
         let string_split = self.register_function(|vm, arguments| {
             let profile = vm.active_profile()?;
             if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
@@ -8121,6 +8233,43 @@ fn unpack_table_values(
     Ok(values)
 }
 
+fn string_format_number(
+    vm: &Vm,
+    value: &Value,
+    operation: &'static str,
+) -> Result<f64, RuntimeError> {
+    let profile = vm.active_profile()?;
+    arithmetic_numeric_value(value, profile)
+        .and_then(|value| value.as_number())
+        .ok_or(RuntimeError::Type {
+            operation,
+            expected: "number",
+            actual: value.type_name(),
+        })
+}
+
+fn string_format_integer(
+    vm: &Vm,
+    value: &Value,
+    operation: &'static str,
+) -> Result<i64, RuntimeError> {
+    let profile = vm.active_profile()?;
+    if matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    ) {
+        return exact_integer_conversion(value, profile).ok_or(RuntimeError::Type {
+            operation,
+            expected: "integer",
+            actual: value.type_name(),
+        });
+    }
+    Ok(string_format_number(vm, value, operation)? as i64)
+}
+
 fn integer_argument(
     arguments: &[Value],
     zero_based_index: usize,
@@ -9526,6 +9675,25 @@ fn ensure_string_result_length(required: usize) -> Result<(), RuntimeError> {
 fn limited_string_value(bytes: &[u8]) -> Result<Value, RuntimeError> {
     ensure_string_result_length(bytes.len())?;
     Ok(Value::String(Arc::from(bytes)))
+}
+
+fn append_formatted_string(
+    result: &mut Vec<u8>,
+    arguments: fmt::Arguments<'_>,
+) -> Result<(), RuntimeError> {
+    let added = formatted_len(arguments);
+    let required = result
+        .len()
+        .checked_add(added)
+        .ok_or(RuntimeError::StringLimit {
+            required: usize::MAX,
+            limit: MAX_STRING_BYTES,
+        })?;
+    ensure_string_result_length(required)?;
+    try_reserve_exact(result, added, "formatted string")?;
+    fmt::write(&mut ByteWriter(result), arguments)
+        .expect("preflighted byte formatting cannot fail");
+    Ok(())
 }
 
 fn append_basic_capture_values(

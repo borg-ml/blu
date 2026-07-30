@@ -563,6 +563,14 @@ reject them. The second result is the profile-typed
 replacement count. Direct table replacements select by the first capture or
 full match; callback replacements and table `__index` handlers fail
 explicitly pending resumable calls.
+`string.format` implements the profile-common unmodified conversion core:
+`%%`, `%s` for string or numeric values, `%d`, `%i`, `%u`, `%x`, `%X`, `%o`,
+`%c`, and default-precision `%f`. Integer conversions truncate in Luau and Lua
+5.1–5.2 and require an exact integer representation in Blu and Lua 5.3–5.5.
+Output growth is fallible and enforces the hard string limit. Flags, field
+widths, explicit precisions, `%e`/`%E`, `%g`/`%G`, `%a`/`%A`, `%q`, and
+non-scalar `%s` behavior remain structured unsupported features rather than
+being approximated.
 Blu and Luau provide `string.split` with a default comma separator,
 non-overlapping byte-string separators, retained empty fields, and byte-wise
 splitting for an empty separator. Its output table capacity is checked before

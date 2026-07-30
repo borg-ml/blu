@@ -5334,6 +5334,70 @@ fn string_split_matches_luau_byte_and_empty_field_semantics() {
 }
 
 #[test]
+fn string_format_executes_the_profile_common_conversion_core() {
+    let source = make_source(
+        b"return string.format('%s:%d:%i:%u:%x:%X:%o:%c:%f:%%','ok',12,-2,-1,255,255,9,65,1.25)"
+            .to_vec(),
+    );
+    let fractional = make_source(b"return string.format('%d',12.9)".to_vec());
+    let unsupported = make_source(b"return string.format('%02d',7)".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compile = |source: &SourceFile| {
+            OwnedCompiler::default()
+                .compile(source, profile, compiler_identity())
+                .unwrap()
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(
+                compile(&source).into_validated_artifact(),
+                BluLimits::default(),
+            ),
+            Ok(vec![Value::String(Arc::from(
+                &b"ok:12:-2:18446744073709551615:ff:FF:11:A:1.250000:%"[..]
+            ))]),
+            "{profile}"
+        );
+
+        let fractional_result = Vm::default().execute_blu_v1(
+            compile(&fractional).into_validated_artifact(),
+            BluLimits::default(),
+        );
+        if matches!(
+            profile,
+            SemanticProfile::Luau | SemanticProfile::Lua51 | SemanticProfile::Lua52
+        ) {
+            assert_eq!(
+                fractional_result,
+                Ok(vec![Value::String(Arc::from(&b"12"[..]))]),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                fractional_result,
+                Err(RuntimeError::Type {
+                    operation: "string.format",
+                    expected: "integer",
+                    actual: "number",
+                }),
+                "{profile}"
+            );
+        }
+
+        assert_eq!(
+            Vm::default().execute_blu_v1(
+                compile(&unsupported).into_validated_artifact(),
+                BluLimits::default(),
+            ),
+            Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "string.format",
+                feature: "flags, widths, and precisions",
+            }),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn luau_table_create_and_find_are_bounded_and_profile_gated() {
     let source = make_source(
         b"local filled=table.create(3,'x') local empty=table.create(3) local fractional=table.create(1.5,'y') return #filled,filled[1],filled[3],filled[4],#empty,empty[1],#fractional,table.find({1,2,1},1),table.find({1,2,1},1,2),table.find({[3]='x'},'x')"
