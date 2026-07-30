@@ -585,16 +585,21 @@ impl Vm {
         Ok(stats)
     }
 
-    fn ensure_heap_objects(
+    fn ensure_heap_objects<'a>(
         &mut self,
         additional: usize,
-        roots: &GcRoots,
+        roots: &'a GcRoots,
+        values: impl IntoIterator<Item = &'a Value>,
+        upvalues: impl IntoIterator<Item = UpvalueId>,
     ) -> Result<(), RuntimeError> {
         let required = self.heap.live_objects().saturating_add(additional);
         if required <= self.heap_object_limit {
             return Ok(());
         }
-        self.collect_internal(roots.values.iter(), roots.upvalues.iter().copied())?;
+        self.collect_internal(
+            roots.values.iter().chain(values),
+            roots.upvalues.iter().copied().chain(upvalues),
+        )?;
         let required = self.heap.live_objects().saturating_add(additional);
         if required <= self.heap_object_limit {
             Ok(())
@@ -628,6 +633,7 @@ impl Vm {
         hash_capacity: usize,
         roots: &GcRoots,
     ) -> Result<TableId, RuntimeError> {
+        self.ensure_heap_objects(1, roots, std::iter::empty(), std::iter::empty())?;
         let requested = self
             .heap
             .table_allocation_bytes(array_capacity, hash_capacity)?;
@@ -640,6 +646,7 @@ impl Vm {
         value: Value,
         roots: &GcRoots,
     ) -> Result<UpvalueId, RuntimeError> {
+        self.ensure_heap_objects(1, roots, std::iter::once(&value), std::iter::empty())?;
         let requested = self.heap.upvalue_allocation_bytes()?;
         self.collect_if_needed(
             requested,
@@ -658,6 +665,7 @@ impl Vm {
         upvalue_capacity: usize,
         roots: &GcRoots,
     ) -> Result<ClosureId, RuntimeError> {
+        self.ensure_heap_objects(1, roots, std::iter::empty(), std::iter::empty())?;
         let requested = self.heap.closure_allocation_bytes(upvalue_capacity)?;
         self.collect_if_needed(requested, roots, std::iter::empty(), std::iter::empty())?;
         Ok(self
@@ -673,6 +681,7 @@ impl Vm {
         upvalue_capacity: usize,
         roots: &GcRoots,
     ) -> Result<ClosureId, RuntimeError> {
+        self.ensure_heap_objects(1, roots, std::iter::empty(), std::iter::empty())?;
         let requested = self.heap.closure_allocation_bytes(upvalue_capacity)?;
         self.collect_if_needed(requested, roots, std::iter::empty(), std::iter::empty())?;
         Ok(self
@@ -685,6 +694,7 @@ impl Vm {
         thread_roots: &[Value],
         roots: &GcRoots,
     ) -> Result<ThreadId, RuntimeError> {
+        self.ensure_heap_objects(1, roots, thread_roots.iter(), std::iter::empty())?;
         let requested = self.heap.thread_allocation_bytes(thread_roots.len())?;
         self.collect_if_needed(requested, roots, thread_roots, std::iter::empty())?;
         Ok(self.heap.allocate_thread(thread_roots)?)
@@ -2085,7 +2095,6 @@ impl Vm {
                         .ok_or(RuntimeError::InvalidPrototype(child))?
                         .upvalue_count;
                     let frame_roots = frame.gc_roots(&self.heap)?;
-                    self.ensure_heap_objects(usize::from(upvalue_count) + 1, &frame_roots)?;
                     // A validated Luau chunk has no per-prototype profile
                     // field, so nested legacy prototypes necessarily inherit
                     // their creating frame's profile. BluV1 translation
@@ -2313,7 +2322,6 @@ impl Vm {
                         });
                     }
                     let roots = frame.gc_roots(&self.heap)?;
-                    self.ensure_heap_objects(1, &roots)?;
                     let table = self.allocate_table(array_capacity, hash_capacity, &roots)?;
                     frame.set(instruction.a(), Value::Table(table))?;
                 }
@@ -2355,7 +2363,6 @@ impl Vm {
                         }
                     };
                     let roots = frame.gc_roots(&self.heap)?;
-                    self.ensure_heap_objects(1, &roots)?;
                     let table = self.allocate_table(0, entries.len(), &roots)?;
                     for (key, value) in entries {
                         let key = materialize_constant(&chunk, prototype, key)?;
@@ -3947,7 +3954,6 @@ impl Vm {
                 .map_err(|_| RuntimeError::Allocation {
                     what: "coroutine state",
                 })?;
-            vm.ensure_heap_objects(1, &roots)?;
             let thread = vm.allocate_thread(std::slice::from_ref(&function), &roots)?;
             vm.threads.insert(thread, ThreadState::New(function));
             Ok(vec![Value::Thread(thread)])
@@ -3988,7 +3994,6 @@ impl Vm {
                 .map_err(|_| RuntimeError::Allocation {
                     what: "coroutine state",
                 })?;
-            vm.ensure_heap_objects(1, &roots)?;
             let thread = vm.allocate_thread(std::slice::from_ref(&function), &roots)?;
             vm.threads.insert(thread, ThreadState::New(function));
             Ok(vec![Value::CoroutineFunction(thread)])
@@ -4488,7 +4493,6 @@ impl Vm {
         });
         let pack = self.register_function(|vm, arguments| {
             let roots = GcRoots::from_values(arguments)?;
-            vm.ensure_heap_objects(1, &roots)?;
             let table = vm.allocate_table(arguments.len(), 1, &roots)?;
             for (index, value) in arguments.iter().enumerate() {
                 vm.table_set(
@@ -7849,6 +7853,97 @@ mod tests {
         );
         assert!(vm.heap.contains_thread(thread));
         assert!(vm.threads.contains_key(&thread));
+        assert_eq!(
+            vm.heap.table_get(garbage, &Value::Integer(1)),
+            Err(HeapError::StaleTable(garbage))
+        );
+    }
+
+    #[test]
+    fn every_vm_heap_allocator_enforces_the_object_limit() {
+        let artifact = Arc::new(
+            validated_blu_program(
+                SemanticProfile::Blu,
+                Vec::new(),
+                vec![BluInstruction::Return { first: 0, count: 0 }],
+                FeatureBits::BASELINE,
+                0,
+            )
+            .into_artifact(),
+        );
+
+        let mut table_vm = Vm::default();
+        let table_limit = table_vm.heap.live_objects();
+        table_vm.heap_object_limit = table_limit;
+        assert_eq!(
+            table_vm.allocate_table(0, 0, &GcRoots::default()),
+            Err(RuntimeError::HeapObjectLimit {
+                required: table_limit + 1,
+                limit: table_limit,
+            })
+        );
+
+        let mut upvalue_vm = Vm::default();
+        let upvalue_limit = upvalue_vm.heap.live_objects();
+        upvalue_vm.heap_object_limit = upvalue_limit;
+        assert_eq!(
+            upvalue_vm.allocate_upvalue(Value::Nil, &GcRoots::default()),
+            Err(RuntimeError::HeapObjectLimit {
+                required: upvalue_limit + 1,
+                limit: upvalue_limit,
+            })
+        );
+
+        let mut closure_vm = Vm::default();
+        let closure_limit = closure_vm.heap.live_objects();
+        closure_vm.heap_object_limit = closure_limit;
+        assert_eq!(
+            closure_vm.allocate_blu_closure(
+                artifact,
+                0,
+                SemanticProfile::Blu,
+                0,
+                &GcRoots::default(),
+            ),
+            Err(RuntimeError::HeapObjectLimit {
+                required: closure_limit + 1,
+                limit: closure_limit,
+            })
+        );
+
+        let mut thread_vm = Vm::default();
+        let thread_limit = thread_vm.heap.live_objects();
+        thread_vm.heap_object_limit = thread_limit;
+        assert_eq!(
+            thread_vm.allocate_thread(&[], &GcRoots::default()),
+            Err(RuntimeError::HeapObjectLimit {
+                required: thread_limit + 1,
+                limit: thread_limit,
+            })
+        );
+    }
+
+    #[test]
+    fn object_limit_collection_makes_room_for_blu_closures() {
+        let artifact = Arc::new(
+            validated_blu_program(
+                SemanticProfile::Blu,
+                Vec::new(),
+                vec![BluInstruction::Return { first: 0, count: 0 }],
+                FeatureBits::BASELINE,
+                0,
+            )
+            .into_artifact(),
+        );
+        let mut vm = Vm::default();
+        let garbage = vm.heap.allocate_table(0, 0).unwrap();
+        vm.heap_object_limit = vm.heap.live_objects();
+
+        let closure = vm
+            .allocate_blu_closure(artifact, 0, SemanticProfile::Blu, 0, &GcRoots::default())
+            .unwrap();
+
+        assert!(vm.heap.blu_closure_parts(closure).is_ok());
         assert_eq!(
             vm.heap.table_get(garbage, &Value::Integer(1)),
             Err(HeapError::StaleTable(garbage))
