@@ -35,8 +35,8 @@ number-only legacy behavior or return modern exact integers when representable.
 distinguishes Lua 5.1's ignored extra arguments from modern base selection.
 `math.min` and `math.max` preserve the selected modern subtype and upstream
 NaN ordering.
-Modern-profile `math.type` and `math.tointeger` provide numeric subtype
-introspection and exact integral conversion.
+Modern-profile `math.type`, `math.tointeger`, and `math.ult` provide numeric
+subtype introspection, exact integral conversion, and unsigned comparison.
 Core `tonumber` conversion preserves profile subtypes, hexadecimal integer and
 floating strings, and the explicit-base grammar and overflow behavior of each
 profile.

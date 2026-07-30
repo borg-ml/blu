@@ -3926,7 +3926,7 @@ fn math_fmod_preserves_modern_integer_semantics_and_zero_split() {
 #[test]
 fn math_type_and_tointeger_follow_modern_profile_contracts() {
     let source = make_source(
-        b"return math.type(math.floor(3)),math.type(3.5),math.type('3'),math.tointeger('3'),math.tointeger(3.2),math.tointeger(-9223372036854775808.0),math.tointeger(9223372036854775808.0),math.tointeger('0x1.8p1'),math.tointeger('0x1.1p1')"
+        b"return math.type(math.floor(3)),math.type(3.5),math.type('3'),math.tointeger('3'),math.tointeger(3.2),math.tointeger(-9223372036854775808.0),math.tointeger(9223372036854775808.0),math.tointeger('0x1.8p1'),math.tointeger('0x1.1p1'),math.ult(-1,1),math.ult(1,-1),math.ult('1',2)"
             .to_vec(),
     );
     for profile in SemanticProfile::ALL {
@@ -3954,6 +3954,9 @@ fn math_type_and_tointeger_follow_modern_profile_contracts() {
                     Value::Nil,
                     Value::Integer(3),
                     Value::Nil,
+                    Value::Boolean(false),
+                    Value::Boolean(true),
+                    Value::Boolean(true),
                 ]),
                 "{profile}"
             );
@@ -3975,6 +3978,39 @@ fn math_type_and_tointeger_follow_modern_profile_contracts() {
                     .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
                 Err(RuntimeError::UnsupportedSemanticProfile {
                     operation: "math.tointeger",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+
+        let source = make_source(b"return math.ult(1.5,2)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            assert_eq!(
+                result,
+                Err(RuntimeError::Type {
+                    operation: "math.ult",
+                    expected: "integer",
+                    actual: "number",
+                }),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.ult",
                     profile,
                 }),
                 "{profile}"

@@ -6512,29 +6512,45 @@ impl Vm {
                 function: "math.tointeger",
                 index: 1,
             })?;
-            let parsed;
-            let value = if let Value::String(bytes) = value {
-                parsed = parse_default_number(trim_ascii_bytes(bytes), profile);
-                parsed.as_ref().unwrap_or(&Value::Nil)
-            } else {
-                value
-            };
-            let integer = match value {
-                Value::Integer(value) => Some(*value),
-                Value::Number(value)
-                    if value.is_finite()
-                        && value.fract() == 0.0
-                        && *value >= i64::MIN as f64
-                        && *value < -(i64::MIN as f64) =>
-                {
-                    Some(*value as i64)
-                }
-                _ => None,
-            };
+            let integer = exact_integer_conversion(value, profile);
             Ok(vec![integer.map_or(Value::Nil, Value::Integer)])
         });
+        let unsigned_less = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.ult",
+                    profile,
+                });
+            }
+            let left = arguments.first().ok_or(RuntimeError::Argument {
+                function: "math.ult",
+                index: 1,
+            })?;
+            let right = arguments.get(1).ok_or(RuntimeError::Argument {
+                function: "math.ult",
+                index: 2,
+            })?;
+            let left = exact_integer_conversion(left, profile).ok_or(RuntimeError::Type {
+                operation: "math.ult",
+                expected: "integer",
+                actual: left.type_name(),
+            })?;
+            let right = exact_integer_conversion(right, profile).ok_or(RuntimeError::Type {
+                operation: "math.ult",
+                expected: "integer",
+                actual: right.type_name(),
+            })?;
+            Ok(vec![Value::Boolean((left as u64) < right as u64)])
+        });
 
-        let table = self.heap.allocate_table(0, 22)?;
+        let table = self.heap.allocate_table(0, 23)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -6556,6 +6572,7 @@ impl Vm {
             (&b"max"[..], Value::NativeFunction(max)),
             (&b"type"[..], Value::NativeFunction(math_type)),
             (&b"tointeger"[..], Value::NativeFunction(to_integer)),
+            (&b"ult"[..], Value::NativeFunction(unsigned_less)),
             (&b"pi"[..], Value::Number(core::f64::consts::PI)),
             (&b"huge"[..], Value::Number(f64::INFINITY)),
         ] {
@@ -6790,6 +6807,28 @@ fn parse_default_number(bytes: &[u8], profile: SemanticProfile) -> Option<Value>
         return None;
     }
     Some(Value::Number(number))
+}
+
+fn exact_integer_conversion(value: &Value, profile: SemanticProfile) -> Option<i64> {
+    let parsed;
+    let value = if let Value::String(bytes) = value {
+        parsed = parse_default_number(trim_ascii_bytes(bytes), profile);
+        parsed.as_ref()?
+    } else {
+        value
+    };
+    match value {
+        Value::Integer(value) => Some(*value),
+        Value::Number(value)
+            if value.is_finite()
+                && value.fract() == 0.0
+                && *value >= i64::MIN as f64
+                && *value < -(i64::MIN as f64) =>
+        {
+            Some(*value as i64)
+        }
+        _ => None,
+    }
 }
 
 fn number_argument(
