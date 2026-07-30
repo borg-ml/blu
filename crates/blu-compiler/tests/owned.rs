@@ -3924,6 +3924,61 @@ fn math_fmod_preserves_modern_integer_semantics_and_zero_split() {
 }
 
 #[test]
+fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
+    let source = make_source(
+        b"return tonumber(' 42 '),tonumber('ff',16),tonumber('0x10'),tonumber(3),tonumber('3.0',10),tonumber('nan'),tonumber('inf'),tonumber('ffffffffffffffff',16),tonumber('x')"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let modern = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        let integral = |value| {
+            if modern {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        let values = Vm::default()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap();
+        assert_eq!(
+            &values[..4],
+            &[integral(42), integral(255), integral(16), integral(3)]
+        );
+        let permissive = matches!(profile, SemanticProfile::Luau | SemanticProfile::Lua51);
+        if permissive {
+            assert_eq!(values[4], Value::Number(3.0), "{profile}");
+            assert!(
+                matches!(values[5], Value::Number(value) if value.is_nan()),
+                "{profile}"
+            );
+            assert_eq!(values[6], Value::Number(f64::INFINITY), "{profile}");
+        } else {
+            assert_eq!(&values[4..7], &[Value::Nil, Value::Nil, Value::Nil]);
+        }
+        assert_eq!(
+            values[7],
+            if modern {
+                Value::Integer(-1)
+            } else {
+                Value::Number(u64::MAX as f64)
+            },
+            "{profile}"
+        );
+        assert_eq!(values[8], Value::Nil, "{profile}");
+    }
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

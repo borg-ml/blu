@@ -407,6 +407,10 @@ second argument as the logarithm base.
 `math.min` and `math.max` retain the selected operand's integer subtype in Blu
 and Lua 5.3–5.5, return numbers in legacy profiles, and use upstream ordered
 selection so NaN does not silently replace or get replaced by another operand.
+`tonumber` preserves existing numeric subtypes and integer string conversions
+for Blu and Lua 5.3–5.5, returns numbers for legacy profiles, accepts ordinary
+hexadecimal strings, and follows profile-specific explicit-base parsing,
+non-finite spelling acceptance, and overflow behavior.
 `string.find` currently implements the common byte-oriented literal-search
 slice: relative start indices, empty needles, nil misses, and explicit
 `plain=true`. Searches without `plain` support search-relative `^`, subject-end

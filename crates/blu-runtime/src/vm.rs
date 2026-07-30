@@ -4685,12 +4685,12 @@ impl Vm {
         self.set_global(&b"type"[..], Value::NativeFunction(type_function));
         self.set_global(&b"typeof"[..], Value::NativeFunction(type_function));
 
-        let tonumber = self.register_function(|_, arguments| {
+        let tonumber = self.register_function(|vm, arguments| {
             let value = arguments.first().ok_or(RuntimeError::Argument {
                 function: "tonumber",
                 index: 1,
             })?;
-            let base = arguments
+            let explicit_base = arguments
                 .get(1)
                 .map(|value| {
                     value.as_number().ok_or(RuntimeError::Type {
@@ -4700,17 +4700,32 @@ impl Vm {
                     })
                 })
                 .transpose()?
-                .unwrap_or(10.0) as u32;
+                .map(|base| base as u32);
+            let base = explicit_base.unwrap_or(10);
             if !(2..=36).contains(&base) {
                 return Err(RuntimeError::ConversionBase(base));
             }
-            if base == 10
-                && let Some(value) = value.as_number()
-            {
-                return Ok(vec![Value::Number(value)]);
+            let profile = vm.active_profile()?;
+            let modern = matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            );
+            if explicit_base.is_none() && value.as_number().is_some() {
+                return Ok(vec![if modern {
+                    value.clone()
+                } else {
+                    Value::Number(
+                        value
+                            .as_number()
+                            .expect("numeric tonumber input was checked above"),
+                    )
+                }]);
             }
             let Value::String(value) = value else {
-                return if base == 10 {
+                return if explicit_base.is_none() {
                     Ok(vec![Value::Nil])
                 } else {
                     Err(RuntimeError::Type {
@@ -4720,23 +4735,13 @@ impl Vm {
                     })
                 };
             };
-            let Ok(value) = std::str::from_utf8(value) else {
-                return Ok(vec![Value::Nil]);
-            };
-            let value = value.trim();
-            let parsed = if base == 10 {
-                value.parse::<f64>().ok()
-            } else if let Some(digits) = value.strip_prefix('-') {
-                u64::from_str_radix(digits, base)
-                    .ok()
-                    .map(|value| -(value as f64))
+            let value = trim_ascii_bytes(value);
+            let parsed = if explicit_base.is_some() {
+                parse_based_number(value, base, profile)
             } else {
-                let digits = value.strip_prefix('+').unwrap_or(value);
-                u64::from_str_radix(digits, base)
-                    .ok()
-                    .map(|value| value as f64)
+                parse_default_number(value, profile)
             };
-            Ok(vec![parsed.map_or(Value::Nil, Value::Number)])
+            Ok(vec![parsed.unwrap_or(Value::Nil)])
         });
         self.set_global(&b"tonumber"[..], Value::NativeFunction(tonumber));
 
@@ -6510,6 +6515,120 @@ fn integer_argument(
             expected: "number",
             actual: value.type_name(),
         })
+}
+
+fn trim_ascii_bytes(mut bytes: &[u8]) -> &[u8] {
+    while bytes.first().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[1..];
+    }
+    while bytes.last().is_some_and(u8::is_ascii_whitespace) {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    bytes
+}
+
+fn parse_based_number(bytes: &[u8], base: u32, profile: SemanticProfile) -> Option<Value> {
+    if base == 10 && matches!(profile, SemanticProfile::Luau | SemanticProfile::Lua51) {
+        return core::str::from_utf8(bytes)
+            .ok()?
+            .parse::<f64>()
+            .ok()
+            .map(Value::Number);
+    }
+    let (negative, digits) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let magnitude = parse_unsigned_based_integer(digits, base)?;
+    if matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    ) {
+        let value = magnitude as i64;
+        Some(Value::Integer(if negative {
+            value.wrapping_neg()
+        } else {
+            value
+        }))
+    } else {
+        let value = magnitude as f64;
+        Some(Value::Number(if negative { -value } else { value }))
+    }
+}
+
+fn parse_unsigned_based_integer(digits: &[u8], base: u32) -> Option<u64> {
+    let mut value = 0_u64;
+    for byte in digits {
+        let digit = match *byte {
+            b'0'..=b'9' => u32::from(*byte - b'0'),
+            b'a'..=b'z' => u32::from(*byte - b'a') + 10,
+            b'A'..=b'Z' => u32::from(*byte - b'A') + 10,
+            _ => return None,
+        };
+        if digit >= base {
+            return None;
+        }
+        value = value
+            .checked_mul(u64::from(base))?
+            .checked_add(u64::from(digit))?;
+    }
+    Some(value)
+}
+
+fn parse_default_number(bytes: &[u8], profile: SemanticProfile) -> Option<Value> {
+    let modern = matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    );
+    let (negative, unsigned) = match bytes.first() {
+        Some(b'-') => (true, &bytes[1..]),
+        Some(b'+') => (false, &bytes[1..]),
+        _ => (false, bytes),
+    };
+    if let Some(hex) = unsigned
+        .strip_prefix(b"0x")
+        .or_else(|| unsigned.strip_prefix(b"0X"))
+    {
+        let magnitude = parse_unsigned_based_integer(hex, 16)?;
+        return Some(if modern {
+            let integer = magnitude as i64;
+            Value::Integer(if negative {
+                integer.wrapping_neg()
+            } else {
+                integer
+            })
+        } else {
+            let value = magnitude as f64;
+            Value::Number(if negative { -value } else { value })
+        });
+    }
+    let text = core::str::from_utf8(bytes).ok()?;
+    if modern
+        && !unsigned.is_empty()
+        && unsigned.iter().all(u8::is_ascii_digit)
+        && let Ok(integer) = text.parse::<i64>()
+    {
+        return Some(Value::Integer(integer));
+    }
+    let number = text.parse::<f64>().ok()?;
+    if !matches!(profile, SemanticProfile::Luau | SemanticProfile::Lua51)
+        && unsigned.iter().any(|byte| {
+            !byte.is_ascii_digit() && !matches!(*byte, b'.' | b'e' | b'E' | b'+' | b'-')
+        })
+    {
+        return None;
+    }
+    Some(Value::Number(number))
 }
 
 fn number_argument(

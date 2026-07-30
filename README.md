@@ -35,6 +35,8 @@ number-only legacy behavior or return modern exact integers when representable.
 distinguishes Lua 5.1's ignored extra arguments from modern base selection.
 `math.min` and `math.max` preserve the selected modern subtype and upstream
 NaN ordering.
+Core `tonumber` conversion preserves profile subtypes, hexadecimal strings,
+and the explicit-base grammar and overflow behavior of each profile.
 Byte-oriented `string.find` supports literal searches, relative starts, empty
 needles, nil misses, explicit plain mode, basic anchors, wildcard bytes,
 portable byte classes, class negation, and escaped punctuation under a work
