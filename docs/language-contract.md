@@ -407,6 +407,9 @@ second argument as the logarithm base.
 `math.min` and `math.max` retain the selected operand's integer subtype in Blu
 and Lua 5.3–5.5, return numbers in legacy profiles, and use upstream ordered
 selection so NaN does not silently replace or get replaced by another operand.
+`math.type` and `math.tointeger` follow the Lua 5.3–5.5 contracts in those
+profiles and Blu. They fail with an explicit unsupported-profile error in
+Luau and Lua 5.1–5.2, where the functions do not exist upstream.
 `tonumber` preserves existing numeric subtypes and integer string conversions
 for Blu and Lua 5.3–5.5, returns numbers for legacy profiles, accepts ordinary
 hexadecimal strings, and follows profile-specific explicit-base parsing,

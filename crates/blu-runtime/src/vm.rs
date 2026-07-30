@@ -6470,8 +6470,71 @@ impl Vm {
                 Ok(vec![Value::Number(result)])
             }
         });
+        let math_type = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.type",
+                    profile,
+                });
+            }
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "math.type",
+                index: 1,
+            })?;
+            Ok(vec![match value {
+                Value::Integer(_) => Value::String(Arc::from(&b"integer"[..])),
+                Value::Number(_) => Value::String(Arc::from(&b"float"[..])),
+                _ => Value::Nil,
+            }])
+        });
+        let to_integer = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.tointeger",
+                    profile,
+                });
+            }
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "math.tointeger",
+                index: 1,
+            })?;
+            let parsed;
+            let value = if let Value::String(bytes) = value {
+                parsed = parse_default_number(trim_ascii_bytes(bytes), profile);
+                parsed.as_ref().unwrap_or(&Value::Nil)
+            } else {
+                value
+            };
+            let integer = match value {
+                Value::Integer(value) => Some(*value),
+                Value::Number(value)
+                    if value.is_finite()
+                        && value.fract() == 0.0
+                        && *value >= i64::MIN as f64
+                        && *value < -(i64::MIN as f64) =>
+                {
+                    Some(*value as i64)
+                }
+                _ => None,
+            };
+            Ok(vec![integer.map_or(Value::Nil, Value::Integer)])
+        });
 
-        let table = self.heap.allocate_table(0, 20)?;
+        let table = self.heap.allocate_table(0, 22)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -6491,6 +6554,8 @@ impl Vm {
             (&b"modf"[..], Value::NativeFunction(modf)),
             (&b"min"[..], Value::NativeFunction(min)),
             (&b"max"[..], Value::NativeFunction(max)),
+            (&b"type"[..], Value::NativeFunction(math_type)),
+            (&b"tointeger"[..], Value::NativeFunction(to_integer)),
             (&b"pi"[..], Value::Number(core::f64::consts::PI)),
             (&b"huge"[..], Value::Number(f64::INFINITY)),
         ] {

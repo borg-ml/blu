@@ -3924,6 +3924,64 @@ fn math_fmod_preserves_modern_integer_semantics_and_zero_split() {
 }
 
 #[test]
+fn math_type_and_tointeger_follow_modern_profile_contracts() {
+    let source = make_source(
+        b"return math.type(math.floor(3)),math.type(3.5),math.type('3'),math.tointeger('3'),math.tointeger(3.2),math.tointeger(-9223372036854775808.0),math.tointeger(9223372036854775808.0)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            assert_eq!(
+                result,
+                Ok(vec![
+                    Value::String(Arc::from(&b"integer"[..])),
+                    Value::String(Arc::from(&b"float"[..])),
+                    Value::Nil,
+                    Value::Integer(3),
+                    Value::Nil,
+                    Value::Integer(i64::MIN),
+                    Value::Nil,
+                ]),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.type",
+                    profile,
+                }),
+                "{profile}"
+            );
+            let source = make_source(b"return math.tointeger(3)".to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "math.tointeger",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
     let source = make_source(
         b"return tonumber(' 42 '),tonumber('ff',16),tonumber('0x10'),tonumber(3),tonumber('3.0',10),tonumber('nan'),tonumber('inf'),tonumber('ffffffffffffffff',16),tonumber('x')"
