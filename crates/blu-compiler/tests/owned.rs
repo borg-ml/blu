@@ -3890,6 +3890,111 @@ fn sole_return_calls_forward_all_results_without_growing_blu_callers() {
 }
 
 #[test]
+fn final_call_arguments_forward_all_results() {
+    for profile in SemanticProfile::ALL {
+        let integer_profile = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        let number = |value| {
+            if integer_profile {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        for (bytes, expected) in [
+            (
+                b"local function pair() return 2, 3 end local function sink(...) return select('#', ...), ... end return sink(1, pair())"
+                    .as_slice(),
+                vec![number(3), number(1), number(2), number(3)],
+            ),
+            (
+                b"local object={} function object:pair() return 2,3 end local function sink(...) return select('#',...),... end return sink(1,object:pair())"
+                    .as_slice(),
+                vec![number(3), number(1), number(2), number(3)],
+            ),
+            (
+                b"local function pass(...) return ... end local function sink(...) return select('#',...),... end local function forward(...) return sink(1,pass(...)) end return forward(2,3)"
+                    .as_slice(),
+                vec![number(3), number(1), number(2), number(3)],
+            ),
+            (
+                b"local function pair() return 2,3 end local function sink(...) return select('#',...),... end return sink(pair(),4)"
+                    .as_slice(),
+                vec![number(2), number(2), number(4)],
+            ),
+            (
+                b"local function pair() return 2,3 end local function sink(...) return select('#',...),... end return 0,sink(1,pair())"
+                    .as_slice(),
+                vec![number(0), number(3), number(1), number(2), number(3)],
+            ),
+            (
+                b"local function pair() return 2,3 end local function pass(...) return ... end local function sink(...) return select('#',...),... end return sink(1,pass(pair()))"
+                    .as_slice(),
+                vec![number(3), number(1), number(2), number(3)],
+            ),
+        ] {
+            let source = make_source(bytes.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(expected),
+                "{profile}"
+            );
+        }
+    }
+
+    let source = make_source(
+        b"local function sink(...) return select('#',...),... end return sink(1,native_pair())"
+            .to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    let mut vm = Vm::default();
+    let pair = vm.register_function(|_, _| Ok(vec![Value::Integer(2), Value::Integer(3)]));
+    vm.set_global(b"native_pair".as_slice(), Value::NativeFunction(pair));
+    assert_eq!(
+        vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![
+            Value::Integer(3),
+            Value::Integer(1),
+            Value::Integer(2),
+            Value::Integer(3),
+        ])
+    );
+
+    let source = make_source(
+        b"local function pair() return {value=2},{value=3} end local a,b,c=collect_args({},pair()) return a~=nil,b.value,c.value"
+            .to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    let mut vm = Vm::default();
+    let collect = vm.register_function(|vm, arguments| {
+        vm.collect(core::iter::empty())?;
+        Ok(arguments.to_vec())
+    });
+    vm.set_global(b"collect_args".as_slice(), Value::NativeFunction(collect));
+    assert_eq!(
+        vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![
+            Value::Boolean(true),
+            Value::Integer(2),
+            Value::Integer(3),
+        ])
+    );
+}
+
+#[test]
 fn mixed_return_prefixes_preserve_all_final_call_results() {
     for profile in SemanticProfile::ALL {
         for bytes in [

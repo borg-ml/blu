@@ -385,7 +385,10 @@ fn translate_instruction(
             prototype,
             instruction: "fixed multi-result calls",
         }),
-        BluInstruction::ReturnCall { .. } | BluInstruction::ReturnCallPrefix { .. } => {
+        BluInstruction::ReturnCall { .. }
+        | BluInstruction::ReturnCallPrefix { .. }
+        | BluInstruction::ReturnCallDynamic { .. }
+        | BluInstruction::ReturnCallDynamicPrefix { .. } => {
             Err(TranslationError::UnsupportedInstruction {
                 prototype,
                 instruction: "return calls",
@@ -400,6 +403,7 @@ fn translate_instruction(
         BluInstruction::Varargs { .. }
         | BluInstruction::ReturnVarargs { .. }
         | BluInstruction::CallVarargsResults { .. }
+        | BluInstruction::CallVarargsAllResults { .. }
         | BluInstruction::ReturnCallVarargs { .. }
         | BluInstruction::ReturnCallVarargsPrefix { .. }
         | BluInstruction::SetListVarargs { .. }
@@ -409,10 +413,15 @@ fn translate_instruction(
                 instruction: "varargs",
             })
         }
-        BluInstruction::SetListCall { .. } => Err(TranslationError::UnsupportedInstruction {
-            prototype,
-            instruction: "dynamic call results",
-        }),
+        BluInstruction::SetListCall { .. }
+        | BluInstruction::CallAllResults { .. }
+        | BluInstruction::CallDynamicAllResults { .. }
+        | BluInstruction::CallDynamicResults { .. } => {
+            Err(TranslationError::UnsupportedInstruction {
+                prototype,
+                instruction: "dynamic call results",
+            })
+        }
         BluInstruction::BitwiseAnd { .. }
         | BluInstruction::BitwiseOr { .. }
         | BluInstruction::BitwiseExclusiveOr { .. }

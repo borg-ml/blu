@@ -87,7 +87,8 @@ observations, and apply the same final-call adjustment. A final call or method
 call in a return statement forwards every result. A sole call uses a canonical
 tail call; preceding fixed return expressions are retained in a GC-rooted
 bounded caller continuation and prepended after the final call completes. Call
-arguments and table constructors do not yet propagate dynamic result tails.
+arguments and table constructors propagate final dynamic result tails through
+bounded continuations.
 Identifier targets resolve to active locals, enclosing upvalues,
 or the VM global registry in that order. Semicolons are retained tokens and
 act as optional statement separators or empty statements, including after
@@ -353,6 +354,12 @@ A final call field likewise consumes every result through a resumable
 `DYNAMIC_CALL_RESULTS` table-fill continuation; suspended frames, outer
 callers, the destination table, and not-yet-inserted return values remain GC
 roots during growth. Active and saved-frame vararg vectors are GC roots.
+Final call arguments such as `target(prefix, producer())` consume every result
+from the producer. Canonical adjacent producer/consumer instructions prevent
+control flow from entering between the calls; the pending result vector is
+bounded by the dynamic stack limit and remains rooted through closure, native,
+nested, variadic, fixed-result, and tail-return consumers. Earlier call
+arguments still adjust to one result.
 General resumable direct-BluV1 callbacks remain unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions
 and both `local function name(...) ... end` and simple

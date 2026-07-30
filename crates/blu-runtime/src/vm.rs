@@ -72,12 +72,14 @@ struct BluCaller {
     result: BluCallResult,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Debug)]
 enum BluCallResult {
     Fixed { destination: u16, count: u16 },
     Truthy { destination: u16, negate: bool },
     ReturnPrefix { first: u16, count: u16 },
     TableList { table: TableId, start: u32 },
+    Dynamic,
+    ReadyDynamic(Vec<Value>),
 }
 
 enum BluReturnDisposition {
@@ -873,6 +875,7 @@ impl Vm {
         let mut registers = try_vec_with_capacity(register_count, "BluV1 runtime registers")?;
         registers.resize(register_count, Value::Nil);
         let mut varargs = Vec::new();
+        let mut dynamic_results = Vec::new();
         let mut open_upvalues = try_vec_with_capacity(register_count, "BluV1 open upvalues")?;
         open_upvalues.resize(register_count, None);
         let mut closure = None;
@@ -1368,8 +1371,11 @@ impl Vm {
                         self.active_profile = Some(profile);
                         continue;
                     }
-                    let roots =
+                    let mut roots =
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
+                    for argument in &arguments {
+                        roots.push_value(argument.clone())?;
+                    }
                     let values = self.call_value(
                         function,
                         &arguments,
@@ -1467,8 +1473,11 @@ impl Vm {
                         self.active_profile = Some(profile);
                         continue;
                     }
-                    let roots =
+                    let mut roots =
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
+                    for argument in &arguments {
+                        roots.push_value(argument.clone())?;
+                    }
                     let values = self.call_value(
                         function,
                         &arguments,
@@ -1498,9 +1507,18 @@ impl Vm {
                     arguments,
                     argument_count,
                     result_count,
+                }
+                | BluInstruction::CallDynamicResults {
+                    destination,
+                    function,
+                    arguments,
+                    argument_count,
+                    result_count,
                 } => {
                     let expands_varargs =
                         matches!(instruction, BluInstruction::CallVarargsResults { .. });
+                    let expands_dynamic =
+                        matches!(instruction, BluInstruction::CallDynamicResults { .. });
                     let function = blu_register(&registers, function)?.clone();
                     let start = usize::from(arguments);
                     let end = start.checked_add(usize::from(argument_count)).ok_or(
@@ -1520,6 +1538,16 @@ impl Vm {
                             &varargs,
                             "BluV1 dynamic call arguments",
                         )?
+                    } else if expands_dynamic {
+                        let mut arguments =
+                            try_clone_values(fixed_arguments, "BluV1 call arguments")?;
+                        try_reserve_exact(
+                            &mut arguments,
+                            dynamic_results.len(),
+                            "BluV1 dynamic call arguments",
+                        )?;
+                        arguments.append(&mut dynamic_results);
+                        arguments
                     } else {
                         try_clone_values(fixed_arguments, "BluV1 call arguments")?
                     };
@@ -1587,8 +1615,11 @@ impl Vm {
                         self.active_profile = Some(profile);
                         continue;
                     }
-                    let roots =
+                    let mut roots =
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
+                    for argument in &arguments {
+                        roots.push_value(argument.clone())?;
+                    }
                     let values = self.call_value(
                         function,
                         &arguments,
@@ -1614,10 +1645,145 @@ impl Vm {
                         )?;
                     }
                 }
+                BluInstruction::CallAllResults {
+                    function,
+                    arguments,
+                    argument_count,
+                }
+                | BluInstruction::CallVarargsAllResults {
+                    function,
+                    arguments,
+                    argument_count,
+                }
+                | BluInstruction::CallDynamicAllResults {
+                    function,
+                    arguments,
+                    argument_count,
+                } => {
+                    let expands_varargs =
+                        matches!(instruction, BluInstruction::CallVarargsAllResults { .. });
+                    let expands_dynamic =
+                        matches!(instruction, BluInstruction::CallDynamicAllResults { .. });
+                    let function = blu_register(&registers, function)?.clone();
+                    let start = usize::from(arguments);
+                    let end = start.checked_add(usize::from(argument_count)).ok_or(
+                        RuntimeError::Register {
+                            register: usize::MAX,
+                            count: registers.len(),
+                        },
+                    )?;
+                    let fixed_arguments =
+                        registers.get(start..end).ok_or(RuntimeError::Register {
+                            register: end.saturating_sub(1),
+                            count: registers.len(),
+                        })?;
+                    let arguments = if expands_varargs {
+                        append_blu_varargs(
+                            fixed_arguments,
+                            &varargs,
+                            "BluV1 dynamic result producer arguments",
+                        )?
+                    } else if expands_dynamic {
+                        let mut arguments = try_clone_values(
+                            fixed_arguments,
+                            "BluV1 dynamic result producer arguments",
+                        )?;
+                        try_reserve_exact(
+                            &mut arguments,
+                            dynamic_results.len(),
+                            "BluV1 nested dynamic call arguments",
+                        )?;
+                        arguments.append(&mut dynamic_results);
+                        arguments
+                    } else {
+                        try_clone_values(
+                            fixed_arguments,
+                            "BluV1 dynamic result producer arguments",
+                        )?
+                    };
+                    let (function, arguments) =
+                        self.resolve_blu_callable(function, arguments, prototype.profile)?;
+                    if let Value::Closure(child_closure) = &function
+                        && self.heap.is_blu_closure(*child_closure)?
+                    {
+                        if callers.len() >= self.call_limit {
+                            return Err(RuntimeError::CallLimit {
+                                limit: self.call_limit,
+                            });
+                        }
+                        let (child_artifact, child, profile, _) =
+                            self.heap.blu_closure_parts(*child_closure)?;
+                        let child_prototype = child_artifact
+                            .prototypes
+                            .get(child)
+                            .ok_or(RuntimeError::InvalidPrototype(child))?;
+                        let child_constants = materialize_blu_constants(child_prototype)?;
+                        let child_register_count = usize::from(child_prototype.register_count);
+                        let mut child_registers =
+                            try_vec_with_capacity(child_register_count, "BluV1 runtime registers")?;
+                        child_registers.resize(child_register_count, Value::Nil);
+                        let copied = arguments
+                            .len()
+                            .min(usize::from(child_prototype.parameter_count));
+                        child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                        let child_varargs = if child_prototype.is_vararg {
+                            try_clone_values(
+                                arguments
+                                    .get(usize::from(child_prototype.parameter_count)..)
+                                    .unwrap_or_default(),
+                                "BluV1 frame varargs",
+                            )?
+                        } else {
+                            Vec::new()
+                        };
+                        let mut child_open_upvalues =
+                            try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
+                        child_open_upvalues.resize(child_register_count, None);
+                        try_reserve_exact(&mut callers, 1, "BluV1 caller frame stack")?;
+                        callers.push(BluCaller {
+                            artifact,
+                            prototype: prototype_index,
+                            constants,
+                            registers,
+                            varargs,
+                            open_upvalues,
+                            closure,
+                            pc: pc + 1,
+                            result: BluCallResult::Dynamic,
+                        });
+                        artifact = child_artifact;
+                        prototype_index = child;
+                        constants = child_constants;
+                        registers = child_registers;
+                        varargs = child_varargs;
+                        open_upvalues = child_open_upvalues;
+                        closure = Some(*child_closure);
+                        pc = 0;
+                        self.active_profile = Some(profile);
+                        continue;
+                    }
+                    let roots =
+                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
+                    dynamic_results = self.call_value(
+                        function,
+                        &arguments,
+                        &mut remaining,
+                        callers.len(),
+                        roots,
+                    )?;
+                    if dynamic_results.len() > MAX_DYNAMIC_REGISTERS {
+                        return Err(RuntimeError::StackLimit {
+                            required: dynamic_results.len(),
+                            limit: MAX_DYNAMIC_REGISTERS,
+                        });
+                    }
+                }
                 BluInstruction::ReturnCall { .. }
                 | BluInstruction::ReturnCallPrefix { .. }
                 | BluInstruction::ReturnCallVarargs { .. }
-                | BluInstruction::ReturnCallVarargsPrefix { .. } => {
+                | BluInstruction::ReturnCallVarargsPrefix { .. }
+                | BluInstruction::ReturnCallDynamic { .. }
+                | BluInstruction::ReturnCallDynamicPrefix { .. } => {
                     let (prefix, function, arguments, argument_count, expands_varargs) =
                         match instruction {
                             BluInstruction::ReturnCall {
@@ -1656,8 +1822,31 @@ impl Vm {
                                 argument_count,
                                 true,
                             ),
+                            BluInstruction::ReturnCallDynamic {
+                                function,
+                                arguments,
+                                argument_count,
+                            } => (None, function, arguments, argument_count, false),
+                            BluInstruction::ReturnCallDynamicPrefix {
+                                first,
+                                count,
+                                function,
+                                arguments,
+                                argument_count,
+                            } => (
+                                Some((first, count)),
+                                function,
+                                arguments,
+                                argument_count,
+                                false,
+                            ),
                             _ => unreachable!(),
                         };
+                    let expands_dynamic = matches!(
+                        instruction,
+                        BluInstruction::ReturnCallDynamic { .. }
+                            | BluInstruction::ReturnCallDynamicPrefix { .. }
+                    );
                     let function = blu_register(&registers, function)?.clone();
                     let start = usize::from(arguments);
                     let end = start.checked_add(usize::from(argument_count)).ok_or(
@@ -1677,6 +1866,16 @@ impl Vm {
                             &varargs,
                             "BluV1 dynamic return call arguments",
                         )?
+                    } else if expands_dynamic {
+                        let mut arguments =
+                            try_clone_values(fixed_arguments, "BluV1 return call arguments")?;
+                        try_reserve_exact(
+                            &mut arguments,
+                            dynamic_results.len(),
+                            "BluV1 dynamic return call arguments",
+                        )?;
+                        arguments.append(&mut dynamic_results);
+                        arguments
                     } else {
                         try_clone_values(fixed_arguments, "BluV1 return call arguments")?
                     };
@@ -1753,8 +1952,11 @@ impl Vm {
                         self.active_profile = Some(profile);
                         continue;
                     }
-                    let roots =
+                    let mut roots =
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
+                    for argument in &arguments {
+                        roots.push_value(argument.clone())?;
+                    }
                     let mut values = self.call_value(
                         function,
                         &arguments,
@@ -1783,7 +1985,7 @@ impl Vm {
                         combined.append(&mut values);
                         values = combined;
                     }
-                    let caller = loop {
+                    let mut caller = loop {
                         let Some(caller) = callers.pop() else {
                             return Ok(values);
                         };
@@ -1792,6 +1994,11 @@ impl Vm {
                             BluReturnDisposition::Propagate(next) => values = next,
                         }
                     };
+                    dynamic_results =
+                        match core::mem::replace(&mut caller.result, BluCallResult::Dynamic) {
+                            BluCallResult::ReadyDynamic(values) => values,
+                            _ => Vec::new(),
+                        };
                     artifact = caller.artifact;
                     prototype_index = caller.prototype;
                     constants = caller.constants;
@@ -2921,7 +3128,7 @@ impl Vm {
                     })?;
                     let values = try_clone_values(values, "BluV1 return values")?;
                     let mut values = values;
-                    let caller = loop {
+                    let mut caller = loop {
                         let Some(caller) = callers.pop() else {
                             return Ok(values);
                         };
@@ -2930,6 +3137,11 @@ impl Vm {
                             BluReturnDisposition::Propagate(next) => values = next,
                         }
                     };
+                    dynamic_results =
+                        match core::mem::replace(&mut caller.result, BluCallResult::Dynamic) {
+                            BluCallResult::ReadyDynamic(values) => values,
+                            _ => Vec::new(),
+                        };
                     artifact = caller.artifact;
                     prototype_index = caller.prototype;
                     constants = caller.constants;
@@ -2963,7 +3175,7 @@ impl Vm {
                     let mut values = try_clone_values(prefix, "BluV1 vararg return prefix")?;
                     try_reserve_exact(&mut values, varargs.len(), "BluV1 dynamic return values")?;
                     values.extend(varargs.iter().cloned());
-                    let caller = loop {
+                    let mut caller = loop {
                         let Some(caller) = callers.pop() else {
                             return Ok(values);
                         };
@@ -2972,6 +3184,11 @@ impl Vm {
                             BluReturnDisposition::Propagate(next) => values = next,
                         }
                     };
+                    dynamic_results =
+                        match core::mem::replace(&mut caller.result, BluCallResult::Dynamic) {
+                            BluCallResult::ReadyDynamic(values) => values,
+                            _ => Vec::new(),
+                        };
                     artifact = caller.artifact;
                     prototype_index = caller.prototype;
                     constants = caller.constants;
@@ -3076,6 +3293,19 @@ impl Vm {
                 self.set_blu_table_list(table, start, values, profile, &roots)?;
                 Ok(BluReturnDisposition::Resume(caller))
             }
+            BluCallResult::Dynamic => {
+                if values.len() > MAX_DYNAMIC_REGISTERS {
+                    return Err(RuntimeError::StackLimit {
+                        required: values.len(),
+                        limit: MAX_DYNAMIC_REGISTERS,
+                    });
+                }
+                caller.result = BluCallResult::ReadyDynamic(values);
+                Ok(BluReturnDisposition::Resume(caller))
+            }
+            BluCallResult::ReadyDynamic(_) => Err(RuntimeError::UnsupportedBluV1Structure {
+                what: "completed dynamic call continuation",
+            }),
         }
     }
 

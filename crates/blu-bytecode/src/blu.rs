@@ -326,6 +326,28 @@ pub enum Instruction {
         argument_count: u16,
         result_count: u16,
     },
+    CallAllResults {
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
+    CallVarargsAllResults {
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
+    CallDynamicResults {
+        destination: u16,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+        result_count: u16,
+    },
+    CallDynamicAllResults {
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
     ReturnCall {
         function: u16,
         arguments: u16,
@@ -344,6 +366,18 @@ pub enum Instruction {
         argument_count: u16,
     },
     ReturnCallVarargsPrefix {
+        first: u16,
+        count: u16,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
+    ReturnCallDynamic {
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
+    ReturnCallDynamicPrefix {
         first: u16,
         count: u16,
         function: u16,
@@ -535,10 +569,16 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::Call { .. }
             | Instruction::CallResults { .. }
             | Instruction::CallVarargsResults { .. }
+            | Instruction::CallAllResults { .. }
+            | Instruction::CallVarargsAllResults { .. }
+            | Instruction::CallDynamicResults { .. }
+            | Instruction::CallDynamicAllResults { .. }
             | Instruction::ReturnCall { .. }
             | Instruction::ReturnCallPrefix { .. }
             | Instruction::ReturnCallVarargs { .. }
             | Instruction::ReturnCallVarargsPrefix { .. }
+            | Instruction::ReturnCallDynamic { .. }
+            | Instruction::ReturnCallDynamicPrefix { .. }
             | Instruction::NewClosure { .. }
             | Instruction::GetUpvalue { .. }
             | Instruction::SetUpvalue { .. }
@@ -584,10 +624,16 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::Call { .. }
                 | Instruction::CallResults { .. }
                 | Instruction::CallVarargsResults { .. }
+                | Instruction::CallAllResults { .. }
+                | Instruction::CallVarargsAllResults { .. }
+                | Instruction::CallDynamicResults { .. }
+                | Instruction::CallDynamicAllResults { .. }
                 | Instruction::ReturnCall { .. }
                 | Instruction::ReturnCallPrefix { .. }
                 | Instruction::ReturnCallVarargs { .. }
                 | Instruction::ReturnCallVarargsPrefix { .. }
+                | Instruction::ReturnCallDynamic { .. }
+                | Instruction::ReturnCallDynamicPrefix { .. }
                 | Instruction::NewClosure { .. }
                 | Instruction::GetUpvalue { .. }
                 | Instruction::SetUpvalue { .. }
@@ -1359,7 +1405,9 @@ fn validate_prototype(
     if prototype.code.iter().any(|instruction| {
         matches!(
             instruction,
-            Instruction::CallResults { .. } | Instruction::CallVarargsResults { .. }
+            Instruction::CallResults { .. }
+                | Instruction::CallVarargsResults { .. }
+                | Instruction::CallDynamicResults { .. }
         )
     }) && !prototype
         .required_features
@@ -1377,6 +1425,8 @@ fn validate_prototype(
                 | Instruction::ReturnCallPrefix { .. }
                 | Instruction::ReturnCallVarargs { .. }
                 | Instruction::ReturnCallVarargsPrefix { .. }
+                | Instruction::ReturnCallDynamic { .. }
+                | Instruction::ReturnCallDynamicPrefix { .. }
         )
     }) && !prototype
         .required_features
@@ -1393,6 +1443,7 @@ fn validate_prototype(
             Instruction::Varargs { .. }
                 | Instruction::ReturnVarargs { .. }
                 | Instruction::CallVarargsResults { .. }
+                | Instruction::CallVarargsAllResults { .. }
                 | Instruction::ReturnCallVarargs { .. }
                 | Instruction::ReturnCallVarargsPrefix { .. }
                 | Instruction::SetListVarargs { .. }
@@ -1415,7 +1466,14 @@ fn validate_prototype(
     if prototype.code.iter().any(|instruction| {
         matches!(
             instruction,
-            Instruction::SetListCall { .. } | Instruction::SetListCallVarargs { .. }
+            Instruction::SetListCall { .. }
+                | Instruction::SetListCallVarargs { .. }
+                | Instruction::CallAllResults { .. }
+                | Instruction::CallVarargsAllResults { .. }
+                | Instruction::CallDynamicResults { .. }
+                | Instruction::CallDynamicAllResults { .. }
+                | Instruction::ReturnCallDynamic { .. }
+                | Instruction::ReturnCallDynamicPrefix { .. }
         )
     }) && !prototype
         .required_features
@@ -1647,6 +1705,32 @@ fn validate_prototype(
     let mut backward_states = HashMap::<usize, Vec<bool>>::new();
     let mut reachable = true;
     for (pc, instruction) in prototype.code.iter().copied().enumerate() {
+        let dynamic_consumer = matches!(
+            instruction,
+            Instruction::CallDynamicResults { .. }
+                | Instruction::CallDynamicAllResults { .. }
+                | Instruction::ReturnCallDynamic { .. }
+                | Instruction::ReturnCallDynamicPrefix { .. }
+        );
+        if dynamic_consumer
+            && (incoming.contains_key(&pc)
+                || backward_target_flags[pc]
+                || !matches!(
+                    pc.checked_sub(1)
+                        .and_then(|previous| prototype.code.get(previous)),
+                    Some(
+                        Instruction::CallAllResults { .. }
+                            | Instruction::CallVarargsAllResults { .. }
+                            | Instruction::CallDynamicAllResults { .. }
+                    )
+                ))
+        {
+            return Err(ValidationError::InvalidInstruction {
+                prototype: index,
+                pc,
+                what: "dynamic call consumer must immediately follow its producer",
+            });
+        }
         if let Some(branch_state) = incoming.remove(&pc) {
             if reachable {
                 for (current, incoming) in initialized.iter_mut().zip(branch_state) {
@@ -1856,6 +1940,13 @@ fn validate_prototype(
                 arguments,
                 argument_count,
                 result_count,
+            }
+            | Instruction::CallDynamicResults {
+                destination,
+                function,
+                arguments,
+                argument_count,
+                result_count,
             } => {
                 check_read(index, pc, function, &initialized)?;
                 let argument_end = usize::from(arguments)
@@ -1891,12 +1982,66 @@ fn validate_prototype(
                 }
                 initialized[usize::from(destination)..result_end].fill(true);
             }
+            Instruction::CallAllResults {
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::CallVarargsAllResults {
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::CallDynamicAllResults {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                check_read(index, pc, function, &initialized)?;
+                let end = usize::from(arguments)
+                    .checked_add(usize::from(argument_count))
+                    .ok_or(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "dynamic call argument register range overflows",
+                    })?;
+                if end > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "dynamic call argument register range is invalid",
+                    });
+                }
+                for register in usize::from(arguments)..end {
+                    check_read(index, pc, register as u16, &initialized)?;
+                }
+                if !matches!(
+                    prototype.code.get(pc + 1),
+                    Some(
+                        Instruction::CallDynamicResults { .. }
+                            | Instruction::CallDynamicAllResults { .. }
+                            | Instruction::ReturnCallDynamic { .. }
+                            | Instruction::ReturnCallDynamicPrefix { .. }
+                    )
+                ) {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "dynamic call producer must be followed by a consumer",
+                    });
+                }
+            }
             Instruction::ReturnCall {
                 function,
                 arguments,
                 argument_count,
             }
             | Instruction::ReturnCallVarargs {
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::ReturnCallDynamic {
                 function,
                 arguments,
                 argument_count,
@@ -1929,6 +2074,13 @@ fn validate_prototype(
                 argument_count,
             }
             | Instruction::ReturnCallVarargsPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::ReturnCallDynamicPrefix {
                 first,
                 count,
                 function,
@@ -2354,6 +2506,8 @@ fn validate_prototype(
                 | Instruction::ReturnCallPrefix { .. }
                 | Instruction::ReturnCallVarargs { .. }
                 | Instruction::ReturnCallVarargsPrefix { .. }
+                | Instruction::ReturnCallDynamic { .. }
+                | Instruction::ReturnCallDynamicPrefix { .. }
                 | Instruction::ReturnVarargs { .. }
         )
     ) {
@@ -2612,10 +2766,18 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::LessThan { .. }
                     | Instruction::LessEqual { .. } => 7,
                     Instruction::Call { .. } => 9,
-                    Instruction::CallResults { .. } | Instruction::CallVarargsResults { .. } => 11,
-                    Instruction::ReturnCall { .. } | Instruction::ReturnCallVarargs { .. } => 7,
+                    Instruction::CallResults { .. }
+                    | Instruction::CallVarargsResults { .. }
+                    | Instruction::CallDynamicResults { .. } => 11,
+                    Instruction::CallAllResults { .. }
+                    | Instruction::CallVarargsAllResults { .. }
+                    | Instruction::CallDynamicAllResults { .. }
+                    | Instruction::ReturnCall { .. }
+                    | Instruction::ReturnCallVarargs { .. }
+                    | Instruction::ReturnCallDynamic { .. } => 7,
                     Instruction::ReturnCallPrefix { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. } => 11,
+                    Instruction::ReturnCallDynamicPrefix { .. } => 11,
                     Instruction::SetListCall { .. } | Instruction::SetListCallVarargs { .. } => 13,
                     Instruction::NewTable { .. } => 3,
                     Instruction::NewClosure { .. }
@@ -2831,6 +2993,50 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 put_u16(out, *argument_count);
                 put_u16(out, *result_count);
             }
+            Instruction::CallAllResults {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(46);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
+            Instruction::CallVarargsAllResults {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(47);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
+            Instruction::CallDynamicResults {
+                destination,
+                function,
+                arguments,
+                argument_count,
+                result_count,
+            } => {
+                out.push(48);
+                put_u16(out, *destination);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+                put_u16(out, *result_count);
+            }
+            Instruction::CallDynamicAllResults {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(51);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
             Instruction::ReturnCall {
                 function,
                 arguments,
@@ -2873,6 +3079,30 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 argument_count,
             } => {
                 out.push(36);
+                put_u16(out, *first);
+                put_u16(out, *count);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
+            Instruction::ReturnCallDynamic {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(49);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
+            Instruction::ReturnCallDynamicPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(50);
                 put_u16(out, *first);
                 put_u16(out, *count);
                 put_u16(out, *function);
@@ -3904,6 +4134,40 @@ fn read_prototype(
             45 => Instruction::BitwiseNot {
                 destination: reader.u16()?,
                 source: reader.u16()?,
+            },
+            46 => Instruction::CallAllResults {
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+            },
+            47 => Instruction::CallVarargsAllResults {
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+            },
+            48 => Instruction::CallDynamicResults {
+                destination: reader.u16()?,
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+                result_count: reader.u16()?,
+            },
+            49 => Instruction::ReturnCallDynamic {
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+            },
+            50 => Instruction::ReturnCallDynamicPrefix {
+                first: reader.u16()?,
+                count: reader.u16()?,
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+            },
+            51 => Instruction::CallDynamicAllResults {
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

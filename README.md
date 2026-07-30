@@ -225,7 +225,11 @@ result. Sole Blu closure calls replace the current frame; preceding fixed
 return values remain in a GC-rooted bounded continuation and are prepended
 after the call completes. Callable tables resolve bounded `__call` chains,
 prepend every table receiver, and enter Blu closure handlers through those
-same continuations. Remaining resumable callbacks stay explicit later work.
+same continuations. Final call arguments expand every result
+(`target(prefix, producer())`) through a GC-rooted continuation; non-final
+calls still collapse to one value, and nested forwarding preserves
+left-to-right evaluation. Remaining resumable callbacks stay explicit later
+work.
 Owned variadic functions support scalar and fixed-width
 `...` reads with nil padding, dynamic return forwarding, and dynamic final
 call arguments, and final table-constructor expansion, including fixed

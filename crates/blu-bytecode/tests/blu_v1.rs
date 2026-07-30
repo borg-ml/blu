@@ -502,6 +502,53 @@ fn dynamic_vararg_calls_round_trip_canonically() {
 }
 
 #[test]
+fn dynamic_final_call_arguments_round_trip_and_require_their_feature() {
+    let limits = BluLimits::default();
+    let make_artifact = || {
+        let mut artifact = fixture();
+        let prototype = &mut artifact.prototypes[0];
+        prototype.register_count = 2;
+        prototype.required_features =
+            FeatureBits::BASELINE | FeatureBits::RETURN_CALLS | FeatureBits::DYNAMIC_CALL_RESULTS;
+        prototype.source_map.truncate(4);
+        prototype.locals.clear();
+        prototype.code = vec![
+            Instruction::LoadConstant {
+                destination: 0,
+                constant: 0,
+            },
+            Instruction::LoadConstant {
+                destination: 1,
+                constant: 0,
+            },
+            Instruction::CallAllResults {
+                function: 1,
+                arguments: 0,
+                argument_count: 0,
+            },
+            Instruction::ReturnCallDynamic {
+                function: 0,
+                arguments: 0,
+                argument_count: 0,
+            },
+        ];
+        artifact
+    };
+    let mut missing = make_artifact();
+    missing.prototypes[0].required_features = FeatureBits::BASELINE | FeatureBits::RETURN_CALLS;
+    assert_eq!(
+        ValidatedArtifact::new(missing, limits),
+        Err(ValidationError::MissingFeature {
+            prototype: 0,
+            feature: "dynamic call results",
+        })
+    );
+    let validated = ValidatedArtifact::new(make_artifact(), limits).unwrap();
+    let bytes = encode(&validated, limits).unwrap();
+    assert_eq!(decode_validated(&bytes, limits).unwrap(), validated);
+}
+
+#[test]
 fn dynamic_vararg_table_lists_round_trip_with_validated_starts() {
     let artifact_with_start = |start| {
         let mut artifact = fixture();

@@ -641,7 +641,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         if self.code.iter().any(|instruction| {
             matches!(
                 instruction,
-                Instruction::CallResults { .. } | Instruction::CallVarargsResults { .. }
+                Instruction::CallResults { .. }
+                    | Instruction::CallVarargsResults { .. }
+                    | Instruction::CallDynamicResults { .. }
+                    | Instruction::CallDynamicAllResults { .. }
             )
         }) {
             required_features = required_features | FeatureBits::FIXED_MULTI_RESULTS;
@@ -653,6 +656,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     | Instruction::ReturnCallPrefix { .. }
                     | Instruction::ReturnCallVarargs { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. }
+                    | Instruction::ReturnCallDynamic { .. }
+                    | Instruction::ReturnCallDynamicPrefix { .. }
             )
         }) {
             required_features = required_features | FeatureBits::RETURN_CALLS;
@@ -673,6 +678,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 Instruction::Varargs { .. }
                     | Instruction::ReturnVarargs { .. }
                     | Instruction::CallVarargsResults { .. }
+                    | Instruction::CallVarargsAllResults { .. }
                     | Instruction::ReturnCallVarargs { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. }
                     | Instruction::SetListVarargs { .. }
@@ -684,7 +690,14 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         if self.code.iter().any(|instruction| {
             matches!(
                 instruction,
-                Instruction::SetListCall { .. } | Instruction::SetListCallVarargs { .. }
+                Instruction::SetListCall { .. }
+                    | Instruction::SetListCallVarargs { .. }
+                    | Instruction::CallAllResults { .. }
+                    | Instruction::CallVarargsAllResults { .. }
+                    | Instruction::CallDynamicResults { .. }
+                    | Instruction::CallDynamicAllResults { .. }
+                    | Instruction::ReturnCallDynamic { .. }
+                    | Instruction::ReturnCallDynamicPrefix { .. }
             )
         }) {
             required_features = required_features | FeatureBits::DYNAMIC_CALL_RESULTS;
@@ -2395,11 +2408,28 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 "vararg expression is outside a variadic function",
             )?));
         }
+        let expands_call = !expands_varargs
+            && end > call.first_argument()
+            && matches!(
+                self.expression(self.call_arguments[end - 1])?.kind(),
+                ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+            );
         let function = self.lower_expression(call.function())?;
         let mut sources = allocate_vec(call.argument_count(), "call argument registers")?;
-        let fixed_end = end - usize::from(expands_varargs);
+        let fixed_end = end - usize::from(expands_varargs || expands_call);
         for index in call.first_argument()..fixed_end {
             sources.push(self.lower_expression(self.call_arguments[index])?);
+        }
+        if expands_call {
+            let (arguments, argument_count) = self.copy_call_arguments(&sources, call.span())?;
+            self.lower_all_call_results(self.call_arguments[end - 1])?;
+            return self.emit_dynamic_call_results(
+                function,
+                arguments,
+                argument_count,
+                result_count,
+                call.span(),
+            );
         }
         self.emit_fixed_call_results(
             function,
@@ -2440,6 +2470,12 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 "vararg expression is outside a variadic function",
             )?));
         }
+        let expands_call = !expands_varargs
+            && end > call.first_argument()
+            && matches!(
+                self.expression(self.call_arguments[end - 1])?.kind(),
+                ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+            );
         let receiver = self.lower_expression(call.receiver())?;
         let key = self.lower_constant(
             Constant::String(copy_bytes(
@@ -2465,9 +2501,20 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 })?;
         let mut sources = allocate_vec(source_count, "method call argument registers")?;
         sources.push(receiver);
-        let fixed_end = end - usize::from(expands_varargs);
+        let fixed_end = end - usize::from(expands_varargs || expands_call);
         for index in call.first_argument()..fixed_end {
             sources.push(self.lower_expression(self.call_arguments[index])?);
+        }
+        if expands_call {
+            let (arguments, argument_count) = self.copy_call_arguments(&sources, call.span())?;
+            self.lower_all_call_results(self.call_arguments[end - 1])?;
+            return self.emit_dynamic_call_results(
+                function,
+                arguments,
+                argument_count,
+                result_count,
+                call.span(),
+            );
         }
         self.emit_fixed_call_results(
             function,
@@ -2523,13 +2570,174 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         }
     }
 
+    fn lower_all_call_results(&mut self, id: ExpressionId) -> Result<(), OwnedCompileError> {
+        let expression = *self.expression(id)?;
+        let (function, sources, expands_varargs, dynamic_argument, span) = match expression.kind() {
+            ExpressionKind::Call(call) => {
+                let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
+                let expands_varargs = end > call.first_argument()
+                    && matches!(
+                        self.expression(self.call_arguments[end - 1])?.kind(),
+                        ExpressionKind::Vararg
+                    );
+                let expands_call = !expands_varargs
+                    && end > call.first_argument()
+                    && matches!(
+                        self.expression(self.call_arguments[end - 1])?.kind(),
+                        ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+                    );
+                let function = self.lower_expression(call.function())?;
+                let mut sources =
+                    allocate_vec(call.argument_count(), "dynamic call argument registers")?;
+                let fixed_end = end - usize::from(expands_varargs || expands_call);
+                for index in call.first_argument()..fixed_end {
+                    sources.push(self.lower_expression(self.call_arguments[index])?);
+                }
+                (
+                    function,
+                    sources,
+                    expands_varargs,
+                    if expands_call {
+                        Some(self.call_arguments[end - 1])
+                    } else {
+                        None
+                    },
+                    call.span(),
+                )
+            }
+            ExpressionKind::MethodCall(call) => {
+                let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
+                let expands_varargs = end > call.first_argument()
+                    && matches!(
+                        self.expression(self.call_arguments[end - 1])?.kind(),
+                        ExpressionKind::Vararg
+                    );
+                let expands_call = !expands_varargs
+                    && end > call.first_argument()
+                    && matches!(
+                        self.expression(self.call_arguments[end - 1])?.kind(),
+                        ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+                    );
+                let receiver = self.lower_expression(call.receiver())?;
+                let key = self.lower_constant(
+                    Constant::String(copy_bytes(
+                        self.source.slice(call.method().span())?,
+                        "method name",
+                    )?),
+                    call.method().span(),
+                )?;
+                let function = self.allocate_register()?;
+                self.emit(
+                    Instruction::GetTable {
+                        destination: function,
+                        table: receiver,
+                        key,
+                    },
+                    call.span(),
+                )?;
+                let source_count = call.argument_count().checked_add(1).ok_or(
+                    OwnedCompileError::InternalInvariant {
+                        message: "dynamic method argument count overflows",
+                    },
+                )?;
+                let mut sources = allocate_vec(source_count, "dynamic method argument registers")?;
+                sources.push(receiver);
+                let fixed_end = end - usize::from(expands_varargs || expands_call);
+                for index in call.first_argument()..fixed_end {
+                    sources.push(self.lower_expression(self.call_arguments[index])?);
+                }
+                (
+                    function,
+                    sources,
+                    expands_varargs,
+                    if expands_call {
+                        Some(self.call_arguments[end - 1])
+                    } else {
+                        None
+                    },
+                    call.span(),
+                )
+            }
+            _ => {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "dynamic result producer is not a call",
+                });
+            }
+        };
+        if expands_varargs && !self.is_vararg {
+            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                "BLU-COMPILE-0006",
+                Phase::Lower,
+                expression.span(),
+                "vararg expression is outside a variadic function",
+            )?));
+        }
+        let (arguments, argument_count) = self.copy_call_arguments(&sources, span)?;
+        if let Some(argument) = dynamic_argument {
+            self.lower_all_call_results(argument)?;
+        }
+        self.emit(
+            if dynamic_argument.is_some() {
+                Instruction::CallDynamicAllResults {
+                    function,
+                    arguments,
+                    argument_count,
+                }
+            } else if expands_varargs {
+                Instruction::CallVarargsAllResults {
+                    function,
+                    arguments,
+                    argument_count,
+                }
+            } else {
+                Instruction::CallAllResults {
+                    function,
+                    arguments,
+                    argument_count,
+                }
+            },
+            span,
+        )
+    }
+
+    fn emit_dynamic_call_results(
+        &mut self,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+        result_count: usize,
+        span: ByteSpan,
+    ) -> Result<Vec<u16>, OwnedCompileError> {
+        let destination = self.allocate_register()?;
+        let result_count =
+            u16::try_from(result_count).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "dynamic call result count passed limits but cannot fit BluV1",
+            })?;
+        let mut results = allocate_vec(usize::from(result_count), "dynamic call result registers")?;
+        results.push(destination);
+        for _ in 1..result_count {
+            results.push(self.allocate_register()?);
+        }
+        self.emit(
+            Instruction::CallDynamicResults {
+                destination,
+                function,
+                arguments,
+                argument_count,
+                result_count,
+            },
+            span,
+        )?;
+        Ok(results)
+    }
+
     fn lower_return_call_expression(
         &mut self,
         id: ExpressionId,
         prefix: Option<(u16, u16)>,
     ) -> Result<bool, OwnedCompileError> {
         let expression = *self.expression(id)?;
-        let (function, sources, expands_varargs, span) = match expression.kind() {
+        let (function, sources, expands_varargs, dynamic_argument, span) = match expression.kind() {
             ExpressionKind::Call(call) => {
                 let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
                 let expands_varargs = end > call.first_argument()
@@ -2545,14 +2753,30 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                         "vararg expression is outside a variadic function",
                     )?));
                 }
+                let expands_call = !expands_varargs
+                    && end > call.first_argument()
+                    && matches!(
+                        self.expression(self.call_arguments[end - 1])?.kind(),
+                        ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+                    );
                 let function = self.lower_expression(call.function())?;
                 let mut sources =
                     allocate_vec(call.argument_count(), "return call argument registers")?;
-                let fixed_end = end - usize::from(expands_varargs);
+                let fixed_end = end - usize::from(expands_varargs || expands_call);
                 for index in call.first_argument()..fixed_end {
                     sources.push(self.lower_expression(self.call_arguments[index])?);
                 }
-                (function, sources, expands_varargs, call.span())
+                (
+                    function,
+                    sources,
+                    expands_varargs,
+                    if expands_call {
+                        Some(self.call_arguments[end - 1])
+                    } else {
+                        None
+                    },
+                    call.span(),
+                )
             }
             ExpressionKind::MethodCall(call) => {
                 let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
@@ -2569,6 +2793,12 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                         "vararg expression is outside a variadic function",
                     )?));
                 }
+                let expands_call = !expands_varargs
+                    && end > call.first_argument()
+                    && matches!(
+                        self.expression(self.call_arguments[end - 1])?.kind(),
+                        ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+                    );
                 let receiver = self.lower_expression(call.receiver())?;
                 let key = self.lower_constant(
                     Constant::String(copy_bytes(
@@ -2594,16 +2824,45 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 let mut sources =
                     allocate_vec(source_count, "return method call argument registers")?;
                 sources.push(receiver);
-                let fixed_end = end - usize::from(expands_varargs);
+                let fixed_end = end - usize::from(expands_varargs || expands_call);
                 for index in call.first_argument()..fixed_end {
                     sources.push(self.lower_expression(self.call_arguments[index])?);
                 }
-                (function, sources, expands_varargs, call.span())
+                (
+                    function,
+                    sources,
+                    expands_varargs,
+                    if expands_call {
+                        Some(self.call_arguments[end - 1])
+                    } else {
+                        None
+                    },
+                    call.span(),
+                )
             }
             _ => return Ok(false),
         };
         let (arguments, argument_count) = self.copy_call_arguments(&sources, span)?;
-        let instruction = if let (true, Some((first, count))) = (expands_varargs, prefix) {
+        if let Some(argument) = dynamic_argument {
+            self.lower_all_call_results(argument)?;
+        }
+        let instruction = if dynamic_argument.is_some() {
+            if let Some((first, count)) = prefix {
+                Instruction::ReturnCallDynamicPrefix {
+                    first,
+                    count,
+                    function,
+                    arguments,
+                    argument_count,
+                }
+            } else {
+                Instruction::ReturnCallDynamic {
+                    function,
+                    arguments,
+                    argument_count,
+                }
+            }
+        } else if let (true, Some((first, count))) = (expands_varargs, prefix) {
             Instruction::ReturnCallVarargsPrefix {
                 first,
                 count,
