@@ -7053,6 +7053,11 @@ impl Vm {
             let value = number_argument(arguments, 0, "math.exp")?;
             Ok(vec![Value::Number(value.exp())])
         });
+        let pow = self.register_function(|_, arguments| {
+            let base = number_argument(arguments, 0, "math.pow")?;
+            let exponent = number_argument(arguments, 1, "math.pow")?;
+            Ok(vec![Value::Number(base.powf(exponent))])
+        });
         let log = self.register_function(|vm, arguments| {
             let value = number_argument(arguments, 0, "math.log")?;
             let result = match (vm.active_profile()?, arguments.get(1)) {
@@ -7478,13 +7483,14 @@ impl Vm {
             }
         });
 
-        let table = self.heap.allocate_table(0, 28)?;
+        let table = self.heap.allocate_table(0, 29)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
             (&b"ceil"[..], Value::NativeFunction(ceil)),
             (&b"sqrt"[..], Value::NativeFunction(sqrt)),
             (&b"exp"[..], Value::NativeFunction(exp)),
+            (&b"pow"[..], Value::NativeFunction(pow)),
             (&b"log"[..], Value::NativeFunction(log)),
             (&b"sin"[..], Value::NativeFunction(sin)),
             (&b"cos"[..], Value::NativeFunction(cos)),

@@ -592,7 +592,7 @@ Blu plugin is active.
 ## Resource limits
 
 The initial shared math library includes `math.fmod`, `math.modf`,
-`math.random`, and `math.randomseed`.
+`math.pow`, `math.random`, and `math.randomseed`.
 `math.fmod` requires two numeric arguments and uses truncating remainder
 semantics, so the result follows the dividend's sign and is intentionally
 distinct from the language `%` operator. Blu and Lua 5.3–5.5 preserve

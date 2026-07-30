@@ -4243,6 +4243,34 @@ fn math_abs_and_log_follow_profile_numeric_contracts() {
 }
 
 #[test]
+fn math_pow_follows_the_shared_numeric_contract() {
+    let source = make_source(b"return math.pow(2,3),math.pow(-1,0.5)".to_vec());
+    let invalid = make_source(b"return math.pow(2,'x')".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let values =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        assert!(
+            matches!(values, Ok(values) if values[0] == Value::Number(8.0) && matches!(values[1], Value::Number(value) if value.is_nan())),
+            "{profile}"
+        );
+
+        let compiled = OwnedCompiler::default()
+            .compile(&invalid, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::Type {
+                operation: "math.pow",
+                ..
+            })
+        ));
+    }
+}
+
+#[test]
 fn math_random_and_randomseed_follow_profile_contracts() {
     for profile in SemanticProfile::ALL {
         let source = make_source(
