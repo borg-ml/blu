@@ -406,7 +406,9 @@ slice: relative start indices, empty needles, nil misses, and explicit
 `$`, byte wildcard `.`, and `%`-escaped punctuation under a fixed pattern-work
 limit. The common byte classes `%a`, `%c`, `%d`, `%l`, `%p`, `%s`, `%u`, `%w`,
 `%x`, and `%z` are supported, with uppercase class letters selecting their
-complements. Bracket sets support byte literals, ranges, the common classes,
+complements. `%g` and `%G` use graph/non-graph bytes in Blu, Luau, and Lua
+5.2–5.5; Lua 5.1 retains its upstream literal-`g`/`G` escape behavior. Bracket
+sets support byte literals, ranges, the common classes,
 leading `^` negation, and a leading literal `]`. Greedy `*`, `+`, and `?`
 repetition and minimal `-` repetition execute through an explicit,
 non-recursive backtracking state machine under the same work limit. Captures,

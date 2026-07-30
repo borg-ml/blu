@@ -33,7 +33,9 @@ number-only legacy behavior or return modern exact integers when representable.
 Byte-oriented `string.find` supports literal searches, relative starts, empty
 needles, nil misses, explicit plain mode, basic anchors, wildcard bytes,
 portable byte classes, class negation, and escaped punctuation under a work
-limit. Bracket sets support byte ranges, classes, and negation. Unimplemented
+limit. The `%g` graph class follows modern profiles while Lua 5.1 preserves its
+literal escape semantics. Bracket sets support byte ranges, classes, and
+negation. Unimplemented
 Lua-pattern syntax fails structurally instead of being treated as literal text.
 All four Lua repetition suffixes are bounded: greedy `*`/`+`/`?` and minimal
 `-`.

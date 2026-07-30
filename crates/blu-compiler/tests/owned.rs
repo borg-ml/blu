@@ -2516,9 +2516,36 @@ fn string_find_supports_common_byte_classes_and_negation() {
 }
 
 #[test]
+fn string_graph_classes_follow_the_explicit_lua51_split() {
+    let source = make_source(
+        b"local a=string.match(' A!','%g+') local b=string.match('A !','%G+') local c=string.match(' A!','[%g]+') return a,b,c"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = if profile == SemanticProfile::Lua51 {
+            vec![Value::Nil, Value::Nil, Value::Nil]
+        } else {
+            vec![
+                Value::String(Arc::from(&b"A!"[..])),
+                Value::String(Arc::from(&b" "[..])),
+                Value::String(Arc::from(&b"A!"[..])),
+            ]
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(expected),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn string_find_rejects_nonportable_pattern_classes_explicitly() {
     for profile in SemanticProfile::ALL {
-        let source = make_source(b"return string.find('!', '%g')".to_vec());
+        let source = make_source(b"return string.find('!', '%q')".to_vec());
         let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
             .unwrap();

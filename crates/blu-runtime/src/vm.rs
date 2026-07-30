@@ -5065,7 +5065,13 @@ impl Vm {
                     capture_count: 0,
                 })
             } else {
-                find_basic_lua_pattern(haystack, needle, start, "string.find")?
+                find_basic_lua_pattern(
+                    haystack,
+                    needle,
+                    start,
+                    "string.find",
+                    vm.active_profile()?,
+                )?
             };
             let Some(found) = found else {
                 return Ok(vec![Value::Nil]);
@@ -5108,8 +5114,13 @@ impl Vm {
             if initial > haystack.len() as i64 + 1 {
                 return Ok(vec![Value::Nil]);
             }
-            let Some(found) =
-                find_basic_lua_pattern(haystack, pattern, initial as usize - 1, "string.match")?
+            let Some(found) = find_basic_lua_pattern(
+                haystack,
+                pattern,
+                initial as usize - 1,
+                "string.match",
+                vm.active_profile()?,
+            )?
             else {
                 return Ok(vec![Value::Nil]);
             };
@@ -5180,8 +5191,13 @@ impl Vm {
             let mut copied_until = 0;
             let mut replacements = 0;
             while replacements < replacement_limit && search_start <= haystack.len() {
-                let Some(found) =
-                    find_basic_lua_pattern(haystack, pattern, search_start, "string.gsub")?
+                let Some(found) = find_basic_lua_pattern(
+                    haystack,
+                    pattern,
+                    search_start,
+                    "string.gsub",
+                    vm.active_profile()?,
+                )?
                 else {
                     break;
                 };
@@ -5204,7 +5220,14 @@ impl Vm {
             }
             if !explicit_limit
                 && replacements == MAX_DYNAMIC_REGISTERS
-                && find_basic_lua_pattern(haystack, pattern, search_start, "string.gsub")?.is_some()
+                && find_basic_lua_pattern(
+                    haystack,
+                    pattern,
+                    search_start,
+                    "string.gsub",
+                    vm.active_profile()?,
+                )?
+                .is_some()
             {
                 return Err(RuntimeError::StackLimit {
                     required: MAX_DYNAMIC_REGISTERS + 1,
@@ -6460,14 +6483,15 @@ struct BasicPatternMatch {
     capture_count: usize,
 }
 
+const MAX_PATTERN_WORK: usize = 10_000_000;
+
 fn find_basic_lua_pattern(
     haystack: &[u8],
     pattern: &[u8],
     start: usize,
     operation: &'static str,
+    profile: SemanticProfile,
 ) -> Result<Option<BasicPatternMatch>, RuntimeError> {
-    const MAX_PATTERN_WORK: usize = 10_000_000;
-
     let anchored = pattern.first() == Some(&b'^');
     let mut index = usize::from(anchored);
     let mut end_anchor = false;
@@ -6515,12 +6539,12 @@ fn find_basic_lua_pattern(
                         feature: "malformed Lua frontier patterns",
                     });
                 }
-                let (set, next) = parse_basic_pattern_set(pattern, index + 2, operation)?;
+                let (set, next) = parse_basic_pattern_set(pattern, index + 2, operation, profile)?;
                 index = next - 2;
                 BasicPatternAtom::Frontier(set)
             } else if matches!(
                 escaped.to_ascii_lowercase(),
-                b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
+                b'a' | b'c' | b'd' | b'g' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
             ) {
                 BasicPatternAtom::Class(escaped)
             } else if matches!(escaped, b'1'..=b'9') {
@@ -6534,7 +6558,7 @@ fn find_basic_lua_pattern(
                 BasicPatternAtom::Literal(escaped)
             }
         } else if byte == b'[' {
-            let (set, next) = parse_basic_pattern_set(pattern, index, operation)?;
+            let (set, next) = parse_basic_pattern_set(pattern, index, operation, profile)?;
             index = next;
             BasicPatternAtom::Set(set)
         } else if byte == b'(' {
@@ -6607,13 +6631,7 @@ fn find_basic_lua_pattern(
     let mut work = 0;
     for position in start..start.saturating_add(candidates) {
         if let Some((end, captures)) = match_basic_pattern_at(
-            haystack,
-            &pieces,
-            position,
-            end_anchor,
-            &mut work,
-            MAX_PATTERN_WORK,
-            operation,
+            haystack, &pieces, position, end_anchor, &mut work, operation, profile,
         )? {
             return Ok(Some(BasicPatternMatch {
                 start: position,
@@ -6663,8 +6681,8 @@ fn match_basic_pattern_at(
     start: usize,
     end_anchor: bool,
     work: &mut usize,
-    work_limit: usize,
     operation: &'static str,
+    profile: SemanticProfile,
 ) -> Result<Option<(usize, [BasicPatternCapture; 32])>, RuntimeError> {
     let capacity = pieces.len().saturating_add(1);
     let mut states = try_vec_with_capacity(capacity, "string.find backtracking states")?;
@@ -6675,7 +6693,7 @@ fn match_basic_pattern_at(
         event: None,
     });
     while let Some(state) = states.pop() {
-        charge_pattern_work(work, 1, work_limit)?;
+        charge_pattern_work(work, 1, MAX_PATTERN_WORK)?;
         match state {
             BasicPatternState::Match {
                 piece,
@@ -6735,7 +6753,7 @@ fn match_basic_pattern_at(
                             feature: "repetition applied to Lua frontier patterns",
                         });
                     }
-                    charge_pattern_work(work, 2, work_limit)?;
+                    charge_pattern_work(work, 2, MAX_PATTERN_WORK)?;
                     let previous = position
                         .checked_sub(1)
                         .and_then(|previous| haystack.get(previous))
@@ -6758,14 +6776,14 @@ fn match_basic_pattern_at(
                             feature: "repetition applied to Lua balanced patterns",
                         });
                     }
-                    charge_pattern_work(work, 1, work_limit)?;
+                    charge_pattern_work(work, 1, MAX_PATTERN_WORK)?;
                     if haystack.get(position) != Some(&open) {
                         continue;
                     }
                     let mut depth = 1usize;
                     let mut end = position + 1;
                     while let Some(byte) = haystack.get(end) {
-                        charge_pattern_work(work, 1, work_limit)?;
+                        charge_pattern_work(work, 1, MAX_PATTERN_WORK)?;
                         end += 1;
                         if *byte == open {
                             depth += 1;
@@ -6802,7 +6820,7 @@ fn match_basic_pattern_at(
                         continue;
                     }
                     let captured = &haystack[capture.start..capture.end];
-                    charge_pattern_work(work, captured.len().max(1), work_limit)?;
+                    charge_pattern_work(work, captured.len().max(1), MAX_PATTERN_WORK)?;
                     let Some(end) = position.checked_add(captured.len()) else {
                         continue;
                     };
@@ -6819,8 +6837,8 @@ fn match_basic_pattern_at(
                     let Some(byte) = haystack.get(position) else {
                         continue;
                     };
-                    charge_pattern_work(work, 1, work_limit)?;
-                    if basic_pattern_atom_matches(&current.atom, *byte) {
+                    charge_pattern_work(work, 1, MAX_PATTERN_WORK)?;
+                    if basic_pattern_atom_matches(&current.atom, *byte, profile) {
                         states.push(BasicPatternState::Match {
                             piece: piece + 1,
                             position: position + 1,
@@ -6832,8 +6850,8 @@ fn match_basic_pattern_at(
 
                 let mut maximum = 0;
                 while let Some(byte) = haystack.get(position + maximum) {
-                    charge_pattern_work(work, 1, work_limit)?;
-                    if !basic_pattern_atom_matches(&current.atom, *byte) {
+                    charge_pattern_work(work, 1, MAX_PATTERN_WORK)?;
+                    if !basic_pattern_atom_matches(&current.atom, *byte, profile) {
                         break;
                     }
                     maximum += 1;
@@ -6939,11 +6957,11 @@ fn charge_pattern_work(work: &mut usize, amount: usize, limit: usize) -> Result<
     }
 }
 
-fn basic_pattern_atom_matches(atom: &BasicPatternAtom, byte: u8) -> bool {
+fn basic_pattern_atom_matches(atom: &BasicPatternAtom, byte: u8, profile: SemanticProfile) -> bool {
     match atom {
         BasicPatternAtom::Literal(expected) => *expected == byte,
         BasicPatternAtom::Any => true,
-        BasicPatternAtom::Class(class) => byte_matches_pattern_class(byte, *class),
+        BasicPatternAtom::Class(class) => byte_matches_pattern_class(byte, *class, profile),
         BasicPatternAtom::Set(set) => pattern_set_contains(set, byte),
         BasicPatternAtom::Backreference(_)
         | BasicPatternAtom::Balanced(_, _)
@@ -6958,6 +6976,7 @@ fn parse_basic_pattern_set(
     pattern: &[u8],
     start: usize,
     operation: &'static str,
+    profile: SemanticProfile,
 ) -> Result<([u64; 4], usize), RuntimeError> {
     let mut cursor = start + 1;
     let negated = pattern.get(cursor) == Some(&b'^');
@@ -6992,10 +7011,10 @@ fn parse_basic_pattern_set(
             )?;
             if matches!(
                 escaped.to_ascii_lowercase(),
-                b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
+                b'a' | b'c' | b'd' | b'g' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
             ) {
                 for candidate in u8::MIN..=u8::MAX {
-                    if byte_matches_pattern_class(candidate, escaped) {
+                    if byte_matches_pattern_class(candidate, escaped, profile) {
                         pattern_set_insert(&mut set, candidate);
                     }
                 }
@@ -7034,11 +7053,15 @@ fn pattern_set_contains(set: &[u64; 4], byte: u8) -> bool {
     set[usize::from(byte) / 64] & (1_u64 << (byte % 64)) != 0
 }
 
-fn byte_matches_pattern_class(byte: u8, class: u8) -> bool {
+fn byte_matches_pattern_class(byte: u8, class: u8, profile: SemanticProfile) -> bool {
+    if profile == SemanticProfile::Lua51 && class.eq_ignore_ascii_case(&b'g') {
+        return byte == class;
+    }
     let matches = match class.to_ascii_lowercase() {
         b'a' => byte.is_ascii_alphabetic(),
         b'c' => byte.is_ascii_control(),
         b'd' => byte.is_ascii_digit(),
+        b'g' => byte.is_ascii_graphic(),
         b'l' => byte.is_ascii_lowercase(),
         b'p' => byte.is_ascii_punctuation(),
         b's' => byte.is_ascii_whitespace(),
