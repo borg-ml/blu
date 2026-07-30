@@ -173,7 +173,7 @@ impl OwnedCompiler {
             self.limits,
             &mut prototypes,
             &[],
-            false,
+            FunctionShape::default(),
             &[],
         )?
         .run(parsed.ast().statements())?;
@@ -424,6 +424,12 @@ enum AssignmentDestination {
     Table { table: u16, key: u16 },
 }
 
+#[derive(Clone, Copy, Default)]
+struct FunctionShape {
+    implicit_self: bool,
+    is_vararg: bool,
+}
+
 struct Lowerer<'a, 'prototypes> {
     source: &'a SourceFile,
     ast: &'a Ast,
@@ -436,6 +442,7 @@ struct Lowerer<'a, 'prototypes> {
     outer_bindings: Vec<OuterBinding>,
     upvalues: Vec<OuterBinding>,
     parameter_count: usize,
+    is_vararg: bool,
     bindings: Vec<Binding>,
     closed_bindings: Vec<Binding>,
     loop_breaks: Vec<Vec<usize>>,
@@ -455,7 +462,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         limits: OwnedCompileLimits,
         prototypes: &'prototypes mut Vec<Prototype>,
         parameters: &[Identifier],
-        implicit_self: bool,
+        shape: FunctionShape,
         outer_bindings: &[OuterBinding],
     ) -> Result<Self, OwnedCompileError> {
         let capacity = ast.node_count().min(4_096);
@@ -473,7 +480,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             prototypes,
             outer_bindings: copied_outer_bindings,
             upvalues: allocate_vec(4, "prototype upvalues")?,
-            parameter_count: parameters.len().saturating_add(usize::from(implicit_self)),
+            parameter_count: parameters
+                .len()
+                .saturating_add(usize::from(shape.implicit_self)),
+            is_vararg: shape.is_vararg,
             bindings: allocate_vec(capacity.min(limits.max_bindings), "local bindings")?,
             closed_bindings: allocate_vec(
                 capacity.min(limits.max_bindings),
@@ -488,7 +498,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             source_map: allocate_vec(capacity.min(limits.max_instructions), "source map")?,
             children: allocate_vec(4, "prototype children")?,
         };
-        if implicit_self {
+        if shape.implicit_self {
             let register = lowerer.allocate_register()?;
             lowerer.push_binding(BindingName::ImplicitSelf, register, 0)?;
         }
@@ -650,6 +660,13 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         }) {
             required_features = required_features | FeatureBits::CLOSURES;
         }
+        if self
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::Varargs { .. }))
+        {
+            required_features = required_features | FeatureBits::VARARGS;
+        }
         Ok(Prototype {
             profile: self.profile,
             source: self.source.identity().id(),
@@ -659,7 +676,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     message: "parameter count passed limits but cannot fit BluV1",
                 }
             })?,
-            is_vararg: false,
+            is_vararg: self.is_vararg,
             required_features,
             constants: self.constants,
             upvalues,
@@ -1400,7 +1417,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             self.limits,
             self.prototypes,
             body.parameters(),
-            implicit_self,
+            FunctionShape {
+                implicit_self,
+                is_vararg: body.is_vararg(),
+            },
             &outer_bindings,
         )?
         .run(body.body().statements())?;
@@ -1779,6 +1799,14 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             return self.emit(Instruction::Return { first: 0, count: 0 }, statement.span());
         }
         let last = values[values.len() - 1];
+        if matches!(self.expression(last)?.kind(), ExpressionKind::Vararg) {
+            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                "BLU-COMPILE-0007",
+                Phase::Lower,
+                self.expression(last)?.span(),
+                "dynamic vararg return forwarding is not yet implemented",
+            )?));
+        }
         if matches!(
             self.expression(last)?.kind(),
             ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
@@ -1872,6 +1900,26 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         let mut array_index = 1_i64;
         for index in constructor.first_field()..end {
             let field = self.table_fields[index];
+            if index + 1 == end
+                && matches!(
+                    field,
+                    TableField::Array(value)
+                        if matches!(self.expression(value)?.kind(), ExpressionKind::Vararg)
+                )
+            {
+                return Err(OwnedCompileError::Diagnostic(
+                    self.source_diagnostic(
+                        "BLU-COMPILE-0007",
+                        Phase::Lower,
+                        self.expression(match field {
+                            TableField::Array(value) => value,
+                            _ => unreachable!(),
+                        })?
+                        .span(),
+                        "dynamic final-field vararg expansion is not yet implemented",
+                    )?,
+                ));
+            }
             let (key, value, span) = match field {
                 TableField::Array(value) => {
                     let span = self.expression(value)?.span();
@@ -1926,6 +1974,17 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         result_count: usize,
     ) -> Result<Vec<u16>, OwnedCompileError> {
         let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
+        if let Some(argument) = self.call_arguments.get(end.saturating_sub(1)).copied()
+            && end > call.first_argument()
+            && matches!(self.expression(argument)?.kind(), ExpressionKind::Vararg)
+        {
+            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                "BLU-COMPILE-0007",
+                Phase::Lower,
+                self.expression(argument)?.span(),
+                "dynamic vararg call arguments are not yet implemented",
+            )?));
+        }
         let function = self.lower_expression(call.function())?;
         let mut sources = allocate_vec(call.argument_count(), "call argument registers")?;
         for index in call.first_argument()..end {
@@ -1947,6 +2006,17 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         result_count: usize,
     ) -> Result<Vec<u16>, OwnedCompileError> {
         let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
+        if let Some(argument) = self.call_arguments.get(end.saturating_sub(1)).copied()
+            && end > call.first_argument()
+            && matches!(self.expression(argument)?.kind(), ExpressionKind::Vararg)
+        {
+            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                "BLU-COMPILE-0007",
+                Phase::Lower,
+                self.expression(argument)?.span(),
+                "dynamic vararg method-call arguments are not yet implemented",
+            )?));
+        }
         let receiver = self.lower_expression(call.receiver())?;
         let key = self.lower_constant(
             Constant::String(copy_bytes(
@@ -1988,6 +2058,36 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             ExpressionKind::Call(call) => self.lower_call_results(call, result_count).map(Some),
             ExpressionKind::MethodCall(call) => {
                 self.lower_method_call_results(call, result_count).map(Some)
+            }
+            ExpressionKind::Vararg => {
+                if !self.is_vararg {
+                    return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0006",
+                        Phase::Lower,
+                        expression.span(),
+                        "vararg expression is outside a variadic function",
+                    )?));
+                }
+                let result_count = u16::try_from(result_count).map_err(|_| {
+                    OwnedCompileError::InternalInvariant {
+                        message: "vararg result count passed limits but cannot fit BluV1",
+                    }
+                })?;
+                let mut results =
+                    allocate_vec(usize::from(result_count), "vararg result registers")?;
+                let destination = self.allocate_register()?;
+                results.push(destination);
+                for _ in 1..result_count {
+                    results.push(self.allocate_register()?);
+                }
+                self.emit(
+                    Instruction::Varargs {
+                        destination,
+                        count: result_count,
+                    },
+                    expression.span(),
+                )?;
+                Ok(Some(results))
             }
             _ => Ok(None),
         }
@@ -2177,6 +2277,16 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         let expression = *self.expression(id)?;
         match expression.kind() {
             ExpressionKind::Nil => self.lower_constant(Constant::Nil, expression.span()),
+            ExpressionKind::Vararg => {
+                let mut results = self.lower_call_expression_results(id, 1)?.ok_or(
+                    OwnedCompileError::InternalInvariant {
+                        message: "vararg expression did not lower as adjusted results",
+                    },
+                )?;
+                results.pop().ok_or(OwnedCompileError::InternalInvariant {
+                    message: "scalar vararg lowering returned no register",
+                })
+            }
             ExpressionKind::Boolean(value) => {
                 self.lower_constant(Constant::Boolean(value), expression.span())
             }

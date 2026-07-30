@@ -397,6 +397,10 @@ fn translate_instruction(
             prototype,
             instruction: "closures",
         }),
+        BluInstruction::Varargs { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "varargs",
+        }),
         BluInstruction::Return { first, count } => {
             let result_field = count
                 .checked_add(1)

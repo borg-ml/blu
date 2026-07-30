@@ -73,6 +73,8 @@ impl FeatureBits {
     pub const FIXED_MULTI_RESULTS: Self = Self(1 << 11);
     /// Tail calls which forward every result directly to the current caller.
     pub const RETURN_CALLS: Self = Self(1 << 12);
+    /// Fixed-width access to a function frame's variadic arguments.
+    pub const VARARGS: Self = Self(1 << 13);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -86,7 +88,8 @@ impl FeatureBits {
             | Self::FIXED_CALLS.0
             | Self::CLOSURES.0
             | Self::FIXED_MULTI_RESULTS.0
-            | Self::RETURN_CALLS.0,
+            | Self::RETURN_CALLS.0
+            | Self::VARARGS.0,
     );
 
     #[must_use]
@@ -316,6 +319,10 @@ pub enum Instruction {
         upvalue: u16,
         source: u16,
     },
+    Varargs {
+        destination: u16,
+        count: u16,
+    },
     Move {
         destination: u16,
         source: u16,
@@ -433,6 +440,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::NewClosure { .. }
             | Instruction::GetUpvalue { .. }
             | Instruction::SetUpvalue { .. }
+            | Instruction::Varargs { .. }
             | Instruction::Move { .. }
             | Instruction::Not { .. }
             | Instruction::Negate { .. }
@@ -468,6 +476,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::NewClosure { .. }
                 | Instruction::GetUpvalue { .. }
                 | Instruction::SetUpvalue { .. }
+                | Instruction::Varargs { .. }
                 | Instruction::Move { .. }
                 | Instruction::Not { .. }
                 | Instruction::Negate { .. }
@@ -1231,6 +1240,24 @@ fn validate_prototype(
         });
     }
     if prototype
+        .code
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::Varargs { .. }))
+    {
+        if !prototype.required_features.contains(FeatureBits::VARARGS) {
+            return Err(ValidationError::MissingFeature {
+                prototype: index,
+                feature: "varargs",
+            });
+        }
+        if !prototype.is_vararg {
+            return Err(ValidationError::InvalidMetadata {
+                prototype: index,
+                what: "vararg instruction in fixed-argument prototype",
+            });
+        }
+    }
+    if prototype
         .constants
         .iter()
         .any(|constant| matches!(constant, Constant::Integer(_)))
@@ -1748,6 +1775,30 @@ fn validate_prototype(
                     });
                 }
             }
+            Instruction::Varargs { destination, count } => {
+                if count == 0 {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "vararg result count must be nonzero",
+                    });
+                }
+                let end = usize::from(destination)
+                    .checked_add(usize::from(count))
+                    .ok_or(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "vararg result register range overflows",
+                    })?;
+                if end > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "vararg result register range is invalid",
+                    });
+                }
+                initialized[usize::from(destination)..end].fill(true);
+            }
             Instruction::Move {
                 destination,
                 source,
@@ -2248,7 +2299,8 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     Instruction::NewTable { .. } => 3,
                     Instruction::NewClosure { .. }
                     | Instruction::GetUpvalue { .. }
-                    | Instruction::SetUpvalue { .. } => 5,
+                    | Instruction::SetUpvalue { .. }
+                    | Instruction::Varargs { .. } => 5,
                     Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. } => 7,
                     Instruction::Jump { .. } => 5,
                     Instruction::Move { .. }
@@ -2450,6 +2502,11 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 out.push(28);
                 put_u16(out, *upvalue);
                 put_u16(out, *source);
+            }
+            Instruction::Varargs { destination, count } => {
+                out.push(32);
+                put_u16(out, *destination);
+                put_u16(out, *count);
             }
             Instruction::Add {
                 destination,
@@ -3316,6 +3373,10 @@ fn read_prototype(
                 function: reader.u16()?,
                 arguments: reader.u16()?,
                 argument_count: reader.u16()?,
+            },
+            32 => Instruction::Varargs {
+                destination: reader.u16()?,
+                count: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

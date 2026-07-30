@@ -2688,3 +2688,92 @@ fn owned_functions_share_mutable_and_transitive_lexical_captures() {
         }
     }
 }
+
+#[test]
+fn owned_variadic_functions_adjust_fixed_vararg_reads() {
+    for bytes in [
+        b"local function select(first, ...) local second, third = ... return first, second, third end return select(1, 2, 3, 4)"
+            .as_slice(),
+        b"local function first(...) return (...) end return first(1, 2, 3)".as_slice(),
+    ] {
+        let source = make_source(bytes.to_vec());
+        for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .expect("fixed vararg reads should compile");
+            assert!(
+                compiled
+                    .artifact()
+                    .prototypes()
+                    .iter()
+                    .any(|prototype| prototype.required_features.contains(FeatureBits::VARARGS)),
+                "{profile}"
+            );
+            let modern = matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            );
+            let expected = if bytes.starts_with(b"local function select") {
+                if modern {
+                    vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+                } else {
+                    vec![
+                        Value::Number(1.0),
+                        Value::Number(2.0),
+                        Value::Number(3.0),
+                    ]
+                }
+            } else if modern {
+                vec![Value::Integer(1)]
+            } else {
+                vec![Value::Number(1.0)]
+            };
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(expected),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
+fn dynamic_vararg_positions_fail_explicitly_until_the_dynamic_area_is_encoded() {
+    for bytes in [
+        b"local function values(...) return ... end".as_slice(),
+        b"local function pass(...) print(...) end".as_slice(),
+        b"local function pack(...) return {...} end".as_slice(),
+    ] {
+        let source = make_source(bytes.to_vec());
+        let error = OwnedCompiler::default()
+            .compile(&source, SemanticProfile::Blu, compiler_identity())
+            .expect_err("dynamic vararg use must not silently truncate");
+        assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
+    }
+}
+
+#[test]
+fn active_and_suspended_blu_varargs_remain_gc_roots() {
+    for bytes in [
+        b"local function keep(...) collect() return (...).value end return keep({value = 42})"
+            .as_slice(),
+        b"local function outer(...) local function inner() collect() end inner() return (...).value end return outer({value = 42})"
+            .as_slice(),
+    ] {
+        let source = make_source(bytes.to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, SemanticProfile::Blu, compiler_identity())
+            .unwrap();
+        let mut vm = Vm::default();
+        let collect = vm.register_function(|vm, _| {
+            vm.collect(std::iter::empty::<&Value>())?;
+            Ok(Vec::new())
+        });
+        vm.set_global(b"collect".as_slice(), Value::NativeFunction(collect));
+        assert_eq!(
+            vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Number(42.0)])
+        );
+    }
+}

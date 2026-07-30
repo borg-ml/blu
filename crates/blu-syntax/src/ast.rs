@@ -368,6 +368,7 @@ impl IndexExpression {
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ExpressionKind {
     Nil,
+    Vararg,
     Boolean(bool),
     DecimalInteger,
     DecimalNumber,
@@ -419,14 +420,21 @@ pub struct LocalStatement {
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FunctionBody {
     parameters: Vec<Identifier>,
+    is_vararg: bool,
     body: Block,
     span: ByteSpan,
 }
 
 impl FunctionBody {
-    pub(crate) const fn new(parameters: Vec<Identifier>, body: Block, span: ByteSpan) -> Self {
+    pub(crate) const fn new(
+        parameters: Vec<Identifier>,
+        is_vararg: bool,
+        body: Block,
+        span: ByteSpan,
+    ) -> Self {
         Self {
             parameters,
+            is_vararg,
             body,
             span,
         }
@@ -435,6 +443,11 @@ impl FunctionBody {
     #[must_use]
     pub fn parameters(&self) -> &[Identifier] {
         &self.parameters
+    }
+
+    #[must_use]
+    pub const fn is_vararg(&self) -> bool {
+        self.is_vararg
     }
 
     #[must_use]

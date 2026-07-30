@@ -278,8 +278,15 @@ generational upvalue cells, refreshes suspended parent registers after child
 returns, and uses an explicit caller stack bounded by the VM call limit.
 Registers, active closures, open upvalues, and suspended callers participate
 in allocation roots. Bootstrap translation continues to reject closure
-instructions explicitly. Dynamic argument/table-tail adjustment, varargs,
-metamethod-aware method lookup, and resumable direct-BluV1 calls remain
+instructions explicitly. Variadic owned functions retain `...` separately
+from named parameters and declare the `VARARGS` feature. Fixed scalar reads
+and fixed adjustment such as `local first, second = ...` use a validated
+destination range, truncate excess arguments, and pad missing arguments with
+`nil`. Active and saved-frame vararg vectors are GC roots. Dynamic-width
+uses—direct `return ...`, final call arguments such as `target(...)`, and
+final constructor fields `{...}`—fail with `BLU-COMPILE-0007` until the capped
+dynamic area is encoded canonically; they are never silently reduced to one
+value. Metamethod-aware method lookup and resumable direct-BluV1 calls remain
 unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions
 and both `local function name(...) ... end` and simple

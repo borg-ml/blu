@@ -65,6 +65,7 @@ struct BluCaller {
     prototype: usize,
     constants: Vec<Value>,
     registers: Vec<Value>,
+    varargs: Vec<Value>,
     open_upvalues: Vec<Option<UpvalueId>>,
     closure: Option<ClosureId>,
     pc: usize,
@@ -859,6 +860,7 @@ impl Vm {
         let register_count = usize::from(prototype.register_count);
         let mut registers = try_vec_with_capacity(register_count, "BluV1 runtime registers")?;
         registers.resize(register_count, Value::Nil);
+        let mut varargs = Vec::new();
         let mut open_upvalues = try_vec_with_capacity(register_count, "BluV1 open upvalues")?;
         open_upvalues.resize(register_count, None);
         let mut closure = None;
@@ -902,6 +904,25 @@ impl Vm {
                         value,
                     )?;
                 }
+                BluInstruction::Varargs { destination, count } => {
+                    for offset in 0..count {
+                        let register =
+                            destination
+                                .checked_add(offset)
+                                .ok_or(RuntimeError::Register {
+                                    register: usize::MAX,
+                                    count: registers.len(),
+                                })?;
+                        let value = varargs.get(offset as usize).cloned().unwrap_or(Value::Nil);
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            register,
+                            value,
+                        )?;
+                    }
+                }
                 BluInstruction::LoadGlobal { destination, name } => {
                     let Value::String(name) =
                         constants.get(name as usize).ok_or(RuntimeError::Constant {
@@ -937,7 +958,8 @@ impl Vm {
                     self.set_global(name.clone(), value);
                 }
                 BluInstruction::NewTable { destination } => {
-                    let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
+                    let roots =
+                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
                     let table = self.allocate_table(0, 0, &roots)?;
                     set_blu_register(
                         &mut self.heap,
@@ -983,7 +1005,8 @@ impl Vm {
                     let table = *table;
                     let key = blu_register(&registers, key)?.clone();
                     let value = blu_register(&registers, value)?.clone();
-                    let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
+                    let roots =
+                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
                     self.table_set(table, key, value, &roots)?;
                 }
                 BluInstruction::Call {
@@ -1028,6 +1051,16 @@ impl Vm {
                             .len()
                             .min(usize::from(child_prototype.parameter_count));
                         child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                        let child_varargs = if child_prototype.is_vararg {
+                            try_clone_values(
+                                arguments
+                                    .get(usize::from(child_prototype.parameter_count)..)
+                                    .unwrap_or_default(),
+                                "BluV1 frame varargs",
+                            )?
+                        } else {
+                            Vec::new()
+                        };
                         let mut child_open_upvalues =
                             try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
                         child_open_upvalues.resize(child_register_count, None);
@@ -1037,6 +1070,7 @@ impl Vm {
                             prototype: prototype_index,
                             constants,
                             registers,
+                            varargs,
                             open_upvalues,
                             closure,
                             pc: pc + 1,
@@ -1049,13 +1083,15 @@ impl Vm {
                         prototype_index = child;
                         constants = child_constants;
                         registers = child_registers;
+                        varargs = child_varargs;
                         open_upvalues = child_open_upvalues;
                         closure = Some(*child_closure);
                         pc = 0;
                         self.active_profile = Some(profile);
                         continue;
                     }
-                    let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
+                    let roots =
+                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
                     let values =
                         self.call_value(function, arguments, &mut remaining, callers.len(), roots)?;
                     let value = values.into_iter().next().unwrap_or(Value::Nil);
@@ -1110,6 +1146,16 @@ impl Vm {
                             .len()
                             .min(usize::from(child_prototype.parameter_count));
                         child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                        let child_varargs = if child_prototype.is_vararg {
+                            try_clone_values(
+                                arguments
+                                    .get(usize::from(child_prototype.parameter_count)..)
+                                    .unwrap_or_default(),
+                                "BluV1 frame varargs",
+                            )?
+                        } else {
+                            Vec::new()
+                        };
                         let mut child_open_upvalues =
                             try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
                         child_open_upvalues.resize(child_register_count, None);
@@ -1119,6 +1165,7 @@ impl Vm {
                             prototype: prototype_index,
                             constants,
                             registers,
+                            varargs,
                             open_upvalues,
                             closure,
                             pc: pc + 1,
@@ -1131,13 +1178,15 @@ impl Vm {
                         prototype_index = child;
                         constants = child_constants;
                         registers = child_registers;
+                        varargs = child_varargs;
                         open_upvalues = child_open_upvalues;
                         closure = Some(*child_closure);
                         pc = 0;
                         self.active_profile = Some(profile);
                         continue;
                     }
-                    let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
+                    let roots =
+                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
                     let values =
                         self.call_value(function, arguments, &mut remaining, callers.len(), roots)?;
                     let mut values = values.into_iter();
@@ -1210,6 +1259,16 @@ impl Vm {
                             .len()
                             .min(usize::from(child_prototype.parameter_count));
                         child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                        let child_varargs = if child_prototype.is_vararg {
+                            try_clone_values(
+                                arguments
+                                    .get(usize::from(child_prototype.parameter_count)..)
+                                    .unwrap_or_default(),
+                                "BluV1 frame varargs",
+                            )?
+                        } else {
+                            Vec::new()
+                        };
                         let mut child_open_upvalues =
                             try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
                         child_open_upvalues.resize(child_register_count, None);
@@ -1220,6 +1279,7 @@ impl Vm {
                                 prototype: prototype_index,
                                 constants,
                                 registers,
+                                varargs,
                                 open_upvalues,
                                 closure,
                                 pc: pc + 1,
@@ -1229,6 +1289,7 @@ impl Vm {
                             prototype_index = child;
                             constants = child_constants;
                             registers = child_registers;
+                            varargs = child_varargs;
                             open_upvalues = child_open_upvalues;
                             closure = Some(*child_closure);
                             pc = 0;
@@ -1239,13 +1300,15 @@ impl Vm {
                         prototype_index = child;
                         constants = child_constants;
                         registers = child_registers;
+                        varargs = child_varargs;
                         open_upvalues = child_open_upvalues;
                         closure = Some(*child_closure);
                         pc = 0;
                         self.active_profile = Some(profile);
                         continue;
                     }
-                    let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
+                    let roots =
+                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
                     let mut values =
                         self.call_value(function, arguments, &mut remaining, callers.len(), roots)?;
                     if let Some((first, count)) = prefix {
@@ -1282,6 +1345,7 @@ impl Vm {
                     prototype_index = caller.prototype;
                     constants = caller.constants;
                     registers = caller.registers;
+                    varargs = caller.varargs;
                     open_upvalues = caller.open_upvalues;
                     closure = caller.closure;
                     pc = caller.pc;
@@ -1304,7 +1368,8 @@ impl Vm {
                         .prototypes
                         .get(child_index)
                         .ok_or(RuntimeError::InvalidPrototype(child_index))?;
-                    let mut roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
+                    let mut roots =
+                        blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
                     let child_closure = self.allocate_blu_closure(
                         artifact.clone(),
                         child_index,
@@ -1747,6 +1812,7 @@ impl Vm {
                     prototype_index = caller.prototype;
                     constants = caller.constants;
                     registers = caller.registers;
+                    varargs = caller.varargs;
                     open_upvalues = caller.open_upvalues;
                     closure = caller.closure;
                     pc = caller.pc;
@@ -5674,11 +5740,14 @@ fn materialize_blu_constants(
 
 fn blu_frame_roots(
     registers: &[Value],
+    varargs: &[Value],
     open_upvalues: &[Option<UpvalueId>],
     closure: Option<ClosureId>,
     callers: &[BluCaller],
 ) -> Result<GcRoots, RuntimeError> {
     let mut roots = GcRoots::from_values(registers)?;
+    try_reserve_exact(&mut roots.values, varargs.len(), "BluV1 vararg GC roots")?;
+    roots.values.extend(varargs.iter().cloned());
     try_reserve_exact(
         &mut roots.upvalues,
         open_upvalues.iter().flatten().count(),
@@ -5698,6 +5767,12 @@ fn blu_frame_roots(
             "BluV1 caller GC roots",
         )?;
         roots.values.extend(caller_values);
+        try_reserve_exact(
+            &mut roots.values,
+            caller.varargs.len(),
+            "BluV1 caller vararg GC roots",
+        )?;
+        roots.values.extend(caller.varargs.iter().cloned());
         try_reserve_exact(
             &mut roots.upvalues,
             caller.open_upvalues.iter().flatten().count(),

@@ -177,6 +177,7 @@ pub enum TokenKind {
     Percent,
     Caret,
     Hash,
+    Ellipsis,
     Concatenate,
     Dot,
     FloorDivide,
@@ -447,6 +448,12 @@ pub fn lex(
             b']' => {
                 offset += 1;
                 TokenKind::RightBracket
+            }
+            b'.' if bytes.get(offset + 1) == Some(&b'.')
+                && bytes.get(offset + 2) == Some(&b'.') =>
+            {
+                offset += 3;
+                TokenKind::Ellipsis
             }
             b'.' if bytes.get(offset + 1) == Some(&b'.') => {
                 offset += 2;

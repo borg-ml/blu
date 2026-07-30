@@ -826,6 +826,23 @@ fn break_is_a_shared_loop_keyword() {
 }
 
 #[test]
+fn ellipsis_is_distinct_from_concatenation() {
+    for profile in SemanticProfile::ALL {
+        let source = source(b"function values(...) return ... end".to_vec());
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert!(!lexed.has_errors(), "{profile}");
+        assert_eq!(
+            significant_kinds(&lexed)
+                .into_iter()
+                .filter(|kind| matches!(kind, TokenKind::Ellipsis))
+                .count(),
+            2,
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn continue_is_blu_and_luau_only() {
     for profile in SemanticProfile::ALL {
         let source = source(b"while true do continue end".to_vec());

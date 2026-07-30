@@ -838,13 +838,19 @@ impl<'a> Parser<'a> {
         }
         self.bump();
         let mut parameters = allocate_vec(2, "function parameters")?;
+        let mut is_vararg = false;
         if !self.at(TokenKind::RightParenthesis) {
             loop {
+                if self.at(TokenKind::Ellipsis) {
+                    self.bump();
+                    is_vararg = true;
+                    break;
+                }
                 if !self.at(TokenKind::Identifier) {
                     self.report_current_or_eof(
                         "BLU-PARSE-0036",
                         "expected a function parameter name",
-                        &["identifier", ")"],
+                        &["identifier", "...", ")"],
                     )?;
                     return Ok(None);
                 }
@@ -897,7 +903,12 @@ impl<'a> Parser<'a> {
         let id = FunctionId::new(self.functions.len());
         push_fallible(
             &mut self.functions,
-            FunctionBody::new(parameters, body, keyword.span().merge(end.span())?),
+            FunctionBody::new(
+                parameters,
+                is_vararg,
+                body,
+                keyword.span().merge(end.span())?,
+            ),
             "AST functions",
         )?;
         Ok(Some(id))
@@ -1361,6 +1372,7 @@ impl<'a> Parser<'a> {
         };
         let kind = match token.kind() {
             TokenKind::Nil => ExpressionKind::Nil,
+            TokenKind::Ellipsis => ExpressionKind::Vararg,
             TokenKind::True => ExpressionKind::Boolean(true),
             TokenKind::False => ExpressionKind::Boolean(false),
             TokenKind::DecimalInteger => ExpressionKind::DecimalInteger,

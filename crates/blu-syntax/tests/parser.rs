@@ -291,6 +291,32 @@ fn function_expressions_and_local_functions_own_parameters_and_bodies() {
 }
 
 #[test]
+fn variadic_functions_retain_their_marker_and_vararg_expressions() {
+    for profile in SemanticProfile::ALL {
+        let source_file =
+            source(b"local function values(first, ...) local next = ... end".to_vec());
+        let parsed = accepted(&source_file, profile, ParseLimits::default());
+        let Statement::LocalFunction(statement) = &parsed.ast().statements()[0] else {
+            panic!("expected local function");
+        };
+        let function = parsed.ast().function(statement.function()).unwrap();
+        assert_eq!(function.parameters().len(), 1);
+        assert!(function.is_vararg());
+        let Statement::Local(local) = &function.body().statements()[0] else {
+            panic!("expected local statement");
+        };
+        assert!(matches!(
+            parsed
+                .ast()
+                .expression(local.value().unwrap())
+                .unwrap()
+                .kind(),
+            ExpressionKind::Vararg
+        ));
+    }
+}
+
+#[test]
 fn named_function_statements_own_global_names_and_bodies() {
     let source = source(b"function answer(value) return value + 2 end".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
