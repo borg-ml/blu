@@ -601,6 +601,10 @@ sequences without NaN and uniform byte-string sequences. It returns no values
 and accepts an omitted or nil comparator. Numeric sorting uses exact mixed
 integer/number ordering without `f64` round-trip loss. Custom comparator callbacks and
 metamethod ordering fail explicitly until native operations can resume calls.
+`table.pack` and `table.unpack` are available in Blu, Luau, and Lua 5.2–5.5;
+Lua 5.1 rejects those table-library names explicitly. The legacy global
+`unpack` is available in Blu, Luau, and Lua 5.1 and is rejected in Lua
+5.2–5.5, where the reference runtimes moved it into the table library.
 `table.move` performs bounded overlap-safe moves and returns the destination
 table for Blu, Luau, and Lua 5.3–5.5. Lua 5.1–5.2 calls fail with an explicit
 unsupported-profile error because those libraries do not define it.

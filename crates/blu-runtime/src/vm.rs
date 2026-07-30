@@ -6624,6 +6624,13 @@ impl Vm {
             Ok(vec![Value::String(Arc::from(result))])
         });
         let pack = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if profile == SemanticProfile::Lua51 {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.pack",
+                    profile,
+                });
+            }
             let roots = GcRoots::from_values(arguments)?;
             let count = profiled_integral_math_result(vm, "table.pack", arguments.len() as f64)?;
             let table = vm.allocate_table(arguments.len(), 1, &roots)?;
@@ -6639,39 +6646,27 @@ impl Vm {
             Ok(vec![Value::Table(table)])
         });
         let unpack = self.register_function(|vm, arguments| {
-            let table = arguments.first().ok_or(RuntimeError::Argument {
-                function: "table.unpack",
-                index: 1,
-            })?;
-            let table = table_id(table)?;
-            let start = arguments
-                .get(1)
-                .map(|_| integer_argument(arguments, 1, "table.unpack"))
-                .transpose()?
-                .unwrap_or(1);
-            let end = arguments
-                .get(2)
-                .map(|_| integer_argument(arguments, 2, "table.unpack"))
-                .transpose()?
-                .unwrap_or(vm.heap.table_length(table)? as i64);
-            if end < start {
-                return Ok(Vec::new());
-            }
-            let count = usize::try_from(end - start + 1).map_err(|_| RuntimeError::StackLimit {
-                required: usize::MAX,
-                limit: MAX_DYNAMIC_REGISTERS,
-            })?;
-            if count > MAX_DYNAMIC_REGISTERS {
-                return Err(RuntimeError::StackLimit {
-                    required: count,
-                    limit: MAX_DYNAMIC_REGISTERS,
+            let profile = vm.active_profile()?;
+            if profile == SemanticProfile::Lua51 {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.unpack",
+                    profile,
                 });
             }
-            let mut values = try_vec_with_capacity(count, "table.unpack results")?;
-            for index in start..=end {
-                values.push(vm.heap.table_get(table, &Value::Integer(index))?);
+            unpack_table_values(vm, arguments, "table.unpack")
+        });
+        let global_unpack = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(
+                profile,
+                SemanticProfile::Blu | SemanticProfile::Luau | SemanticProfile::Lua51
+            ) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "unpack",
+                    profile,
+                });
             }
-            Ok(values)
+            unpack_table_values(vm, arguments, "unpack")
         });
         let move_values = self.register_function(|vm, arguments| {
             let profile = vm.active_profile()?;
@@ -7055,6 +7050,7 @@ impl Vm {
             )?;
         }
         self.set_global(&b"table"[..], Value::Table(table));
+        self.set_global(&b"unpack"[..], Value::NativeFunction(global_unpack));
         Ok(())
     }
 
@@ -7910,6 +7906,45 @@ fn profile_version(profile: SemanticProfile) -> Result<&'static [u8], RuntimeErr
             });
         }
     })
+}
+
+fn unpack_table_values(
+    vm: &mut Vm,
+    arguments: &[Value],
+    function: &'static str,
+) -> Result<Vec<Value>, RuntimeError> {
+    let table = arguments
+        .first()
+        .ok_or(RuntimeError::Argument { function, index: 1 })?;
+    let table = table_id(table)?;
+    let start = arguments
+        .get(1)
+        .map(|_| integer_argument(arguments, 1, function))
+        .transpose()?
+        .unwrap_or(1);
+    let end = arguments
+        .get(2)
+        .map(|_| integer_argument(arguments, 2, function))
+        .transpose()?
+        .unwrap_or(vm.heap.table_length(table)? as i64);
+    if end < start {
+        return Ok(Vec::new());
+    }
+    let count = usize::try_from(end - start + 1).map_err(|_| RuntimeError::StackLimit {
+        required: usize::MAX,
+        limit: MAX_DYNAMIC_REGISTERS,
+    })?;
+    if count > MAX_DYNAMIC_REGISTERS {
+        return Err(RuntimeError::StackLimit {
+            required: count,
+            limit: MAX_DYNAMIC_REGISTERS,
+        });
+    }
+    let mut values = try_vec_with_capacity(count, "table unpack results")?;
+    for index in start..=end {
+        values.push(vm.heap.table_get(table, &Value::Integer(index))?);
+    }
+    Ok(values)
 }
 
 fn integer_argument(

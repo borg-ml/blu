@@ -5494,6 +5494,91 @@ fn legacy_table_size_helpers_follow_profile_availability() {
 }
 
 #[test]
+fn table_pack_and_unpack_names_follow_profile_availability() {
+    let pack_source = make_source(b"local value=table.pack(10,nil,30) return value.n".to_vec());
+    let table_unpack_source = make_source(
+        b"local first,second=table.unpack({10,20,30},2,3) return first,second".to_vec(),
+    );
+    let global_unpack_source =
+        make_source(b"local first,second=unpack({10,20,30},2,3) return first,second".to_vec());
+    for profile in SemanticProfile::ALL {
+        let modern = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        let count = if modern {
+            Value::Integer(3)
+        } else {
+            Value::Number(3.0)
+        };
+        let value = |integer| {
+            if modern {
+                Value::Integer(integer)
+            } else {
+                Value::Number(integer as f64)
+            }
+        };
+
+        let compiled = OwnedCompiler::default()
+            .compile(&pack_source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if profile == SemanticProfile::Lua51 {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.pack",
+                    profile,
+                })
+            );
+        } else {
+            assert_eq!(result, Ok(vec![count]), "{profile}");
+        }
+
+        let compiled = OwnedCompiler::default()
+            .compile(&table_unpack_source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if profile == SemanticProfile::Lua51 {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.unpack",
+                    profile,
+                })
+            );
+        } else {
+            assert_eq!(result, Ok(vec![value(20), value(30)]), "{profile}");
+        }
+
+        let compiled = OwnedCompiler::default()
+            .compile(&global_unpack_source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Luau | SemanticProfile::Lua51
+        ) {
+            assert_eq!(result, Ok(vec![value(20), value(30)]), "{profile}");
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "unpack",
+                    profile,
+                })
+            );
+        }
+    }
+}
+
+#[test]
 fn luau_frozen_tables_enforce_heap_wide_immutability() {
     let source = make_source(
         b"local value={x=1} local frozen=table.freeze(value) local clone=table.clone(value) return frozen==value,table.isfrozen(value),table.isfrozen(clone),clone.x"
@@ -5716,7 +5801,7 @@ fn legacy_gcinfo_is_profile_gated_and_reports_integer_kibibytes() {
 #[test]
 fn base_library_counts_follow_profile_numeric_subtypes() {
     let source = make_source(
-        b"local packed=table.pack(10,nil,30) local first,second=string.byte('AZ',1,2) local next_key=next({10}) local iterator,state,initial=ipairs({10}) local ipairs_key=iterator(state,initial) return rawlen('abc'),rawlen({10,20}),select('#',10,20,30),string.len('abc'),first,second,packed.n,next_key,initial,ipairs_key"
+        b"local first,second=string.byte('AZ',1,2) local next_key=next({10}) local iterator,state,initial=ipairs({10}) local ipairs_key=iterator(state,initial) return rawlen('abc'),rawlen({10,20}),select('#',10,20,30),string.len('abc'),first,second,next_key,initial,ipairs_key"
             .to_vec(),
     );
     for profile in SemanticProfile::ALL {
@@ -5746,7 +5831,6 @@ fn base_library_counts_follow_profile_numeric_subtypes() {
                 integral(3),
                 integral(65),
                 integral(90),
-                integral(3),
                 integral(1),
                 integral(0),
                 integral(1),
