@@ -563,6 +563,10 @@ produce a structured error as in Luau. Both functions are Blu/Luau-only.
 that state. Indexed writes, `rawset`, `table.clear`, sorting, and metatable
 changes all enforce the same heap-level flag. Freezing twice and freezing a
 protected-metatable table fail structurally; shallow clones are mutable.
+Legacy `table.getn` is available in Blu, Luau, and Lua 5.1; `table.maxn` is
+available in Blu, Luau, and Lua 5.1–5.2. Later Lua profiles reject these names
+explicitly. Blu returns an exact integer from `getn`; `maxn` remains a number
+because fractional numeric keys participate in its upstream contract.
 `coroutine.running` follows the active profile: Lua 5.1 returns nil on the main
 thread, Luau returns only the thread, and Blu/Lua 5.2–5.5 also return the
 main-thread boolean. `coroutine.isyieldable` is true on Luau's main thread,

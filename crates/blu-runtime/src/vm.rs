@@ -6953,8 +6953,51 @@ impl Vm {
                 vm.heap.table_is_frozen(table_id(table)?)?,
             )])
         });
+        let getn = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(
+                profile,
+                SemanticProfile::Blu | SemanticProfile::Luau | SemanticProfile::Lua51
+            ) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.getn",
+                    profile,
+                });
+            }
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.getn",
+                index: 1,
+            })?;
+            let length = vm.heap.table_length(table_id(table)?)?;
+            Ok(vec![if profile == SemanticProfile::Blu {
+                Value::Integer(length as i64)
+            } else {
+                Value::Number(length as f64)
+            }])
+        });
+        let maxn = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Luau
+                    | SemanticProfile::Lua51
+                    | SemanticProfile::Lua52
+            ) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.maxn",
+                    profile,
+                });
+            }
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.maxn",
+                index: 1,
+            })?;
+            let maximum = vm.heap.table_max_numeric_key(table_id(table)?)?;
+            Ok(vec![Value::Number(maximum)])
+        });
 
-        let table = self.heap.allocate_table(0, 13)?;
+        let table = self.heap.allocate_table(0, 15)?;
         for (name, function) in [
             (&b"insert"[..], insert),
             (&b"remove"[..], remove),
@@ -6969,6 +7012,8 @@ impl Vm {
             (&b"clone"[..], clone_table),
             (&b"freeze"[..], freeze),
             (&b"isfrozen"[..], is_frozen),
+            (&b"getn"[..], getn),
+            (&b"maxn"[..], maxn),
         ] {
             self.heap.table_set(
                 table,

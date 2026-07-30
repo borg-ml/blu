@@ -53,6 +53,8 @@ the pinned Luau edge behavior, plus numeric classification and
 The `bit32` library provides variadic AND/OR/XOR, NOT, shifts, rotates, field
 extraction, and field replacement in Blu, Luau, Lua 5.2, and Lua 5.3 profiles,
 with explicit profile-specific input conversion and result subtypes.
+Legacy `table.getn` and `table.maxn` are also profile-gated to the pinned
+versions that retain them, while Blu exposes both for migration.
 Core `tonumber` conversion preserves profile subtypes, hexadecimal integer and
 floating strings, and the explicit-base grammar and overflow behavior of each
 profile.

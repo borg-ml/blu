@@ -403,6 +403,26 @@ impl Heap {
         Ok(self.table(table)?.length())
     }
 
+    pub fn table_max_numeric_key(&self, table: TableId) -> Result<f64, HeapError> {
+        let table = self.table(table)?;
+        let mut maximum = table
+            .array
+            .iter()
+            .rposition(|value| !matches!(value, Value::Nil))
+            .map_or(0.0, |index| (index + 1) as f64);
+        for key in table.hash.keys() {
+            let number = match key {
+                Key::Integer(value) => *value as f64,
+                Key::Number(bits) => f64::from_bits(*bits),
+                _ => continue,
+            };
+            if number > maximum {
+                maximum = number;
+            }
+        }
+        Ok(maximum)
+    }
+
     pub fn table_clear(&mut self, table: TableId) -> Result<(), HeapError> {
         let table = self.table_mut(table)?;
         if table.frozen {

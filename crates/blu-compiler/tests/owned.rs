@@ -5328,6 +5328,67 @@ fn luau_table_clear_and_clone_preserve_shallow_structure() {
 }
 
 #[test]
+fn legacy_table_size_helpers_follow_profile_availability() {
+    let getn_source = make_source(b"return table.getn({10,20})".to_vec());
+    let maxn_source =
+        make_source(b"return table.maxn({[1]=true,[3]=true,[2.5]=true,[-9]=true})".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&getn_source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Luau | SemanticProfile::Lua51
+        ) {
+            assert_eq!(
+                result,
+                Ok(vec![if profile == SemanticProfile::Blu {
+                    Value::Integer(2)
+                } else {
+                    Value::Number(2.0)
+                }]),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.getn",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+
+        let compiled = OwnedCompiler::default()
+            .compile(&maxn_source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Luau
+                | SemanticProfile::Lua51
+                | SemanticProfile::Lua52
+        ) {
+            assert_eq!(result, Ok(vec![Value::Number(3.0)]), "{profile}");
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.maxn",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn luau_frozen_tables_enforce_heap_wide_immutability() {
     let source = make_source(
         b"local value={x=1} local frozen=table.freeze(value) local clone=table.clone(value) return frozen==value,table.isfrozen(value),table.isfrozen(clone),clone.x"
