@@ -6139,9 +6139,19 @@ impl Vm {
                     append_limited_string(&mut result, b"%")?;
                     continue;
                 }
+                let left_aligned = specifier == b'-';
+                if left_aligned {
+                    specifier = format.get(cursor).copied().ok_or(
+                        RuntimeError::UnsupportedLibraryFeature {
+                            function: "string.format",
+                            feature: "a flag without a conversion specifier",
+                        },
+                    )?;
+                    cursor += 1;
+                }
                 let mut width = None;
                 if matches!(specifier, b'1'..=b'9') {
-                    let width_start = percent + 1;
+                    let width_start = cursor - 1;
                     while format.get(cursor).is_some_and(u8::is_ascii_digit) {
                         cursor += 1;
                     }
@@ -6190,7 +6200,7 @@ impl Vm {
                 if matches!(specifier, b'-' | b'+' | b' ' | b'#' | b'0') {
                     return Err(RuntimeError::UnsupportedLibraryFeature {
                         function: "string.format",
-                        feature: "format flags",
+                        feature: "this format flag or flag combination",
                     });
                 }
                 let value = arguments.get(argument).ok_or(RuntimeError::Argument {
@@ -6277,7 +6287,7 @@ impl Vm {
                         });
                     }
                 }
-                append_right_aligned_field(&mut result, &field, width.unwrap_or(0))?;
+                append_aligned_field(&mut result, &field, width.unwrap_or(0), left_aligned)?;
             }
             Ok(vec![Value::String(Arc::from(result))])
         });
@@ -9759,22 +9769,32 @@ fn append_formatted_string(
     Ok(())
 }
 
-fn append_right_aligned_field(
+fn append_aligned_field(
     result: &mut Vec<u8>,
     field: &[u8],
     width: usize,
+    left_aligned: bool,
 ) -> Result<(), RuntimeError> {
     let padding = width.saturating_sub(field.len());
-    if padding > 0 {
-        const SPACES: [u8; 32] = [b' '; 32];
-        let mut remaining = padding;
-        while remaining > 0 {
-            let count = remaining.min(SPACES.len());
-            append_limited_string(result, &SPACES[..count])?;
-            remaining -= count;
-        }
+    if !left_aligned {
+        append_format_padding(result, padding)?;
     }
-    append_limited_string(result, field)
+    append_limited_string(result, field)?;
+    if left_aligned {
+        append_format_padding(result, padding)?;
+    }
+    Ok(())
+}
+
+fn append_format_padding(result: &mut Vec<u8>, padding: usize) -> Result<(), RuntimeError> {
+    const SPACES: [u8; 32] = [b' '; 32];
+    let mut remaining = padding;
+    while remaining > 0 {
+        let count = remaining.min(SPACES.len());
+        append_limited_string(result, &SPACES[..count])?;
+        remaining -= count;
+    }
+    Ok(())
 }
 
 fn append_scientific_string(
