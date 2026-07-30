@@ -14,8 +14,9 @@ mod parser;
 pub use ast::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
-    DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, Identifier, IfClause,
-    IfStatement, IndexExpression, LocalListStatement, LocalStatement, MethodCallExpression,
+    DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody,
+    FunctionExpression, FunctionId, Identifier, IfClause, IfStatement, IndexExpression,
+    LocalFunctionStatement, LocalListStatement, LocalStatement, MethodCallExpression,
     NumericForStatement, RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField,
     UnaryExpression, UnaryOperator, WhileStatement,
 };
@@ -131,6 +132,7 @@ pub enum TokenKind {
     Comment,
     DialectDirective,
     Local,
+    Function,
     Return,
     Not,
     And,
@@ -860,6 +862,7 @@ pub fn lex(
                 }
                 match &bytes[start..offset] {
                     b"local" => TokenKind::Local,
+                    b"function" => TokenKind::Function,
                     b"return" => TokenKind::Return,
                     b"not" => TokenKind::Not,
                     b"and" => TokenKind::And,

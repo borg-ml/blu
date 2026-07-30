@@ -254,6 +254,54 @@ fn method_calls_retain_receiver_method_and_explicit_arguments() {
 }
 
 #[test]
+fn function_expressions_and_local_functions_own_parameters_and_bodies() {
+    let source = source(
+        b"local function combine(first, second) return function(extra) return first + second + extra end end"
+            .to_vec(),
+    );
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::LocalFunction(local) = parsed.ast().statements()[0] else {
+        panic!("expected local function");
+    };
+    assert_eq!(source.slice(local.name().span()).unwrap(), b"combine");
+    let outer = parsed.ast().function(local.function()).unwrap();
+    assert_eq!(outer.parameters().len(), 2);
+    assert_eq!(
+        source.slice(outer.parameters()[0].span()).unwrap(),
+        b"first"
+    );
+    let Statement::Return(returned) = &outer.body().statements()[0] else {
+        panic!("expected outer return");
+    };
+    let ExpressionKind::Function(inner_expression) = parsed
+        .ast()
+        .expression(returned.values()[0])
+        .unwrap()
+        .kind()
+    else {
+        panic!("expected returned function expression");
+    };
+    let inner = parsed.ast().function(inner_expression.function()).unwrap();
+    assert_eq!(inner.parameters().len(), 1);
+    assert_eq!(
+        source.slice(inner.parameters()[0].span()).unwrap(),
+        b"extra"
+    );
+    assert!(matches!(inner.body().statements()[0], Statement::Return(_)));
+}
+
+#[test]
+fn nested_function_loop_control_does_not_inherit_outer_loop_scope() {
+    let source = source(b"while true do local function invalid() break end end".to_vec());
+    let ParseOutcome::Rejected(rejected) =
+        parse(&source, SemanticProfile::Blu, ParseLimits::default()).unwrap()
+    else {
+        panic!("nested function break should reject");
+    };
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0022");
+}
+
+#[test]
 fn local_name_and_value_lists_preserve_order_and_adjustment_shape() {
     for profile in SemanticProfile::ALL {
         let source = source(b"local first, second, missing = 40, 2\nreturn first".to_vec());

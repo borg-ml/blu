@@ -15,6 +15,42 @@ impl ExpressionId {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FunctionId(usize);
+
+impl FunctionId {
+    pub(crate) const fn new(index: usize) -> Self {
+        Self(index)
+    }
+
+    #[must_use]
+    pub const fn as_usize(self) -> usize {
+        self.0
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FunctionExpression {
+    function: FunctionId,
+    span: ByteSpan,
+}
+
+impl FunctionExpression {
+    pub(crate) const fn new(function: FunctionId, span: ByteSpan) -> Self {
+        Self { function, span }
+    }
+
+    #[must_use]
+    pub const fn function(self) -> FunctionId {
+        self.function
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
 /// A parsed identifier. Its spelling remains in the source bytes.
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct Identifier {
@@ -346,6 +382,7 @@ pub enum ExpressionKind {
     Field(FieldExpression),
     Call(CallExpression),
     MethodCall(MethodCallExpression),
+    Function(FunctionExpression),
     Unary(UnaryExpression),
     Binary(BinaryExpression),
 }
@@ -377,6 +414,70 @@ pub struct LocalStatement {
     name: Identifier,
     value: Option<ExpressionId>,
     span: ByteSpan,
+}
+
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct FunctionBody {
+    parameters: Vec<Identifier>,
+    body: Block,
+    span: ByteSpan,
+}
+
+impl FunctionBody {
+    pub(crate) const fn new(parameters: Vec<Identifier>, body: Block, span: ByteSpan) -> Self {
+        Self {
+            parameters,
+            body,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub fn parameters(&self) -> &[Identifier] {
+        &self.parameters
+    }
+
+    #[must_use]
+    pub const fn body(&self) -> &Block {
+        &self.body
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LocalFunctionStatement {
+    name: Identifier,
+    function: FunctionId,
+    span: ByteSpan,
+}
+
+impl LocalFunctionStatement {
+    pub(crate) const fn new(name: Identifier, function: FunctionId, span: ByteSpan) -> Self {
+        Self {
+            name,
+            function,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> Identifier {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn function(self) -> FunctionId {
+        self.function
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -815,6 +916,7 @@ impl BreakStatement {
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Statement {
     Local(LocalStatement),
+    LocalFunction(LocalFunctionStatement),
     LocalList(LocalListStatement),
     Assignment(AssignmentStatement),
     AssignmentList(AssignmentListStatement),
@@ -834,6 +936,7 @@ impl Statement {
     pub const fn span(&self) -> ByteSpan {
         match self {
             Self::Local(statement) => statement.span(),
+            Self::LocalFunction(statement) => statement.span(),
             Self::LocalList(statement) => statement.span(),
             Self::Assignment(statement) => statement.span(),
             Self::AssignmentList(statement) => statement.span(),
@@ -884,6 +987,7 @@ impl Block {
                 Statement::Repeat(statement) => statement.body().node_count(),
                 Statement::Do(statement) => statement.body().node_count(),
                 Statement::NumericFor(statement) => statement.body().node_count(),
+                Statement::LocalFunction(_) => 0,
                 _ => 0,
             };
             count.saturating_add(1).saturating_add(nested)
@@ -903,6 +1007,7 @@ pub struct Ast {
     expressions: Vec<Expression>,
     table_fields: Vec<TableField>,
     call_arguments: Vec<ExpressionId>,
+    functions: Vec<FunctionBody>,
 }
 
 impl Ast {
@@ -913,6 +1018,7 @@ impl Ast {
         expressions: Vec<Expression>,
         table_fields: Vec<TableField>,
         call_arguments: Vec<ExpressionId>,
+        functions: Vec<FunctionBody>,
     ) -> Self {
         Self {
             profile,
@@ -921,6 +1027,7 @@ impl Ast {
             expressions,
             table_fields,
             call_arguments,
+            functions,
         }
     }
 
@@ -985,11 +1092,27 @@ impl Ast {
     }
 
     #[must_use]
+    pub fn function(&self, id: FunctionId) -> Option<&FunctionBody> {
+        self.functions.get(id.as_usize())
+    }
+
+    #[must_use]
+    pub fn functions(&self) -> &[FunctionBody] {
+        &self.functions
+    }
+
+    #[must_use]
     pub fn node_count(&self) -> usize {
         self.block
             .node_count()
             .saturating_add(self.expressions.len())
             .saturating_add(self.table_fields.len())
             .saturating_add(self.call_arguments.len())
+            .saturating_add(self.functions.iter().fold(0, |count, function| {
+                count
+                    .saturating_add(1)
+                    .saturating_add(function.parameters().len())
+                    .saturating_add(function.body().node_count())
+            }))
     }
 }

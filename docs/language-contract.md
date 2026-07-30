@@ -235,6 +235,12 @@ in allocation roots. Bootstrap translation continues to reject closure
 instructions explicitly. MULTRET/vararg adjustment, owned function syntax,
 metamethod-aware method lookup, and resumable direct-BluV1 calls remain
 unsupported.
+The owned parser represents anonymous `function (...) ... end` expressions
+and `local function name(...) ... end` declarations with bounded parameter
+vectors and function-owned lexical blocks. Loop-control scope is reset at
+every function boundary. Compiler lowering still rejects these nodes with
+`BLU-COMPILE-0005` until lexical capture resolution emits the validated
+closure instructions above; parsing support alone is not an execution claim.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

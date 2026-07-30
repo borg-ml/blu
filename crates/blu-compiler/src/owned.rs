@@ -562,6 +562,14 @@ impl<'a> Lowerer<'a> {
                     self.lower_local(*local)?;
                     false
                 }
+                Statement::LocalFunction(function) => {
+                    return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0005",
+                        Phase::Lower,
+                        function.span(),
+                        "owned function lowering is not implemented yet",
+                    )?));
+                }
                 Statement::LocalList(local) => {
                     self.lower_local_list(local)?;
                     false
@@ -1554,6 +1562,14 @@ impl<'a> Lowerer<'a> {
             }
             ExpressionKind::Call(call) => self.lower_call(call),
             ExpressionKind::MethodCall(call) => self.lower_method_call(call),
+            ExpressionKind::Function(function) => {
+                Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                    "BLU-COMPILE-0005",
+                    Phase::Lower,
+                    function.span(),
+                    "owned function lowering is not implemented yet",
+                )?))
+            }
             ExpressionKind::Unary(unary) => match unary.operator() {
                 UnaryOperator::Not => {
                     let source = self.lower_expression(unary.operand())?;

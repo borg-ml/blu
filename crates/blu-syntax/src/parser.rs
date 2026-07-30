@@ -2,10 +2,11 @@ use crate::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement, ContinueStatement,
     DialectDirective, DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression,
-    Identifier, IfClause, IfStatement, IndexExpression, LexError, Lexed, LexerLimits,
-    LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement, RepeatStatement,
-    ReturnStatement, Statement, TableConstructor, TableField, Token, TokenKind, UnaryExpression,
-    UnaryOperator, WhileStatement, lex,
+    FunctionBody, FunctionExpression, FunctionId, Identifier, IfClause, IfStatement,
+    IndexExpression, LexError, Lexed, LexerLimits, LocalFunctionStatement, LocalListStatement,
+    LocalStatement, MethodCallExpression, NumericForStatement, RepeatStatement, ReturnStatement,
+    Statement, TableConstructor, TableField, Token, TokenKind, UnaryExpression, UnaryOperator,
+    WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -293,6 +294,8 @@ struct Parser<'a> {
     table_field_count: usize,
     call_arguments: Vec<ExpressionId>,
     call_argument_count: usize,
+    functions: Vec<FunctionBody>,
+    function_node_count: usize,
     diagnostics: Vec<Diagnostic>,
 }
 
@@ -318,6 +321,8 @@ impl<'a> Parser<'a> {
             table_field_count: 0,
             call_arguments: allocate_vec(ast_capacity, "AST call arguments")?,
             call_argument_count: 0,
+            functions: allocate_vec(ast_capacity.min(64), "AST functions")?,
+            function_node_count: 0,
             diagnostics: allocate_vec(diagnostic_capacity, "parser diagnostics")?,
         })
     }
@@ -339,6 +344,7 @@ impl<'a> Parser<'a> {
             self.expressions,
             self.table_fields,
             self.call_arguments,
+            self.functions,
         );
         Ok((Some(ast), self.diagnostics))
     }
@@ -741,12 +747,121 @@ impl<'a> Parser<'a> {
         Ok(Block::new(body))
     }
 
+    fn parse_function_body(&mut self, keyword: Token) -> Result<Option<FunctionId>, ParseError> {
+        if !self.at(TokenKind::LeftParenthesis) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0035",
+                "expected `(` before function parameters",
+                &["("],
+            )?;
+            return Ok(None);
+        }
+        self.bump();
+        let mut parameters = allocate_vec(2, "function parameters")?;
+        if !self.at(TokenKind::RightParenthesis) {
+            loop {
+                if !self.at(TokenKind::Identifier) {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0036",
+                        "expected a function parameter name",
+                        &["identifier", ")"],
+                    )?;
+                    return Ok(None);
+                }
+                let Some(parameter) = self.bump() else {
+                    return Err(ParseError::InternalInvariant {
+                        message: "identifier check succeeded without a current token",
+                    });
+                };
+                self.function_node_count = self.function_node_count.saturating_add(1);
+                self.check_ast_limit()?;
+                push_fallible(
+                    &mut parameters,
+                    Identifier::new(parameter.span()),
+                    "function parameters",
+                )?;
+                if !self.at(TokenKind::Comma) {
+                    break;
+                }
+                self.bump();
+            }
+        }
+        if !self.at(TokenKind::RightParenthesis) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0037",
+                "expected `)` after function parameters",
+                &[")"],
+            )?;
+            return Ok(None);
+        }
+        self.bump();
+        let outer_loop_depth = core::mem::replace(&mut self.loop_depth, 0);
+        let parsed_body = self.parse_nested_block(&[TokenKind::End]);
+        self.loop_depth = outer_loop_depth;
+        let body = parsed_body?;
+        if !self.at(TokenKind::End) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0038",
+                "expected `end` to close function",
+                &["end"],
+            )?;
+            return Ok(None);
+        }
+        let Some(end) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "end check succeeded without a current token",
+            });
+        };
+        self.function_node_count = self.function_node_count.saturating_add(1);
+        self.check_ast_limit()?;
+        let id = FunctionId::new(self.functions.len());
+        push_fallible(
+            &mut self.functions,
+            FunctionBody::new(parameters, body, keyword.span().merge(end.span())?),
+            "AST functions",
+        )?;
+        Ok(Some(id))
+    }
+
     fn parse_local(&mut self) -> Result<(), ParseError> {
         let Some(keyword) = self.bump() else {
             return Err(ParseError::InternalInvariant {
                 message: "local parser entered without a current token",
             });
         };
+        if self.at(TokenKind::Function) {
+            let Some(function_keyword) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "function check succeeded without a current token",
+                });
+            };
+            if !self.at(TokenKind::Identifier) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0034",
+                    "expected a local function name",
+                    &["identifier"],
+                )?;
+                return Ok(());
+            }
+            let Some(name) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "identifier check succeeded without a current token",
+                });
+            };
+            let Some(function) = self.parse_function_body(function_keyword)? else {
+                return Ok(());
+            };
+            let Some(body) = self.functions.get(function.as_usize()) else {
+                return Err(ParseError::InternalInvariant {
+                    message: "new function body is out of bounds",
+                });
+            };
+            return self.push_statement(Statement::LocalFunction(LocalFunctionStatement::new(
+                Identifier::new(name.span()),
+                function,
+                keyword.span().merge(body.span())?,
+            )));
+        }
         let name = if self.at(TokenKind::Identifier) {
             let Some(identifier) = self.bump() else {
                 return Err(ParseError::InternalInvariant {
@@ -1078,6 +1193,25 @@ impl<'a> Parser<'a> {
             TokenKind::BinaryInteger => ExpressionKind::BinaryInteger,
             TokenKind::StringLiteral => ExpressionKind::StringLiteral,
             TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
+            TokenKind::Function => {
+                self.bump();
+                let Some(function) = self.parse_function_body(token)? else {
+                    return Ok(None);
+                };
+                let Some(body) = self.functions.get(function.as_usize()) else {
+                    return Err(ParseError::InternalInvariant {
+                        message: "new function body is out of bounds",
+                    });
+                };
+                let expression = self.push_expression(
+                    Expression::new(
+                        ExpressionKind::Function(FunctionExpression::new(function, body.span())),
+                        body.span(),
+                    ),
+                    1,
+                )?;
+                return self.parse_postfix(expression).map(Some);
+            }
             TokenKind::LeftBrace => {
                 let table = self.parse_table_constructor(token)?;
                 return self.parse_postfix(table).map(Some);
@@ -1462,6 +1596,7 @@ impl<'a> Parser<'a> {
             .saturating_add(self.expressions.len())
             .saturating_add(self.table_field_count)
             .saturating_add(self.call_argument_count)
+            .saturating_add(self.function_node_count)
             .saturating_add(1);
         if required > self.limits.max_ast_nodes {
             Err(ParseError::Limit {
