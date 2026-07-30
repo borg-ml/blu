@@ -32,6 +32,8 @@ legacy one-argument Luau/Lua 5.1–5.2 contract or modern Blu/Lua 5.3–5.5
 number-only legacy behavior or return modern exact integers when representable.
 `math.abs` preserves modern integer inputs, while `math.log` explicitly
 distinguishes Lua 5.1's ignored extra arguments from modern base selection.
+`math.min` and `math.max` preserve the selected modern subtype and upstream
+NaN ordering.
 Byte-oriented `string.find` supports literal searches, relative starts, empty
 needles, nil misses, explicit plain mode, basic anchors, wildcard bytes,
 portable byte classes, class negation, and escaped punctuation under a work

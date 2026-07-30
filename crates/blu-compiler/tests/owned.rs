@@ -3842,6 +3842,43 @@ fn math_abs_and_log_follow_profile_numeric_contracts() {
 }
 
 #[test]
+fn math_min_and_max_preserve_selected_subtypes_and_lua_nan_ordering() {
+    let source = make_source(
+        b"local nan=0/0 local a=math.min(nan,1) local b=math.max(1,nan) return math.min(3,2),math.max(2,3),math.min(3,2.5),a~=a,b"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let integral = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                integral(2),
+                integral(3),
+                Value::Number(2.5),
+                Value::Boolean(true),
+                integral(1),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

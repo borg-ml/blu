@@ -6345,47 +6345,73 @@ impl Vm {
                 Value::Number(fractional),
             ])
         });
-        let min = self.register_function(|_, arguments| {
+        let min = self.register_function(|vm, arguments| {
             let mut values = arguments.iter();
-            let first = values.next().ok_or(RuntimeError::Argument {
+            let mut selected = values.next().ok_or(RuntimeError::Argument {
                 function: "math.min",
                 index: 1,
             })?;
-            let mut result = first.as_number().ok_or(RuntimeError::Type {
+            let mut result = selected.as_number().ok_or(RuntimeError::Type {
                 operation: "math.min",
                 expected: "number",
-                actual: first.type_name(),
+                actual: selected.type_name(),
             })?;
             for value in values {
-                let value = value.as_number().ok_or(RuntimeError::Type {
+                let numeric = value.as_number().ok_or(RuntimeError::Type {
                     operation: "math.min",
                     expected: "number",
                     actual: value.type_name(),
                 })?;
-                result = result.min(value);
+                if numeric < result {
+                    selected = value;
+                    result = numeric;
+                }
             }
-            Ok(vec![Value::Number(result)])
+            if matches!(
+                vm.active_profile()?,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Ok(vec![selected.clone()])
+            } else {
+                Ok(vec![Value::Number(result)])
+            }
         });
-        let max = self.register_function(|_, arguments| {
+        let max = self.register_function(|vm, arguments| {
             let mut values = arguments.iter();
-            let first = values.next().ok_or(RuntimeError::Argument {
+            let mut selected = values.next().ok_or(RuntimeError::Argument {
                 function: "math.max",
                 index: 1,
             })?;
-            let mut result = first.as_number().ok_or(RuntimeError::Type {
+            let mut result = selected.as_number().ok_or(RuntimeError::Type {
                 operation: "math.max",
                 expected: "number",
-                actual: first.type_name(),
+                actual: selected.type_name(),
             })?;
             for value in values {
-                let value = value.as_number().ok_or(RuntimeError::Type {
+                let numeric = value.as_number().ok_or(RuntimeError::Type {
                     operation: "math.max",
                     expected: "number",
                     actual: value.type_name(),
                 })?;
-                result = result.max(value);
+                if numeric > result {
+                    selected = value;
+                    result = numeric;
+                }
             }
-            Ok(vec![Value::Number(result)])
+            if matches!(
+                vm.active_profile()?,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Ok(vec![selected.clone()])
+            } else {
+                Ok(vec![Value::Number(result)])
+            }
         });
 
         let table = self.heap.allocate_table(0, 20)?;
