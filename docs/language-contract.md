@@ -446,6 +446,9 @@ commands differ by upstream version and fail explicitly until profile-dispatched
 sequences without NaN and uniform byte-string sequences. It returns no values
 and accepts an omitted or nil comparator. Custom comparator callbacks and
 metamethod ordering fail explicitly until native operations can resume calls.
+`table.move` performs bounded overlap-safe moves and returns the destination
+table for Blu, Luau, and Lua 5.3–5.5. Lua 5.1–5.2 calls fail with an explicit
+unsupported-profile error because those libraries do not define it.
 
 ## Authority profiles
 

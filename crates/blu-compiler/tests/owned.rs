@@ -3179,6 +3179,63 @@ fn table_sort_rejects_custom_comparators_and_unordered_values() {
 }
 
 #[test]
+fn table_move_handles_overlap_destinations_and_profile_availability() {
+    let source = make_source(
+        b"local t={1,2,3,4} local r=table.move(t,1,3,2) local d={} local s=table.move(t,2,4,1,d) local u={1,2,3,4} table.move(u,2,4,1) return r==t,t[1],t[2],t[3],t[4],s==d,d[1],d[2],d[3],u[1],u[2],u[3],u[4]"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Lua51 | SemanticProfile::Lua52) {
+            assert!(matches!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.move",
+                    ..
+                })
+            ));
+            continue;
+        }
+        let number = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            result,
+            Ok(vec![
+                Value::Boolean(true),
+                number(1),
+                number(1),
+                number(2),
+                number(3),
+                Value::Boolean(true),
+                number(1),
+                number(2),
+                number(3),
+                number(2),
+                number(3),
+                number(4),
+                number(4),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn decimal_and_hexadecimal_byte_escapes_decode_by_profile() {
     let decimal = make_source(br#"return "\0\7\65\255""#.to_vec());
     for profile in SemanticProfile::ALL {

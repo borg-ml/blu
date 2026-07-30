@@ -51,6 +51,8 @@ The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
 `table.sort` provides bounded default ordering for uniform number and byte-string
 sequences; custom comparator callbacks remain explicit pending resumable calls.
+Overlap-safe bounded `table.move` is available for Blu, Luau, and Lua 5.3–5.5,
+with explicit rejection in Lua 5.1–5.2 profiles.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
 remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,

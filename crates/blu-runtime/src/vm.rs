@@ -6056,6 +6056,63 @@ impl Vm {
             }
             Ok(values)
         });
+        let move_values = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if matches!(profile, SemanticProfile::Lua51 | SemanticProfile::Lua52) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.move",
+                    profile,
+                });
+            }
+            let source = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.move",
+                index: 1,
+            })?;
+            let source = table_id(source)?;
+            let first = integer_argument(arguments, 1, "table.move")?;
+            let last = integer_argument(arguments, 2, "table.move")?;
+            let target = integer_argument(arguments, 3, "table.move")?;
+            let destination = arguments.get(4).map_or(Ok(source), table_id)?;
+            if last < first {
+                return Ok(vec![Value::Table(destination)]);
+            }
+            let count = i128::from(last) - i128::from(first) + 1;
+            let final_target = i128::from(target) + count - 1;
+            if final_target > i128::from(i64::MAX) {
+                return Err(RuntimeError::TablePosition {
+                    function: "table.move",
+                    position: i64::MAX,
+                    length: usize::MAX,
+                });
+            }
+            let count = usize::try_from(count).map_err(|_| RuntimeError::StackLimit {
+                required: usize::MAX,
+                limit: MAX_DYNAMIC_REGISTERS,
+            })?;
+            if count > MAX_DYNAMIC_REGISTERS {
+                return Err(RuntimeError::StackLimit {
+                    required: count,
+                    limit: MAX_DYNAMIC_REGISTERS,
+                });
+            }
+            let roots = GcRoots::from_values(arguments)?;
+            let backwards =
+                source == destination && target > first && i128::from(target) <= i128::from(last);
+            for offset in 0..count {
+                let offset = if backwards {
+                    count - offset - 1
+                } else {
+                    offset
+                };
+                let offset = i64::try_from(offset).map_err(|_| RuntimeError::StackLimit {
+                    required: count,
+                    limit: MAX_DYNAMIC_REGISTERS,
+                })?;
+                let value = vm.heap.table_get(source, &Value::Integer(first + offset))?;
+                vm.table_set(destination, Value::Integer(target + offset), value, &roots)?;
+            }
+            Ok(vec![Value::Table(destination)])
+        });
         let sort = self.register_function(|vm, arguments| {
             let table = arguments.first().ok_or(RuntimeError::Argument {
                 function: "table.sort",
@@ -6128,13 +6185,14 @@ impl Vm {
             Ok(Vec::new())
         });
 
-        let table = self.heap.allocate_table(0, 6)?;
+        let table = self.heap.allocate_table(0, 7)?;
         for (name, function) in [
             (&b"insert"[..], insert),
             (&b"remove"[..], remove),
             (&b"concat"[..], concat),
             (&b"pack"[..], pack),
             (&b"unpack"[..], unpack),
+            (&b"move"[..], move_values),
             (&b"sort"[..], sort),
         ] {
             self.heap.table_set(
