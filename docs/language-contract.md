@@ -457,6 +457,12 @@ source operators.
 follow the Lua 5.3–5.5 contracts in those profiles and Blu. They fail with an
 explicit unsupported-profile error in Luau and Lua 5.1–5.2, where the
 functions do not exist upstream.
+`math.frexp` returns a binary fraction plus an exponent number in Luau and Lua
+5.1–5.2 or an exponent integer in Blu and Lua 5.3–5.5. It preserves signed
+zero and handles subnormal and non-finite values without an intermediate
+overflow. `math.ldexp` composes the pair; Luau and Lua 5.1–5.2 truncate a
+fractional exponent, while modern profiles require an integer-representable
+exponent.
 `math.random()` returns a number in `[0, 1)`. Bounded results are numbers in
 Luau and Lua 5.1–5.2 and integers in Blu and Lua 5.3–5.5. Luau and Lua 5.1
 truncate fractional bounds, Lua 5.2 rounds them, and modern profiles require
@@ -592,7 +598,7 @@ Blu plugin is active.
 ## Resource limits
 
 The initial shared math library includes `math.fmod`, `math.modf`,
-`math.pow`, `math.random`, and `math.randomseed`.
+`math.pow`, `math.frexp`, `math.ldexp`, `math.random`, and `math.randomseed`.
 `math.fmod` requires two numeric arguments and uses truncating remainder
 semantics, so the result follows the dividend's sign and is intentionally
 distinct from the language `%` operator. Blu and Lua 5.3–5.5 preserve

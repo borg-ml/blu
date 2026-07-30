@@ -26,7 +26,9 @@ metamethods, an initial standard library, and host-configured cached `require`.
 The math slice includes shared truncating `math.fmod`; unlike floor-based `%`,
 its remainder preserves the dividend's sign, with modern integer preservation
 and zero-divisor errors. Shared `math.pow` provides the library form of
-floating exponentiation. `math.atan` follows the
+floating exponentiation, while `math.frexp` and `math.ldexp` split and compose
+binary exponents with profile-appropriate exponent subtypes and conversion.
+`math.atan` follows the
 legacy one-argument Luau/Lua 5.1–5.2 contract or modern Blu/Lua 5.3–5.5
 `atan2(y, x)` contract according to the active profile; `math.asin` and
 `math.acos` follow the shared numeric contract. Profile-aware `math.floor` and

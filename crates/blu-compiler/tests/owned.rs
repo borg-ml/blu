@@ -4271,6 +4271,103 @@ fn math_pow_follows_the_shared_numeric_contract() {
 }
 
 #[test]
+fn math_frexp_and_ldexp_follow_profile_numeric_contracts() {
+    let source = make_source(
+        b"local f,e=math.frexp(-12) local z,ze=math.frexp(-0.0) local sf,se=math.frexp(5e-324) local inf,ie=math.frexp(math.huge) return f,e,math.ldexp(f,e),z,ze,sf,se,math.ldexp(sf,se),inf,ie"
+            .to_vec(),
+    );
+    let fractional = make_source(b"return math.ldexp(0.5,2.5)".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let exponent = if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            Value::Integer(4)
+        } else {
+            Value::Number(4.0)
+        };
+        let zero_exponent = if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            Value::Integer(0)
+        } else {
+            Value::Number(0.0)
+        };
+        let values =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        assert!(
+            matches!(
+                values,
+                Ok(values)
+                    if values == [
+                        Value::Number(-0.75),
+                        exponent,
+                        Value::Number(-12.0),
+                        Value::Number(-0.0),
+                        zero_exponent,
+                        Value::Number(0.5),
+                        if matches!(
+                            profile,
+                            SemanticProfile::Blu
+                                | SemanticProfile::Lua53
+                                | SemanticProfile::Lua54
+                                | SemanticProfile::Lua55
+                        ) {
+                            Value::Integer(-1073)
+                        } else {
+                            Value::Number(-1073.0)
+                        },
+                        Value::Number(f64::from_bits(1)),
+                        Value::Number(f64::INFINITY),
+                        if matches!(
+                            profile,
+                            SemanticProfile::Blu
+                                | SemanticProfile::Lua53
+                                | SemanticProfile::Lua54
+                                | SemanticProfile::Lua55
+                        ) {
+                            Value::Integer(0)
+                        } else {
+                            Value::Number(0.0)
+                        },
+                    ]
+            ),
+            "{profile}"
+        );
+
+        let compiled = OwnedCompiler::default()
+            .compile(&fractional, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Luau | SemanticProfile::Lua51 | SemanticProfile::Lua52
+        ) {
+            assert_eq!(result, Ok(vec![Value::Number(2.0)]), "{profile}");
+        } else {
+            assert!(matches!(
+                result,
+                Err(RuntimeError::Type {
+                    operation: "math.ldexp",
+                    ..
+                })
+            ));
+        }
+    }
+}
+
+#[test]
 fn math_random_and_randomseed_follow_profile_contracts() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

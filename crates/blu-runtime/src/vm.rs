@@ -7058,6 +7058,20 @@ impl Vm {
             let exponent = number_argument(arguments, 1, "math.pow")?;
             Ok(vec![Value::Number(base.powf(exponent))])
         });
+        let frexp = self.register_function(|vm, arguments| {
+            let value = number_argument(arguments, 0, "math.frexp")?;
+            let (fraction, exponent) = split_binary_exponent(value);
+            Ok(vec![
+                Value::Number(fraction),
+                profiled_integral_math_result(vm, "math.frexp", f64::from(exponent))?,
+            ])
+        });
+        let ldexp = self.register_function(|vm, arguments| {
+            let value = number_argument(arguments, 0, "math.ldexp")?;
+            let exponent =
+                math_exponent_argument(vm.active_profile()?, arguments, 1, "math.ldexp")?;
+            Ok(vec![Value::Number(scale_binary_exponent(value, exponent))])
+        });
         let log = self.register_function(|vm, arguments| {
             let value = number_argument(arguments, 0, "math.log")?;
             let result = match (vm.active_profile()?, arguments.get(1)) {
@@ -7483,7 +7497,7 @@ impl Vm {
             }
         });
 
-        let table = self.heap.allocate_table(0, 29)?;
+        let table = self.heap.allocate_table(0, 31)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -7491,6 +7505,8 @@ impl Vm {
             (&b"sqrt"[..], Value::NativeFunction(sqrt)),
             (&b"exp"[..], Value::NativeFunction(exp)),
             (&b"pow"[..], Value::NativeFunction(pow)),
+            (&b"frexp"[..], Value::NativeFunction(frexp)),
+            (&b"ldexp"[..], Value::NativeFunction(ldexp)),
             (&b"log"[..], Value::NativeFunction(log)),
             (&b"sin"[..], Value::NativeFunction(sin)),
             (&b"cos"[..], Value::NativeFunction(cos)),
@@ -7778,6 +7794,75 @@ fn random_integer_argument(
         SemanticProfile::Luau | SemanticProfile::Lua51 => number.trunc(),
         _ => unreachable!("modern random arguments are handled above"),
     } as i64)
+}
+
+fn math_exponent_argument(
+    profile: SemanticProfile,
+    arguments: &[Value],
+    index: usize,
+    function: &'static str,
+) -> Result<i32, RuntimeError> {
+    let value = arguments.get(index).ok_or(RuntimeError::Argument {
+        function,
+        index: index + 1,
+    })?;
+    let integer = if matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    ) {
+        exact_integer_conversion(value, profile)
+    } else {
+        value
+            .as_number()
+            .filter(|number| number.is_finite())
+            .map(|number| number.trunc() as i64)
+    };
+    let integer = integer.ok_or(RuntimeError::Type {
+        operation: function,
+        expected: "integer-representable number",
+        actual: value.type_name(),
+    })?;
+    i32::try_from(integer).map_err(|_| RuntimeError::InvalidRange {
+        operation: function,
+    })
+}
+
+fn split_binary_exponent(value: f64) -> (f64, i32) {
+    if value == 0.0 || !value.is_finite() {
+        return (value, 0);
+    }
+    let bits = value.to_bits();
+    let stored_exponent = ((bits >> 52) & 0x7ff) as i32;
+    if stored_exponent == 0 {
+        let (fraction, exponent) = split_binary_exponent(value * 2.0_f64.powi(54));
+        return (fraction, exponent - 54);
+    }
+    let fraction_bits = (bits & ((1u64 << 63) | ((1u64 << 52) - 1))) | (1022u64 << 52);
+    (f64::from_bits(fraction_bits), stored_exponent - 1022)
+}
+
+fn scale_binary_exponent(mut value: f64, mut exponent: i32) -> f64 {
+    if value == 0.0 || !value.is_finite() {
+        return value;
+    }
+    if exponent > 2097 {
+        return f64::INFINITY.copysign(value);
+    }
+    if exponent < -2098 {
+        return 0.0_f64.copysign(value);
+    }
+    while exponent > 1023 && value.is_finite() {
+        value *= 2.0_f64.powi(1023);
+        exponent -= 1023;
+    }
+    while exponent < -1022 && value != 0.0 {
+        value *= 2.0_f64.powi(-1022);
+        exponent += 1022;
+    }
+    value * 2.0_f64.powi(exponent)
 }
 
 fn random_seed_argument(
