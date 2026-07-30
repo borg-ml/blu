@@ -75,6 +75,7 @@ struct BluCaller {
 #[derive(Clone, Copy, Debug)]
 enum BluCallResult {
     Fixed { destination: u16, count: u16 },
+    Truthy { destination: u16, negate: bool },
     ReturnPrefix { first: u16, count: u16 },
     TableList { table: TableId, start: u32 },
 }
@@ -2473,19 +2474,193 @@ impl Vm {
                     };
                     let left = blu_register(&registers, left)?.clone();
                     let right = blu_register(&registers, right)?.clone();
-                    let value = self.compare_value(
-                        opcode,
-                        left,
-                        right,
-                        CallContext::new(&mut remaining, 0, GcRoots::default()),
-                    )?;
-                    set_blu_register(
-                        &mut self.heap,
-                        &mut registers,
-                        &open_upvalues,
-                        destination,
-                        Value::Boolean(value),
-                    )?;
+                    let modern = matches!(
+                        prototype.profile,
+                        SemanticProfile::Blu
+                            | SemanticProfile::Lua53
+                            | SemanticProfile::Lua54
+                            | SemanticProfile::Lua55
+                    );
+                    let raw = match opcode {
+                        Opcode::JumpIfEq if left == right => Some(true),
+                        Opcode::JumpIfEq
+                            if !matches!((&left, &right), (Value::Table(_), Value::Table(_))) =>
+                        {
+                            Some(false)
+                        }
+                        Opcode::JumpIfLt => {
+                            if let (Some(left), Some(right)) = (left.as_number(), right.as_number())
+                            {
+                                Some(left < right)
+                            } else if let (Value::String(left), Value::String(right)) =
+                                (&left, &right)
+                            {
+                                Some(left < right)
+                            } else {
+                                None
+                            }
+                        }
+                        Opcode::JumpIfLe => {
+                            if let (Some(left), Some(right)) = (left.as_number(), right.as_number())
+                            {
+                                Some(left <= right)
+                            } else if let (Value::String(left), Value::String(right)) =
+                                (&left, &right)
+                            {
+                                Some(left <= right)
+                            } else {
+                                None
+                            }
+                        }
+                        _ => None,
+                    };
+                    if let Some(value) = raw {
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            destination,
+                            Value::Boolean(value),
+                        )?;
+                    } else {
+                        let select =
+                            |vm: &Self,
+                             left: &Value,
+                             right: &Value,
+                             name: &'static str|
+                             -> Result<Option<Value>, RuntimeError> {
+                                if modern {
+                                    Ok(vm.metamethod(left, name)?.or(vm.metamethod(right, name)?))
+                                } else {
+                                    vm.shared_metamethod(left, right, name)
+                                }
+                            };
+                        let (function, arguments, negate) = match opcode {
+                            Opcode::JumpIfEq => match select(self, &left, &right, "__eq")? {
+                                Some(function) => (function, [left, right], false),
+                                None => {
+                                    set_blu_register(
+                                        &mut self.heap,
+                                        &mut registers,
+                                        &open_upvalues,
+                                        destination,
+                                        Value::Boolean(false),
+                                    )?;
+                                    pc += 1;
+                                    continue;
+                                }
+                            },
+                            Opcode::JumpIfLt => {
+                                let function = select(self, &left, &right, "__lt")?.ok_or(
+                                    RuntimeError::Type {
+                                        operation: "comparison",
+                                        expected: "matching values or __lt metamethods",
+                                        actual: left.type_name(),
+                                    },
+                                )?;
+                                (function, [left, right], false)
+                            }
+                            Opcode::JumpIfLe => {
+                                if let Some(function) = select(self, &left, &right, "__le")? {
+                                    (function, [left, right], false)
+                                } else if prototype.profile != SemanticProfile::Lua55
+                                    && let Some(function) = select(self, &right, &left, "__lt")?
+                                {
+                                    (function, [right, left], true)
+                                } else {
+                                    return Err(RuntimeError::Type {
+                                        operation: "comparison",
+                                        expected: "matching values or __le/__lt metamethods",
+                                        actual: left.type_name(),
+                                    });
+                                }
+                            }
+                            _ => return Err(RuntimeError::UnsupportedComparison(opcode)),
+                        };
+                        if let Value::Closure(child_closure) = &function
+                            && self.heap.is_blu_closure(*child_closure)?
+                        {
+                            if callers.len() >= self.call_limit {
+                                return Err(RuntimeError::CallLimit {
+                                    limit: self.call_limit,
+                                });
+                            }
+                            let (child_artifact, child, profile, _) =
+                                self.heap.blu_closure_parts(*child_closure)?;
+                            let child_prototype = child_artifact
+                                .prototypes
+                                .get(child)
+                                .ok_or(RuntimeError::InvalidPrototype(child))?;
+                            let child_constants = materialize_blu_constants(child_prototype)?;
+                            let child_register_count = usize::from(child_prototype.register_count);
+                            let mut child_registers = try_vec_with_capacity(
+                                child_register_count,
+                                "BluV1 runtime registers",
+                            )?;
+                            child_registers.resize(child_register_count, Value::Nil);
+                            let copied = arguments
+                                .len()
+                                .min(usize::from(child_prototype.parameter_count));
+                            child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                            let child_varargs = if child_prototype.is_vararg {
+                                try_clone_values(
+                                    arguments
+                                        .get(usize::from(child_prototype.parameter_count)..)
+                                        .unwrap_or_default(),
+                                    "BluV1 frame varargs",
+                                )?
+                            } else {
+                                Vec::new()
+                            };
+                            let mut child_open_upvalues =
+                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
+                            child_open_upvalues.resize(child_register_count, None);
+                            try_reserve_exact(&mut callers, 1, "BluV1 comparison caller frame")?;
+                            callers.push(BluCaller {
+                                artifact,
+                                prototype: prototype_index,
+                                constants,
+                                registers,
+                                varargs,
+                                open_upvalues,
+                                closure,
+                                pc: pc + 1,
+                                result: BluCallResult::Truthy {
+                                    destination,
+                                    negate,
+                                },
+                            });
+                            artifact = child_artifact;
+                            prototype_index = child;
+                            constants = child_constants;
+                            registers = child_registers;
+                            varargs = child_varargs;
+                            open_upvalues = child_open_upvalues;
+                            closure = Some(*child_closure);
+                            pc = 0;
+                            self.active_profile = Some(profile);
+                            continue;
+                        }
+                        let roots = blu_frame_roots(
+                            &registers,
+                            &varargs,
+                            &open_upvalues,
+                            closure,
+                            &callers,
+                        )?;
+                        let value = self
+                            .call_value(function, &arguments, &mut remaining, callers.len(), roots)?
+                            .first()
+                            .is_some_and(Value::is_truthy)
+                            != negate;
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            destination,
+                            Value::Boolean(value),
+                        )?;
+                    }
                 }
                 BluInstruction::JumpIfTruthy { condition, target }
                 | BluInstruction::JumpIfFalsy { condition, target } => {
@@ -2643,6 +2818,20 @@ impl Vm {
                         values.next().unwrap_or(Value::Nil),
                     )?;
                 }
+                Ok(BluReturnDisposition::Resume(caller))
+            }
+            BluCallResult::Truthy {
+                destination,
+                negate,
+            } => {
+                let value = values.first().is_some_and(Value::is_truthy) != negate;
+                set_blu_register(
+                    &mut self.heap,
+                    &mut caller.registers,
+                    &caller.open_upvalues,
+                    destination,
+                    Value::Boolean(value),
+                )?;
                 Ok(BluReturnDisposition::Resume(caller))
             }
             BluCallResult::ReturnPrefix { first, count } => {

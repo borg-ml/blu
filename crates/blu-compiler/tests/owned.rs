@@ -801,6 +801,76 @@ fn comparisons_are_canonical_profile_neutral_and_directly_executable() {
 }
 
 #[test]
+fn owned_comparisons_invoke_resumable_profile_handlers() {
+    let source = make_source(
+        b"local mt = {__eq = function() return true end, __lt = function() return false end, __le = function() return true end} local a = setmetatable({}, mt) local b = setmetatable({}, mt) return a == b, a < b, a <= b"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::Boolean(false),
+                Value::Boolean(true)
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_equality_handler_selection_is_profile_specific() {
+    let source = make_source(
+        b"local a = setmetatable({}, {}) local b = setmetatable({}, {__eq = function() return true end}) return a == b"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let modern = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(modern)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_less_equal_fallback_is_removed_only_in_lua55() {
+    let source = make_source(
+        b"local mt = {__lt = function() return false end} local a = setmetatable({}, mt) local b = setmetatable({}, mt) return a <= b"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if profile == SemanticProfile::Lua55 {
+            assert!(
+                matches!(result, Err(RuntimeError::Type { .. })),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(result, Ok(vec![Value::Boolean(true)]), "{profile}");
+        }
+    }
+}
+
+#[test]
 fn indexed_assignment_lists_snapshot_targets_and_rhs_before_committing() {
     let source = make_source(
         b"local left = {10} local right = {20} local index = 1 left[index], index, right[index] = right[index], 2, left[index] return left[1], right[1], index"

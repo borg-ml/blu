@@ -150,8 +150,12 @@ produce Boolean values. `Equal`, `LessThan`, and `LessEqual` are the artifact
 primitives; the compiler derives `~=`, `>`, and `>=` with Boolean negation or
 operand reversal while preserving source evaluation order. Equality between
 unlike scalar types is false. Ordering accepts compatible numeric operands or
-two byte strings and otherwise fails structurally at runtime. These rules are
-shared by the current scalar owned slice across all profiles. The bootstrap
+two byte strings. Table handler results resume into Boolean conversion. Luau
+and Lua 5.1–5.2 require both operands to expose the same comparison handler;
+Lua 5.3–5.5 search left then right. Luau and Lua 5.1–5.4 implement a missing
+`__le` as `not (right < left)`, while Lua 5.5 removed that fallback. Blu
+explicitly selects modern left/right lookup with the Lua 5.4 fallback.
+Ordering without the required handler fails structurally. The bootstrap
 translator rejects canonical comparisons explicitly rather than substituting
 Luau conditional-skip instructions whose control-flow shape is different.
 Canonical `JumpIfTruthy` and `JumpIfFalsy` instructions use absolute
