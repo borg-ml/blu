@@ -297,6 +297,13 @@ pub enum Instruction {
         arguments: u16,
         argument_count: u16,
     },
+    ReturnCallPrefix {
+        first: u16,
+        count: u16,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
     NewClosure {
         destination: u16,
         child: u16,
@@ -422,6 +429,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::Call { .. }
             | Instruction::CallResults { .. }
             | Instruction::ReturnCall { .. }
+            | Instruction::ReturnCallPrefix { .. }
             | Instruction::NewClosure { .. }
             | Instruction::GetUpvalue { .. }
             | Instruction::SetUpvalue { .. }
@@ -456,6 +464,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::Call { .. }
                 | Instruction::CallResults { .. }
                 | Instruction::ReturnCall { .. }
+                | Instruction::ReturnCallPrefix { .. }
                 | Instruction::NewClosure { .. }
                 | Instruction::GetUpvalue { .. }
                 | Instruction::SetUpvalue { .. }
@@ -1207,13 +1216,14 @@ fn validate_prototype(
             feature: "fixed multi-result calls",
         });
     }
-    if prototype
-        .code
-        .iter()
-        .any(|instruction| matches!(instruction, Instruction::ReturnCall { .. }))
-        && !prototype
-            .required_features
-            .contains(FeatureBits::RETURN_CALLS)
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::ReturnCall { .. } | Instruction::ReturnCallPrefix { .. }
+        )
+    }) && !prototype
+        .required_features
+        .contains(FeatureBits::RETURN_CALLS)
     {
         return Err(ValidationError::MissingFeature {
             prototype: index,
@@ -1630,6 +1640,50 @@ fn validate_prototype(
                 }
                 reachable = false;
             }
+            Instruction::ReturnCallPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                let prefix_end = usize::from(first).checked_add(usize::from(count)).ok_or(
+                    ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "return call prefix register range overflows",
+                    },
+                )?;
+                if prefix_end > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "return call prefix register range is invalid",
+                    });
+                }
+                for register in usize::from(first)..prefix_end {
+                    check_read(index, pc, register as u16, &initialized)?;
+                }
+                check_read(index, pc, function, &initialized)?;
+                let argument_end = usize::from(arguments)
+                    .checked_add(usize::from(argument_count))
+                    .ok_or(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "return call argument register range overflows",
+                    })?;
+                if argument_end > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "return call argument register range is invalid",
+                    });
+                }
+                for register in usize::from(arguments)..argument_end {
+                    check_read(index, pc, register as u16, &initialized)?;
+                }
+                reachable = false;
+            }
             Instruction::NewClosure { destination, child } => {
                 check_register(index, pc, destination, registers)?;
                 let child_index = *prototype.children.get(child as usize).ok_or(
@@ -1933,7 +1987,11 @@ fn validate_prototype(
     }
     if !matches!(
         prototype.code.last(),
-        Some(Instruction::Return { .. } | Instruction::ReturnCall { .. })
+        Some(
+            Instruction::Return { .. }
+                | Instruction::ReturnCall { .. }
+                | Instruction::ReturnCallPrefix { .. }
+        )
     ) {
         return Err(ValidationError::InvalidInstruction {
             prototype: index,
@@ -2186,6 +2244,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     Instruction::Call { .. } => 9,
                     Instruction::CallResults { .. } => 11,
                     Instruction::ReturnCall { .. } => 7,
+                    Instruction::ReturnCallPrefix { .. } => 11,
                     Instruction::NewTable { .. } => 3,
                     Instruction::NewClosure { .. }
                     | Instruction::GetUpvalue { .. }
@@ -2356,6 +2415,20 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 argument_count,
             } => {
                 out.push(30);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
+            Instruction::ReturnCallPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(31);
+                put_u16(out, *first);
+                put_u16(out, *count);
                 put_u16(out, *function);
                 put_u16(out, *arguments);
                 put_u16(out, *argument_count);
@@ -3233,6 +3306,13 @@ fn read_prototype(
                 result_count: reader.u16()?,
             },
             30 => Instruction::ReturnCall {
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+            },
+            31 => Instruction::ReturnCallPrefix {
+                first: reader.u16()?,
+                count: reader.u16()?,
                 function: reader.u16()?,
                 arguments: reader.u16()?,
                 argument_count: reader.u16()?,

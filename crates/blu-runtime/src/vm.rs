@@ -68,8 +68,18 @@ struct BluCaller {
     open_upvalues: Vec<Option<UpvalueId>>,
     closure: Option<ClosureId>,
     pc: usize,
-    destination: u16,
-    result_count: u16,
+    result: BluCallResult,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum BluCallResult {
+    Fixed { destination: u16, count: u16 },
+    ReturnPrefix { first: u16, count: u16 },
+}
+
+enum BluReturnDisposition {
+    Resume(BluCaller),
+    Propagate(Vec<Value>),
 }
 
 impl GcRoots {
@@ -1020,8 +1030,10 @@ impl Vm {
                             open_upvalues,
                             closure,
                             pc: pc + 1,
-                            destination,
-                            result_count: 1,
+                            result: BluCallResult::Fixed {
+                                destination,
+                                count: 1,
+                            },
                         });
                         artifact = child_artifact;
                         prototype_index = child;
@@ -1100,8 +1112,10 @@ impl Vm {
                             open_upvalues,
                             closure,
                             pc: pc + 1,
-                            destination,
-                            result_count,
+                            result: BluCallResult::Fixed {
+                                destination,
+                                count: result_count,
+                            },
                         });
                         artifact = child_artifact;
                         prototype_index = child;
@@ -1134,11 +1148,22 @@ impl Vm {
                         )?;
                     }
                 }
-                BluInstruction::ReturnCall {
-                    function,
-                    arguments,
-                    argument_count,
-                } => {
+                BluInstruction::ReturnCall { .. } | BluInstruction::ReturnCallPrefix { .. } => {
+                    let (prefix, function, arguments, argument_count) = match instruction {
+                        BluInstruction::ReturnCall {
+                            function,
+                            arguments,
+                            argument_count,
+                        } => (None, function, arguments, argument_count),
+                        BluInstruction::ReturnCallPrefix {
+                            first,
+                            count,
+                            function,
+                            arguments,
+                            argument_count,
+                        } => (Some((first, count)), function, arguments, argument_count),
+                        _ => unreachable!(),
+                    };
                     let function = blu_register(&registers, function)?.clone();
                     let start = usize::from(arguments);
                     let end = start.checked_add(usize::from(argument_count)).ok_or(
@@ -1154,6 +1179,11 @@ impl Vm {
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
+                        if prefix.is_some() && callers.len() >= self.call_limit {
+                            return Err(RuntimeError::CallLimit {
+                                limit: self.call_limit,
+                            });
+                        }
                         let arguments = try_clone_values(arguments, "BluV1 return call arguments")?;
                         let (child_artifact, child, profile, _) =
                             self.heap.blu_closure_parts(*child_closure)?;
@@ -1173,6 +1203,28 @@ impl Vm {
                         let mut child_open_upvalues =
                             try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
                         child_open_upvalues.resize(child_register_count, None);
+                        if let Some((first, count)) = prefix {
+                            try_reserve_exact(&mut callers, 1, "BluV1 return-prefix caller frame")?;
+                            callers.push(BluCaller {
+                                artifact,
+                                prototype: prototype_index,
+                                constants,
+                                registers,
+                                open_upvalues,
+                                closure,
+                                pc: pc + 1,
+                                result: BluCallResult::ReturnPrefix { first, count },
+                            });
+                            artifact = child_artifact;
+                            prototype_index = child;
+                            constants = child_constants;
+                            registers = child_registers;
+                            open_upvalues = child_open_upvalues;
+                            closure = Some(*child_closure);
+                            pc = 0;
+                            self.active_profile = Some(profile);
+                            continue;
+                        }
                         artifact = child_artifact;
                         prototype_index = child;
                         constants = child_constants;
@@ -1184,32 +1236,38 @@ impl Vm {
                         continue;
                     }
                     let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
-                    let values =
+                    let mut values =
                         self.call_value(function, arguments, &mut remaining, callers.len(), roots)?;
-                    let Some(mut caller) = callers.pop() else {
-                        return Ok(values);
-                    };
-                    refresh_blu_open_upvalues(
-                        &self.heap,
-                        &mut caller.registers,
-                        &caller.open_upvalues,
-                    )?;
-                    let mut values = values.into_iter();
-                    for offset in 0..caller.result_count {
-                        let destination = caller.destination.checked_add(offset).ok_or(
+                    if let Some((first, count)) = prefix {
+                        let start = usize::from(first);
+                        let end = start.checked_add(usize::from(count)).ok_or(
                             RuntimeError::Register {
                                 register: usize::MAX,
-                                count: caller.registers.len(),
+                                count: registers.len(),
                             },
                         )?;
-                        set_blu_register(
-                            &mut self.heap,
-                            &mut caller.registers,
-                            &caller.open_upvalues,
-                            destination,
-                            values.next().unwrap_or(Value::Nil),
+                        let prefix = registers.get(start..end).ok_or(RuntimeError::Register {
+                            register: end.saturating_sub(1),
+                            count: registers.len(),
+                        })?;
+                        let mut combined = try_clone_values(prefix, "BluV1 return prefix")?;
+                        try_reserve_exact(
+                            &mut combined,
+                            values.len(),
+                            "BluV1 dynamic return values",
                         )?;
+                        combined.append(&mut values);
+                        values = combined;
                     }
+                    let caller = loop {
+                        let Some(caller) = callers.pop() else {
+                            return Ok(values);
+                        };
+                        match self.apply_blu_return(caller, values)? {
+                            BluReturnDisposition::Resume(caller) => break caller,
+                            BluReturnDisposition::Propagate(next) => values = next,
+                        }
+                    };
                     artifact = caller.artifact;
                     prototype_index = caller.prototype;
                     constants = caller.constants;
@@ -1651,30 +1709,16 @@ impl Vm {
                         count: registers.len(),
                     })?;
                     let values = try_clone_values(values, "BluV1 return values")?;
-                    let Some(mut caller) = callers.pop() else {
-                        return Ok(values);
+                    let mut values = values;
+                    let caller = loop {
+                        let Some(caller) = callers.pop() else {
+                            return Ok(values);
+                        };
+                        match self.apply_blu_return(caller, values)? {
+                            BluReturnDisposition::Resume(caller) => break caller,
+                            BluReturnDisposition::Propagate(next) => values = next,
+                        }
                     };
-                    refresh_blu_open_upvalues(
-                        &self.heap,
-                        &mut caller.registers,
-                        &caller.open_upvalues,
-                    )?;
-                    let mut values = values.into_iter();
-                    for offset in 0..caller.result_count {
-                        let destination = caller.destination.checked_add(offset).ok_or(
-                            RuntimeError::Register {
-                                register: usize::MAX,
-                                count: caller.registers.len(),
-                            },
-                        )?;
-                        set_blu_register(
-                            &mut self.heap,
-                            &mut caller.registers,
-                            &caller.open_upvalues,
-                            destination,
-                            values.next().unwrap_or(Value::Nil),
-                        )?;
-                    }
                     artifact = caller.artifact;
                     prototype_index = caller.prototype;
                     constants = caller.constants;
@@ -1693,6 +1737,56 @@ impl Vm {
                 }
             }
             pc += 1;
+        }
+    }
+
+    fn apply_blu_return(
+        &mut self,
+        mut caller: BluCaller,
+        values: Vec<Value>,
+    ) -> Result<BluReturnDisposition, RuntimeError> {
+        refresh_blu_open_upvalues(&self.heap, &mut caller.registers, &caller.open_upvalues)?;
+        match caller.result {
+            BluCallResult::Fixed { destination, count } => {
+                let mut values = values.into_iter();
+                for offset in 0..count {
+                    let destination =
+                        destination
+                            .checked_add(offset)
+                            .ok_or(RuntimeError::Register {
+                                register: usize::MAX,
+                                count: caller.registers.len(),
+                            })?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut caller.registers,
+                        &caller.open_upvalues,
+                        destination,
+                        values.next().unwrap_or(Value::Nil),
+                    )?;
+                }
+                Ok(BluReturnDisposition::Resume(caller))
+            }
+            BluCallResult::ReturnPrefix { first, count } => {
+                let start = usize::from(first);
+                let end = start
+                    .checked_add(usize::from(count))
+                    .ok_or(RuntimeError::Register {
+                        register: usize::MAX,
+                        count: caller.registers.len(),
+                    })?;
+                let prefix = caller
+                    .registers
+                    .get(start..end)
+                    .ok_or(RuntimeError::Register {
+                        register: end.saturating_sub(1),
+                        count: caller.registers.len(),
+                    })?;
+                let mut combined = try_clone_values(prefix, "BluV1 return prefix")?;
+                try_reserve_exact(&mut combined, values.len(), "BluV1 dynamic return values")?;
+                combined.extend(values);
+                Ok(BluReturnDisposition::Propagate(combined))
+            }
         }
     }
 

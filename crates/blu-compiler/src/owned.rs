@@ -630,11 +630,12 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         {
             required_features = required_features | FeatureBits::FIXED_MULTI_RESULTS;
         }
-        if self
-            .code
-            .iter()
-            .any(|instruction| matches!(instruction, Instruction::ReturnCall { .. }))
-        {
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::ReturnCall { .. } | Instruction::ReturnCallPrefix { .. }
+            )
+        }) {
             required_features = required_features | FeatureBits::RETURN_CALLS;
         }
         if self.code.iter().any(|instruction| {
@@ -1583,8 +1584,39 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         if values.is_empty() {
             return self.emit(Instruction::Return { first: 0, count: 0 }, statement.span());
         }
-        if values.len() == 1 && self.lower_return_call_expression(values[0])? {
-            return Ok(());
+        let last = values[values.len() - 1];
+        if matches!(
+            self.expression(last)?.kind(),
+            ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+        ) {
+            if values.len() == 1 {
+                if self.lower_return_call_expression(last, None)? {
+                    return Ok(());
+                }
+            } else {
+                let prefix_expressions = &values[..values.len() - 1];
+                let mut prefix_registers =
+                    allocate_vec(prefix_expressions.len(), "return prefix registers")?;
+                for expression in prefix_expressions.iter().copied() {
+                    prefix_registers.push(self.lower_expression(expression)?);
+                }
+                let contiguous = prefix_registers
+                    .windows(2)
+                    .all(|pair| pair[0].checked_add(1) == Some(pair[1]));
+                let first = if contiguous {
+                    prefix_registers[0]
+                } else {
+                    self.copy_return_values(prefix_expressions, &prefix_registers)?
+                };
+                let count = u16::try_from(prefix_expressions.len()).map_err(|_| {
+                    OwnedCompileError::InternalInvariant {
+                        message: "return prefix count passed limits but cannot fit BluV1",
+                    }
+                })?;
+                if self.lower_return_call_expression(last, Some((first, count)))? {
+                    return Ok(());
+                }
+            }
         }
         let mut registers = allocate_vec(values.len(), "return registers")?;
         for expression_id in values.iter().copied() {
@@ -1770,6 +1802,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     fn lower_return_call_expression(
         &mut self,
         id: ExpressionId,
+        prefix: Option<(u16, u16)>,
     ) -> Result<bool, OwnedCompileError> {
         let expression = *self.expression(id)?;
         let (function, sources, span) = match expression.kind() {
@@ -1818,14 +1851,22 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             _ => return Ok(false),
         };
         let (arguments, argument_count) = self.copy_call_arguments(&sources, span)?;
-        self.emit(
+        let instruction = if let Some((first, count)) = prefix {
+            Instruction::ReturnCallPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            }
+        } else {
             Instruction::ReturnCall {
                 function,
                 arguments,
                 argument_count,
-            },
-            span,
-        )?;
+            }
+        };
+        self.emit(instruction, span)?;
         Ok(true)
     }
 

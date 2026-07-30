@@ -359,6 +359,37 @@ fn return_calls_round_trip_terminate_prototypes_and_require_their_feature() {
 }
 
 #[test]
+fn prefixed_return_calls_round_trip_with_validated_ranges() {
+    let mut artifact = fixture();
+    let prototype = &mut artifact.prototypes[0];
+    prototype.required_features = FeatureBits::BASELINE | FeatureBits::RETURN_CALLS;
+    prototype.code = vec![
+        Instruction::LoadConstant {
+            destination: 0,
+            constant: 0,
+        },
+        Instruction::LoadConstant {
+            destination: 1,
+            constant: 1,
+        },
+        Instruction::ReturnCallPrefix {
+            first: 1,
+            count: 1,
+            function: 0,
+            arguments: 0,
+            argument_count: 0,
+        },
+    ];
+    prototype.source_map.truncate(3);
+    prototype.locals.clear();
+
+    let limits = BluLimits::default();
+    let validated = ValidatedArtifact::new(artifact, limits).unwrap();
+    let bytes = encode(&validated, limits).unwrap();
+    assert_eq!(decode_validated(&bytes, limits).unwrap(), validated);
+}
+
+#[test]
 fn closure_instructions_round_trip_with_validated_capture_metadata() {
     let limits = BluLimits::default();
     let validated = ValidatedArtifact::new(closure_fixture(), limits).unwrap();

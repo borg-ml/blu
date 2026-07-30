@@ -2248,6 +2248,59 @@ fn sole_return_calls_forward_all_results_without_growing_blu_callers() {
 }
 
 #[test]
+fn mixed_return_prefixes_preserve_all_final_call_results() {
+    for profile in SemanticProfile::ALL {
+        for bytes in [
+            b"local function pair() return 2, 3 end local function forward() return 1, pair() end return forward()"
+                .as_slice(),
+            b"local object = {} function object:pair() return 2, 3 end local function forward() return 1, object:pair() end return forward()"
+                .as_slice(),
+        ] {
+            let source = make_source(bytes.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            let integer_profile = matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            );
+            assert_eq!(
+                Vm::default().with_call_limit(1).execute_blu_v1(
+                    compiled.into_validated_artifact(),
+                    BluLimits::default(),
+                ),
+                Ok(if integer_profile {
+                    vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)]
+                } else {
+                    vec![
+                        Value::Number(1.0),
+                        Value::Number(2.0),
+                        Value::Number(3.0),
+                    ]
+                }),
+                "{profile}"
+            );
+        }
+    }
+
+    let source = make_source(b"return 1, native_pair()".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    let mut vm = Vm::default();
+    let function = vm.register_function(|_, _| Ok(vec![Value::Number(2.0), Value::Number(3.0)]));
+    vm.set_global(b"native_pair".as_slice(), Value::NativeFunction(function));
+    assert_eq!(
+        vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![
+            Value::Number(1.0),
+            Value::Number(2.0),
+            Value::Number(3.0),
+        ])
+    );
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

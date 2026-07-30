@@ -130,12 +130,12 @@ closure/native/table-call path. Scalar contexts produce the first result or
 `nil`; a final call in a local or identifier assignment list requests the
 remaining bounded result count, truncating excess results and padding missing
 results with `nil`. Call statements support side-effecting APIs such as
-`print`. A sole call or method call in a return statement forwards every
-result through a canonical tail call; Blu closure tail calls replace the
-current frame instead of growing the bounded caller stack. Mixed-prefix
-returns, dynamic argument and table-constructor tails, variable arguments,
-metamethod-aware method lookup, and resumable direct-BluV1 calls remain
-explicit later work.
+`print`. A final call or method call in a return statement forwards every
+result. Sole Blu closure calls replace the current frame; preceding fixed
+return values remain in a GC-rooted bounded continuation and are prepended
+after the call completes. Dynamic argument and table-constructor tails,
+variable arguments, metamethod-aware method lookup, and resumable direct-BluV1
+calls remain explicit later work.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 
