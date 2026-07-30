@@ -67,6 +67,8 @@ impl FeatureBits {
     pub const TABLES: Self = Self(1 << 8);
     /// Fixed-argument calls producing one scalar result.
     pub const FIXED_CALLS: Self = Self(1 << 9);
+    /// Heap closures whose captures are declared by child-prototype metadata.
+    pub const CLOSURES: Self = Self(1 << 10);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -77,7 +79,8 @@ impl FeatureBits {
             | Self::BACKWARD_BRANCHES.0
             | Self::GLOBALS.0
             | Self::TABLES.0
-            | Self::FIXED_CALLS.0,
+            | Self::FIXED_CALLS.0
+            | Self::CLOSURES.0,
     );
 
     #[must_use]
@@ -276,6 +279,18 @@ pub enum Instruction {
         arguments: u16,
         argument_count: u16,
     },
+    NewClosure {
+        destination: u16,
+        child: u16,
+    },
+    GetUpvalue {
+        destination: u16,
+        upvalue: u16,
+    },
+    SetUpvalue {
+        upvalue: u16,
+        source: u16,
+    },
     Move {
         destination: u16,
         source: u16,
@@ -387,6 +402,9 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::GetTable { .. }
             | Instruction::SetTable { .. }
             | Instruction::Call { .. }
+            | Instruction::NewClosure { .. }
+            | Instruction::GetUpvalue { .. }
+            | Instruction::SetUpvalue { .. }
             | Instruction::Move { .. }
             | Instruction::Not { .. }
             | Instruction::Negate { .. }
@@ -416,6 +434,9 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::GetTable { .. }
                 | Instruction::SetTable { .. }
                 | Instruction::Call { .. }
+                | Instruction::NewClosure { .. }
+                | Instruction::GetUpvalue { .. }
+                | Instruction::SetUpvalue { .. }
                 | Instruction::Move { .. }
                 | Instruction::Not { .. }
                 | Instruction::Negate { .. }
@@ -741,7 +762,7 @@ pub fn validate(artifact: &Artifact, limits: BluLimits) -> Result<(), Validation
     )?;
     parents.resize(artifact.prototypes.len(), None);
     for (index, prototype) in artifact.prototypes.iter().enumerate() {
-        validate_prototype(index, prototype, &sources, limits)?;
+        validate_prototype(index, prototype, &artifact.prototypes, &sources, limits)?;
         check_limit(
             "child count",
             prototype.children.len(),
@@ -1081,6 +1102,7 @@ fn validate_prototype_graph(prototypes: &[Prototype], main: usize) -> Result<(),
 fn validate_prototype(
     index: usize,
     prototype: &Prototype,
+    prototypes: &[Prototype],
     sources: &HashMap<SourceId, u32>,
     limits: BluLimits,
 ) -> Result<(), ValidationError> {
@@ -1186,6 +1208,20 @@ fn validate_prototype(
         return Err(ValidationError::MissingFeature {
             prototype: index,
             feature: "fixed calls",
+        });
+    }
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::NewClosure { .. }
+                | Instruction::GetUpvalue { .. }
+                | Instruction::SetUpvalue { .. }
+        )
+    }) && !prototype.required_features.contains(FeatureBits::CLOSURES)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "closures",
         });
     }
     if prototype.code.iter().any(|instruction| {
@@ -1479,6 +1515,70 @@ fn validate_prototype(
                     check_read(index, pc, register, &initialized)?;
                 }
                 initialized[destination as usize] = true;
+            }
+            Instruction::NewClosure { destination, child } => {
+                check_register(index, pc, destination, registers)?;
+                let child_index = *prototype.children.get(child as usize).ok_or(
+                    ValidationError::InvalidReference {
+                        prototype: Some(index),
+                        what: "child prototype",
+                        index: child as usize,
+                        count: prototype.children.len(),
+                    },
+                )? as usize;
+                let child_prototype =
+                    prototypes
+                        .get(child_index)
+                        .ok_or(ValidationError::InvalidReference {
+                            prototype: Some(index),
+                            what: "child prototype",
+                            index: child_index,
+                            count: prototypes.len(),
+                        })?;
+                for capture in &child_prototype.upvalues {
+                    match *capture {
+                        Upvalue::ParentRegister(register) => {
+                            check_read(index, pc, register, &initialized)?;
+                        }
+                        Upvalue::ParentUpvalue(upvalue) => {
+                            if upvalue as usize >= prototype.upvalues.len() {
+                                return Err(ValidationError::InvalidReference {
+                                    prototype: Some(index),
+                                    what: "parent upvalue",
+                                    index: upvalue as usize,
+                                    count: prototype.upvalues.len(),
+                                });
+                            }
+                        }
+                    }
+                }
+                initialized[destination as usize] = true;
+            }
+            Instruction::GetUpvalue {
+                destination,
+                upvalue,
+            } => {
+                check_register(index, pc, destination, registers)?;
+                if upvalue as usize >= prototype.upvalues.len() {
+                    return Err(ValidationError::InvalidReference {
+                        prototype: Some(index),
+                        what: "upvalue",
+                        index: upvalue as usize,
+                        count: prototype.upvalues.len(),
+                    });
+                }
+                initialized[destination as usize] = true;
+            }
+            Instruction::SetUpvalue { upvalue, source } => {
+                check_read(index, pc, source, &initialized)?;
+                if upvalue as usize >= prototype.upvalues.len() {
+                    return Err(ValidationError::InvalidReference {
+                        prototype: Some(index),
+                        what: "upvalue",
+                        index: upvalue as usize,
+                        count: prototype.upvalues.len(),
+                    });
+                }
             }
             Instruction::Move {
                 destination,
@@ -1968,6 +2068,9 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::LessEqual { .. } => 7,
                     Instruction::Call { .. } => 9,
                     Instruction::NewTable { .. } => 3,
+                    Instruction::NewClosure { .. }
+                    | Instruction::GetUpvalue { .. }
+                    | Instruction::SetUpvalue { .. } => 5,
                     Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. } => 7,
                     Instruction::Jump { .. } => 5,
                     Instruction::Move { .. }
@@ -2113,6 +2216,24 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 put_u16(out, *function);
                 put_u16(out, *arguments);
                 put_u16(out, *argument_count);
+            }
+            Instruction::NewClosure { destination, child } => {
+                out.push(26);
+                put_u16(out, *destination);
+                put_u16(out, *child);
+            }
+            Instruction::GetUpvalue {
+                destination,
+                upvalue,
+            } => {
+                out.push(27);
+                put_u16(out, *destination);
+                put_u16(out, *upvalue);
+            }
+            Instruction::SetUpvalue { upvalue, source } => {
+                out.push(28);
+                put_u16(out, *upvalue);
+                put_u16(out, *source);
             }
             Instruction::Add {
                 destination,
@@ -2948,6 +3069,18 @@ fn read_prototype(
                 function: reader.u16()?,
                 arguments: reader.u16()?,
                 argument_count: reader.u16()?,
+            },
+            26 => Instruction::NewClosure {
+                destination: reader.u16()?,
+                child: reader.u16()?,
+            },
+            27 => Instruction::GetUpvalue {
+                destination: reader.u16()?,
+                upvalue: reader.u16()?,
+            },
+            28 => Instruction::SetUpvalue {
+                upvalue: reader.u16()?,
+                source: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

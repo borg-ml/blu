@@ -199,6 +199,45 @@ fn comparison_fixture(profile: SemanticProfile, instruction: Instruction) -> Art
     artifact
 }
 
+fn closure_fixture() -> Artifact {
+    let mut artifact = fixture();
+    let span = ByteSpan::from_usize(SourceId::new(7), 0, 0).unwrap();
+    artifact.prototypes[0].register_count = 2;
+    artifact.prototypes[0].required_features = FeatureBits::BASELINE | FeatureBits::CLOSURES;
+    artifact.prototypes[0].constants = vec![Constant::Number(42.0)];
+    artifact.prototypes[0].code = vec![
+        Instruction::LoadConstant {
+            destination: 0,
+            constant: 0,
+        },
+        Instruction::NewClosure {
+            destination: 1,
+            child: 0,
+        },
+        Instruction::Return { first: 1, count: 1 },
+    ];
+    artifact.prototypes[0].source_map = vec![span; 3];
+    artifact.prototypes[0].locals.clear();
+    artifact.prototypes[1].register_count = 2;
+    artifact.prototypes[1].parameter_count = 1;
+    artifact.prototypes[1].is_vararg = false;
+    artifact.prototypes[1].required_features = FeatureBits::BASELINE | FeatureBits::CLOSURES;
+    artifact.prototypes[1].constants.clear();
+    artifact.prototypes[1].code = vec![
+        Instruction::GetUpvalue {
+            destination: 1,
+            upvalue: 0,
+        },
+        Instruction::SetUpvalue {
+            upvalue: 0,
+            source: 0,
+        },
+        Instruction::Return { first: 1, count: 1 },
+    ];
+    artifact.prototypes[1].source_map = vec![span; 3];
+    artifact
+}
+
 fn forward_branch_fixture(profile: SemanticProfile) -> Artifact {
     let mut artifact = baseline_fixture(profile);
     artifact.prototypes[0].required_features =
@@ -233,6 +272,61 @@ fn canonical_round_trip_preserves_profiles_and_metadata() {
         [Upvalue::ParentRegister(0)]
     );
     assert_eq!(decoded.validation_policy(), limits);
+}
+
+#[test]
+fn closure_instructions_round_trip_with_validated_capture_metadata() {
+    let limits = BluLimits::default();
+    let validated = ValidatedArtifact::new(closure_fixture(), limits).unwrap();
+    let bytes = encode(&validated, limits).unwrap();
+    let decoded = decode_validated(&bytes, limits).unwrap();
+    assert_eq!(decoded, validated);
+    assert_eq!(
+        decoded.prototypes()[0].code[1],
+        Instruction::NewClosure {
+            destination: 1,
+            child: 0
+        }
+    );
+    assert_eq!(
+        decoded.prototypes()[1].code[..2],
+        [
+            Instruction::GetUpvalue {
+                destination: 1,
+                upvalue: 0
+            },
+            Instruction::SetUpvalue {
+                upvalue: 0,
+                source: 0
+            }
+        ]
+    );
+}
+
+#[test]
+fn closure_validation_requires_features_and_initialized_captures() {
+    let limits = BluLimits::default();
+    let mut missing_feature = closure_fixture();
+    missing_feature.prototypes[0].required_features = FeatureBits::BASELINE;
+    assert_eq!(
+        ValidatedArtifact::new(missing_feature, limits),
+        Err(ValidationError::MissingFeature {
+            prototype: 0,
+            feature: "closures"
+        })
+    );
+
+    let mut uninitialized = closure_fixture();
+    uninitialized.prototypes[0].code.remove(0);
+    uninitialized.prototypes[0].source_map.remove(0);
+    assert!(matches!(
+        ValidatedArtifact::new(uninitialized, limits),
+        Err(ValidationError::InvalidInstruction {
+            prototype: 0,
+            pc: 0,
+            what: "register is read before initialization"
+        })
+    ));
 }
 
 #[test]

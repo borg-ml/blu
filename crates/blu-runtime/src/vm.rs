@@ -941,6 +941,11 @@ impl Vm {
                     let value = values.into_iter().next().unwrap_or(Value::Nil);
                     set_blu_register(&mut registers, destination, value)?;
                 }
+                BluInstruction::NewClosure { .. }
+                | BluInstruction::GetUpvalue { .. }
+                | BluInstruction::SetUpvalue { .. } => {
+                    return Err(RuntimeError::UnsupportedBluV1Structure { what: "closures" });
+                }
                 BluInstruction::Add {
                     destination,
                     left,

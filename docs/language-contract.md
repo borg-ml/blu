@@ -221,9 +221,16 @@ limits, active GC roots, and callable-table behavior. The expression result is
 the first returned value or `nil`; additional values are discarded. Call
 statements discard that scalar result. Colon method calls evaluate their
 receiver once, perform raw table lookup before evaluating explicit arguments,
-and pass the receiver as the first argument. MULTRET/vararg adjustment, owned
-closures, metamethod-aware method lookup, and resumable direct-BluV1 calls
-remain unsupported.
+and pass the receiver as the first argument. BluV1 reserves the `CLOSURES`
+feature for canonical `NewClosure`, `GetUpvalue`, and `SetUpvalue`
+instructions. Validation resolves child indices through the parent's declared
+child list, verifies every capture against initialized parent registers or
+declared parent upvalues, and bounds every upvalue access. Encoding and
+decoding preserve this metadata, while bootstrap translation and direct
+execution still reject closure instructions explicitly until the generational
+closure heap and bounded BluV1 frame stack consume them. MULTRET/vararg
+adjustment, owned function syntax, metamethod-aware method lookup, and
+resumable direct-BluV1 calls remain unsupported.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success
