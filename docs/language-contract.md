@@ -252,6 +252,11 @@ frontend resolves lexical locals first and otherwise lowers scalar identifier
 reads and assignments as globals. Assignment lists preserve simultaneous
 right-hand-side evaluation across mixed local, captured, and global identifier
 targets. Versioned `_ENV`/`getfenv`/`setfenv` behavior remains unsupported.
+When no explicit registry value shadows it, `_VERSION` is resolved from the
+active frame as `Blu`, `Luau`, or `Lua 5.1` through `Lua 5.5`. This avoids
+leaking the VM's configured fallback dialect into an explicitly profiled
+artifact. Guest and host global writes override the contextual default using
+the ordinary shared registry.
 BluV1 table construction and indexed access require the `TABLES` feature bit.
 The owned grammar accepts bounded constructors with sequential array fields,
 identifier-keyed fields, and bracket-keyed fields, plus bracket or dot-name

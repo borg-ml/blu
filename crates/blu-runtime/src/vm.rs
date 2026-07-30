@@ -466,6 +466,20 @@ impl Vm {
         self.globals.get(name)
     }
 
+    fn global_for_profile(
+        &self,
+        name: &[u8],
+        profile: SemanticProfile,
+    ) -> Result<Value, RuntimeError> {
+        if let Some(value) = self.globals.get(name) {
+            return Ok(value.clone());
+        }
+        if name == b"_VERSION" {
+            return Ok(Value::String(Arc::from(profile_version(profile)?)));
+        }
+        Ok(Value::Nil)
+    }
+
     pub fn take_output(&mut self) -> Vec<u8> {
         core::mem::take(&mut self.output)
     }
@@ -951,7 +965,7 @@ impl Vm {
                             what: "validated global name is not a string",
                         });
                     };
-                    let value = self.globals.get(name).cloned().unwrap_or(Value::Nil);
+                    let value = self.global_for_profile(name, prototype.profile)?;
                     set_blu_register(
                         &mut self.heap,
                         &mut registers,
@@ -3556,7 +3570,7 @@ impl Vm {
                         },
                     )?)?;
                     let name = string_bytes(&name, "global lookup")?;
-                    let value = self.globals.get(name).cloned().unwrap_or(Value::Nil);
+                    let value = self.global_for_profile(name, frame.profile)?;
                     frame.set(instruction.a(), value)?;
                 }
                 Opcode::SetGlobal => {
@@ -7880,6 +7894,24 @@ fn string_bytes<'a>(value: &'a Value, operation: &'static str) -> Result<&'a [u8
     }
 }
 
+fn profile_version(profile: SemanticProfile) -> Result<&'static [u8], RuntimeError> {
+    Ok(match profile {
+        SemanticProfile::Blu => b"Blu",
+        SemanticProfile::Luau => b"Luau",
+        SemanticProfile::Lua51 => b"Lua 5.1",
+        SemanticProfile::Lua52 => b"Lua 5.2",
+        SemanticProfile::Lua53 => b"Lua 5.3",
+        SemanticProfile::Lua54 => b"Lua 5.4",
+        SemanticProfile::Lua55 => b"Lua 5.5",
+        profile => {
+            return Err(RuntimeError::UnsupportedSemanticProfile {
+                operation: "_VERSION",
+                profile,
+            });
+        }
+    })
+}
+
 fn integer_argument(
     arguments: &[Value],
     zero_based_index: usize,
@@ -11804,6 +11836,28 @@ mod tests {
             vm.execute(&chunk),
             Err(RuntimeError::Validation(error)) if error.message.contains("constant 99")
         ));
+    }
+
+    #[test]
+    fn contextual_version_global_applies_to_legacy_luau_frames_and_can_be_overridden() {
+        let code = vec![
+            abc(Opcode::GetGlobal, 0, 0, 0),
+            0,
+            abc(Opcode::Return, 0, 2, 0),
+        ];
+        let chunk = test_chunk(&[b"_VERSION"], vec![Constant::String(0)], code, 1);
+        let mut vm = Vm::new(Dialect::Luau);
+
+        assert_eq!(
+            vm.execute(&chunk),
+            Ok(vec![Value::String(Arc::from(&b"Luau"[..]))])
+        );
+
+        vm.set_global(&b"_VERSION"[..], Value::String(Arc::from(&b"custom"[..])));
+        assert_eq!(
+            vm.execute(&chunk),
+            Ok(vec![Value::String(Arc::from(&b"custom"[..]))])
+        );
     }
 
     #[test]

@@ -26,6 +26,9 @@ metamethods, an initial standard library, and host-configured cached `require`.
 The owned Blu/Luau frontend also lowers value-selecting
 `if ... then ... elseif ... else ...` expressions with short-circuit branches;
 Lua profiles reject that Luau syntax explicitly.
+The contextual `_VERSION` global reports `Blu`, `Luau`, or the selected
+`Lua 5.1`–`Lua 5.5` profile and remains explicitly overridable by the guest or
+embedder.
 The math slice includes shared truncating `math.fmod`; unlike floor-based `%`,
 its remainder preserves the dividend's sign, with modern integer preservation
 and zero-divisor errors. Shared `math.pow` provides the library form of

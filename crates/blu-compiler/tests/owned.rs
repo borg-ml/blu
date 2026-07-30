@@ -1741,6 +1741,41 @@ fn owned_fixed_calls_propagate_native_errors() {
 }
 
 #[test]
+fn version_global_defaults_to_the_active_profile_and_remains_overridable() {
+    let source = make_source(b"return _VERSION".to_vec());
+    let override_source = make_source(b"_VERSION='custom' return _VERSION".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = match profile {
+            SemanticProfile::Blu => &b"Blu"[..],
+            SemanticProfile::Luau => &b"Luau"[..],
+            SemanticProfile::Lua51 => &b"Lua 5.1"[..],
+            SemanticProfile::Lua52 => &b"Lua 5.2"[..],
+            SemanticProfile::Lua53 => &b"Lua 5.3"[..],
+            SemanticProfile::Lua54 => &b"Lua 5.4"[..],
+            SemanticProfile::Lua55 => &b"Lua 5.5"[..],
+            _ => unreachable!("SemanticProfile::ALL contains known profiles"),
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::String(Arc::from(expected))]),
+            "{profile}"
+        );
+
+        let compiled = OwnedCompiler::default()
+            .compile(&override_source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::String(Arc::from(&b"custom"[..]))]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_fixed_calls_reach_host_registered_globals() {
     let source = make_source(br#"return host_echo("registered")"#.to_vec());
     let compiled = OwnedCompiler::default()
