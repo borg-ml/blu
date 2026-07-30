@@ -197,6 +197,14 @@ writes the VM embedding registry; an absent name produces `nil`. The owned
 frontend resolves lexical locals first and otherwise lowers scalar identifier
 reads and single-target assignments as globals. Global list assignment and
 versioned `_ENV`/`getfenv`/`setfenv` behavior remain unsupported.
+BluV1 table construction and indexed access require the `TABLES` feature bit.
+The initial owned grammar accepts empty `{}` constructors and bracket-indexed
+reads or single-target writes. Direct execution allocates through the
+generational heap, roots the complete active register file before allocation or
+growth, performs raw value-keyed access, and returns `nil` for absent keys.
+Indexing a non-table and invalid table keys return structured runtime errors.
+Constructor fields, dot syntax, indexed assignment lists, and metamethod-aware
+owned table access remain unsupported rather than silently approximated.
 Direct BluV1 execution transiently charges its runtime constant vector,
 register file, copied string payloads, and largest possible fixed return buffer
 against the VM memory configuration, then releases that charge on both success

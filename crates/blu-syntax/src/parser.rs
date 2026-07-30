@@ -1,9 +1,10 @@
 use crate::{
-    AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
-    BreakStatement, ContinueStatement, DialectDirective, DoStatement, Expression, ExpressionId,
-    ExpressionKind, Identifier, IfClause, IfStatement, LexError, Lexed, LexerLimits,
-    LocalListStatement, LocalStatement, NumericForStatement, RepeatStatement, ReturnStatement,
-    Statement, Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
+    AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
+    BinaryOperator, Block, BreakStatement, ContinueStatement, DialectDirective, DoStatement,
+    Expression, ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement, IndexExpression,
+    LexError, Lexed, LexerLimits, LocalListStatement, LocalStatement, NumericForStatement,
+    RepeatStatement, ReturnStatement, Statement, Token, TokenKind, UnaryExpression, UnaryOperator,
+    WhileStatement, lex,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -859,7 +860,59 @@ impl<'a> Parser<'a> {
             });
         };
         let mut targets = allocate_vec(1, "assignment target list")?;
-        targets.push(Identifier::new(target.span()));
+        let identifier = Identifier::new(target.span());
+        let mut target_expression = self.push_expression(
+            Expression::new(ExpressionKind::Identifier(identifier), target.span()),
+            1,
+        )?;
+        while self.at(TokenKind::LeftBracket) {
+            self.bump();
+            let Some(key) = self.parse_expression(0)? else {
+                return Ok(());
+            };
+            let Some(close) = self
+                .current()
+                .filter(|token| token.kind() == TokenKind::RightBracket)
+            else {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0024",
+                    "expected `]` after table key",
+                    &["]"],
+                )?;
+                return Ok(());
+            };
+            self.bump();
+            let depth = target_expression.depth.max(key.depth).saturating_add(1);
+            let span = self
+                .expression(target_expression.id)?
+                .span()
+                .merge(close.span())?;
+            target_expression = self.push_expression(
+                Expression::new(
+                    ExpressionKind::Index(IndexExpression::new(target_expression.id, key.id, span)),
+                    span,
+                ),
+                depth,
+            )?;
+        }
+        let first_target = match self.expression(target_expression.id)?.kind() {
+            ExpressionKind::Identifier(identifier) => AssignmentTarget::Identifier(identifier),
+            ExpressionKind::Index(index) => AssignmentTarget::Index(index),
+            _ => {
+                return Err(ParseError::InternalInvariant {
+                    message: "assignment target parser produced a non-target expression",
+                });
+            }
+        };
+        targets.push(first_target);
+        if matches!(first_target, AssignmentTarget::Index(_)) && self.at(TokenKind::Comma) {
+            self.report_current(
+                "BLU-PARSE-0026",
+                "indexed targets are not yet supported in assignment lists",
+                &["="],
+            )?;
+            return Ok(());
+        }
         while self.at(TokenKind::Comma) {
             self.bump();
             if !self.at(TokenKind::Identifier) {
@@ -877,7 +930,7 @@ impl<'a> Parser<'a> {
             };
             push_fallible(
                 &mut targets,
-                Identifier::new(target.span()),
+                AssignmentTarget::Identifier(Identifier::new(target.span())),
                 "assignment target list",
             )?;
         }
@@ -1030,6 +1083,25 @@ impl<'a> Parser<'a> {
             TokenKind::BinaryInteger => ExpressionKind::BinaryInteger,
             TokenKind::StringLiteral => ExpressionKind::StringLiteral,
             TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
+            TokenKind::LeftBrace => {
+                self.bump();
+                let Some(close) = self
+                    .current()
+                    .filter(|token| token.kind() == TokenKind::RightBrace)
+                else {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0025",
+                        "only empty table constructors are currently supported",
+                        &["}"],
+                    )?;
+                    return Ok(None);
+                };
+                self.bump();
+                let span = token.span().merge(close.span())?;
+                let table =
+                    self.push_expression(Expression::new(ExpressionKind::EmptyTable, span), 1)?;
+                return self.parse_postfix(table).map(Some);
+            }
             TokenKind::LeftParenthesis => {
                 self.bump();
                 let Some(inner) = self.parse_expression(0)? else {
@@ -1048,12 +1120,11 @@ impl<'a> Parser<'a> {
                 };
                 self.bump();
                 let span = token.span().merge(close.span())?;
-                return self
-                    .push_expression(
-                        Expression::new(ExpressionKind::Group(inner.id), span),
-                        inner.depth.saturating_add(1),
-                    )
-                    .map(Some);
+                let group = self.push_expression(
+                    Expression::new(ExpressionKind::Group(inner.id), span),
+                    inner.depth.saturating_add(1),
+                )?;
+                return self.parse_postfix(group).map(Some);
             }
             _ => {
                 self.report_current(
@@ -1073,8 +1144,42 @@ impl<'a> Parser<'a> {
             }
         };
         self.bump();
-        self.push_expression(Expression::new(kind, token.span()), 1)
-            .map(Some)
+        let primary = self.push_expression(Expression::new(kind, token.span()), 1)?;
+        self.parse_postfix(primary).map(Some)
+    }
+
+    fn parse_postfix(
+        &mut self,
+        mut expression: BuiltExpression,
+    ) -> Result<BuiltExpression, ParseError> {
+        while self.at(TokenKind::LeftBracket) {
+            self.bump();
+            let Some(key) = self.parse_expression(0)? else {
+                return Ok(expression);
+            };
+            let Some(close) = self
+                .current()
+                .filter(|token| token.kind() == TokenKind::RightBracket)
+            else {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0024",
+                    "expected `]` after table key",
+                    &["]"],
+                )?;
+                return Ok(expression);
+            };
+            self.bump();
+            let depth = expression.depth.max(key.depth).saturating_add(1);
+            let span = self.expression(expression.id)?.span().merge(close.span())?;
+            expression = self.push_expression(
+                Expression::new(
+                    ExpressionKind::Index(IndexExpression::new(expression.id, key.id, span)),
+                    span,
+                ),
+                depth,
+            )?;
+        }
+        Ok(expression)
     }
 
     fn push_expression(

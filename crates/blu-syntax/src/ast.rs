@@ -140,6 +140,34 @@ impl BinaryExpression {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct IndexExpression {
+    table: ExpressionId,
+    key: ExpressionId,
+    span: ByteSpan,
+}
+
+impl IndexExpression {
+    pub(crate) const fn new(table: ExpressionId, key: ExpressionId, span: ByteSpan) -> Self {
+        Self { table, key, span }
+    }
+
+    #[must_use]
+    pub const fn table(self) -> ExpressionId {
+        self.table
+    }
+
+    #[must_use]
+    pub const fn key(self) -> ExpressionId {
+        self.key
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum ExpressionKind {
     Nil,
     Boolean(bool),
@@ -149,8 +177,10 @@ pub enum ExpressionKind {
     HexNumber,
     BinaryInteger,
     StringLiteral,
+    EmptyTable,
     Identifier(Identifier),
     Group(ExpressionId),
+    Index(IndexExpression),
     Unary(UnaryExpression),
     Binary(BinaryExpression),
 }
@@ -186,13 +216,13 @@ pub struct LocalStatement {
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AssignmentStatement {
-    target: Identifier,
+    target: AssignmentTarget,
     value: ExpressionId,
     span: ByteSpan,
 }
 
 impl AssignmentStatement {
-    pub(crate) const fn new(target: Identifier, value: ExpressionId, span: ByteSpan) -> Self {
+    pub(crate) const fn new(target: AssignmentTarget, value: ExpressionId, span: ByteSpan) -> Self {
         Self {
             target,
             value,
@@ -201,7 +231,7 @@ impl AssignmentStatement {
     }
 
     #[must_use]
-    pub const fn target(self) -> Identifier {
+    pub const fn target(self) -> AssignmentTarget {
         self.target
     }
 
@@ -216,16 +246,32 @@ impl AssignmentStatement {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum AssignmentTarget {
+    Identifier(Identifier),
+    Index(IndexExpression),
+}
+
+impl AssignmentTarget {
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        match self {
+            Self::Identifier(identifier) => identifier.span(),
+            Self::Index(index) => index.span(),
+        }
+    }
+}
+
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct AssignmentListStatement {
-    targets: Vec<Identifier>,
+    targets: Vec<AssignmentTarget>,
     values: Vec<ExpressionId>,
     span: ByteSpan,
 }
 
 impl AssignmentListStatement {
     pub(crate) const fn new(
-        targets: Vec<Identifier>,
+        targets: Vec<AssignmentTarget>,
         values: Vec<ExpressionId>,
         span: ByteSpan,
     ) -> Self {
@@ -237,7 +283,7 @@ impl AssignmentListStatement {
     }
 
     #[must_use]
-    pub fn targets(&self) -> &[Identifier] {
+    pub fn targets(&self) -> &[AssignmentTarget] {
         &self.targets
     }
 

@@ -117,6 +117,11 @@ Canonical BluV1 global loads and stores connect the owned frontend to the VM's
 embedding registry. Unknown scalar reads produce `nil`, and scalar writes
 persist in the VM; global list assignment and environment-rebinding APIs remain
 explicitly unsupported.
+The owned frontend also supports empty table constructors and general
+bracket-indexed reads and single-target writes. These execute directly through
+the generational heap, return `nil` for absent keys, and retain active registers
+as GC roots during allocation and table growth. Constructor fields, dot syntax,
+metamethod dispatch, and indexed assignment lists remain explicit later work.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

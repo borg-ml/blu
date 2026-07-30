@@ -371,6 +371,12 @@ fn translate_instruction(
                 instruction: "globals",
             })
         }
+        BluInstruction::NewTable { .. }
+        | BluInstruction::GetTable { .. }
+        | BluInstruction::SetTable { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "tables",
+        }),
         BluInstruction::Return { first, count } => {
             let result_field = count
                 .checked_add(1)

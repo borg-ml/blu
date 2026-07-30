@@ -63,6 +63,8 @@ impl FeatureBits {
     pub const BACKWARD_BRANCHES: Self = Self(1 << 6);
     /// Global environment access using byte-string constant names.
     pub const GLOBALS: Self = Self(1 << 7);
+    /// Heap-allocated tables with general value-keyed reads and writes.
+    pub const TABLES: Self = Self(1 << 8);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -71,7 +73,8 @@ impl FeatureBits {
             | Self::COMPARISONS.0
             | Self::FORWARD_BRANCHES.0
             | Self::BACKWARD_BRANCHES.0
-            | Self::GLOBALS.0,
+            | Self::GLOBALS.0
+            | Self::TABLES.0,
     );
 
     #[must_use]
@@ -251,6 +254,19 @@ pub enum Instruction {
         name: u32,
         source: u16,
     },
+    NewTable {
+        destination: u16,
+    },
+    GetTable {
+        destination: u16,
+        table: u16,
+        key: u16,
+    },
+    SetTable {
+        table: u16,
+        key: u16,
+        value: u16,
+    },
     Move {
         destination: u16,
         source: u16,
@@ -358,6 +374,9 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             Instruction::LoadConstant { .. }
             | Instruction::LoadGlobal { .. }
             | Instruction::StoreGlobal { .. }
+            | Instruction::NewTable { .. }
+            | Instruction::GetTable { .. }
+            | Instruction::SetTable { .. }
             | Instruction::Move { .. }
             | Instruction::Not { .. }
             | Instruction::Negate { .. }
@@ -383,6 +402,9 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             Instruction::LoadConstant { .. }
                 | Instruction::LoadGlobal { .. }
                 | Instruction::StoreGlobal { .. }
+                | Instruction::NewTable { .. }
+                | Instruction::GetTable { .. }
+                | Instruction::SetTable { .. }
                 | Instruction::Move { .. }
                 | Instruction::Not { .. }
                 | Instruction::Negate { .. }
@@ -1142,6 +1164,20 @@ fn validate_prototype(
             feature: "globals",
         });
     }
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::NewTable { .. }
+                | Instruction::GetTable { .. }
+                | Instruction::SetTable { .. }
+        )
+    }) && !prototype.required_features.contains(FeatureBits::TABLES)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "tables",
+        });
+    }
     if prototype
         .code
         .iter()
@@ -1373,6 +1409,25 @@ fn validate_prototype(
                         count: prototype.constants.len(),
                     });
                 }
+            }
+            Instruction::NewTable { destination } => {
+                check_register(index, pc, destination, registers)?;
+                initialized[destination as usize] = true;
+            }
+            Instruction::GetTable {
+                destination,
+                table,
+                key,
+            } => {
+                check_register(index, pc, destination, registers)?;
+                check_read(index, pc, table, &initialized)?;
+                check_read(index, pc, key, &initialized)?;
+                initialized[destination as usize] = true;
+            }
+            Instruction::SetTable { table, key, value } => {
+                check_read(index, pc, table, &initialized)?;
+                check_read(index, pc, key, &initialized)?;
+                check_read(index, pc, value, &initialized)?;
             }
             Instruction::Move {
                 destination,
@@ -1847,6 +1902,8 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     Instruction::LoadConstant { .. }
                     | Instruction::LoadGlobal { .. }
                     | Instruction::StoreGlobal { .. }
+                    | Instruction::GetTable { .. }
+                    | Instruction::SetTable { .. }
                     | Instruction::Add { .. }
                     | Instruction::Subtract { .. }
                     | Instruction::Multiply { .. }
@@ -1858,6 +1915,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::Equal { .. }
                     | Instruction::LessThan { .. }
                     | Instruction::LessEqual { .. } => 7,
+                    Instruction::NewTable { .. } => 3,
                     Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. } => 7,
                     Instruction::Jump { .. } => 5,
                     Instruction::Move { .. }
@@ -1971,6 +2029,26 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 out.push(21);
                 put_u32(out, *name);
                 put_u16(out, *source);
+            }
+            Instruction::NewTable { destination } => {
+                out.push(22);
+                put_u16(out, *destination);
+            }
+            Instruction::GetTable {
+                destination,
+                table,
+                key,
+            } => {
+                out.push(23);
+                put_u16(out, *destination);
+                put_u16(out, *table);
+                put_u16(out, *key);
+            }
+            Instruction::SetTable { table, key, value } => {
+                out.push(24);
+                put_u16(out, *table);
+                put_u16(out, *key);
+                put_u16(out, *value);
             }
             Instruction::Add {
                 destination,
@@ -2677,7 +2755,7 @@ fn read_prototype(
         children.push(reader.u32()?);
     }
 
-    let instruction_count = reader.count("instruction count", limits.max_code_per_prototype, 5)?;
+    let instruction_count = reader.count("instruction count", limits.max_code_per_prototype, 3)?;
     DecodeBudget::add(
         &mut budget.code,
         instruction_count,
@@ -2787,6 +2865,19 @@ fn read_prototype(
             21 => Instruction::StoreGlobal {
                 name: reader.u32()?,
                 source: reader.u16()?,
+            },
+            22 => Instruction::NewTable {
+                destination: reader.u16()?,
+            },
+            23 => Instruction::GetTable {
+                destination: reader.u16()?,
+                table: reader.u16()?,
+                key: reader.u16()?,
+            },
+            24 => Instruction::SetTable {
+                table: reader.u16()?,
+                key: reader.u16()?,
+                value: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

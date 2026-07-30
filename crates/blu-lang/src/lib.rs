@@ -535,6 +535,14 @@ return value"#
             SourceLimits::default(),
         )
         .unwrap();
+        let tables = SourceFile::new(
+            SourceId::new(32),
+            "tables.blu",
+            br#"local values = {}; values["answer"] = 42; return values["answer"], values["missing"]"#
+                .to_vec(),
+            SourceLimits::default(),
+        )
+        .unwrap();
         let compiler = CompilerIdentity::new(
             CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
             "blu-owned",
@@ -544,6 +552,23 @@ return value"#
         )
         .unwrap();
         for profile in SemanticProfile::ALL {
+            let compiled = OwnedCompiler::default()
+                .compile(&tables, profile, compiler.clone())
+                .unwrap();
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(42)
+            } else {
+                Value::Number(42.0)
+            };
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_compilation(compiled, bytecode::blu::BluLimits::default()),
+                Ok(vec![expected, Value::Nil]),
+                "{profile}"
+            );
             let compiled = OwnedCompiler::default()
                 .compile(&globals, profile, compiler.clone())
                 .unwrap();

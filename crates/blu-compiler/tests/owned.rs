@@ -1189,6 +1189,80 @@ fn owned_scalar_globals_round_trip_and_persist_in_the_vm_registry() {
 }
 
 #[test]
+fn owned_empty_tables_support_indexed_reads_writes_and_missing_keys() {
+    let source = make_source(
+        br#"local values = {}; values["answer"] = 40; return values["answer"], values["missing"]"#
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .expect("table source should compile");
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .required_features
+                .contains(FeatureBits::TABLES)
+        );
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::NewTable { .. }))
+        );
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::SetTable { .. }))
+        );
+        assert!(
+            compiled
+                .artifact()
+                .main()
+                .code
+                .iter()
+                .any(|instruction| matches!(instruction, Instruction::GetTable { .. }))
+        );
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Value::Integer(40)
+        } else {
+            Value::Number(40.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected, Value::Nil]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_indexing_non_tables_returns_structured_type_errors() {
+    for bytes in [
+        br#"local value = 1; return value["key"]"#.as_slice(),
+        br#"local value = 1; value["key"] = 2"#.as_slice(),
+    ] {
+        let source = make_source(bytes.to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, SemanticProfile::Blu, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(blu_runtime::RuntimeError::Type { .. })
+        ));
+    }
+}
+
+#[test]
 fn ordered_comparisons_reject_incompatible_operand_types() {
     let source = make_source(br#"return 1 < "2""#.to_vec());
     for profile in SemanticProfile::ALL {

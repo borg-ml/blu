@@ -12,10 +12,11 @@ mod ast;
 mod parser;
 
 pub use ast::{
-    AssignmentListStatement, AssignmentStatement, Ast, BinaryExpression, BinaryOperator, Block,
-    BreakStatement, ContinueStatement, DoStatement, Expression, ExpressionId, ExpressionKind,
-    Identifier, IfClause, IfStatement, LocalListStatement, LocalStatement, NumericForStatement,
-    RepeatStatement, ReturnStatement, Statement, UnaryExpression, UnaryOperator, WhileStatement,
+    AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryExpression,
+    BinaryOperator, Block, BreakStatement, ContinueStatement, DoStatement, Expression,
+    ExpressionId, ExpressionKind, Identifier, IfClause, IfStatement, IndexExpression,
+    LocalListStatement, LocalStatement, NumericForStatement, RepeatStatement, ReturnStatement,
+    Statement, UnaryExpression, UnaryOperator, WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
@@ -175,6 +176,10 @@ pub enum TokenKind {
     FloorDivide,
     LeftParenthesis,
     RightParenthesis,
+    LeftBrace,
+    RightBrace,
+    LeftBracket,
+    RightBracket,
     Unknown,
 }
 
@@ -421,6 +426,18 @@ pub fn lex(
                 offset += 1;
                 TokenKind::Hash
             }
+            b'{' => {
+                offset += 1;
+                TokenKind::LeftBrace
+            }
+            b'}' => {
+                offset += 1;
+                TokenKind::RightBrace
+            }
+            b']' => {
+                offset += 1;
+                TokenKind::RightBracket
+            }
             b'.' if bytes.get(offset + 1) == Some(&b'.') => {
                 offset += 2;
                 TokenKind::Concatenate
@@ -445,6 +462,10 @@ pub fn lex(
                     push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
                 }
                 TokenKind::StringLiteral
+            }
+            b'[' => {
+                offset += 1;
+                TokenKind::LeftBracket
             }
             quote @ (b'\'' | b'"') => {
                 offset += 1;

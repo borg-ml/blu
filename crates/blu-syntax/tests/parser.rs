@@ -105,6 +105,45 @@ fn local_without_initializer_has_no_value_and_ends_at_its_name() {
 }
 
 #[test]
+fn empty_table_constructors_and_indexing_preserve_structure() {
+    let source = source(br#"local values = {}; values["key"] = 7; return values["key"]"#.to_vec());
+    let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
+    assert_eq!(parsed.ast().statements().len(), 3);
+
+    let Statement::Local(local) = parsed.ast().statements()[0] else {
+        panic!("expected local table");
+    };
+    assert!(matches!(
+        parsed
+            .ast()
+            .expression(local.value().unwrap())
+            .unwrap()
+            .kind(),
+        ExpressionKind::EmptyTable
+    ));
+
+    let Statement::Assignment(assignment) = parsed.ast().statements()[1] else {
+        panic!("expected indexed assignment");
+    };
+    assert!(matches!(
+        assignment.target(),
+        blu_syntax::AssignmentTarget::Index(_)
+    ));
+
+    let Statement::Return(returned) = &parsed.ast().statements()[2] else {
+        panic!("expected indexed return");
+    };
+    assert!(matches!(
+        parsed
+            .ast()
+            .expression(returned.values()[0])
+            .unwrap()
+            .kind(),
+        ExpressionKind::Index(_)
+    ));
+}
+
+#[test]
 fn local_name_and_value_lists_preserve_order_and_adjustment_shape() {
     for profile in SemanticProfile::ALL {
         let source = source(b"local first, second, missing = 40, 2\nreturn first".to_vec());

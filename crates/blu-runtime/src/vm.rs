@@ -880,6 +880,44 @@ impl Vm {
                     let value = blu_register(&registers, source)?.clone();
                     self.set_global(name.clone(), value);
                 }
+                BluInstruction::NewTable { destination } => {
+                    let roots = GcRoots::from_values(&registers)?;
+                    let table = self.allocate_table(0, 0, &roots)?;
+                    set_blu_register(&mut registers, destination, Value::Table(table))?;
+                }
+                BluInstruction::GetTable {
+                    destination,
+                    table,
+                    key,
+                } => {
+                    let table = blu_register(&registers, table)?;
+                    let Value::Table(table) = table else {
+                        return Err(RuntimeError::Type {
+                            operation: "table index",
+                            expected: "table",
+                            actual: table.type_name(),
+                        });
+                    };
+                    let value = self
+                        .heap
+                        .table_get(*table, blu_register(&registers, key)?)?;
+                    set_blu_register(&mut registers, destination, value)?;
+                }
+                BluInstruction::SetTable { table, key, value } => {
+                    let table_value = blu_register(&registers, table)?;
+                    let Value::Table(table) = table_value else {
+                        return Err(RuntimeError::Type {
+                            operation: "table assignment",
+                            expected: "table",
+                            actual: table_value.type_name(),
+                        });
+                    };
+                    let table = *table;
+                    let key = blu_register(&registers, key)?.clone();
+                    let value = blu_register(&registers, value)?.clone();
+                    let roots = GcRoots::from_values(&registers)?;
+                    self.table_set(table, key, value, &roots)?;
+                }
                 BluInstruction::Add {
                     destination,
                     left,

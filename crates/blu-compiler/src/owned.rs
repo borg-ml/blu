@@ -28,10 +28,10 @@ use blu_core::{
     Severity, SourceFile, SourceIdentity, SpanError,
 };
 use blu_syntax::{
-    AssignmentListStatement, AssignmentStatement, Ast, BinaryOperator, Expression, ExpressionId,
-    ExpressionKind, IfStatement, LocalListStatement, LocalStatement, NumericForStatement,
-    ParseError, ParseLimits, ParseOutcome, Rejected, RepeatStatement, ReturnStatement, Statement,
-    UnaryOperator, WhileStatement, parse,
+    AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryOperator,
+    Expression, ExpressionId, ExpressionKind, IfStatement, LocalListStatement, LocalStatement,
+    NumericForStatement, ParseError, ParseLimits, ParseOutcome, Rejected, RepeatStatement,
+    ReturnStatement, Statement, UnaryOperator, WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -513,6 +513,16 @@ impl<'a> Lowerer<'a> {
             )
         }) {
             required_features = required_features | FeatureBits::GLOBALS;
+        }
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::NewTable { .. }
+                    | Instruction::GetTable { .. }
+                    | Instruction::SetTable { .. }
+            )
+        }) {
+            required_features = required_features | FeatureBits::TABLES;
         }
         Ok(Prototype {
             profile: ast.profile(),
@@ -1025,18 +1035,31 @@ impl<'a> Lowerer<'a> {
         &mut self,
         statement: AssignmentStatement,
     ) -> Result<(), OwnedCompileError> {
-        let source = self.lower_expression(statement.value())?;
-        if let Some(destination) = self.resolve_local(statement.target().span())? {
-            self.emit(
-                Instruction::Move {
-                    destination,
-                    source,
-                },
-                statement.span(),
-            )
-        } else {
-            let name = self.global_name_constant(statement.target().span())?;
-            self.emit(Instruction::StoreGlobal { name, source }, statement.span())
+        match statement.target() {
+            AssignmentTarget::Identifier(identifier) => {
+                let source = self.lower_expression(statement.value())?;
+                if let Some(destination) = self.resolve_local(identifier.span())? {
+                    self.emit(
+                        Instruction::Move {
+                            destination,
+                            source,
+                        },
+                        statement.span(),
+                    )
+                } else {
+                    let name = self.global_name_constant(identifier.span())?;
+                    self.emit(Instruction::StoreGlobal { name, source }, statement.span())
+                }
+            }
+            AssignmentTarget::Index(index) => {
+                let table = self.lower_expression(index.table())?;
+                let key = self.lower_expression(index.key())?;
+                let value = self.lower_expression(statement.value())?;
+                self.emit(
+                    Instruction::SetTable { table, key, value },
+                    statement.span(),
+                )
+            }
         }
     }
 
@@ -1102,6 +1125,11 @@ impl<'a> Lowerer<'a> {
             "assignment destination registers",
         )?;
         for target in statement.targets() {
+            let AssignmentTarget::Identifier(target) = target else {
+                return Err(OwnedCompileError::InternalInvariant {
+                    message: "indexed assignment reached list lowering",
+                });
+            };
             destinations.push(self.resolve(target.span())?);
         }
         let capacity = statement.targets().len().max(statement.values().len());
@@ -1264,6 +1292,11 @@ impl<'a> Lowerer<'a> {
                 let constant = self.string_constant(expression.span())?;
                 self.lower_constant(constant, expression.span())
             }
+            ExpressionKind::EmptyTable => {
+                let destination = self.allocate_register()?;
+                self.emit(Instruction::NewTable { destination }, expression.span())?;
+                Ok(destination)
+            }
             ExpressionKind::Identifier(identifier) => {
                 if let Some(register) = self.resolve_local(identifier.span())? {
                     Ok(register)
@@ -1278,6 +1311,20 @@ impl<'a> Lowerer<'a> {
                 }
             }
             ExpressionKind::Group(inner) => self.lower_expression(inner),
+            ExpressionKind::Index(index) => {
+                let table = self.lower_expression(index.table())?;
+                let key = self.lower_expression(index.key())?;
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::GetTable {
+                        destination,
+                        table,
+                        key,
+                    },
+                    expression.span(),
+                )?;
+                Ok(destination)
+            }
             ExpressionKind::Unary(unary) => match unary.operator() {
                 UnaryOperator::Not => {
                     let source = self.lower_expression(unary.operand())?;
