@@ -166,8 +166,16 @@ impl OwnedCompiler {
             }
         };
         let mut prototypes = allocate_vec(1, "artifact prototypes")?;
-        let prototype = Lowerer::new(source, parsed.ast(), self.limits, &mut prototypes, &[], &[])?
-            .run(parsed.ast().statements())?;
+        let prototype = Lowerer::new(
+            source,
+            parsed.ast(),
+            self.limits,
+            &mut prototypes,
+            &[],
+            false,
+            &[],
+        )?
+        .run(parsed.ast().statements())?;
         let main =
             u32::try_from(prototypes.len()).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "prototype count passed limits but cannot fit BluV1",
@@ -370,9 +378,32 @@ impl From<DiagnosticError> for OwnedCompileError {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BindingName {
+    Source(ByteSpan),
+    ImplicitSelf,
+}
+
+impl BindingName {
+    fn matches(self, source: &SourceFile, name: ByteSpan) -> Result<bool, OwnedCompileError> {
+        let expected = match self {
+            Self::Source(span) => source.slice(span)?,
+            Self::ImplicitSelf => b"self",
+        };
+        Ok(expected == source.slice(name)?)
+    }
+
+    fn bytes(self, source: &SourceFile) -> Result<&[u8], OwnedCompileError> {
+        match self {
+            Self::Source(span) => Ok(source.slice(span)?),
+            Self::ImplicitSelf => Ok(b"self"),
+        }
+    }
+}
+
 #[derive(Clone, Copy)]
 struct Binding {
-    name: ByteSpan,
+    name: BindingName,
     register: u16,
     start_pc: u32,
     end_pc: Option<u32>,
@@ -380,7 +411,7 @@ struct Binding {
 
 #[derive(Clone, Copy)]
 struct OuterBinding {
-    name: ByteSpan,
+    name: BindingName,
     source: Upvalue,
 }
 
@@ -422,6 +453,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         limits: OwnedCompileLimits,
         prototypes: &'prototypes mut Vec<Prototype>,
         parameters: &[Identifier],
+        implicit_self: bool,
         outer_bindings: &[OuterBinding],
     ) -> Result<Self, OwnedCompileError> {
         let capacity = ast.node_count().min(4_096);
@@ -439,7 +471,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             prototypes,
             outer_bindings: copied_outer_bindings,
             upvalues: allocate_vec(4, "prototype upvalues")?,
-            parameter_count: parameters.len(),
+            parameter_count: parameters.len().saturating_add(usize::from(implicit_self)),
             bindings: allocate_vec(capacity.min(limits.max_bindings), "local bindings")?,
             closed_bindings: allocate_vec(
                 capacity.min(limits.max_bindings),
@@ -454,9 +486,13 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             source_map: allocate_vec(capacity.min(limits.max_instructions), "source map")?,
             children: allocate_vec(4, "prototype children")?,
         };
+        if implicit_self {
+            let register = lowerer.allocate_register()?;
+            lowerer.push_binding(BindingName::ImplicitSelf, register, 0)?;
+        }
         for parameter in parameters {
             let register = lowerer.allocate_register()?;
-            lowerer.push_binding(parameter.span(), register, 0)?;
+            lowerer.push_binding(BindingName::Source(parameter.span()), register, 0)?;
         }
         Ok(lowerer)
     }
@@ -473,7 +509,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             })?;
         let mut debug_bytes = 0_usize;
         for binding in self.closed_bindings.iter().chain(&self.bindings) {
-            let name_len = self.source.slice(binding.name)?.len();
+            let name_len = binding.name.bytes(self.source)?.len();
             check_limit(
                 OwnedCompileLimit::DebugNameBytes,
                 name_len,
@@ -498,7 +534,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             .saturating_add(self.bindings.len());
         let mut locals = allocate_vec(binding_count, "local debug entries")?;
         for binding in self.closed_bindings.into_iter().chain(self.bindings) {
-            let name = copy_bytes(self.source.slice(binding.name)?, "local debug name")?;
+            let name = copy_bytes(binding.name.bytes(self.source)?, "local debug name")?;
             locals.push(LocalDebug {
                 name,
                 register: binding.register,
@@ -640,8 +676,13 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                             message: "instruction count passed limits but cannot fit a debug PC",
                         }
                     })?;
-                    self.push_binding(function.name().span(), destination, start_pc)?;
-                    let closure = self.lower_function(function.function(), function.span())?;
+                    self.push_binding(
+                        BindingName::Source(function.name().span()),
+                        destination,
+                        start_pc,
+                    )?;
+                    let closure =
+                        self.lower_function(function.function(), function.span(), false)?;
                     self.emit(
                         Instruction::Move {
                             destination,
@@ -948,7 +989,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         push_fallible(
             &mut self.bindings,
             Binding {
-                name: statement.name().span(),
+                name: BindingName::Source(statement.name().span()),
                 register: index,
                 start_pc,
                 end_pc: None,
@@ -1117,12 +1158,16 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "instruction count passed limits but cannot fit a debug PC",
             })?;
-        self.push_binding(statement.name().span(), register, start_pc)
+        self.push_binding(
+            BindingName::Source(statement.name().span()),
+            register,
+            start_pc,
+        )
     }
 
     fn push_binding(
         &mut self,
-        name: ByteSpan,
+        name: BindingName,
         register: u16,
         start_pc: u32,
     ) -> Result<(), OwnedCompileError> {
@@ -1155,6 +1200,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         &mut self,
         function: FunctionId,
         span: ByteSpan,
+        implicit_self: bool,
     ) -> Result<u16, OwnedCompileError> {
         let body = self
             .ast
@@ -1195,6 +1241,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             self.limits,
             self.prototypes,
             body.parameters(),
+            implicit_self,
             &outer_bindings,
         )?
         .run(body.body().statements())?;
@@ -1240,7 +1287,11 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             });
         };
         if statement.names().len() == 1 {
-            let closure = self.lower_function(statement.function(), statement.span())?;
+            let closure = self.lower_function(
+                statement.function(),
+                statement.span(),
+                statement.is_method(),
+            )?;
             let name = self.global_name_constant(root.span())?;
             return self.emit(
                 Instruction::StoreGlobal {
@@ -1272,7 +1323,11 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             )?;
             table = destination;
         }
-        let closure = self.lower_function(statement.function(), statement.span())?;
+        let closure = self.lower_function(
+            statement.function(),
+            statement.span(),
+            statement.is_method(),
+        )?;
         let Some(field) = statement.names().last().copied() else {
             return Err(OwnedCompileError::InternalInvariant {
                 message: "named function statement lost its final path component",
@@ -1413,7 +1468,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             push_fallible(
                 &mut self.bindings,
                 Binding {
-                    name: name.span(),
+                    name: BindingName::Source(name.span()),
                     register,
                     start_pc,
                     end_pc: None,
@@ -1853,7 +1908,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             ExpressionKind::Call(call) => self.lower_call(call),
             ExpressionKind::MethodCall(call) => self.lower_method_call(call),
             ExpressionKind::Function(function) => {
-                self.lower_function(function.function(), function.span())
+                self.lower_function(function.function(), function.span(), false)
             }
             ExpressionKind::Unary(unary) => match unary.operator() {
                 UnaryOperator::Not => {
@@ -2444,9 +2499,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     }
 
     fn resolve_local(&self, name: ByteSpan) -> Result<Option<u16>, OwnedCompileError> {
-        let bytes = self.source.slice(name)?;
         for binding in self.bindings.iter().rev() {
-            if self.source.slice(binding.name)? == bytes {
+            if binding.name.matches(self.source, name)? {
                 return Ok(Some(binding.register));
             }
         }
@@ -2454,9 +2508,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     }
 
     fn resolve_upvalue(&mut self, name: ByteSpan) -> Result<Option<u16>, OwnedCompileError> {
-        let bytes = self.source.slice(name)?;
         for (index, binding) in self.upvalues.iter().enumerate().rev() {
-            if self.source.slice(binding.name)? == bytes {
+            if binding.name.matches(self.source, name)? {
                 return Ok(Some(u16::try_from(index).map_err(|_| {
                     OwnedCompileError::InternalInvariant {
                         message: "upvalue count passed limits but cannot fit BluV1",
@@ -2465,7 +2518,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             }
         }
         for binding in self.outer_bindings.iter().rev() {
-            if self.source.slice(binding.name)? == bytes {
+            if binding.name.matches(self.source, name)? {
                 let binding = *binding;
                 let index = self.push_upvalue(binding)?;
                 return Ok(Some(index));

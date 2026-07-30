@@ -873,6 +873,32 @@ impl<'a> Parser<'a> {
                 "function name path",
             )?;
         }
+        let is_method = if self.at(TokenKind::Colon) {
+            self.bump();
+            if !self.at(TokenKind::Identifier) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0041",
+                    "expected a method name after `:`",
+                    &["identifier"],
+                )?;
+                return Ok(());
+            }
+            let Some(method) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "identifier check succeeded without a current token",
+                });
+            };
+            self.function_node_count = self.function_node_count.saturating_add(1);
+            self.check_ast_limit()?;
+            push_fallible(
+                &mut names,
+                Identifier::new(method.span()),
+                "function name path",
+            )?;
+            true
+        } else {
+            false
+        };
         let Some(function) = self.parse_function_body(keyword)? else {
             return Ok(());
         };
@@ -884,6 +910,7 @@ impl<'a> Parser<'a> {
         self.push_statement(Statement::Function(FunctionStatement::new(
             names,
             function,
+            is_method,
             keyword.span().merge(body.span())?,
         )))
     }

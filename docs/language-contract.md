@@ -233,9 +233,8 @@ generational upvalue cells, refreshes suspended parent registers after child
 returns, and uses an explicit caller stack bounded by the VM call limit.
 Registers, active closures, open upvalues, and suspended callers participate
 in allocation roots. Bootstrap translation continues to reject closure
-instructions explicitly. MULTRET/vararg adjustment, colon-method function
-declarations, metamethod-aware method lookup, and resumable direct-BluV1 calls
-remain unsupported.
+instructions explicitly. MULTRET/vararg adjustment, metamethod-aware method
+lookup, and resumable direct-BluV1 calls remain unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions
 and both `local function name(...) ... end` and simple
 `function name(...) ... end` declarations with bounded parameter vectors and
@@ -243,7 +242,10 @@ function-owned lexical blocks. Loop-control scope is reset at every function
 boundary. Simple named declarations install the resulting closure in the VM
 global registry. Dotted declarations traverse local, captured, or global table
 roots through canonical raw `GetTable` operations and store the closure in the
-final field; colon-method declaration names remain unsupported.
+final field. Colon-method declarations add an explicit compiler-owned `self`
+binding before source parameters and store the closure in the named method
+field. The binding has a real debug name but no fabricated source span;
+existing colon calls supply the receiver exactly once as argument zero.
 The owned compiler lowers noncapturing functions to
 recursive BluV1 prototype trees, emits `NEWCLOSURE`, and records fixed
 parameters for bounded child-frame argument copying. This path executes in all

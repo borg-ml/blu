@@ -2137,6 +2137,24 @@ fn owned_named_function_statements_install_recursive_globals() {
                 "{profile}"
             );
         }
+
+        for bytes in [
+            b"local object = { base = 40 } function object:add(value) return self.base + value end return object:add(2)"
+                .as_slice(),
+            b"local object = { base = 40 } function object:make(value) return function(extra) return self.base + value + extra end end local add = object:make(1) return add(1)"
+                .as_slice(),
+        ] {
+            let source = make_source(bytes.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(vec![Value::Number(42.0)]),
+                "{profile}"
+            );
+        }
     }
 }
 

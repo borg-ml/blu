@@ -298,6 +298,7 @@ fn named_function_statements_own_global_names_and_bodies() {
         panic!("expected named function statement");
     };
     assert_eq!(function.names().len(), 1);
+    assert!(!function.is_method());
     assert_eq!(source.slice(function.names()[0].span()).unwrap(), b"answer");
     let body = parsed.ast().function(function.function()).unwrap();
     assert_eq!(body.parameters().len(), 1);
@@ -317,6 +318,7 @@ fn dotted_function_statements_preserve_each_name_component() {
         .map(|name| parsed_source.slice(name.span()).unwrap())
         .collect();
     assert_eq!(names, [b"package".as_slice(), b"module", b"answer"]);
+    assert!(!function.is_method());
 
     let malformed = source(b"function package.() end".to_vec());
     let ParseOutcome::Rejected(rejected) =
@@ -325,6 +327,30 @@ fn dotted_function_statements_preserve_each_name_component() {
         panic!("missing dotted function name should reject");
     };
     assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0040");
+
+    let method_source = source(b"function package.module:answer(value) return self end".to_vec());
+    let parsed = accepted(&method_source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Function(method) = &parsed.ast().statements()[0] else {
+        panic!("expected method function statement");
+    };
+    assert!(method.is_method());
+    let names: Vec<&[u8]> = method
+        .names()
+        .iter()
+        .map(|name| method_source.slice(name.span()).unwrap())
+        .collect();
+    assert_eq!(names, [b"package".as_slice(), b"module", b"answer"]);
+
+    let malformed_method = source(b"function package:() end".to_vec());
+    let ParseOutcome::Rejected(rejected) = parse(
+        &malformed_method,
+        SemanticProfile::Blu,
+        ParseLimits::default(),
+    )
+    .unwrap() else {
+        panic!("missing method name should reject");
+    };
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0041");
 }
 
 #[test]

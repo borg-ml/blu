@@ -459,14 +459,21 @@ pub struct LocalFunctionStatement {
 pub struct FunctionStatement {
     names: Vec<Identifier>,
     function: FunctionId,
+    is_method: bool,
     span: ByteSpan,
 }
 
 impl FunctionStatement {
-    pub(crate) const fn new(names: Vec<Identifier>, function: FunctionId, span: ByteSpan) -> Self {
+    pub(crate) const fn new(
+        names: Vec<Identifier>,
+        function: FunctionId,
+        is_method: bool,
+        span: ByteSpan,
+    ) -> Self {
         Self {
             names,
             function,
+            is_method,
             span,
         }
     }
@@ -479,6 +486,11 @@ impl FunctionStatement {
     #[must_use]
     pub const fn function(&self) -> FunctionId {
         self.function
+    }
+
+    #[must_use]
+    pub const fn is_method(&self) -> bool {
+        self.is_method
     }
 
     #[must_use]
