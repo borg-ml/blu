@@ -5017,25 +5017,24 @@ impl Vm {
                 return Ok(vec![Value::Nil]);
             }
             let plain = arguments.get(3).is_some_and(Value::is_truthy);
-            if !plain && needle.iter().any(|byte| b"^$*+?.([%-".contains(byte)) {
-                return Err(RuntimeError::UnsupportedLibraryFeature {
-                    function: "string.find",
-                    feature: "Lua patterns",
-                });
-            }
             let start = initial as usize - 1;
-            let offset = if needle.is_empty() {
-                Some(0)
+            let found = if plain {
+                let offset = if needle.is_empty() {
+                    Some(0)
+                } else {
+                    haystack[start..]
+                        .windows(needle.len())
+                        .position(|window| window == needle)
+                };
+                offset.map(|offset| (start + offset, start + offset + needle.len()))
             } else {
-                haystack[start..]
-                    .windows(needle.len())
-                    .position(|window| window == needle)
+                find_basic_lua_pattern(haystack, needle, start)?
             };
-            let Some(offset) = offset else {
+            let Some((first, end)) = found else {
                 return Ok(vec![Value::Nil]);
             };
-            let first = start + offset + 1;
-            let last = first + needle.len() - 1;
+            let first = first + 1;
+            let last = end;
             Ok(vec![
                 profiled_integral_math_result(vm, "string.find", first as f64)?,
                 profiled_integral_math_result(vm, "string.find", last as f64)?,
@@ -6158,6 +6157,92 @@ fn relative_index(index: i64, length: usize) -> i64 {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BasicPatternAtom {
+    Literal(u8),
+    Any,
+}
+
+fn find_basic_lua_pattern(
+    haystack: &[u8],
+    pattern: &[u8],
+    start: usize,
+) -> Result<Option<(usize, usize)>, RuntimeError> {
+    const MAX_PATTERN_WORK: usize = 10_000_000;
+
+    let anchored = pattern.first() == Some(&b'^');
+    let mut index = usize::from(anchored);
+    let mut end_anchor = false;
+    let mut atoms = try_vec_with_capacity(pattern.len(), "string.find pattern atoms")?;
+    while index < pattern.len() {
+        let byte = pattern[index];
+        if byte == b'$' && index + 1 == pattern.len() {
+            end_anchor = true;
+            index += 1;
+        } else if byte == b'.' {
+            atoms.push(BasicPatternAtom::Any);
+            index += 1;
+        } else if byte == b'%' {
+            let escaped =
+                pattern
+                    .get(index + 1)
+                    .copied()
+                    .ok_or(RuntimeError::UnsupportedLibraryFeature {
+                        function: "string.find",
+                        feature: "malformed Lua patterns",
+                    })?;
+            if escaped.is_ascii_alphanumeric() {
+                return Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.find",
+                    feature: "Lua pattern classes and captures",
+                });
+            }
+            atoms.push(BasicPatternAtom::Literal(escaped));
+            index += 2;
+        } else if b"*+?-[]()".contains(&byte) {
+            return Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "string.find",
+                feature: "Lua pattern repetition, sets, and captures",
+            });
+        } else {
+            atoms.push(BasicPatternAtom::Literal(byte));
+            index += 1;
+        }
+    }
+
+    let candidates = if anchored {
+        1
+    } else {
+        haystack.len().saturating_sub(start).saturating_add(1)
+    };
+    let required = candidates.saturating_mul(atoms.len().max(1));
+    if required > MAX_PATTERN_WORK {
+        return Err(RuntimeError::PatternWorkLimit {
+            required,
+            limit: MAX_PATTERN_WORK,
+        });
+    }
+    for position in start..start.saturating_add(candidates) {
+        let Some(end) = position.checked_add(atoms.len()) else {
+            continue;
+        };
+        if end > haystack.len() || end_anchor && end != haystack.len() {
+            continue;
+        }
+        if atoms
+            .iter()
+            .zip(&haystack[position..end])
+            .all(|(atom, byte)| match atom {
+                BasicPatternAtom::Literal(expected) => expected == byte,
+                BasicPatternAtom::Any => true,
+            })
+        {
+            return Ok(Some((position, end)));
+        }
+    }
+    Ok(None)
+}
+
 fn try_concat_bytes(value: &Value) -> Result<Option<Cow<'_, [u8]>>, RuntimeError> {
     match value {
         Value::String(value) => Ok(Some(Cow::Borrowed(value))),
@@ -7243,6 +7328,10 @@ pub enum RuntimeError {
         function: &'static str,
         feature: &'static str,
     },
+    PatternWorkLimit {
+        required: usize,
+        limit: usize,
+    },
     Type {
         operation: &'static str,
         expected: &'static str,
@@ -7411,6 +7500,12 @@ impl fmt::Display for RuntimeError {
             }
             Self::UnsupportedLibraryFeature { function, feature } => {
                 write!(f, "{function} does not yet support {feature}")
+            }
+            Self::PatternWorkLimit { required, limit } => {
+                write!(
+                    f,
+                    "pattern match requires {required} steps, limit is {limit}"
+                )
             }
             Self::Type {
                 operation,

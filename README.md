@@ -31,8 +31,9 @@ legacy one-argument Luau/Lua 5.1–5.2 contract or modern Blu/Lua 5.3–5.5
 `math.ceil` and the integral result of two-result `math.modf` preserve
 number-only legacy behavior or return modern exact integers when representable.
 Byte-oriented `string.find` supports literal searches, relative starts, empty
-needles, nil misses, and explicit plain mode. Unimplemented Lua-pattern syntax
-fails structurally instead of being treated as literal text.
+needles, nil misses, explicit plain mode, basic anchors, wildcard bytes, and
+escaped punctuation under a work limit. Unimplemented Lua-pattern syntax fails
+structurally instead of being treated as literal text.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
 remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,

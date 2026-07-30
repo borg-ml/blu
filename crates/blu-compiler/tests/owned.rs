@@ -2288,7 +2288,7 @@ fn string_find_uses_byte_indices_plain_search_and_profile_subtypes() {
 fn string_find_rejects_patterns_unless_plain_is_explicit() {
     for (source, expected) in [
         (b"return string.find('a.c', '.', 1, true)".as_slice(), true),
-        (b"return string.find('abc', '.')".as_slice(), false),
+        (b"return string.find('abc', 'a*')".as_slice(), false),
     ] {
         for profile in SemanticProfile::ALL {
             let compiled = OwnedCompiler::default()
@@ -2307,13 +2307,63 @@ fn string_find_rejects_patterns_unless_plain_is_explicit() {
                         result,
                         Err(RuntimeError::UnsupportedLibraryFeature {
                             function: "string.find",
-                            feature: "Lua patterns",
+                            ..
                         })
                     ),
                     "{profile}"
                 );
             }
         }
+    }
+}
+
+#[test]
+fn string_find_supports_basic_anchors_wildcards_and_escapes() {
+    let source = make_source(
+        b"local a, b = string.find('xxa.c', '^a.c$', 3) local c, d = string.find('xxa.c', 'a%.c$') return a, b, c, d"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let index = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![index(3), index(5), index(3), index(5)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn string_find_preflights_pattern_work() {
+    let source = make_source(
+        b"return string.find(string.rep('a', 4000), string.rep('a', 3000) .. 'b')".to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::PatternWorkLimit {
+                limit: 10_000_000,
+                ..
+            })
+        ));
     }
 }
 

@@ -400,11 +400,13 @@ truncation-toward-zero integral result and returns the signed fractional part
 as a number.
 `string.find` currently implements the common byte-oriented literal-search
 slice: relative start indices, empty needles, nil misses, and explicit
-`plain=true`. Searches without `plain` also accept patterns containing no Lua
-pattern metacharacters. Pattern syntax is not reinterpreted as literal text;
-it fails with a structured unsupported-library-feature error until the
-versioned pattern engine is implemented. Returned indices follow the active
-profile's legacy-number or modern-integer policy.
+`plain=true`. Searches without `plain` support search-relative `^`, subject-end
+`$`, byte wildcard `.`, and `%`-escaped punctuation under a fixed pattern-work
+limit. Repetition, sets, classes, captures, and malformed escapes are not
+reinterpreted as literal text; they fail with a structured
+unsupported-library-feature error until the versioned pattern engine is
+expanded. Returned indices follow the active profile's legacy-number or
+modern-integer policy.
 
 ## Authority profiles
 
