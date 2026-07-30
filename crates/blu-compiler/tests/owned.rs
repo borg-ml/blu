@@ -3306,6 +3306,37 @@ fn owned_binary_arithmetic_invokes_resumable_metamethods() {
 }
 
 #[test]
+fn owned_callable_table_metamethods_resume_across_operator_families() {
+    let source = make_source(
+        b"local left local right local handler handler = setmetatable({}, {__call = function(self, a, b) return self == handler and a == left and (b == right or b == left or b == nil) end}) local mt = {__add = handler, __unm = handler, __concat = handler, __eq = handler, __lt = handler, __le = handler, __len = handler} left = setmetatable({}, mt) right = setmetatable({}, mt) return left + right, -left, left .. right, left == right, left < right, left <= right, #left"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let length = if profile == SemanticProfile::Lua51 {
+            Value::Number(0.0)
+        } else {
+            Value::Boolean(true)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                Value::Boolean(true),
+                length,
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_unary_negation_invokes_resumable_metamethods() {
     let source = make_source(
         b"local value value = setmetatable({}, {__unm = function(a, b) return a == value and b == value, 99 end}) return -value"

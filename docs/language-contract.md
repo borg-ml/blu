@@ -256,6 +256,10 @@ is currently legal. Blu floor-division semantics remain deliberately
 unassigned. Unary negation invokes `__unm` with the operand in both argument
 positions, matching the pinned Lua and Luau implementations. Bitwise
 metamethod events remain later work.
+Arithmetic, unary, concatenation, length, and comparison event values may
+themselves be callable tables. The runtime resolves their bounded `__call`
+chains before invocation, prepends every callable-table receiver, and keeps a
+final Blu closure on the explicit operation continuation.
 Owned unary `#` measures the raw sequence length of tables without a `__len`
 handler, using the same profile-specific integer/number result subtype as
 string length. Lua 5.1 ignores table `__len` and therefore remains raw. Blu,

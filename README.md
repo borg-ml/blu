@@ -142,7 +142,8 @@ vararg and call MULTRET expansion are implemented. Concatenation invokes
 left-then-right `__concat` handlers through a resumable continuation when
 string/number coercion is unavailable. Comparison continuations preserve
 profile-specific handler selection and Lua 5.5's removal of reversed-`__lt`
-fallback.
+fallback. Operator event values may themselves be bounded callable-table
+chains; their final Blu closures remain on the explicit continuation stack.
 Unary `#` measures raw table sequences in Lua 5.1. Other profiles resumably
 invoke a present table `__len` closure or native handler and otherwise use the
 raw sequence length.

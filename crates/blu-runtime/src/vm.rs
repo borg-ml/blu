@@ -1987,6 +1987,8 @@ impl Vm {
                             try_vec_with_capacity(2, "BluV1 arithmetic metamethod arguments")?;
                         arguments.push(left);
                         arguments.push(right);
+                        let (function, arguments) =
+                            self.resolve_blu_callable(function, arguments, prototype.profile)?;
                         if let Value::Closure(child_closure) = &function
                             && self.heap.is_blu_closure(*child_closure)?
                         {
@@ -2117,7 +2119,11 @@ impl Vm {
                                     expected: "number or __unm metamethod",
                                     actual: other.type_name(),
                                 })?;
-                            let arguments = [source.clone(), source];
+                            let mut arguments = try_vec_with_capacity(2, "BluV1 __unm arguments")?;
+                            arguments.push(source.clone());
+                            arguments.push(source);
+                            let (function, arguments) =
+                                self.resolve_blu_callable(function, arguments, prototype.profile)?;
                             if let Value::Closure(child_closure) = &function
                                 && self.heap.is_blu_closure(*child_closure)?
                             {
@@ -2239,6 +2245,8 @@ impl Vm {
                     if let Some(function) = handler {
                         let mut arguments = try_vec_with_capacity(1, "BluV1 __len arguments")?;
                         arguments.push(source);
+                        let (function, arguments) =
+                            self.resolve_blu_callable(function, arguments, prototype.profile)?;
                         if let Value::Closure(child_closure) = &function
                             && self.heap.is_blu_closure(*child_closure)?
                         {
@@ -2378,7 +2386,11 @@ impl Vm {
                                 expected: "string, number, or __concat metamethod",
                                 actual: left.type_name(),
                             })?;
-                        let arguments = [left, right];
+                        let mut arguments = try_vec_with_capacity(2, "BluV1 __concat arguments")?;
+                        arguments.push(left);
+                        arguments.push(right);
+                        let (function, arguments) =
+                            self.resolve_blu_callable(function, arguments, prototype.profile)?;
                         if let Value::Closure(child_closure) = &function
                             && self.heap.is_blu_closure(*child_closure)?
                         {
@@ -2590,6 +2602,9 @@ impl Vm {
                             }
                             _ => return Err(RuntimeError::UnsupportedComparison(opcode)),
                         };
+                        let arguments = try_clone_values(&arguments, "BluV1 comparison arguments")?;
+                        let (function, arguments) =
+                            self.resolve_blu_callable(function, arguments, prototype.profile)?;
                         if let Value::Closure(child_closure) = &function
                             && self.heap.is_blu_closure(*child_closure)?
                         {
@@ -4346,16 +4361,8 @@ impl Vm {
             .table_get(metatable, &Value::String(Arc::from(name.as_bytes())))?;
         if matches!(value, Value::Nil) {
             Ok(None)
-        } else if matches!(
-            value,
-            Value::Closure(_) | Value::CoroutineFunction(_) | Value::NativeFunction(_)
-        ) {
-            Ok(Some(value))
         } else {
-            Err(RuntimeError::UnsupportedMetamethod {
-                name,
-                actual: value.type_name(),
-            })
+            Ok(Some(value))
         }
     }
 
