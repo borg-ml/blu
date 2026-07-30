@@ -7095,6 +7095,36 @@ impl Vm {
                 number_argument(arguments, 0, "math.tan")?.tan(),
             )])
         });
+        let sinh = self.register_function(|vm, arguments| {
+            reject_lua55_compat_math(vm, "math.sinh")?;
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.sinh")?.sinh(),
+            )])
+        });
+        let cosh = self.register_function(|vm, arguments| {
+            reject_lua55_compat_math(vm, "math.cosh")?;
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.cosh")?.cosh(),
+            )])
+        });
+        let tanh = self.register_function(|vm, arguments| {
+            reject_lua55_compat_math(vm, "math.tanh")?;
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.tanh")?.tanh(),
+            )])
+        });
+        let log10 = self.register_function(|vm, arguments| {
+            reject_lua55_compat_math(vm, "math.log10")?;
+            Ok(vec![Value::Number(
+                number_argument(arguments, 0, "math.log10")?.log10(),
+            )])
+        });
+        let atan2 = self.register_function(|vm, arguments| {
+            reject_lua55_compat_math(vm, "math.atan2")?;
+            let y = number_argument(arguments, 0, "math.atan2")?;
+            let x = number_argument(arguments, 1, "math.atan2")?;
+            Ok(vec![Value::Number(y.atan2(x))])
+        });
         let atan = self.register_function(|vm, arguments| {
             let y = number_argument(arguments, 0, "math.atan")?;
             let result = match vm.active_profile()? {
@@ -7497,7 +7527,7 @@ impl Vm {
             }
         });
 
-        let table = self.heap.allocate_table(0, 31)?;
+        let table = self.heap.allocate_table(0, 36)?;
         for (name, value) in [
             (&b"abs"[..], Value::NativeFunction(abs)),
             (&b"floor"[..], Value::NativeFunction(floor)),
@@ -7511,6 +7541,11 @@ impl Vm {
             (&b"sin"[..], Value::NativeFunction(sin)),
             (&b"cos"[..], Value::NativeFunction(cos)),
             (&b"tan"[..], Value::NativeFunction(tan)),
+            (&b"sinh"[..], Value::NativeFunction(sinh)),
+            (&b"cosh"[..], Value::NativeFunction(cosh)),
+            (&b"tanh"[..], Value::NativeFunction(tanh)),
+            (&b"log10"[..], Value::NativeFunction(log10)),
+            (&b"atan2"[..], Value::NativeFunction(atan2)),
             (&b"atan"[..], Value::NativeFunction(atan)),
             (&b"asin"[..], Value::NativeFunction(asin)),
             (&b"acos"[..], Value::NativeFunction(acos)),
@@ -7828,6 +7863,17 @@ fn math_exponent_argument(
     i32::try_from(integer).map_err(|_| RuntimeError::InvalidRange {
         operation: function,
     })
+}
+
+fn reject_lua55_compat_math(vm: &Vm, function: &'static str) -> Result<(), RuntimeError> {
+    if vm.active_profile()? == SemanticProfile::Lua55 {
+        Err(RuntimeError::UnsupportedLibraryFeature {
+            function,
+            feature: "function removed in Lua 5.5",
+        })
+    } else {
+        Ok(())
+    }
 }
 
 fn split_binary_exponent(value: f64) -> (f64, i32) {

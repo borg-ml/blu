@@ -28,6 +28,9 @@ its remainder preserves the dividend's sign, with modern integer preservation
 and zero-divisor errors. Shared `math.pow` provides the library form of
 floating exponentiation, while `math.frexp` and `math.ldexp` split and compose
 binary exponents with profile-appropriate exponent subtypes and conversion.
+The legacy `sinh`/`cosh`/`tanh`/`log10`/`atan2` names remain available in Blu,
+Luau, and Lua 5.1–5.4 profiles and fail explicitly in Lua 5.5, which removed
+them.
 `math.atan` follows the
 legacy one-argument Luau/Lua 5.1–5.2 contract or modern Blu/Lua 5.3–5.5
 `atan2(y, x)` contract according to the active profile; `math.asin` and

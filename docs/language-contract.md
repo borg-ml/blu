@@ -463,6 +463,10 @@ zero and handles subnormal and non-finite values without an intermediate
 overflow. `math.ldexp` composes the pair; Luau and Lua 5.1–5.2 truncate a
 fractional exponent, while modern profiles require an integer-representable
 exponent.
+The legacy `math.sinh`, `math.cosh`, `math.tanh`, `math.log10`, and
+`math.atan2` names exist in Blu, Luau, and Lua 5.1–5.4. Lua 5.5 removed them,
+so its profile returns a structured unsupported-feature error instead of
+silently substituting another function.
 `math.random()` returns a number in `[0, 1)`. Bounded results are numbers in
 Luau and Lua 5.1–5.2 and integers in Blu and Lua 5.3–5.5. Luau and Lua 5.1
 truncate fractional bounds, Lua 5.2 rounds them, and modern profiles require

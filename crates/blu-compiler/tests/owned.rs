@@ -4368,6 +4368,41 @@ fn math_frexp_and_ldexp_follow_profile_numeric_contracts() {
 }
 
 #[test]
+fn legacy_elementary_math_is_explicitly_removed_only_in_lua55() {
+    let source = make_source(
+        b"return math.sinh(0),math.cosh(0),math.tanh(0),math.log10(100),math.atan2(1,0)".to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if profile == SemanticProfile::Lua55 {
+            assert!(matches!(
+                result,
+                Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "math.sinh",
+                    feature: "function removed in Lua 5.5",
+                })
+            ));
+        } else {
+            assert_eq!(
+                result,
+                Ok(vec![
+                    Value::Number(0.0),
+                    Value::Number(1.0),
+                    Value::Number(0.0),
+                    Value::Number(2.0),
+                    Value::Number(core::f64::consts::FRAC_PI_2),
+                ]),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn math_random_and_randomseed_follow_profile_contracts() {
     for profile in SemanticProfile::ALL {
         let source = make_source(
