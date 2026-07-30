@@ -115,8 +115,9 @@ both directions. Zero or dynamic steps fail during lowering until their
 conflicting profile-specific runtime behavior can be represented directly.
 Canonical BluV1 global loads and stores connect the owned frontend to the VM's
 embedding registry. Unknown scalar reads produce `nil`, and scalar writes
-persist in the VM; global list assignment and environment-rebinding APIs remain
-explicitly unsupported.
+persist in the VM; identifier assignment lists can mix locals, captures, and
+globals while preserving simultaneous assignment. Environment-rebinding APIs
+remain explicitly unsupported.
 The owned frontend also supports bounded table constructors with sequential
 array, identifier-keyed, and bracket-keyed fields, plus bracket and dot-name
 reads and single-target writes. These execute directly through the generational
@@ -124,11 +125,14 @@ heap, return `nil` for absent keys, and retain active registers as GC roots
 during allocation and table growth. Metamethod dispatch, indexed assignment
 lists, and final-field MULTRET expansion remain explicit later work.
 Bounded postfix calls evaluate the callee and fixed scalar arguments
-left-to-right, dispatch through the VM's existing closure/native/table-call
-path, and produce the first result or `nil`. Call statements support
-side-effecting APIs such as `print`. Variable argument/result adjustment,
-owned function declarations, metamethod-aware method lookup, and resumable direct-BluV1
-calls remain explicit later work.
+left-to-right and dispatch through the VM's existing
+closure/native/table-call path. Scalar contexts produce the first result or
+`nil`; a final call in a local or identifier assignment list requests the
+remaining bounded result count, truncating excess results and padding missing
+results with `nil`. Call statements support side-effecting APIs such as
+`print`. Dynamic result propagation through returns, arguments, and table
+constructors, variable arguments, metamethod-aware method lookup, and
+resumable direct-BluV1 calls remain explicit later work.
 The older `Engine::execute` source path continues to use the pinned Luau
 compatibility compiler while the owned grammar and executor are expanded.
 

@@ -381,6 +381,10 @@ fn translate_instruction(
             prototype,
             instruction: "fixed calls",
         }),
+        BluInstruction::CallResults { .. } => Err(TranslationError::UnsupportedInstruction {
+            prototype,
+            instruction: "fixed multi-result calls",
+        }),
         BluInstruction::NewClosure { .. }
         | BluInstruction::GetUpvalue { .. }
         | BluInstruction::SetUpvalue { .. } => Err(TranslationError::UnsupportedInstruction {

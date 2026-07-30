@@ -76,13 +76,16 @@ The separate `blu_compiler::owned::OwnedCompiler`, also re-exported through
 locals (with explicit shadowing), decimal integer
 literals, truthiness-based boolean `not`, numeric `+`/`-`/`*`, profile-gated `//`, and
 an optional final bare or expression-list `return`. Falling off the chunk emits
-an EOF-spanned zero-result return. Fixed scalar local name/value lists evaluate
+an EOF-spanned zero-result return. Local name/value lists evaluate
 all right-hand expressions before introducing any listed binding, discard
-extra values, and initialize missing values to `nil`. Function-call/MULTRET
-adjustment remains outside this owned slice. Fixed scalar assignment lists
+extra values, and initialize missing values to `nil`. A final call or method
+call expands to the statically bounded number of remaining local slots.
+Assignment lists
 likewise snapshot every right-hand expression before moving adjusted values
 into targets from left to right, permitting swaps without partial-write
-observations. Identifier targets resolve to active locals, enclosing upvalues,
+observations, and apply the same final-call adjustment. Dynamic MULTRET
+propagation through returns, arguments, and table constructors remains outside
+this owned slice. Identifier targets resolve to active locals, enclosing upvalues,
 or the VM global registry in that order. Semicolons are retained tokens and
 act as optional statement separators or empty statements, including after
 `return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
@@ -212,7 +215,7 @@ performs raw value-keyed access, and returns `nil` for absent keys. Indexing a
 non-table and invalid table keys return structured runtime errors. Indexed
 assignment lists, final-field MULTRET expansion, and metamethod-aware owned
 table access remain unsupported rather than silently approximated.
-BluV1 fixed calls require the `FIXED_CALLS` feature bit. The instruction names
+BluV1 scalar fixed calls require the `FIXED_CALLS` feature bit. The instruction names
 one initialized function register and a validated contiguous range of
 initialized argument registers, and initializes one destination. Owned postfix
 calls evaluate the callee first and each scalar argument left-to-right, then
@@ -222,7 +225,13 @@ limits, active GC roots, and callable-table behavior. The expression result is
 the first returned value or `nil`; additional values are discarded. Call
 statements discard that scalar result. Colon method calls evaluate their
 receiver once, perform raw table lookup before evaluating explicit arguments,
-and pass the receiver as the first argument. BluV1 reserves the `CLOSURES`
+and pass the receiver as the first argument. `FIXED_MULTI_RESULTS` adds a
+canonical call instruction with a validated, statically requested contiguous
+result range. Direct execution truncates excess results and pads missing
+results with `nil`; the owned frontend uses it for final calls in local and
+plain-identifier assignment lists. Bootstrap translation rejects this
+instruction explicitly because Luau MULTRET translation is not yet canonical.
+BluV1 reserves the `CLOSURES`
 feature for canonical `NewClosure`, `GetUpvalue`, and `SetUpvalue`
 instructions. Validation resolves child indices through the parent's declared
 child list, verifies every capture against initialized parent registers or
@@ -233,8 +242,9 @@ generational upvalue cells, refreshes suspended parent registers after child
 returns, and uses an explicit caller stack bounded by the VM call limit.
 Registers, active closures, open upvalues, and suspended callers participate
 in allocation roots. Bootstrap translation continues to reject closure
-instructions explicitly. MULTRET/vararg adjustment, metamethod-aware method
-lookup, and resumable direct-BluV1 calls remain unsupported.
+instructions explicitly. Dynamic MULTRET/vararg adjustment,
+metamethod-aware method lookup, and resumable direct-BluV1 calls remain
+unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions
 and both `local function name(...) ... end` and simple
 `function name(...) ... end` declarations with bounded parameter vectors and

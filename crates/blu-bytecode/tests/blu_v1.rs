@@ -275,6 +275,50 @@ fn canonical_round_trip_preserves_profiles_and_metadata() {
 }
 
 #[test]
+fn fixed_multi_result_calls_round_trip_and_require_their_feature() {
+    let artifact_with_features = |required_features| {
+        let mut artifact = fixture();
+        let prototype = &mut artifact.prototypes[0];
+        prototype.register_count = 4;
+        prototype.required_features = required_features;
+        prototype.code = vec![
+            Instruction::LoadConstant {
+                destination: 0,
+                constant: 0,
+            },
+            Instruction::CallResults {
+                destination: 1,
+                function: 0,
+                arguments: 0,
+                argument_count: 0,
+                result_count: 3,
+            },
+            Instruction::Return { first: 1, count: 3 },
+        ];
+        prototype.source_map.truncate(3);
+        prototype.locals.clear();
+        artifact
+    };
+
+    let limits = BluLimits::default();
+    let validated = ValidatedArtifact::new(
+        artifact_with_features(FeatureBits::BASELINE | FeatureBits::FIXED_MULTI_RESULTS),
+        limits,
+    )
+    .unwrap();
+    let bytes = encode(&validated, limits).unwrap();
+    assert_eq!(decode_validated(&bytes, limits).unwrap(), validated);
+
+    assert_eq!(
+        ValidatedArtifact::new(artifact_with_features(FeatureBits::BASELINE), limits),
+        Err(ValidationError::MissingFeature {
+            prototype: 0,
+            feature: "fixed multi-result calls",
+        })
+    );
+}
+
+#[test]
 fn closure_instructions_round_trip_with_validated_capture_metadata() {
     let limits = BluLimits::default();
     let validated = ValidatedArtifact::new(closure_fixture(), limits).unwrap();

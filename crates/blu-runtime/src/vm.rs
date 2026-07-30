@@ -69,6 +69,7 @@ struct BluCaller {
     closure: Option<ClosureId>,
     pc: usize,
     destination: u16,
+    result_count: u16,
 }
 
 impl GcRoots {
@@ -1020,6 +1021,7 @@ impl Vm {
                             closure,
                             pc: pc + 1,
                             destination,
+                            result_count: 1,
                         });
                         artifact = child_artifact;
                         prototype_index = child;
@@ -1042,6 +1044,95 @@ impl Vm {
                         destination,
                         value,
                     )?;
+                }
+                BluInstruction::CallResults {
+                    destination,
+                    function,
+                    arguments,
+                    argument_count,
+                    result_count,
+                } => {
+                    let function = blu_register(&registers, function)?.clone();
+                    let start = usize::from(arguments);
+                    let end = start.checked_add(usize::from(argument_count)).ok_or(
+                        RuntimeError::Register {
+                            register: usize::MAX,
+                            count: registers.len(),
+                        },
+                    )?;
+                    let arguments = registers.get(start..end).ok_or(RuntimeError::Register {
+                        register: end.saturating_sub(1),
+                        count: registers.len(),
+                    })?;
+                    if let Value::Closure(child_closure) = &function
+                        && self.heap.is_blu_closure(*child_closure)?
+                    {
+                        if callers.len() >= self.call_limit {
+                            return Err(RuntimeError::CallLimit {
+                                limit: self.call_limit,
+                            });
+                        }
+                        let arguments = try_clone_values(arguments, "BluV1 call arguments")?;
+                        let (child_artifact, child, profile, _) =
+                            self.heap.blu_closure_parts(*child_closure)?;
+                        let child_prototype = child_artifact
+                            .prototypes
+                            .get(child)
+                            .ok_or(RuntimeError::InvalidPrototype(child))?;
+                        let child_constants = materialize_blu_constants(child_prototype)?;
+                        let child_register_count = usize::from(child_prototype.register_count);
+                        let mut child_registers =
+                            try_vec_with_capacity(child_register_count, "BluV1 runtime registers")?;
+                        child_registers.resize(child_register_count, Value::Nil);
+                        let copied = arguments
+                            .len()
+                            .min(usize::from(child_prototype.parameter_count));
+                        child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                        let mut child_open_upvalues =
+                            try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
+                        child_open_upvalues.resize(child_register_count, None);
+                        try_reserve_exact(&mut callers, 1, "BluV1 caller frame stack")?;
+                        callers.push(BluCaller {
+                            artifact,
+                            prototype: prototype_index,
+                            constants,
+                            registers,
+                            open_upvalues,
+                            closure,
+                            pc: pc + 1,
+                            destination,
+                            result_count,
+                        });
+                        artifact = child_artifact;
+                        prototype_index = child;
+                        constants = child_constants;
+                        registers = child_registers;
+                        open_upvalues = child_open_upvalues;
+                        closure = Some(*child_closure);
+                        pc = 0;
+                        self.active_profile = Some(profile);
+                        continue;
+                    }
+                    let roots = blu_frame_roots(&registers, &open_upvalues, closure, &callers)?;
+                    let values =
+                        self.call_value(function, arguments, &mut remaining, callers.len(), roots)?;
+                    let mut values = values.into_iter();
+                    for offset in 0..result_count {
+                        let target =
+                            destination
+                                .checked_add(offset)
+                                .ok_or(RuntimeError::Register {
+                                    register: usize::MAX,
+                                    count: registers.len(),
+                                })?;
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            target,
+                            values.next().unwrap_or(Value::Nil),
+                        )?;
+                    }
                 }
                 BluInstruction::NewClosure { destination, child } => {
                     let child_index = *prototype
@@ -1476,14 +1567,22 @@ impl Vm {
                         &mut caller.registers,
                         &caller.open_upvalues,
                     )?;
-                    let value = values.into_iter().next().unwrap_or(Value::Nil);
-                    set_blu_register(
-                        &mut self.heap,
-                        &mut caller.registers,
-                        &caller.open_upvalues,
-                        caller.destination,
-                        value,
-                    )?;
+                    let mut values = values.into_iter();
+                    for offset in 0..caller.result_count {
+                        let destination = caller.destination.checked_add(offset).ok_or(
+                            RuntimeError::Register {
+                                register: usize::MAX,
+                                count: caller.registers.len(),
+                            },
+                        )?;
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut caller.registers,
+                            &caller.open_upvalues,
+                            destination,
+                            values.next().unwrap_or(Value::Nil),
+                        )?;
+                    }
                     artifact = caller.artifact;
                     prototype_index = caller.prototype;
                     constants = caller.constants;

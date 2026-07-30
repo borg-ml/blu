@@ -623,6 +623,13 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         {
             required_features = required_features | FeatureBits::FIXED_CALLS;
         }
+        if self
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::CallResults { .. }))
+        {
+            required_features = required_features | FeatureBits::FIXED_MULTI_RESULTS;
+        }
         if self.code.iter().any(|instruction| {
             matches!(
                 instruction,
@@ -1444,7 +1451,15 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
 
         let capacity = statement.names().len().max(statement.values().len());
         let mut registers = allocate_vec(capacity, "local declaration registers")?;
-        for value in statement.values().iter().copied() {
+        for (index, value) in statement.values().iter().copied().enumerate() {
+            let is_last = index + 1 == statement.values().len();
+            let requested = statement.names().len().saturating_sub(index);
+            if is_last && requested > 1 {
+                if let Some(results) = self.lower_call_expression_results(value, requested)? {
+                    registers.extend(results);
+                    continue;
+                }
+            }
             registers.push(self.lower_expression(value)?);
         }
         while registers.len() < statement.names().len() {
@@ -1502,8 +1517,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         let capacity = statement.targets().len().max(statement.values().len());
         let mut sources = allocate_vec(capacity, "assignment source registers")?;
         for (index, value) in statement.values().iter().copied().enumerate() {
-            let source = self.lower_expression(value)?;
-            if index < destinations.len() {
+            let is_last = index + 1 == statement.values().len();
+            let requested = destinations.len().saturating_sub(index);
+            let mut values = if is_last && requested > 1 {
+                self.lower_call_expression_results(value, requested)?
+                    .unwrap_or_else(Vec::new)
+            } else {
+                Vec::new()
+            };
+            if values.is_empty() {
+                values.push(self.lower_expression(value)?);
+            }
+            for source in values.into_iter().take(requested) {
                 let snapshot = self.allocate_register()?;
                 self.emit(
                     Instruction::Move {
@@ -1653,16 +1678,38 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     }
 
     fn lower_call(&mut self, call: CallExpression) -> Result<u16, OwnedCompileError> {
+        let mut results = self.lower_call_results(call, 1)?;
+        results.pop().ok_or(OwnedCompileError::InternalInvariant {
+            message: "single-result call did not allocate a result register",
+        })
+    }
+
+    fn lower_call_results(
+        &mut self,
+        call: CallExpression,
+        result_count: usize,
+    ) -> Result<Vec<u16>, OwnedCompileError> {
         let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
         let function = self.lower_expression(call.function())?;
         let mut sources = allocate_vec(call.argument_count(), "call argument registers")?;
         for index in call.first_argument()..end {
             sources.push(self.lower_expression(self.call_arguments[index])?);
         }
-        self.emit_fixed_call(function, &sources, call.span())
+        self.emit_fixed_call_results(function, &sources, result_count, call.span())
     }
 
     fn lower_method_call(&mut self, call: MethodCallExpression) -> Result<u16, OwnedCompileError> {
+        let mut results = self.lower_method_call_results(call, 1)?;
+        results.pop().ok_or(OwnedCompileError::InternalInvariant {
+            message: "single-result method call did not allocate a result register",
+        })
+    }
+
+    fn lower_method_call_results(
+        &mut self,
+        call: MethodCallExpression,
+        result_count: usize,
+    ) -> Result<Vec<u16>, OwnedCompileError> {
         let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
         let receiver = self.lower_expression(call.receiver())?;
         let key = self.lower_constant(
@@ -1692,7 +1739,22 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         for index in call.first_argument()..end {
             sources.push(self.lower_expression(self.call_arguments[index])?);
         }
-        self.emit_fixed_call(function, &sources, call.span())
+        self.emit_fixed_call_results(function, &sources, result_count, call.span())
+    }
+
+    fn lower_call_expression_results(
+        &mut self,
+        id: ExpressionId,
+        result_count: usize,
+    ) -> Result<Option<Vec<u16>>, OwnedCompileError> {
+        let expression = *self.expression(id)?;
+        match expression.kind() {
+            ExpressionKind::Call(call) => self.lower_call_results(call, result_count).map(Some),
+            ExpressionKind::MethodCall(call) => {
+                self.lower_method_call_results(call, result_count).map(Some)
+            }
+            _ => Ok(None),
+        }
     }
 
     fn call_argument_end(
@@ -1713,18 +1775,20 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         Ok(end)
     }
 
-    fn emit_fixed_call(
+    fn emit_fixed_call_results(
         &mut self,
         function: u16,
         sources: &[u16],
+        result_count: usize,
         span: ByteSpan,
-    ) -> Result<u16, OwnedCompileError> {
+    ) -> Result<Vec<u16>, OwnedCompileError> {
         let limit = self
             .limits
             .artifact
             .max_registers_per_prototype
             .min(u16::MAX as usize);
         check_limit(OwnedCompileLimit::CallArguments, sources.len(), limit)?;
+        check_limit(OwnedCompileLimit::ReturnValues, result_count, limit)?;
         let arguments = if sources.is_empty() {
             0
         } else {
@@ -1753,16 +1817,38 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             u16::try_from(sources.len()).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "call argument count passed limits but cannot fit BluV1",
             })?;
-        self.emit(
-            Instruction::Call {
-                destination,
-                function,
-                arguments,
-                argument_count,
-            },
-            span,
-        )?;
-        Ok(destination)
+        let result_count =
+            u16::try_from(result_count).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "call result count passed limits but cannot fit BluV1",
+            })?;
+        let mut results = allocate_vec(usize::from(result_count), "call result registers")?;
+        results.push(destination);
+        for _ in 1..result_count {
+            results.push(self.allocate_register()?);
+        }
+        if result_count == 1 {
+            self.emit(
+                Instruction::Call {
+                    destination,
+                    function,
+                    arguments,
+                    argument_count,
+                },
+                span,
+            )?;
+        } else {
+            self.emit(
+                Instruction::CallResults {
+                    destination,
+                    function,
+                    arguments,
+                    argument_count,
+                    result_count,
+                },
+                span,
+            )?;
+        }
+        Ok(results)
     }
 
     fn lower_expression(&mut self, id: ExpressionId) -> Result<u16, OwnedCompileError> {
