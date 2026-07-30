@@ -86,6 +86,8 @@ remain GC roots. Initial generational coroutine threads implement
 including nested calls, resume arguments, successful protected-call
 suspension, resumed `pcall`/`xpcall` error unwinding, yielding error handlers,
 and GC-traced continuations.
+Owned sole-call returns replace the current closure frame, providing proper
+tail recursion independently of the configured ordinary call-depth limit.
 Portable V1 package envelopes provide bounded canonical decoding, SHA-256
 identity, explicit dialect and authority requirements, and an opaque validated
 bytecode payload. The public engine currently executes only dialect-matched

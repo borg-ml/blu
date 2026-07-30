@@ -3803,7 +3803,7 @@ fn fixed_multi_result_calls_accept_native_results_and_nil_pad() {
 fn sole_return_calls_forward_all_results_without_growing_blu_callers() {
     for profile in SemanticProfile::ALL {
         let source = make_source(
-            b"local function pair(value) if value == 0 then return 40, 2 end return pair(value - 1) end local function forward() return pair(20) end local a, b, c = forward() return a, b, c"
+            b"local function pair(value) if value == 0 then return 40, 2 end return pair(value - 1) end local function forward() return pair(10000) end local a, b, c = forward() return a, b, c"
                 .to_vec(),
         );
         let compiled = OwnedCompiler::default()
