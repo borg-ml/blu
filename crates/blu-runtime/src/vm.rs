@@ -6474,8 +6474,49 @@ impl Vm {
             vm.heap.set_table_metatable(clone, metatable)?;
             Ok(vec![Value::Table(clone)])
         });
+        let freeze = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.freeze",
+                    profile,
+                });
+            }
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.freeze",
+                index: 1,
+            })?;
+            let table = table_id(value)?;
+            if let Some(metatable) = vm.heap.table_metatable(table)?
+                && !matches!(
+                    vm.heap
+                        .table_get(metatable, &Value::String(Arc::from(&b"__metatable"[..])))?,
+                    Value::Nil
+                )
+            {
+                return Err(RuntimeError::MetatableProtected);
+            }
+            vm.heap.table_freeze(table)?;
+            Ok(vec![value.clone()])
+        });
+        let is_frozen = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.isfrozen",
+                    profile,
+                });
+            }
+            let table = arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.isfrozen",
+                index: 1,
+            })?;
+            Ok(vec![Value::Boolean(
+                vm.heap.table_is_frozen(table_id(table)?)?,
+            )])
+        });
 
-        let table = self.heap.allocate_table(0, 11)?;
+        let table = self.heap.allocate_table(0, 13)?;
         for (name, function) in [
             (&b"insert"[..], insert),
             (&b"remove"[..], remove),
@@ -6488,6 +6529,8 @@ impl Vm {
             (&b"find"[..], find),
             (&b"clear"[..], clear),
             (&b"clone"[..], clone_table),
+            (&b"freeze"[..], freeze),
+            (&b"isfrozen"[..], is_frozen),
         ] {
             self.heap.table_set(
                 table,

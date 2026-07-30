@@ -68,6 +68,8 @@ pub enum HeapError {
     NilKey,
     NanKey,
     InvalidIterationKey,
+    FrozenTable,
+    AlreadyFrozen,
 }
 
 impl fmt::Display for HeapError {
@@ -84,6 +86,8 @@ impl fmt::Display for HeapError {
             Self::NilKey => f.write_str("table index is nil"),
             Self::NanKey => f.write_str("table index is NaN"),
             Self::InvalidIterationKey => f.write_str("invalid key to table iteration"),
+            Self::FrozenTable => f.write_str("attempt to modify a frozen table"),
+            Self::AlreadyFrozen => f.write_str("table is already frozen"),
         }
     }
 }
@@ -207,6 +211,7 @@ impl Heap {
                 hash,
                 hash_capacity,
                 metatable: None,
+                frozen: false,
             }))
         })?;
         Ok(TableId {
@@ -373,7 +378,11 @@ impl Heap {
     pub fn table_set(&mut self, table: TableId, key: Value, value: Value) -> Result<(), HeapError> {
         let key = Key::from_value(&key)?;
         let Self { slots, memory, .. } = self;
-        table_mut_in_slots(slots, table)?.set(key, value, memory)
+        let table = table_mut_in_slots(slots, table)?;
+        if table.frozen {
+            return Err(HeapError::FrozenTable);
+        }
+        table.set(key, value, memory)
     }
 
     pub(crate) fn table_set_bytes(
@@ -383,7 +392,11 @@ impl Heap {
         value: &Value,
     ) -> Result<usize, HeapError> {
         let key = Key::from_value(key)?;
-        self.table(table)?.set_bytes(&key, value)
+        let table = self.table(table)?;
+        if table.frozen {
+            return Err(HeapError::FrozenTable);
+        }
+        table.set_bytes(&key, value)
     }
 
     pub fn table_length(&self, table: TableId) -> Result<usize, HeapError> {
@@ -392,8 +405,24 @@ impl Heap {
 
     pub fn table_clear(&mut self, table: TableId) -> Result<(), HeapError> {
         let table = self.table_mut(table)?;
+        if table.frozen {
+            return Err(HeapError::FrozenTable);
+        }
         table.array.fill(Value::Nil);
         table.hash.clear();
+        Ok(())
+    }
+
+    pub fn table_is_frozen(&self, table: TableId) -> Result<bool, HeapError> {
+        Ok(self.table(table)?.frozen)
+    }
+
+    pub fn table_freeze(&mut self, table: TableId) -> Result<(), HeapError> {
+        let table = self.table_mut(table)?;
+        if table.frozen {
+            return Err(HeapError::AlreadyFrozen);
+        }
+        table.frozen = true;
         Ok(())
     }
 
@@ -409,7 +438,11 @@ impl Heap {
         if let Some(metatable) = metatable {
             self.table(metatable)?;
         }
-        self.table_mut(table)?.metatable = metatable;
+        let table = self.table_mut(table)?;
+        if table.frozen {
+            return Err(HeapError::FrozenTable);
+        }
+        table.metatable = metatable;
         Ok(())
     }
 
@@ -865,6 +898,7 @@ struct Table {
     hash: HashMap<Key, Value>,
     hash_capacity: usize,
     metatable: Option<TableId>,
+    frozen: bool,
 }
 
 impl Table {

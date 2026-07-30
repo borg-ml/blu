@@ -479,6 +479,10 @@ functions explicitly.
 `table.clone` performs a bounded shallow copy, so self-references still point
 to the source, and preserves unprotected metatables. Protected metatables
 produce a structured error as in Luau. Both functions are Blu/Luau-only.
+`table.freeze` marks a table shallowly immutable and `table.isfrozen` exposes
+that state. Indexed writes, `rawset`, `table.clear`, sorting, and metatable
+changes all enforce the same heap-level flag. Freezing twice and freezing a
+protected-metatable table fail structurally; shallow clones are mutable.
 `collectgarbage` supports the shared `collect` and `count` commands. Collection
 traces active frames, globals, threads, upvalues, and host-retained values.
 `count` reports the runtime's accounted GC-heap kibibytes; it is not presented

@@ -65,6 +65,8 @@ Blu/Luau `table.create` and `table.find` provide bounded preallocation/fill and
 raw array search with profile-typed result indices.
 `table.clear` retains allocation while removing entries, and `table.clone`
 performs a bounded shallow copy with unprotected metatable preservation.
+`table.freeze`/`table.isfrozen` enforce shallow immutability through every heap
+mutation path; clones of frozen tables remain mutable.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
 `table.sort` provides bounded default ordering for uniform number and byte-string

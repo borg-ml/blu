@@ -9,7 +9,7 @@ use blu_core::{
     CompilerId, CompilerIdentity, DiagnosticError, DiagnosticLimit, IdentityLimits, Phase,
     SemanticProfile, SourceFile, SourceId, SourceLimits,
 };
-use blu_runtime::{Dialect, RuntimeError, Value, Vm};
+use blu_runtime::{Dialect, HeapError, RuntimeError, Value, Vm};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -4313,6 +4313,83 @@ fn luau_table_clear_and_clone_preserve_shallow_structure() {
                 result,
                 Err(RuntimeError::UnsupportedSemanticProfile {
                     operation: "table.clone",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
+fn luau_frozen_tables_enforce_heap_wide_immutability() {
+    let source = make_source(
+        b"local value={x=1} local frozen=table.freeze(value) local clone=table.clone(value) return frozen==value,table.isfrozen(value),table.isfrozen(clone),clone.x"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+            assert_eq!(
+                result,
+                Ok(vec![
+                    Value::Boolean(true),
+                    Value::Boolean(true),
+                    Value::Boolean(false),
+                    Value::Number(1.0),
+                ]),
+                "{profile}"
+            );
+            for source in [
+                b"local value=table.freeze({x=1}) value.x=2 return value".as_slice(),
+                b"local value=table.freeze({x=1}) return rawset(value,'x',2)".as_slice(),
+                b"local value=table.freeze({x=1}) return table.clear(value)".as_slice(),
+                b"local value=table.freeze({x=1}) return setmetatable(value,{})".as_slice(),
+                b"local value=table.freeze({2,1}) return table.sort(value)".as_slice(),
+            ] {
+                let compiled = OwnedCompiler::default()
+                    .compile(&make_source(source.to_vec()), profile, compiler_identity())
+                    .unwrap();
+                assert_eq!(
+                    Vm::default()
+                        .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                    Err(RuntimeError::Heap(HeapError::FrozenTable)),
+                    "{profile}"
+                );
+            }
+            let source =
+                make_source(b"local value=table.freeze({}) return table.freeze(value)".to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Err(RuntimeError::Heap(HeapError::AlreadyFrozen)),
+                "{profile}"
+            );
+            let source = make_source(
+                b"local value=setmetatable({},{__metatable='locked'}) return table.freeze(value)"
+                    .to_vec(),
+            );
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Err(RuntimeError::MetatableProtected),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.freeze",
                     profile,
                 }),
                 "{profile}"
