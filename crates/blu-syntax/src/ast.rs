@@ -455,34 +455,34 @@ pub struct LocalFunctionStatement {
     span: ByteSpan,
 }
 
-#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FunctionStatement {
-    name: Identifier,
+    names: Vec<Identifier>,
     function: FunctionId,
     span: ByteSpan,
 }
 
 impl FunctionStatement {
-    pub(crate) const fn new(name: Identifier, function: FunctionId, span: ByteSpan) -> Self {
+    pub(crate) const fn new(names: Vec<Identifier>, function: FunctionId, span: ByteSpan) -> Self {
         Self {
-            name,
+            names,
             function,
             span,
         }
     }
 
     #[must_use]
-    pub const fn name(self) -> Identifier {
-        self.name
+    pub fn names(&self) -> &[Identifier] {
+        &self.names
     }
 
     #[must_use]
-    pub const fn function(self) -> FunctionId {
+    pub const fn function(&self) -> FunctionId {
         self.function
     }
 
     #[must_use]
-    pub const fn span(self) -> ByteSpan {
+    pub const fn span(&self) -> ByteSpan {
         self.span
     }
 }

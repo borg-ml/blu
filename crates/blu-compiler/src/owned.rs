@@ -29,10 +29,10 @@ use blu_core::{
 };
 use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryOperator,
-    CallExpression, Expression, ExpressionId, ExpressionKind, FunctionId, Identifier, IfStatement,
-    LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement, ParseError,
-    ParseLimits, ParseOutcome, Rejected, RepeatStatement, ReturnStatement, Statement,
-    TableConstructor, TableField, UnaryOperator, WhileStatement, parse,
+    CallExpression, Expression, ExpressionId, ExpressionKind, FunctionId, FunctionStatement,
+    Identifier, IfStatement, LocalListStatement, LocalStatement, MethodCallExpression,
+    NumericForStatement, ParseError, ParseLimits, ParseOutcome, Rejected, RepeatStatement,
+    ReturnStatement, Statement, TableConstructor, TableField, UnaryOperator, WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -652,15 +652,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     false
                 }
                 Statement::Function(function) => {
-                    let closure = self.lower_function(function.function(), function.span())?;
-                    let name = self.global_name_constant(function.name().span())?;
-                    self.emit(
-                        Instruction::StoreGlobal {
-                            name,
-                            source: closure,
-                        },
-                        function.span(),
-                    )?;
+                    self.lower_function_statement(function)?;
                     false
                 }
                 Statement::LocalList(local) => {
@@ -1235,6 +1227,95 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             },
             span,
         )?;
+        Ok(destination)
+    }
+
+    fn lower_function_statement(
+        &mut self,
+        statement: &FunctionStatement,
+    ) -> Result<(), OwnedCompileError> {
+        let Some(root) = statement.names().first().copied() else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "named function statement has an empty name path",
+            });
+        };
+        if statement.names().len() == 1 {
+            let closure = self.lower_function(statement.function(), statement.span())?;
+            let name = self.global_name_constant(root.span())?;
+            return self.emit(
+                Instruction::StoreGlobal {
+                    name,
+                    source: closure,
+                },
+                statement.span(),
+            );
+        }
+
+        let mut table = self.lower_identifier(root, statement.span())?;
+        let field_count = statement.names().len();
+        for field in &statement.names()[1..field_count - 1] {
+            let key = self.lower_constant(
+                Constant::String(copy_bytes(
+                    self.source.slice(field.span())?,
+                    "function path field",
+                )?),
+                field.span(),
+            )?;
+            let destination = self.allocate_register()?;
+            self.emit(
+                Instruction::GetTable {
+                    destination,
+                    table,
+                    key,
+                },
+                field.span(),
+            )?;
+            table = destination;
+        }
+        let closure = self.lower_function(statement.function(), statement.span())?;
+        let Some(field) = statement.names().last().copied() else {
+            return Err(OwnedCompileError::InternalInvariant {
+                message: "named function statement lost its final path component",
+            });
+        };
+        let key = self.lower_constant(
+            Constant::String(copy_bytes(
+                self.source.slice(field.span())?,
+                "function path field",
+            )?),
+            field.span(),
+        )?;
+        self.emit(
+            Instruction::SetTable {
+                table,
+                key,
+                value: closure,
+            },
+            statement.span(),
+        )
+    }
+
+    fn lower_identifier(
+        &mut self,
+        identifier: Identifier,
+        span: ByteSpan,
+    ) -> Result<u16, OwnedCompileError> {
+        if let Some(register) = self.resolve_local(identifier.span())? {
+            return Ok(register);
+        }
+        let destination = self.allocate_register()?;
+        if let Some(upvalue) = self.resolve_upvalue(identifier.span())? {
+            self.emit(
+                Instruction::GetUpvalue {
+                    destination,
+                    upvalue,
+                },
+                span,
+            )?;
+        } else {
+            let name = self.global_name_constant(identifier.span())?;
+            self.emit(Instruction::LoadGlobal { destination, name }, span)?;
+        }
         Ok(destination)
     }
 

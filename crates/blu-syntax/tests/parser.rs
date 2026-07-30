@@ -294,13 +294,37 @@ fn function_expressions_and_local_functions_own_parameters_and_bodies() {
 fn named_function_statements_own_global_names_and_bodies() {
     let source = source(b"function answer(value) return value + 2 end".to_vec());
     let parsed = accepted(&source, SemanticProfile::Blu, ParseLimits::default());
-    let Statement::Function(function) = parsed.ast().statements()[0] else {
+    let Statement::Function(function) = &parsed.ast().statements()[0] else {
         panic!("expected named function statement");
     };
-    assert_eq!(source.slice(function.name().span()).unwrap(), b"answer");
+    assert_eq!(function.names().len(), 1);
+    assert_eq!(source.slice(function.names()[0].span()).unwrap(), b"answer");
     let body = parsed.ast().function(function.function()).unwrap();
     assert_eq!(body.parameters().len(), 1);
     assert!(matches!(body.body().statements()[0], Statement::Return(_)));
+}
+
+#[test]
+fn dotted_function_statements_preserve_each_name_component() {
+    let parsed_source = source(b"function package.module.answer(value) return value end".to_vec());
+    let parsed = accepted(&parsed_source, SemanticProfile::Blu, ParseLimits::default());
+    let Statement::Function(function) = &parsed.ast().statements()[0] else {
+        panic!("expected dotted function statement");
+    };
+    let names: Vec<&[u8]> = function
+        .names()
+        .iter()
+        .map(|name| parsed_source.slice(name.span()).unwrap())
+        .collect();
+    assert_eq!(names, [b"package".as_slice(), b"module", b"answer"]);
+
+    let malformed = source(b"function package.() end".to_vec());
+    let ParseOutcome::Rejected(rejected) =
+        parse(&malformed, SemanticProfile::Blu, ParseLimits::default()).unwrap()
+    else {
+        panic!("missing dotted function name should reject");
+    };
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0040");
 }
 
 #[test]

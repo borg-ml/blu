@@ -2119,6 +2119,24 @@ fn owned_named_function_statements_install_recursive_globals() {
             "{profile}"
         );
         assert!(matches!(vm.global(b"factorial"), Some(Value::Closure(_))));
+
+        for bytes in [
+            b"local package = { module = {} } function package.module.answer(value) return value + 2 end return package.module.answer(40)"
+                .as_slice(),
+            b"package = { module = {} } function package.module.answer(value) return value + 2 end return package.module.answer(40)"
+                .as_slice(),
+        ] {
+            let source = make_source(bytes.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .unwrap();
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(vec![Value::Number(42.0)]),
+                "{profile}"
+            );
+        }
     }
 }
 

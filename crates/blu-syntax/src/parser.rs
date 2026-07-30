@@ -844,6 +844,35 @@ impl<'a> Parser<'a> {
                 message: "identifier check succeeded without a current token",
             });
         };
+        let mut names = allocate_vec(2, "function name path")?;
+        push_fallible(
+            &mut names,
+            Identifier::new(name.span()),
+            "function name path",
+        )?;
+        while self.at(TokenKind::Dot) {
+            self.bump();
+            if !self.at(TokenKind::Identifier) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0040",
+                    "expected a name after `.` in function declaration",
+                    &["identifier"],
+                )?;
+                return Ok(());
+            }
+            let Some(field) = self.bump() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "identifier check succeeded without a current token",
+                });
+            };
+            self.function_node_count = self.function_node_count.saturating_add(1);
+            self.check_ast_limit()?;
+            push_fallible(
+                &mut names,
+                Identifier::new(field.span()),
+                "function name path",
+            )?;
+        }
         let Some(function) = self.parse_function_body(keyword)? else {
             return Ok(());
         };
@@ -853,7 +882,7 @@ impl<'a> Parser<'a> {
             });
         };
         self.push_statement(Statement::Function(FunctionStatement::new(
-            Identifier::new(name.span()),
+            names,
             function,
             keyword.span().merge(body.span())?,
         )))
