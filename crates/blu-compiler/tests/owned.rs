@@ -1452,6 +1452,33 @@ fn generic_for_executes_pairs_and_owned_iterators_across_profiles() {
             );
         }
     }
+
+    let metamethod_source = make_source(
+        b"local mt={} function mt.__band(a,b) return 11 end function mt.__bor(a,b) return 12 end function mt.__bxor(a,b) return 13 end function mt.__shl(a,b) return 14 end function mt.__shr(a,b) return 15 end function mt.__bnot(a,b) return rawequal(a,b) and 16 or 0 end local x=setmetatable({},mt) return x&1,1|x,x~1,1<<x,x>>1,~x"
+            .to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Blu,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&metamethod_source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::Integer(11),
+                Value::Integer(12),
+                Value::Integer(13),
+                Value::Integer(14),
+                Value::Integer(15),
+                Value::Integer(16),
+            ]),
+            "{profile}"
+        );
+    }
 }
 
 #[test]

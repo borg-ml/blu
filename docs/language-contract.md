@@ -151,8 +151,10 @@ Canonical 64-bit integer bitwise instructions cover `&`, `|`, binary and unary
 magnitudes of at least 64 yield zero. Lua 5.3 retains its upstream
 numeric-string conversion; Lua 5.4–5.5 reject strings. Blu selects the Lua
 5.4+ conversion rule. Luau and Lua 5.1–5.2 reject the syntax during lexing.
-Bitwise metamethod dispatch remains an explicit unsupported operand path until
-it uses the resumable operation machinery. The Luau bootstrap translator
+The runtime selects left then right `__band`, `__bor`, `__bxor`, `__shl`, and
+`__shr` handlers for non-convertible operands and invokes `__bnot` with the
+upstream duplicate unary operand. Owned closures resume through the bounded
+caller stack and contribute their first result. The Luau bootstrap translator
 rejects these canonical 64-bit instructions rather than narrowing them to
 32-bit operations.
 Canonical comparison instructions likewise name independent operands and

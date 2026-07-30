@@ -2078,75 +2078,177 @@ impl Vm {
                         )?;
                     }
                 }
-                BluInstruction::BitwiseAnd {
-                    destination,
-                    left,
-                    right,
-                }
-                | BluInstruction::BitwiseOr {
-                    destination,
-                    left,
-                    right,
-                }
-                | BluInstruction::BitwiseExclusiveOr {
-                    destination,
-                    left,
-                    right,
-                }
-                | BluInstruction::ShiftLeft {
-                    destination,
-                    left,
-                    right,
-                }
-                | BluInstruction::ShiftRight {
-                    destination,
-                    left,
-                    right,
-                } => {
-                    let left = blu_bitwise_integer(
-                        blu_register(&registers, left)?,
-                        prototype.profile,
-                        "bitwise operation",
-                    )?;
-                    let right = blu_bitwise_integer(
-                        blu_register(&registers, right)?,
-                        prototype.profile,
-                        "bitwise operation",
-                    )?;
-                    let result = match instruction {
-                        BluInstruction::BitwiseAnd { .. } => left & right,
-                        BluInstruction::BitwiseOr { .. } => left | right,
-                        BluInstruction::BitwiseExclusiveOr { .. } => left ^ right,
-                        BluInstruction::ShiftLeft { .. } => lua_shift_left(left, right),
-                        BluInstruction::ShiftRight { .. } => {
-                            lua_shift_left(left, right.wrapping_neg())
-                        }
+                BluInstruction::BitwiseAnd { .. }
+                | BluInstruction::BitwiseOr { .. }
+                | BluInstruction::BitwiseExclusiveOr { .. }
+                | BluInstruction::ShiftLeft { .. }
+                | BluInstruction::ShiftRight { .. }
+                | BluInstruction::BitwiseNot { .. } => {
+                    let (destination, left_register, right_register, event) = match instruction {
+                        BluInstruction::BitwiseAnd {
+                            destination,
+                            left,
+                            right,
+                        } => (destination, left, right, "__band"),
+                        BluInstruction::BitwiseOr {
+                            destination,
+                            left,
+                            right,
+                        } => (destination, left, right, "__bor"),
+                        BluInstruction::BitwiseExclusiveOr {
+                            destination,
+                            left,
+                            right,
+                        } => (destination, left, right, "__bxor"),
+                        BluInstruction::ShiftLeft {
+                            destination,
+                            left,
+                            right,
+                        } => (destination, left, right, "__shl"),
+                        BluInstruction::ShiftRight {
+                            destination,
+                            left,
+                            right,
+                        } => (destination, left, right, "__shr"),
+                        BluInstruction::BitwiseNot {
+                            destination,
+                            source,
+                        } => (destination, source, source, "__bnot"),
                         _ => unreachable!("bitwise execution arm filters the instruction"),
                     };
-                    set_blu_register(
-                        &mut self.heap,
-                        &mut registers,
-                        &open_upvalues,
-                        destination,
-                        Value::Integer(result),
-                    )?;
-                }
-                BluInstruction::BitwiseNot {
-                    destination,
-                    source,
-                } => {
-                    let source = blu_bitwise_integer(
-                        blu_register(&registers, source)?,
-                        prototype.profile,
-                        "bitwise not",
-                    )?;
-                    set_blu_register(
-                        &mut self.heap,
-                        &mut registers,
-                        &open_upvalues,
-                        destination,
-                        Value::Integer(!source),
-                    )?;
+                    let left = blu_register(&registers, left_register)?.clone();
+                    let right = blu_register(&registers, right_register)?.clone();
+                    let converted_left =
+                        blu_bitwise_integer(&left, prototype.profile, "bitwise operation");
+                    let converted_right =
+                        blu_bitwise_integer(&right, prototype.profile, "bitwise operation");
+                    if let (Ok(left_integer), Ok(right_integer)) = (converted_left, converted_right)
+                    {
+                        let result = match instruction {
+                            BluInstruction::BitwiseAnd { .. } => left_integer & right_integer,
+                            BluInstruction::BitwiseOr { .. } => left_integer | right_integer,
+                            BluInstruction::BitwiseExclusiveOr { .. } => {
+                                left_integer ^ right_integer
+                            }
+                            BluInstruction::ShiftLeft { .. } => {
+                                lua_shift_left(left_integer, right_integer)
+                            }
+                            BluInstruction::ShiftRight { .. } => {
+                                lua_shift_left(left_integer, right_integer.wrapping_neg())
+                            }
+                            BluInstruction::BitwiseNot { .. } => !left_integer,
+                            _ => unreachable!("bitwise execution arm filters the instruction"),
+                        };
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            destination,
+                            Value::Integer(result),
+                        )?;
+                    } else {
+                        let function = self
+                            .metamethod(&left, event)?
+                            .or(self.metamethod(&right, event)?);
+                        let Some(function) = function else {
+                            blu_bitwise_integer(&left, prototype.profile, "bitwise operation")?;
+                            blu_bitwise_integer(&right, prototype.profile, "bitwise operation")?;
+                            unreachable!("one bitwise operand conversion failed");
+                        };
+                        let mut arguments =
+                            try_vec_with_capacity(2, "BluV1 bitwise metamethod arguments")?;
+                        arguments.push(left);
+                        arguments.push(right);
+                        let (function, arguments) =
+                            self.resolve_blu_callable(function, arguments, prototype.profile)?;
+                        if let Value::Closure(child_closure) = &function
+                            && self.heap.is_blu_closure(*child_closure)?
+                        {
+                            if callers.len() >= self.call_limit {
+                                return Err(RuntimeError::CallLimit {
+                                    limit: self.call_limit,
+                                });
+                            }
+                            let (child_artifact, child, profile, _) =
+                                self.heap.blu_closure_parts(*child_closure)?;
+                            let child_prototype = child_artifact
+                                .prototypes
+                                .get(child)
+                                .ok_or(RuntimeError::InvalidPrototype(child))?;
+                            let child_constants = materialize_blu_constants(child_prototype)?;
+                            let child_register_count = usize::from(child_prototype.register_count);
+                            let mut child_registers = try_vec_with_capacity(
+                                child_register_count,
+                                "BluV1 runtime registers",
+                            )?;
+                            child_registers.resize(child_register_count, Value::Nil);
+                            let copied = arguments
+                                .len()
+                                .min(usize::from(child_prototype.parameter_count));
+                            child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                            let child_varargs = if child_prototype.is_vararg {
+                                try_clone_values(
+                                    arguments
+                                        .get(usize::from(child_prototype.parameter_count)..)
+                                        .unwrap_or_default(),
+                                    "BluV1 frame varargs",
+                                )?
+                            } else {
+                                Vec::new()
+                            };
+                            let mut child_open_upvalues =
+                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
+                            child_open_upvalues.resize(child_register_count, None);
+                            try_reserve_exact(
+                                &mut callers,
+                                1,
+                                "BluV1 bitwise metamethod caller frame",
+                            )?;
+                            callers.push(BluCaller {
+                                artifact,
+                                prototype: prototype_index,
+                                constants,
+                                registers,
+                                varargs,
+                                open_upvalues,
+                                closure,
+                                pc: pc + 1,
+                                result: BluCallResult::Fixed {
+                                    destination,
+                                    count: 1,
+                                },
+                            });
+                            artifact = child_artifact;
+                            prototype_index = child;
+                            constants = child_constants;
+                            registers = child_registers;
+                            varargs = child_varargs;
+                            open_upvalues = child_open_upvalues;
+                            closure = Some(*child_closure);
+                            pc = 0;
+                            self.active_profile = Some(profile);
+                            continue;
+                        }
+                        let roots = blu_frame_roots(
+                            &registers,
+                            &varargs,
+                            &open_upvalues,
+                            closure,
+                            &callers,
+                        )?;
+                        let value = self
+                            .call_value(function, &arguments, &mut remaining, callers.len(), roots)?
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Value::Nil);
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            destination,
+                            value,
+                        )?;
+                    }
                 }
                 BluInstruction::Move {
                     destination,
