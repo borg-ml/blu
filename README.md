@@ -138,7 +138,9 @@ closure/native handlers; writes likewise follow `__newindex` chains or
 handlers. Binary arithmetic dispatches `__add`, `__sub`, `__mul`, `__div`,
 `__mod`, `__pow`, and dialect-gated `__idiv` through the same bounded
 continuation path; unary negation likewise dispatches `__unm`. Final-field
-vararg and call MULTRET expansion are implemented.
+vararg and call MULTRET expansion are implemented. Concatenation invokes
+left-then-right `__concat` handlers through a resumable continuation when
+string/number coercion is unavailable.
 Unary `#` measures raw table sequences in Lua 5.1. Other profiles resumably
 invoke a present table `__len` closure or native handler and otherwise use the
 raw sequence length.

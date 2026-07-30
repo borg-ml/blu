@@ -696,6 +696,42 @@ fn concatenation_is_canonical_profile_neutral_and_directly_executable() {
 }
 
 #[test]
+fn owned_concatenation_invokes_resumable_metamethods() {
+    let source = make_source(
+        b"local left = setmetatable({}, {__concat = function(a, b) return a, b end}) local right = {} return left .. right"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result = Vm::default()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap();
+        assert_eq!(result.len(), 1, "{profile}");
+        assert!(matches!(result[0], Value::Table(_)), "{profile}");
+    }
+}
+
+#[test]
+fn owned_concatenation_uses_the_right_handler_when_the_left_has_none() {
+    let source = make_source(
+        b"local left = {} local right right = setmetatable({}, {__concat = function(a, b) return a == left and b == right end}) return left .. right"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn comparisons_are_canonical_profile_neutral_and_directly_executable() {
     let source = make_source(
         br#"return 2 == 2, 2 ~= 3, 1 < 2, 2 <= 2, 3 > 2, 3 >= 3, "a" < "b", 1 == "1", 1 + 2 < 4, "ab" == "ab""#

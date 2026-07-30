@@ -139,6 +139,9 @@ before allocation. A bare return uses a zero-width validated register
 range and produces no values.
 The canonical concatenation instruction names independent left and right
 registers and executes string/number coercion directly for every profile.
+When coercion is unavailable, the runtime selects the left then right
+`__concat` handler; owned closures resume through the bounded caller
+continuation and contribute only their first result.
 The Luau bootstrap translator rejects it explicitly because Luau's range-form
 opcode requires verified contiguous operands; it does not silently rewrite
 canonical register semantics.

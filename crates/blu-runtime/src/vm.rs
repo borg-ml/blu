@@ -2342,18 +2342,113 @@ impl Vm {
                 } => {
                     let left = blu_register(&registers, left)?.clone();
                     let right = blu_register(&registers, right)?.clone();
-                    let value = self.concat_value(
-                        left,
-                        right,
-                        CallContext::new(&mut remaining, 0, GcRoots::default()),
-                    )?;
-                    set_blu_register(
-                        &mut self.heap,
-                        &mut registers,
-                        &open_upvalues,
-                        destination,
-                        value,
-                    )?;
+                    if try_concat_bytes(&left)?.is_some() && try_concat_bytes(&right)?.is_some() {
+                        let value = self.concat_value(
+                            left,
+                            right,
+                            CallContext::new(&mut remaining, 0, GcRoots::default()),
+                        )?;
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            destination,
+                            value,
+                        )?;
+                    } else {
+                        let function = self
+                            .metamethod(&left, "__concat")?
+                            .or(self.metamethod(&right, "__concat")?)
+                            .ok_or(RuntimeError::Type {
+                                operation: "concatenation",
+                                expected: "string, number, or __concat metamethod",
+                                actual: left.type_name(),
+                            })?;
+                        let arguments = [left, right];
+                        if let Value::Closure(child_closure) = &function
+                            && self.heap.is_blu_closure(*child_closure)?
+                        {
+                            if callers.len() >= self.call_limit {
+                                return Err(RuntimeError::CallLimit {
+                                    limit: self.call_limit,
+                                });
+                            }
+                            let (child_artifact, child, profile, _) =
+                                self.heap.blu_closure_parts(*child_closure)?;
+                            let child_prototype = child_artifact
+                                .prototypes
+                                .get(child)
+                                .ok_or(RuntimeError::InvalidPrototype(child))?;
+                            let child_constants = materialize_blu_constants(child_prototype)?;
+                            let child_register_count = usize::from(child_prototype.register_count);
+                            let mut child_registers = try_vec_with_capacity(
+                                child_register_count,
+                                "BluV1 runtime registers",
+                            )?;
+                            child_registers.resize(child_register_count, Value::Nil);
+                            let copied = arguments
+                                .len()
+                                .min(usize::from(child_prototype.parameter_count));
+                            child_registers[..copied].clone_from_slice(&arguments[..copied]);
+                            let child_varargs = if child_prototype.is_vararg {
+                                try_clone_values(
+                                    arguments
+                                        .get(usize::from(child_prototype.parameter_count)..)
+                                        .unwrap_or_default(),
+                                    "BluV1 frame varargs",
+                                )?
+                            } else {
+                                Vec::new()
+                            };
+                            let mut child_open_upvalues =
+                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
+                            child_open_upvalues.resize(child_register_count, None);
+                            try_reserve_exact(&mut callers, 1, "BluV1 __concat caller frame")?;
+                            callers.push(BluCaller {
+                                artifact,
+                                prototype: prototype_index,
+                                constants,
+                                registers,
+                                varargs,
+                                open_upvalues,
+                                closure,
+                                pc: pc + 1,
+                                result: BluCallResult::Fixed {
+                                    destination,
+                                    count: 1,
+                                },
+                            });
+                            artifact = child_artifact;
+                            prototype_index = child;
+                            constants = child_constants;
+                            registers = child_registers;
+                            varargs = child_varargs;
+                            open_upvalues = child_open_upvalues;
+                            closure = Some(*child_closure);
+                            pc = 0;
+                            self.active_profile = Some(profile);
+                            continue;
+                        }
+                        let roots = blu_frame_roots(
+                            &registers,
+                            &varargs,
+                            &open_upvalues,
+                            closure,
+                            &callers,
+                        )?;
+                        let value = self
+                            .call_value(function, &arguments, &mut remaining, callers.len(), roots)?
+                            .into_iter()
+                            .next()
+                            .unwrap_or(Value::Nil);
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            destination,
+                            value,
+                        )?;
+                    }
                 }
                 BluInstruction::Equal {
                     destination,
