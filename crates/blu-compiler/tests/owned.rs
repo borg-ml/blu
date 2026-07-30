@@ -3118,6 +3118,24 @@ fn owned_binary_arithmetic_invokes_resumable_metamethods() {
 }
 
 #[test]
+fn owned_unary_negation_invokes_resumable_metamethods() {
+    let source = make_source(
+        b"local value value = setmetatable({}, {__unm = function(a, b) return a == value and b == value, 99 end}) return -value"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn owned_arithmetic_uses_the_right_handler_when_the_left_has_none() {
     let source = make_source(
         b"local left = {} local right right = setmetatable({}, {__add = function(a, b) return a == left and b == right end}) return left + right"

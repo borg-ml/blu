@@ -246,7 +246,9 @@ operand is nonnumeric, it selects the left then right `__add`, `__sub`,
 snapshotted operands through the bounded caller continuation. `__idiv` follows
 the same rule only in Luau and Lua 5.3–5.5, matching the profiles where `//`
 is currently legal. Blu floor-division semantics remain deliberately
-unassigned. Unary and bitwise metamethod events remain later work.
+unassigned. Unary negation invokes `__unm` with the operand in both argument
+positions, matching the pinned Lua and Luau implementations. Bitwise
+metamethod events remain later work.
 Owned unary `#` measures the raw sequence length of tables without a `__len`
 handler, using the same profile-specific integer/number result subtype as
 string length. Lua 5.1 ignores table `__len` and therefore remains raw. Blu,
