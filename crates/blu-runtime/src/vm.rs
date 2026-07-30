@@ -5204,7 +5204,13 @@ impl Vm {
                 let first = found.start;
                 let end = found.end;
                 append_limited_string(&mut result, &haystack[copied_until..first])?;
-                append_gsub_replacement(&mut result, &replacement, haystack, &found)?;
+                append_gsub_replacement(
+                    &mut result,
+                    &replacement,
+                    haystack,
+                    &found,
+                    vm.active_profile()?,
+                )?;
                 replacements += 1;
                 if end > first {
                     search_start = end;
@@ -7131,6 +7137,7 @@ fn append_gsub_replacement(
     replacement: &[u8],
     haystack: &[u8],
     found: &BasicPatternMatch,
+    profile: SemanticProfile,
 ) -> Result<(), RuntimeError> {
     let mut index = 0;
     while index < replacement.len() {
@@ -7173,10 +7180,14 @@ fn append_gsub_replacement(
                 }
             }
             _ => {
-                return Err(RuntimeError::UnsupportedLibraryFeature {
-                    function: "string.gsub",
-                    feature: "nonportable replacement escapes",
-                });
+                if profile == SemanticProfile::Lua51 {
+                    append_limited_string(result, &replacement[index + 1..index + 2])?;
+                } else {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "string.gsub",
+                        feature: "nonportable replacement escapes",
+                    });
+                }
             }
         }
         index += 2;

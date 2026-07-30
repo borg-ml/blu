@@ -2974,6 +2974,35 @@ fn string_gsub_expands_substring_and_position_capture_references() {
 }
 
 #[test]
+fn string_gsub_replacement_escapes_follow_the_lua51_split() {
+    let source = make_source(b"return string.gsub('a','a','%q')".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if profile == SemanticProfile::Lua51 {
+            assert_eq!(
+                result,
+                Ok(vec![
+                    Value::String(Arc::from(&b"q"[..])),
+                    Value::Number(1.0)
+                ])
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.gsub",
+                    feature: "nonportable replacement escapes",
+                })
+            ));
+        }
+    }
+}
+
+#[test]
 fn string_gsub_rejects_unimplemented_replacements_structurally() {
     for profile in SemanticProfile::ALL {
         for source in [

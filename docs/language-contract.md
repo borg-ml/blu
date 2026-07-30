@@ -431,7 +431,9 @@ at each subject boundary, through the same set and work-limit semantics.
 `string.gsub` uses the same engine with bounded non-overlapping replacement
 and Lua-compatible empty-match progress. String and numeric replacements
 support literal bytes, `%%`, `%0`, and `%1` through `%9` substring or
-position-capture expansion; the second result is the profile-typed
+position-capture expansion. Lua 5.1 preserves its permissive behavior for
+other `%x` replacement escapes by emitting `x`; Blu, Luau, and Lua 5.2–5.5
+reject them. The second result is the profile-typed
 replacement count. Capture references, table replacements, and callback
 replacements fail explicitly.
 `collectgarbage` supports the shared `collect` and `count` commands. Collection
