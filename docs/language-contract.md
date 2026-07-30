@@ -355,7 +355,7 @@ whose integer execution semantics are not assigned. Nested prototypes,
 upvalues, and the rest of the language remain explicit unsupported structure,
 not an implicit compatibility claim.
 
-Ordinary bytecode calls currently run on an owned, bounded VM frame stack.
+Legacy Luau-bytecode calls currently run on an owned, bounded VM frame stack.
 Suspended callers and their registers are traced as GC roots. Generational
 thread values support `coroutine.create`, `resume`, `yield`, `status`, `wrap`,
 `running`, `isyieldable`, and `close`, including nested yields and successful
@@ -364,6 +364,10 @@ explicit frames to the nearest suspended `pcall` or `xpcall`; `xpcall` handlers
 may themselves yield without losing outer callers. Luau `running` returns one
 value and reports the main thread as yieldable; Blu follows modern Lua by
 returning `(thread, is_main)` and making the main thread non-yieldable.
+Owned BluV1 closures are not yet converted into this legacy continuation
+representation; resuming or yielding them remains part of the explicit
+resumable-continuation milestone rather than silently using the wrong frame
+format.
 
 ## Semantic profiles
 
@@ -483,6 +487,11 @@ produce a structured error as in Luau. Both functions are Blu/Luau-only.
 that state. Indexed writes, `rawset`, `table.clear`, sorting, and metatable
 changes all enforce the same heap-level flag. Freezing twice and freezing a
 protected-metatable table fail structurally; shallow clones are mutable.
+`coroutine.running` follows the active profile: Lua 5.1 returns nil on the main
+thread, Luau returns only the thread, and Blu/Lua 5.2–5.5 also return the
+main-thread boolean. `coroutine.isyieldable` is true on Luau's main thread,
+false on the Blu/Lua 5.3–5.5 main thread, true inside their coroutines, and
+explicitly unsupported for Lua 5.1–5.2 where it is absent.
 `collectgarbage` supports the shared `collect` and `count` commands. Collection
 traces active frames, globals, threads, upvalues, and host-retained values.
 `count` reports the runtime's accounted GC-heap kibibytes; it is not presented

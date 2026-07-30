@@ -67,6 +67,9 @@ raw array search with profile-typed result indices.
 performs a bounded shallow copy with unprotected metatable preservation.
 `table.freeze`/`table.isfrozen` enforce shallow immutability through every heap
 mutation path; clones of frozen tables remain mutable.
+`coroutine.running` and `coroutine.isyieldable` dispatch on the executing
+artifact profile, including Lua 5.1 main-thread nil and Luau main-thread
+yieldability.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
 `table.sort` provides bounded default ordering for uniform number and byte-string

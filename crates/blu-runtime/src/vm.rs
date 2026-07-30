@@ -5659,17 +5659,45 @@ impl Vm {
             Ok(vec![Value::CoroutineFunction(thread)])
         });
         let running = self.register_function(|vm, _| {
-            let thread = vm.running_thread.unwrap_or(vm.main_thread);
-            let mut result = vec![Value::Thread(thread)];
-            if vm.dialect == Dialect::Blu {
-                result.push(Value::Boolean(vm.running_thread.is_none()));
+            let profile = vm.active_profile()?;
+            if profile == SemanticProfile::Lua51 && vm.running_thread.is_none() {
+                return Ok(vec![Value::Nil]);
             }
-            Ok(result)
+            let thread = Value::Thread(vm.running_thread.unwrap_or(vm.main_thread));
+            match profile {
+                SemanticProfile::Luau | SemanticProfile::Lua51 => Ok(vec![thread]),
+                SemanticProfile::Blu
+                | SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55 => {
+                    Ok(vec![thread, Value::Boolean(vm.running_thread.is_none())])
+                }
+                _ => Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "coroutine.running",
+                    profile,
+                }),
+            }
         });
         let isyieldable = self.register_function(|vm, _| {
-            Ok(vec![Value::Boolean(
-                vm.running_thread.is_some() || vm.dialect == Dialect::Luau,
-            )])
+            let profile = vm.active_profile()?;
+            match profile {
+                SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55 => Ok(vec![Value::Boolean(vm.running_thread.is_some())]),
+                SemanticProfile::Luau => Ok(vec![Value::Boolean(true)]),
+                SemanticProfile::Lua51 | SemanticProfile::Lua52 => {
+                    Err(RuntimeError::UnsupportedSemanticProfile {
+                        operation: "coroutine.isyieldable",
+                        profile,
+                    })
+                }
+                _ => Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "coroutine.isyieldable",
+                    profile,
+                }),
+            }
         });
         let close = self.register_function(|vm, arguments| {
             let thread = thread_argument(arguments, 0, "coroutine.close")?;

@@ -4399,6 +4399,60 @@ fn luau_frozen_tables_enforce_heap_wide_immutability() {
 }
 
 #[test]
+fn coroutine_introspection_uses_the_active_semantic_profile() {
+    let main_source =
+        make_source(b"local thread,main=coroutine.running() return type(thread),main".to_vec());
+    let yieldable_source = make_source(b"return coroutine.isyieldable()".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compile = |source: &SourceFile| {
+            OwnedCompiler::default()
+                .compile(source, profile, compiler_identity())
+                .unwrap()
+        };
+        let main = Vm::default()
+            .execute_blu_v1(
+                compile(&main_source).into_validated_artifact(),
+                BluLimits::default(),
+            )
+            .unwrap();
+        assert_eq!(
+            main,
+            match profile {
+                SemanticProfile::Lua51 => vec![Value::String(Arc::from(&b"nil"[..])), Value::Nil,],
+                SemanticProfile::Luau =>
+                    vec![Value::String(Arc::from(&b"thread"[..])), Value::Nil,],
+                _ => vec![
+                    Value::String(Arc::from(&b"thread"[..])),
+                    Value::Boolean(true),
+                ],
+            },
+            "{profile}"
+        );
+
+        let yieldable = Vm::default().execute_blu_v1(
+            compile(&yieldable_source).into_validated_artifact(),
+            BluLimits::default(),
+        );
+        match profile {
+            SemanticProfile::Lua51 | SemanticProfile::Lua52 => assert_eq!(
+                yieldable,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "coroutine.isyieldable",
+                    profile,
+                }),
+                "{profile}"
+            ),
+            SemanticProfile::Luau => {
+                assert_eq!(yieldable, Ok(vec![Value::Boolean(true)]), "{profile}");
+            }
+            _ => {
+                assert_eq!(yieldable, Ok(vec![Value::Boolean(false)]), "{profile}");
+            }
+        }
+    }
+}
+
+#[test]
 fn tonumber_preserves_profile_subtypes_and_explicit_base_grammar() {
     let source = make_source(
         b"return tonumber(' 42 '),tonumber('ff',16),tonumber('0x10'),tonumber(3),tonumber('3.0',10),tonumber('nan'),tonumber('inf'),tonumber('ffffffffffffffff',16),tonumber('0x1.8p1'),tonumber('-0x1p2'),tonumber('x')"
