@@ -4075,6 +4075,125 @@ fn math_type_and_tointeger_follow_modern_profile_contracts() {
 }
 
 #[test]
+fn bit32_core_follows_profile_specific_conversion_and_result_rules() {
+    let source = make_source(
+        b"return bit32.band(),bit32.bor(),bit32.bxor(),bit32.band(0xffffffff,0x12345678),bit32.bnot(0),bit32.lshift(1,-1),bit32.rshift(1,-1),bit32.lshift(1,32),bit32.arshift(0x80000000,1),bit32.band('3',1),bit32.band(-1,0xffffffff)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Luau
+                | SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+        ) {
+            let integral = |value| {
+                if matches!(profile, SemanticProfile::Blu | SemanticProfile::Lua53) {
+                    Value::Integer(value)
+                } else {
+                    Value::Number(value as f64)
+                }
+            };
+            assert_eq!(
+                result,
+                Ok(vec![
+                    integral(4_294_967_295),
+                    integral(0),
+                    integral(0),
+                    integral(0x1234_5678),
+                    integral(4_294_967_295),
+                    integral(0),
+                    integral(2),
+                    integral(0),
+                    integral(0xc000_0000),
+                    integral(1),
+                    integral(4_294_967_295),
+                ]),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "bit32.band",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+
+        let fractional = make_source(b"return bit32.band(1.5,3)".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&fractional, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        match profile {
+            SemanticProfile::Blu => assert_eq!(result, Ok(vec![Value::Integer(1)])),
+            SemanticProfile::Luau => assert_eq!(result, Ok(vec![Value::Number(1.0)])),
+            SemanticProfile::Lua52 => assert_eq!(result, Ok(vec![Value::Number(2.0)])),
+            SemanticProfile::Lua53 => assert_eq!(
+                result,
+                Err(RuntimeError::Type {
+                    operation: "bit32.band",
+                    expected: "integer-representable number",
+                    actual: "number",
+                })
+            ),
+            SemanticProfile::Lua51 | SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
+                assert_eq!(
+                    result,
+                    Err(RuntimeError::UnsupportedSemanticProfile {
+                        operation: "bit32.band",
+                        profile,
+                    })
+                );
+            }
+            _ => panic!("unhandled semantic profile {profile}"),
+        }
+
+        let invalid = make_source(b"return bit32.bnot('nope')".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&invalid, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Luau
+                | SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+        ) {
+            assert_eq!(
+                result,
+                Err(RuntimeError::Type {
+                    operation: "bit32.bnot",
+                    expected: "number",
+                    actual: "string",
+                }),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                result,
+                Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "bit32.bnot",
+                    profile,
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn luau_math_extensions_are_profile_gated_and_edge_compatible() {
     let source = make_source(
         b"return math.clamp(5,1,3),math.clamp(-1,1,3),math.sign(-3),math.sign(0),math.sign(0/0),math.round(1.5),math.round(-1.5),math.round(1.49)"

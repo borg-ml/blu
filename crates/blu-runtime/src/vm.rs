@@ -5588,6 +5588,7 @@ impl Vm {
 
         self.install_table_library()?;
         self.install_math_library()?;
+        self.install_bit32_library()?;
         self.install_coroutine_library()?;
         Ok(())
     }
@@ -6981,6 +6982,116 @@ impl Vm {
         self.set_global(&b"math"[..], Value::Table(table));
         Ok(())
     }
+
+    fn install_bit32_library(&mut self) -> Result<(), RuntimeError> {
+        let band = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.band")?;
+            let mut result = u32::MAX;
+            for index in 0..arguments.len() {
+                result &= bit32_argument(vm, arguments, index, "bit32.band")?;
+            }
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.band",
+                f64::from(result),
+            )?])
+        });
+        let bor = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.bor")?;
+            let mut result = 0u32;
+            for index in 0..arguments.len() {
+                result |= bit32_argument(vm, arguments, index, "bit32.bor")?;
+            }
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.bor",
+                f64::from(result),
+            )?])
+        });
+        let bxor = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.bxor")?;
+            let mut result = 0u32;
+            for index in 0..arguments.len() {
+                result ^= bit32_argument(vm, arguments, index, "bit32.bxor")?;
+            }
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.bxor",
+                f64::from(result),
+            )?])
+        });
+        let bnot = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.bnot")?;
+            let result = !bit32_argument(vm, arguments, 0, "bit32.bnot")?;
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.bnot",
+                f64::from(result),
+            )?])
+        });
+        let lshift = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.lshift")?;
+            let value = bit32_argument(vm, arguments, 0, "bit32.lshift")?;
+            let displacement = bit32_argument(vm, arguments, 1, "bit32.lshift")? as i32;
+            let result = bit32_shift(value, displacement);
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.lshift",
+                f64::from(result),
+            )?])
+        });
+        let rshift = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.rshift")?;
+            let value = bit32_argument(vm, arguments, 0, "bit32.rshift")?;
+            let displacement = bit32_argument(vm, arguments, 1, "bit32.rshift")? as i32;
+            let result = bit32_shift(value, displacement.saturating_neg());
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.rshift",
+                f64::from(result),
+            )?])
+        });
+        let arshift = self.register_function(|vm, arguments| {
+            bit32_profile(vm, "bit32.arshift")?;
+            let value = bit32_argument(vm, arguments, 0, "bit32.arshift")?;
+            let displacement = bit32_argument(vm, arguments, 1, "bit32.arshift")? as i32;
+            let result = if displacement < 0 {
+                bit32_shift(value, displacement.saturating_neg())
+            } else if displacement >= 32 {
+                if value & 0x8000_0000 == 0 {
+                    0
+                } else {
+                    u32::MAX
+                }
+            } else {
+                ((value as i32) >> displacement) as u32
+            };
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "bit32.arshift",
+                f64::from(result),
+            )?])
+        });
+
+        let table = self.heap.allocate_table(0, 7)?;
+        for (name, function) in [
+            (&b"band"[..], band),
+            (&b"bor"[..], bor),
+            (&b"bxor"[..], bxor),
+            (&b"bnot"[..], bnot),
+            (&b"lshift"[..], lshift),
+            (&b"rshift"[..], rshift),
+            (&b"arshift"[..], arshift),
+        ] {
+            self.heap.table_set(
+                table,
+                Value::String(Arc::from(name)),
+                Value::NativeFunction(function),
+            )?;
+        }
+        self.set_global(&b"bit32"[..], Value::Table(table));
+        Ok(())
+    }
 }
 
 fn string_bytes<'a>(value: &'a Value, operation: &'static str) -> Result<&'a [u8], RuntimeError> {
@@ -7227,6 +7338,88 @@ fn exact_integer_conversion(value: &Value, profile: SemanticProfile) -> Option<i
             Some(*value as i64)
         }
         _ => None,
+    }
+}
+
+fn bit32_profile(vm: &Vm, operation: &'static str) -> Result<SemanticProfile, RuntimeError> {
+    let profile = vm.active_profile()?;
+    if matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Luau
+            | SemanticProfile::Lua52
+            | SemanticProfile::Lua53
+    ) {
+        Ok(profile)
+    } else {
+        Err(RuntimeError::UnsupportedSemanticProfile { operation, profile })
+    }
+}
+
+fn bit32_argument(
+    vm: &Vm,
+    arguments: &[Value],
+    index: usize,
+    function: &'static str,
+) -> Result<u32, RuntimeError> {
+    let profile = bit32_profile(vm, function)?;
+    let value = arguments.get(index).ok_or(RuntimeError::Argument {
+        function,
+        index: index + 1,
+    })?;
+    let parsed;
+    let value = if let Value::String(bytes) = value {
+        parsed = parse_default_number(trim_ascii_bytes(bytes), profile);
+        parsed.as_ref().ok_or(RuntimeError::Type {
+            operation: function,
+            expected: "number",
+            actual: "string",
+        })?
+    } else {
+        value
+    };
+    if profile == SemanticProfile::Lua53 {
+        return Ok(
+            exact_integer_conversion(value, profile).ok_or(RuntimeError::Type {
+                operation: function,
+                expected: "integer-representable number",
+                actual: value.type_name(),
+            })? as u32,
+        );
+    }
+    let number = value.as_number().ok_or(RuntimeError::Type {
+        operation: function,
+        expected: "number",
+        actual: value.type_name(),
+    })?;
+    let number = match profile {
+        SemanticProfile::Lua52 => number.round_ties_even(),
+        SemanticProfile::Blu | SemanticProfile::Luau => number.trunc(),
+        SemanticProfile::Lua53 => unreachable!("Lua 5.3 integers are handled above"),
+        _ => {
+            return Err(RuntimeError::UnsupportedSemanticProfile {
+                operation: function,
+                profile,
+            });
+        }
+    };
+    if !number.is_finite() {
+        return Err(RuntimeError::Type {
+            operation: function,
+            expected: "finite number",
+            actual: value.type_name(),
+        });
+    }
+    Ok(number.rem_euclid(4_294_967_296.0) as u32)
+}
+
+fn bit32_shift(value: u32, displacement: i32) -> u32 {
+    if displacement >= 32 || displacement <= -32 {
+        0
+    } else if displacement >= 0 {
+        value << displacement
+    } else {
+        value >> displacement.unsigned_abs()
     }
 }
 
