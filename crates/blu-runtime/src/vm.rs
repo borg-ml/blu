@@ -335,7 +335,11 @@ impl Vm {
         self.deadline
     }
 
-    fn check_interruption(&self) -> Result<(), RuntimeError> {
+    /// Checks cooperative interruption and the configured wall-clock deadline.
+    ///
+    /// Native callbacks that perform bounded units of potentially long work
+    /// should call this between units and propagate the returned error.
+    pub fn check_execution(&self) -> Result<(), RuntimeError> {
         if self.interrupted.load(Ordering::Acquire) {
             return Err(RuntimeError::Interrupted);
         }
@@ -436,6 +440,15 @@ impl Vm {
     fn active_profile(&self) -> Result<SemanticProfile, RuntimeError> {
         self.active_profile
             .map_or_else(|| self.configured_profile(), Ok)
+    }
+
+    /// Returns the active caller's semantic profile, or the VM's configured
+    /// fallback profile while no frame is executing.
+    ///
+    /// Native callbacks can use this to implement profile-specific behavior
+    /// without consulting a process-global dialect.
+    pub fn active_semantic_profile(&self) -> Result<SemanticProfile, RuntimeError> {
+        self.active_profile()
     }
 
     /// Compatibility helper for registering a native callback.
@@ -976,7 +989,7 @@ impl Vm {
         let mut remaining = self.instruction_limit;
         let mut pc = 0usize;
         loop {
-            self.check_interruption()?;
+            self.check_execution()?;
             let prototype = artifact
                 .prototypes
                 .get(prototype_index)
@@ -3577,7 +3590,7 @@ impl Vm {
         depth: usize,
     ) -> Result<Vec<Value>, RuntimeError> {
         loop {
-            self.check_interruption()?;
+            self.check_execution()?;
             self.active_profile = Some(frame.profile);
             let depth = depth + callers.len();
             if *remaining == 0 {
@@ -11747,6 +11760,7 @@ mod tests {
             .join()
             .unwrap();
         assert!(interrupt.is_interrupted());
+        assert_eq!(vm.check_execution(), Err(RuntimeError::Interrupted));
 
         let chunk = load(RETURN_THREE_V12, LoadLimits::default()).unwrap();
         assert_eq!(vm.execute(&chunk), Err(RuntimeError::Interrupted));
@@ -11780,6 +11794,7 @@ mod tests {
         let deadline = Instant::now();
         let mut vm = Vm::default().with_deadline(deadline);
         assert_eq!(vm.deadline(), Some(deadline));
+        assert_eq!(vm.check_execution(), Err(RuntimeError::DeadlineExceeded));
 
         let chunk = load(RETURN_THREE_V12, LoadLimits::default()).unwrap();
         assert_eq!(vm.execute(&chunk), Err(RuntimeError::DeadlineExceeded));

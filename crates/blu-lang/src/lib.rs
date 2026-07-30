@@ -9,6 +9,7 @@ pub use blu_bytecode as bytecode;
 pub use blu_compiler::{
     CompileError, CompileOptions, CompiledBytecode, Compiler, LUAU_COMPILER_RELEASE,
 };
+pub use blu_core::SemanticProfile;
 pub use blu_package as package;
 pub use blu_runtime::{Dialect, InterruptHandle, RuntimeError, Value, Vm};
 

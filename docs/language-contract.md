@@ -661,7 +661,11 @@ An absolute `std::time::Instant` deadline can independently be installed with
 `RuntimeError::DeadlineExceeded`, and clearing it permits later execution.
 This is cooperative VM interruption, not preemption of a currently running
 native callback. Blocking or long-running host functions must honor
-cancellation through their own declared contract.
+cancellation through their own declared contract. A callback can call
+`Vm::check_execution` between bounded work units to observe both interruption
+and deadline expiry. `Vm::active_semantic_profile` reports the executing
+caller's artifact profile inside a callback, rather than the VM's fallback
+dialect, so one host binding can dispatch explicit Blu/Luau/Lua behavior.
 Output growth is preflighted and uses fallible
 reservation. Guest-driven arena, table, closure-upvalue, and thread-root
 capacity growth also uses checked fallible reservation and returns structured

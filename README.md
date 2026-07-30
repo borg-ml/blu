@@ -195,7 +195,9 @@ Embedders can also request persistent cooperative interruption from another
 thread through `Vm::interrupt_handle` or `Engine::interrupt_handle`; both
 execution engines stop with a structured error at an instruction boundary.
 Absolute wall-clock deadlines use the same safe boundary and remain distinct
-from deterministic instruction fuel.
+from deterministic instruction fuel. Native callbacks can query the active
+artifact profile and cooperatively poll both conditions through the public VM
+API.
 Shared `break` statements are structurally restricted to loop bodies and patch
 only the innermost loop's exit, including through nested conditional blocks.
 `continue` is an explicit Blu/Luau extension that restarts the innermost loop;

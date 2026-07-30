@@ -1741,6 +1741,34 @@ fn owned_fixed_calls_propagate_native_errors() {
 }
 
 #[test]
+fn native_callbacks_observe_the_active_artifact_profile() {
+    let source = make_source(b"return host_profile()".to_vec());
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let mut vm = Vm::default();
+        let host_profile = vm.register_function(|vm, _| {
+            Ok(vec![Value::String(Arc::from(
+                vm.active_semantic_profile()?.to_string().into_bytes(),
+            ))])
+        });
+        vm.set_global(
+            b"host_profile".as_slice(),
+            Value::NativeFunction(host_profile),
+        );
+
+        assert_eq!(
+            vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::String(Arc::from(
+                profile.to_string().into_bytes()
+            ))]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn version_global_defaults_to_the_active_profile_and_remains_overridable() {
     let source = make_source(b"return _VERSION".to_vec());
     let override_source = make_source(b"_VERSION='custom' return _VERSION".to_vec());
