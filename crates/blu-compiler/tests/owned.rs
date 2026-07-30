@@ -2158,6 +2158,96 @@ fn fixed_multi_result_calls_accept_native_results_and_nil_pad() {
 }
 
 #[test]
+fn sole_return_calls_forward_all_results_without_growing_blu_callers() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(
+            b"local function pair(value) if value == 0 then return 40, 2 end return pair(value - 1) end local function forward() return pair(20) end local a, b, c = forward() return a, b, c"
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(
+            compiled
+                .artifact()
+                .prototypes()
+                .iter()
+                .any(|prototype| prototype
+                    .required_features
+                    .contains(FeatureBits::RETURN_CALLS)),
+            "{profile}"
+        );
+        assert_eq!(
+            Vm::default()
+                .with_call_limit(1)
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default(),),
+            Ok(vec![
+                if matches!(
+                    profile,
+                    SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) {
+                    Value::Integer(40)
+                } else {
+                    Value::Number(40.0)
+                },
+                if matches!(
+                    profile,
+                    SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) {
+                    Value::Integer(2)
+                } else {
+                    Value::Number(2.0)
+                },
+                Value::Nil,
+            ]),
+            "{profile}"
+        );
+
+        let source = make_source(
+            b"local object = {} function object:pair() return 40, 2 end local function forward() return object:pair() end local a, b = forward() return a, b"
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let integer_profile = matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        );
+        assert_eq!(
+            Vm::default()
+                .with_call_limit(1)
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default(),),
+            Ok(vec![
+                if integer_profile {
+                    Value::Integer(40)
+                } else {
+                    Value::Number(40.0)
+                },
+                if integer_profile {
+                    Value::Integer(2)
+                } else {
+                    Value::Number(2.0)
+                },
+            ]),
+            "{profile}"
+        );
+    }
+
+    let source = make_source(b"return native_pair()".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    let mut vm = Vm::default();
+    let function = vm.register_function(|_, _| Ok(vec![Value::Number(40.0), Value::Number(2.0)]));
+    vm.set_global(b"native_pair".as_slice(), Value::NativeFunction(function));
+    assert_eq!(
+        vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Number(40.0), Value::Number(2.0)])
+    );
+}
+
+#[test]
 fn owned_named_function_statements_install_recursive_globals() {
     for profile in SemanticProfile::ALL {
         let source = make_source(

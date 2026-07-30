@@ -630,6 +630,13 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         {
             required_features = required_features | FeatureBits::FIXED_MULTI_RESULTS;
         }
+        if self
+            .code
+            .iter()
+            .any(|instruction| matches!(instruction, Instruction::ReturnCall { .. }))
+        {
+            required_features = required_features | FeatureBits::RETURN_CALLS;
+        }
         if self.code.iter().any(|instruction| {
             matches!(
                 instruction,
@@ -1576,6 +1583,9 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         if values.is_empty() {
             return self.emit(Instruction::Return { first: 0, count: 0 }, statement.span());
         }
+        if values.len() == 1 && self.lower_return_call_expression(values[0])? {
+            return Ok(());
+        }
         let mut registers = allocate_vec(values.len(), "return registers")?;
         for expression_id in values.iter().copied() {
             registers.push(self.lower_expression(expression_id)?);
@@ -1757,6 +1767,68 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         }
     }
 
+    fn lower_return_call_expression(
+        &mut self,
+        id: ExpressionId,
+    ) -> Result<bool, OwnedCompileError> {
+        let expression = *self.expression(id)?;
+        let (function, sources, span) = match expression.kind() {
+            ExpressionKind::Call(call) => {
+                let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
+                let function = self.lower_expression(call.function())?;
+                let mut sources =
+                    allocate_vec(call.argument_count(), "return call argument registers")?;
+                for index in call.first_argument()..end {
+                    sources.push(self.lower_expression(self.call_arguments[index])?);
+                }
+                (function, sources, call.span())
+            }
+            ExpressionKind::MethodCall(call) => {
+                let end = self.call_argument_end(call.first_argument(), call.argument_count())?;
+                let receiver = self.lower_expression(call.receiver())?;
+                let key = self.lower_constant(
+                    Constant::String(copy_bytes(
+                        self.source.slice(call.method().span())?,
+                        "method name",
+                    )?),
+                    call.method().span(),
+                )?;
+                let function = self.allocate_register()?;
+                self.emit(
+                    Instruction::GetTable {
+                        destination: function,
+                        table: receiver,
+                        key,
+                    },
+                    call.span(),
+                )?;
+                let source_count = call.argument_count().checked_add(1).ok_or(
+                    OwnedCompileError::InternalInvariant {
+                        message: "return method call argument count overflows",
+                    },
+                )?;
+                let mut sources =
+                    allocate_vec(source_count, "return method call argument registers")?;
+                sources.push(receiver);
+                for index in call.first_argument()..end {
+                    sources.push(self.lower_expression(self.call_arguments[index])?);
+                }
+                (function, sources, call.span())
+            }
+            _ => return Ok(false),
+        };
+        let (arguments, argument_count) = self.copy_call_arguments(&sources, span)?;
+        self.emit(
+            Instruction::ReturnCall {
+                function,
+                arguments,
+                argument_count,
+            },
+            span,
+        )?;
+        Ok(true)
+    }
+
     fn call_argument_end(
         &self,
         first_argument: usize,
@@ -1789,34 +1861,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             .min(u16::MAX as usize);
         check_limit(OwnedCompileLimit::CallArguments, sources.len(), limit)?;
         check_limit(OwnedCompileLimit::ReturnValues, result_count, limit)?;
-        let arguments = if sources.is_empty() {
-            0
-        } else {
-            let first = self.allocate_register()?;
-            self.emit(
-                Instruction::Move {
-                    destination: first,
-                    source: sources[0],
-                },
-                span,
-            )?;
-            for source in sources.iter().copied().skip(1) {
-                let destination = self.allocate_register()?;
-                self.emit(
-                    Instruction::Move {
-                        destination,
-                        source,
-                    },
-                    span,
-                )?;
-            }
-            first
-        };
+        let (arguments, argument_count) = self.copy_call_arguments(sources, span)?;
         let destination = self.allocate_register()?;
-        let argument_count =
-            u16::try_from(sources.len()).map_err(|_| OwnedCompileError::InternalInvariant {
-                message: "call argument count passed limits but cannot fit BluV1",
-            })?;
         let result_count =
             u16::try_from(result_count).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "call result count passed limits but cannot fit BluV1",
@@ -1849,6 +1895,47 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             )?;
         }
         Ok(results)
+    }
+
+    fn copy_call_arguments(
+        &mut self,
+        sources: &[u16],
+        span: ByteSpan,
+    ) -> Result<(u16, u16), OwnedCompileError> {
+        let limit = self
+            .limits
+            .artifact
+            .max_registers_per_prototype
+            .min(u16::MAX as usize);
+        check_limit(OwnedCompileLimit::CallArguments, sources.len(), limit)?;
+        let arguments = if sources.is_empty() {
+            0
+        } else {
+            let first = self.allocate_register()?;
+            self.emit(
+                Instruction::Move {
+                    destination: first,
+                    source: sources[0],
+                },
+                span,
+            )?;
+            for source in sources.iter().copied().skip(1) {
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::Move {
+                        destination,
+                        source,
+                    },
+                    span,
+                )?;
+            }
+            first
+        };
+        let argument_count =
+            u16::try_from(sources.len()).map_err(|_| OwnedCompileError::InternalInvariant {
+                message: "call argument count passed limits but cannot fit BluV1",
+            })?;
+        Ok((arguments, argument_count))
     }
 
     fn lower_expression(&mut self, id: ExpressionId) -> Result<u16, OwnedCompileError> {

@@ -83,9 +83,10 @@ call expands to the statically bounded number of remaining local slots.
 Assignment lists
 likewise snapshot every right-hand expression before moving adjusted values
 into targets from left to right, permitting swaps without partial-write
-observations, and apply the same final-call adjustment. Dynamic MULTRET
-propagation through returns, arguments, and table constructors remains outside
-this owned slice. Identifier targets resolve to active locals, enclosing upvalues,
+observations, and apply the same final-call adjustment. A sole call or method
+call in a return statement forwards every result through a canonical tail
+call. Mixed-prefix returns, call arguments, and table constructors do not yet
+propagate dynamic result tails. Identifier targets resolve to active locals, enclosing upvalues,
 or the VM global registry in that order. Semicolons are retained tokens and
 act as optional statement separators or empty statements, including after
 `return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
@@ -231,6 +232,13 @@ result range. Direct execution truncates excess results and pads missing
 results with `nil`; the owned frontend uses it for final calls in local and
 plain-identifier assignment lists. Bootstrap translation rejects this
 instruction explicitly because Luau MULTRET translation is not yet canonical.
+`RETURN_CALLS` adds a terminal canonical instruction for sole-call return
+statements. Direct execution forwards every native result and replaces the
+current Blu closure frame for Blu callees, so tail-recursive chains remain
+bounded by the instruction limit without consuming caller-stack capacity.
+Method return calls preserve the same single receiver evaluation and implicit
+first argument as scalar method calls. Bootstrap translation rejects return
+calls explicitly.
 BluV1 reserves the `CLOSURES`
 feature for canonical `NewClosure`, `GetUpvalue`, and `SetUpvalue`
 instructions. Validation resolves child indices through the parent's declared
@@ -242,7 +250,8 @@ generational upvalue cells, refreshes suspended parent registers after child
 returns, and uses an explicit caller stack bounded by the VM call limit.
 Registers, active closures, open upvalues, and suspended callers participate
 in allocation roots. Bootstrap translation continues to reject closure
-instructions explicitly. Dynamic MULTRET/vararg adjustment,
+instructions explicitly. Mixed-prefix dynamic MULTRET, argument/table-tail
+adjustment, varargs,
 metamethod-aware method lookup, and resumable direct-BluV1 calls remain
 unsupported.
 The owned parser represents anonymous `function (...) ... end` expressions

@@ -71,6 +71,8 @@ impl FeatureBits {
     pub const CLOSURES: Self = Self(1 << 10);
     /// Fixed-argument calls producing a bounded, statically requested result range.
     pub const FIXED_MULTI_RESULTS: Self = Self(1 << 11);
+    /// Tail calls which forward every result directly to the current caller.
+    pub const RETURN_CALLS: Self = Self(1 << 12);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -83,7 +85,8 @@ impl FeatureBits {
             | Self::TABLES.0
             | Self::FIXED_CALLS.0
             | Self::CLOSURES.0
-            | Self::FIXED_MULTI_RESULTS.0,
+            | Self::FIXED_MULTI_RESULTS.0
+            | Self::RETURN_CALLS.0,
     );
 
     #[must_use]
@@ -289,6 +292,11 @@ pub enum Instruction {
         argument_count: u16,
         result_count: u16,
     },
+    ReturnCall {
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
     NewClosure {
         destination: u16,
         child: u16,
@@ -413,6 +421,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::SetTable { .. }
             | Instruction::Call { .. }
             | Instruction::CallResults { .. }
+            | Instruction::ReturnCall { .. }
             | Instruction::NewClosure { .. }
             | Instruction::GetUpvalue { .. }
             | Instruction::SetUpvalue { .. }
@@ -446,6 +455,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::SetTable { .. }
                 | Instruction::Call { .. }
                 | Instruction::CallResults { .. }
+                | Instruction::ReturnCall { .. }
                 | Instruction::NewClosure { .. }
                 | Instruction::GetUpvalue { .. }
                 | Instruction::SetUpvalue { .. }
@@ -1198,6 +1208,19 @@ fn validate_prototype(
         });
     }
     if prototype
+        .code
+        .iter()
+        .any(|instruction| matches!(instruction, Instruction::ReturnCall { .. }))
+        && !prototype
+            .required_features
+            .contains(FeatureBits::RETURN_CALLS)
+    {
+        return Err(ValidationError::MissingFeature {
+            prototype: index,
+            feature: "return calls",
+        });
+    }
+    if prototype
         .constants
         .iter()
         .any(|constant| matches!(constant, Constant::Integer(_)))
@@ -1582,6 +1605,31 @@ fn validate_prototype(
                 }
                 initialized[usize::from(destination)..result_end].fill(true);
             }
+            Instruction::ReturnCall {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                check_read(index, pc, function, &initialized)?;
+                let end = usize::from(arguments)
+                    .checked_add(usize::from(argument_count))
+                    .ok_or(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "return call argument register range overflows",
+                    })?;
+                if end > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "return call argument register range is invalid",
+                    });
+                }
+                for register in usize::from(arguments)..end {
+                    check_read(index, pc, register as u16, &initialized)?;
+                }
+                reachable = false;
+            }
             Instruction::NewClosure { destination, child } => {
                 check_register(index, pc, destination, registers)?;
                 let child_index = *prototype.children.get(child as usize).ok_or(
@@ -1883,7 +1931,10 @@ fn validate_prototype(
             }
         }
     }
-    if !matches!(prototype.code.last(), Some(Instruction::Return { .. })) {
+    if !matches!(
+        prototype.code.last(),
+        Some(Instruction::Return { .. } | Instruction::ReturnCall { .. })
+    ) {
         return Err(ValidationError::InvalidInstruction {
             prototype: index,
             pc: prototype.code.len(),
@@ -2134,6 +2185,7 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     | Instruction::LessEqual { .. } => 7,
                     Instruction::Call { .. } => 9,
                     Instruction::CallResults { .. } => 11,
+                    Instruction::ReturnCall { .. } => 7,
                     Instruction::NewTable { .. } => 3,
                     Instruction::NewClosure { .. }
                     | Instruction::GetUpvalue { .. }
@@ -2297,6 +2349,16 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 put_u16(out, *arguments);
                 put_u16(out, *argument_count);
                 put_u16(out, *result_count);
+            }
+            Instruction::ReturnCall {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(30);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
             }
             Instruction::NewClosure { destination, child } => {
                 out.push(26);
@@ -3169,6 +3231,11 @@ fn read_prototype(
                 arguments: reader.u16()?,
                 argument_count: reader.u16()?,
                 result_count: reader.u16()?,
+            },
+            30 => Instruction::ReturnCall {
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {
