@@ -1825,6 +1825,48 @@ impl Vm {
                     );
                     continue;
                 }
+                BluInstruction::ReturnVarargs { first, count } => {
+                    let start = usize::from(first);
+                    let end =
+                        start
+                            .checked_add(usize::from(count))
+                            .ok_or(RuntimeError::Register {
+                                register: usize::MAX,
+                                count: registers.len(),
+                            })?;
+                    let prefix = registers.get(start..end).ok_or(RuntimeError::Register {
+                        register: end.saturating_sub(1),
+                        count: registers.len(),
+                    })?;
+                    let mut values = try_clone_values(prefix, "BluV1 vararg return prefix")?;
+                    try_reserve_exact(&mut values, varargs.len(), "BluV1 dynamic return values")?;
+                    values.extend(varargs.iter().cloned());
+                    let caller = loop {
+                        let Some(caller) = callers.pop() else {
+                            return Ok(values);
+                        };
+                        match self.apply_blu_return(caller, values)? {
+                            BluReturnDisposition::Resume(caller) => break caller,
+                            BluReturnDisposition::Propagate(next) => values = next,
+                        }
+                    };
+                    artifact = caller.artifact;
+                    prototype_index = caller.prototype;
+                    constants = caller.constants;
+                    registers = caller.registers;
+                    varargs = caller.varargs;
+                    open_upvalues = caller.open_upvalues;
+                    closure = caller.closure;
+                    pc = caller.pc;
+                    self.active_profile = Some(
+                        artifact
+                            .prototypes
+                            .get(prototype_index)
+                            .ok_or(RuntimeError::InvalidPrototype(prototype_index))?
+                            .profile,
+                    );
+                    continue;
+                }
             }
             pc += 1;
         }

@@ -660,11 +660,12 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         }) {
             required_features = required_features | FeatureBits::CLOSURES;
         }
-        if self
-            .code
-            .iter()
-            .any(|instruction| matches!(instruction, Instruction::Varargs { .. }))
-        {
+        if self.code.iter().any(|instruction| {
+            matches!(
+                instruction,
+                Instruction::Varargs { .. } | Instruction::ReturnVarargs { .. }
+            )
+        }) {
             required_features = required_features | FeatureBits::VARARGS;
         }
         Ok(Prototype {
@@ -1800,12 +1801,31 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         }
         let last = values[values.len() - 1];
         if matches!(self.expression(last)?.kind(), ExpressionKind::Vararg) {
-            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                "BLU-COMPILE-0007",
-                Phase::Lower,
-                self.expression(last)?.span(),
-                "dynamic vararg return forwarding is not yet implemented",
-            )?));
+            let prefix_expressions = &values[..values.len() - 1];
+            let mut prefix_registers =
+                allocate_vec(prefix_expressions.len(), "vararg return prefix registers")?;
+            for expression in prefix_expressions.iter().copied() {
+                prefix_registers.push(self.lower_expression(expression)?);
+            }
+            let first = if prefix_registers.is_empty() {
+                0
+            } else if prefix_registers
+                .windows(2)
+                .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
+            {
+                prefix_registers[0]
+            } else {
+                self.copy_return_values(prefix_expressions, &prefix_registers)?
+            };
+            let count = u16::try_from(prefix_expressions.len()).map_err(|_| {
+                OwnedCompileError::InternalInvariant {
+                    message: "vararg return prefix passed limits but cannot fit BluV1",
+                }
+            })?;
+            return self.emit(
+                Instruction::ReturnVarargs { first, count },
+                statement.span(),
+            );
         }
         if matches!(
             self.expression(last)?.kind(),

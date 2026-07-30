@@ -390,6 +390,53 @@ fn prefixed_return_calls_round_trip_with_validated_ranges() {
 }
 
 #[test]
+fn dynamic_vararg_returns_round_trip_and_require_vararg_metadata() {
+    let artifact_with_metadata = |required_features, is_vararg| {
+        let mut artifact = fixture();
+        let prototype = &mut artifact.prototypes[0];
+        prototype.is_vararg = is_vararg;
+        prototype.required_features = required_features;
+        prototype.code = vec![
+            Instruction::LoadConstant {
+                destination: 0,
+                constant: 0,
+            },
+            Instruction::ReturnVarargs { first: 0, count: 1 },
+        ];
+        prototype.source_map.truncate(2);
+        prototype.locals.clear();
+        artifact
+    };
+
+    let limits = BluLimits::default();
+    let validated = ValidatedArtifact::new(
+        artifact_with_metadata(FeatureBits::BASELINE | FeatureBits::VARARGS, true),
+        limits,
+    )
+    .unwrap();
+    let bytes = encode(&validated, limits).unwrap();
+    assert_eq!(decode_validated(&bytes, limits).unwrap(), validated);
+
+    assert_eq!(
+        ValidatedArtifact::new(artifact_with_metadata(FeatureBits::BASELINE, true), limits),
+        Err(ValidationError::MissingFeature {
+            prototype: 0,
+            feature: "varargs",
+        })
+    );
+    assert_eq!(
+        ValidatedArtifact::new(
+            artifact_with_metadata(FeatureBits::BASELINE | FeatureBits::VARARGS, false),
+            limits
+        ),
+        Err(ValidationError::InvalidMetadata {
+            prototype: 0,
+            what: "vararg instruction in fixed-argument prototype",
+        })
+    );
+}
+
+#[test]
 fn closure_instructions_round_trip_with_validated_capture_metadata() {
     let limits = BluLimits::default();
     let validated = ValidatedArtifact::new(closure_fixture(), limits).unwrap();

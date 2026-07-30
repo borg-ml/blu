@@ -323,6 +323,10 @@ pub enum Instruction {
         destination: u16,
         count: u16,
     },
+    ReturnVarargs {
+        first: u16,
+        count: u16,
+    },
     Move {
         destination: u16,
         source: u16,
@@ -441,6 +445,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::GetUpvalue { .. }
             | Instruction::SetUpvalue { .. }
             | Instruction::Varargs { .. }
+            | Instruction::ReturnVarargs { .. }
             | Instruction::Move { .. }
             | Instruction::Not { .. }
             | Instruction::Negate { .. }
@@ -477,6 +482,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::GetUpvalue { .. }
                 | Instruction::SetUpvalue { .. }
                 | Instruction::Varargs { .. }
+                | Instruction::ReturnVarargs { .. }
                 | Instruction::Move { .. }
                 | Instruction::Not { .. }
                 | Instruction::Negate { .. }
@@ -1239,11 +1245,12 @@ fn validate_prototype(
             feature: "return calls",
         });
     }
-    if prototype
-        .code
-        .iter()
-        .any(|instruction| matches!(instruction, Instruction::Varargs { .. }))
-    {
+    if prototype.code.iter().any(|instruction| {
+        matches!(
+            instruction,
+            Instruction::Varargs { .. } | Instruction::ReturnVarargs { .. }
+        )
+    }) {
         if !prototype.required_features.contains(FeatureBits::VARARGS) {
             return Err(ValidationError::MissingFeature {
                 prototype: index,
@@ -1799,6 +1806,26 @@ fn validate_prototype(
                 }
                 initialized[usize::from(destination)..end].fill(true);
             }
+            Instruction::ReturnVarargs { first, count } => {
+                let end = usize::from(first).checked_add(usize::from(count)).ok_or(
+                    ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "vararg return prefix register range overflows",
+                    },
+                )?;
+                if end > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "vararg return prefix register range is invalid",
+                    });
+                }
+                for register in first..first + count {
+                    check_read(index, pc, register, &initialized)?;
+                }
+                reachable = false;
+            }
             Instruction::Move {
                 destination,
                 source,
@@ -2042,6 +2069,7 @@ fn validate_prototype(
             Instruction::Return { .. }
                 | Instruction::ReturnCall { .. }
                 | Instruction::ReturnCallPrefix { .. }
+                | Instruction::ReturnVarargs { .. }
         )
     ) {
         return Err(ValidationError::InvalidInstruction {
@@ -2300,7 +2328,8 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     Instruction::NewClosure { .. }
                     | Instruction::GetUpvalue { .. }
                     | Instruction::SetUpvalue { .. }
-                    | Instruction::Varargs { .. } => 5,
+                    | Instruction::Varargs { .. }
+                    | Instruction::ReturnVarargs { .. } => 5,
                     Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. } => 7,
                     Instruction::Jump { .. } => 5,
                     Instruction::Move { .. }
@@ -2506,6 +2535,11 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
             Instruction::Varargs { destination, count } => {
                 out.push(32);
                 put_u16(out, *destination);
+                put_u16(out, *count);
+            }
+            Instruction::ReturnVarargs { first, count } => {
+                out.push(33);
+                put_u16(out, *first);
                 put_u16(out, *count);
             }
             Instruction::Add {
@@ -3376,6 +3410,10 @@ fn read_prototype(
             },
             32 => Instruction::Varargs {
                 destination: reader.u16()?,
+                count: reader.u16()?,
+            },
+            33 => Instruction::ReturnVarargs {
+                first: reader.u16()?,
                 count: reader.u16()?,
             },
             tag => {

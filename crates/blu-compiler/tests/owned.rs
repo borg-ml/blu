@@ -2739,9 +2739,55 @@ fn owned_variadic_functions_adjust_fixed_vararg_reads() {
 }
 
 #[test]
-fn dynamic_vararg_positions_fail_explicitly_until_the_dynamic_area_is_encoded() {
+fn owned_variadic_functions_forward_dynamic_returns() {
+    for (bytes, modern_expected, legacy_expected) in [
+        (
+            b"local function values(...) return ... end return values(1, 2, 3)".as_slice(),
+            vec![Value::Integer(1), Value::Integer(2), Value::Integer(3)],
+            vec![Value::Number(1.0), Value::Number(2.0), Value::Number(3.0)],
+        ),
+        (
+            b"local function values(...) return 0, ... end return values(1, 2, 3)".as_slice(),
+            vec![
+                Value::Integer(0),
+                Value::Integer(1),
+                Value::Integer(2),
+                Value::Integer(3),
+            ],
+            vec![
+                Value::Number(0.0),
+                Value::Number(1.0),
+                Value::Number(2.0),
+                Value::Number(3.0),
+            ],
+        ),
+    ] {
+        for profile in SemanticProfile::ALL {
+            let source = make_source(bytes.to_vec());
+            let compiled = OwnedCompiler::default()
+                .compile(&source, profile, compiler_identity())
+                .expect("dynamic vararg returns should compile");
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                modern_expected.clone()
+            } else {
+                legacy_expected.clone()
+            };
+            assert_eq!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Ok(expected),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
+fn remaining_dynamic_vararg_positions_fail_explicitly() {
     for bytes in [
-        b"local function values(...) return ... end".as_slice(),
         b"local function pass(...) print(...) end".as_slice(),
         b"local function pack(...) return {...} end".as_slice(),
     ] {
