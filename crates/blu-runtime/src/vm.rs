@@ -6161,6 +6161,7 @@ fn relative_index(index: i64, length: usize) -> i64 {
 enum BasicPatternAtom {
     Literal(u8),
     Any,
+    Class(u8),
 }
 
 fn find_basic_lua_pattern(
@@ -6191,13 +6192,19 @@ fn find_basic_lua_pattern(
                         function: "string.find",
                         feature: "malformed Lua patterns",
                     })?;
-            if escaped.is_ascii_alphanumeric() {
+            if matches!(
+                escaped.to_ascii_lowercase(),
+                b'a' | b'c' | b'd' | b'l' | b'p' | b's' | b'u' | b'w' | b'x' | b'z'
+            ) {
+                atoms.push(BasicPatternAtom::Class(escaped));
+            } else if escaped.is_ascii_alphanumeric() {
                 return Err(RuntimeError::UnsupportedLibraryFeature {
                     function: "string.find",
-                    feature: "Lua pattern classes and captures",
+                    feature: "dialect-specific Lua pattern classes and captures",
                 });
+            } else {
+                atoms.push(BasicPatternAtom::Literal(escaped));
             }
-            atoms.push(BasicPatternAtom::Literal(escaped));
             index += 2;
         } else if b"*+?-[]()".contains(&byte) {
             return Err(RuntimeError::UnsupportedLibraryFeature {
@@ -6235,12 +6242,34 @@ fn find_basic_lua_pattern(
             .all(|(atom, byte)| match atom {
                 BasicPatternAtom::Literal(expected) => expected == byte,
                 BasicPatternAtom::Any => true,
+                BasicPatternAtom::Class(class) => byte_matches_pattern_class(*byte, *class),
             })
         {
             return Ok(Some((position, end)));
         }
     }
     Ok(None)
+}
+
+fn byte_matches_pattern_class(byte: u8, class: u8) -> bool {
+    let matches = match class.to_ascii_lowercase() {
+        b'a' => byte.is_ascii_alphabetic(),
+        b'c' => byte.is_ascii_control(),
+        b'd' => byte.is_ascii_digit(),
+        b'l' => byte.is_ascii_lowercase(),
+        b'p' => byte.is_ascii_punctuation(),
+        b's' => byte.is_ascii_whitespace(),
+        b'u' => byte.is_ascii_uppercase(),
+        b'w' => byte.is_ascii_alphanumeric(),
+        b'x' => byte.is_ascii_hexdigit(),
+        b'z' => byte == 0,
+        _ => false,
+    };
+    if class.is_ascii_lowercase() {
+        matches
+    } else {
+        !matches
+    }
 }
 
 fn try_concat_bytes(value: &Value) -> Result<Option<Cow<'_, [u8]>>, RuntimeError> {

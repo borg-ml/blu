@@ -2349,6 +2349,61 @@ fn string_find_supports_basic_anchors_wildcards_and_escapes() {
 }
 
 #[test]
+fn string_find_supports_common_byte_classes_and_negation() {
+    let source = make_source(
+        b"local a, b = string.find('x7Y', '%d') local c, d = string.find('x7Y', '%D') local e, f = string.find('\\000a', '%z') return a, b, c, d, e, f"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let index = |value| {
+            if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(value)
+            } else {
+                Value::Number(value as f64)
+            }
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                index(2),
+                index(2),
+                index(1),
+                index(1),
+                index(1),
+                index(1)
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn string_find_rejects_nonportable_pattern_classes_explicitly() {
+    for profile in SemanticProfile::ALL {
+        let source = make_source(b"return string.find('!', '%g')".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "string.find",
+                feature: "dialect-specific Lua pattern classes and captures",
+            })
+        ));
+    }
+}
+
+#[test]
 fn string_find_preflights_pattern_work() {
     let source = make_source(
         b"return string.find(string.rep('a', 4000), string.rep('a', 3000) .. 'b')".to_vec(),

@@ -402,11 +402,13 @@ as a number.
 slice: relative start indices, empty needles, nil misses, and explicit
 `plain=true`. Searches without `plain` support search-relative `^`, subject-end
 `$`, byte wildcard `.`, and `%`-escaped punctuation under a fixed pattern-work
-limit. Repetition, sets, classes, captures, and malformed escapes are not
-reinterpreted as literal text; they fail with a structured
-unsupported-library-feature error until the versioned pattern engine is
-expanded. Returned indices follow the active profile's legacy-number or
-modern-integer policy.
+limit. The common byte classes `%a`, `%c`, `%d`, `%l`, `%p`, `%s`, `%u`, `%w`,
+`%x`, and `%z` are supported, with uppercase class letters selecting their
+complements. Repetition, sets, captures, malformed escapes, and classes that
+differ between targeted dialects are not reinterpreted as literal text; they
+fail with a structured unsupported-library-feature error until profile-specific
+pattern dispatch is implemented. Returned indices follow the active profile's
+legacy-number or modern-integer policy.
 
 ## Authority profiles
 
