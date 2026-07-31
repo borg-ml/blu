@@ -317,6 +317,164 @@ local result = first.name == "answer"
     and package.loaded.empty == true
 print(type(result) .. ":" .. tostring(result))
 "#;
+const PACKAGE_SEARCHER_SOURCE: &str = r#"
+local calls = 0
+local key = _VERSION == "Lua 5.1" and "loaders" or "searchers"
+local searchers = {}
+searchers[1] = function(name)
+    calls = calls + 1
+    if name == "guest" then
+        return function(module_name)
+            return { name = module_name, answer = 42 }
+        end
+    end
+end
+package[key] = searchers
+local value = require("guest")
+return value.name == "guest"
+    and value.answer == 42
+    and value == package.loaded.guest
+    and calls == 1
+"#;
+const PACKAGE_SEARCHER_REFERENCE_SOURCE: &str = r#"
+local calls = 0
+local key = _VERSION == "Lua 5.1" and "loaders" or "searchers"
+local searchers = {}
+searchers[1] = function(name)
+    calls = calls + 1
+    if name == "guest" then
+        return function(module_name)
+            return { name = module_name, answer = 42 }
+        end
+    end
+end
+package[key] = searchers
+local value = require("guest")
+local result = value.name == "guest"
+    and value.answer == 42
+    and value == package.loaded.guest
+    and calls == 1
+print(type(result) .. ":" .. tostring(result))
+"#;
+const UTF8_SOURCE: &str = r#"
+local text = utf8.char(65, 233, 0x1F600)
+local first, second, third = utf8.codepoint(text, 1, #text)
+local invalid, position = utf8.len("\255")
+local surrogate = utf8.char(0xD800)
+local surrogate_codepoint = 0
+if _VERSION == "Lua 5.3" or _VERSION == "Blu" then
+    surrogate_codepoint = utf8.codepoint(surrogate)
+end
+local surrogate_length, surrogate_position = utf8.len(surrogate)
+local valid_surrogate = pcall(utf8.char, 0xD800)
+return utf8.len(text) == 3
+    and first == 65
+    and second == 233
+    and third == 0x1F600
+    and type(utf8.charpattern) == "string"
+    and invalid == nil
+    and position == 1
+    and #surrogate == 3
+    and ((_VERSION == "Lua 5.3" or _VERSION == "Blu")
+        and surrogate_codepoint == 0xD800
+        and surrogate_length == 1
+        or (_VERSION == "Lua 5.4" or _VERSION == "Lua 5.5")
+        and surrogate_length == nil
+        and surrogate_position == 1)
+    and valid_surrogate
+"#;
+const UTF8_REFERENCE_SOURCE: &str = r#"
+local text = utf8.char(65, 233, 0x1F600)
+local first, second, third = utf8.codepoint(text, 1, #text)
+local invalid, position = utf8.len("\255")
+local surrogate = utf8.char(0xD800)
+local surrogate_codepoint = 0
+if _VERSION == "Lua 5.3" then
+    surrogate_codepoint = utf8.codepoint(surrogate)
+end
+local surrogate_length, surrogate_position = utf8.len(surrogate)
+local valid_surrogate = pcall(utf8.char, 0xD800)
+local result = utf8.len(text) == 3
+    and first == 65
+    and second == 233
+    and third == 0x1F600
+    and type(utf8.charpattern) == "string"
+    and invalid == nil
+    and position == 1
+    and #surrogate == 3
+    and ((_VERSION == "Lua 5.3"
+        and surrogate_codepoint == 0xD800
+        and surrogate_length == 1)
+        or (_VERSION == "Lua 5.4" or _VERSION == "Lua 5.5")
+        and surrogate_length == nil
+        and surrogate_position == 1)
+    and valid_surrogate
+print(type(result) .. ":" .. tostring(result))
+"#;
+const UTF8_OFFSET_SOURCE: &str = r#"
+local text = "A" .. utf8.char(233) .. utf8.char(0x1F600) .. "Z"
+local first = utf8.offset(text, 1)
+local second = utf8.offset(text, 2)
+local inside = utf8.offset(text, 0, 3)
+local previous, previous_end = utf8.offset(text, -1)
+return first == 1
+    and second == 2
+    and inside == 2
+    and previous == 8
+    and ((_VERSION == "Lua 5.5" and previous_end == 8)
+        or (_VERSION ~= "Lua 5.5" and previous_end == nil))
+"#;
+const UTF8_OFFSET_REFERENCE_SOURCE: &str = r#"
+local text = "A" .. utf8.char(233) .. utf8.char(0x1F600) .. "Z"
+local first = utf8.offset(text, 1)
+local second = utf8.offset(text, 2)
+local inside = utf8.offset(text, 0, 3)
+local previous, previous_end = utf8.offset(text, -1)
+local result = first == 1
+    and second == 2
+    and inside == 2
+    and previous == 8
+    and ((_VERSION == "Lua 5.5" and previous_end == 8)
+        or (_VERSION ~= "Lua 5.5" and previous_end == nil))
+print(type(result) .. ":" .. tostring(result))
+"#;
+const UTF8_CODES_SOURCE: &str = r#"
+local text = "A" .. utf8.char(233) .. utf8.char(0x1F600)
+local iterator, state, control = utf8.codes(text)
+local first_position, first_codepoint = iterator(state, control)
+local second_position, second_codepoint = iterator(state, first_position)
+local third_position, third_codepoint = iterator(state, second_position)
+local finished = iterator(state, third_position)
+return type(iterator) == "function"
+    and state == text
+    and control == 0
+    and first_position == 1
+    and first_codepoint == 65
+    and second_position == 2
+    and second_codepoint == 233
+    and third_position == 4
+    and third_codepoint == 0x1F600
+    and finished == nil
+"#;
+const UTF8_CODES_REFERENCE_SOURCE: &str = r#"
+local text = "A" .. utf8.char(233) .. utf8.char(0x1F600)
+local iterator, state, control = utf8.codes(text)
+local first_position, first_codepoint = iterator(state, control)
+local second_position, second_codepoint = iterator(state, first_position)
+local third_position, third_codepoint = iterator(state, second_position)
+local finished = iterator(state, third_position)
+local result = type(iterator) == "function"
+    and state == text
+    and control == 0
+    and first_position == 1
+    and first_codepoint == 65
+    and second_position == 2
+    and second_codepoint == 233
+    and third_position == 4
+    and third_codepoint == 0x1F600
+    and finished == nil
+print(type(result) .. ":" .. tostring(result))
+"#;
 const METATABLE_SOURCE: &str = r#"
 local prototype = { answer = 42 }
 local object = setmetatable({}, { __index = prototype })
@@ -636,8 +794,11 @@ local environment = { answer = 40 }
 local loaded = load("answer = answer + 1; return answer", "chunk", "t", environment)
 local first = loaded()
 local second = loaded()
+local binary, mode_message = load("return 1", "chunk", "b")
+local text = load("return 42", "chunk", "t")
 return default_result == 40 and answer == 40 and first == 41 and second == 42
-    and environment.answer == 42
+    and environment.answer == 42 and binary == nil and type(mode_message) == "string"
+    and text() == 42
 "#;
 const LOAD_ENVIRONMENT_REFERENCE_SOURCE: &str = r#"
 answer = 39
@@ -647,8 +808,11 @@ local environment = { answer = 40 }
 local loaded = load("answer = answer + 1; return answer", "chunk", "t", environment)
 local first = loaded()
 local second = loaded()
+local binary, mode_message = load("return 1", "chunk", "b")
+local text = load("return 42", "chunk", "t")
 local result = default_result == 40 and answer == 40 and first == 41 and second == 42
-    and environment.answer == 42
+    and environment.answer == 42 and binary == nil and type(mode_message) == "string"
+    and text() == 42
 print(type(result) .. ":" .. tostring(result))
 "#;
 const LOAD_READER_SOURCE: &str = r#"
@@ -658,7 +822,18 @@ local loaded, message = load(function()
     index = index + 1
     return chunks[index]
 end)
-return loaded ~= nil and message == nil and loaded() == 42 and index == 3
+local empty_chunks = { "return 7", "", " + 2" }
+local empty_index = 0
+local empty_loaded = load(function()
+    empty_index = empty_index + 1
+    return empty_chunks[empty_index]
+end)
+return loaded ~= nil
+    and message == nil
+    and loaded() == 42
+    and index == 3
+    and empty_loaded() == 7
+    and empty_index == 2
 "#;
 const LOAD_READER_REFERENCE_SOURCE: &str = r#"
 local chunks = { "return 40", " + 2" }
@@ -667,7 +842,18 @@ local loaded, message = load(function()
     index = index + 1
     return chunks[index]
 end)
-local result = loaded ~= nil and message == nil and loaded() == 42 and index == 3
+local empty_chunks = { "return 7", "", " + 2" }
+local empty_index = 0
+local empty_loaded = load(function()
+    empty_index = empty_index + 1
+    return empty_chunks[empty_index]
+end)
+local result = loaded ~= nil
+    and message == nil
+    and loaded() == 42
+    and index == 3
+    and empty_loaded() == 7
+    and empty_index == 2
 print(type(result) .. ":" .. tostring(result))
 "#;
 const LUA51_ENVIRONMENT_SOURCE: &str = r#"
@@ -680,7 +866,8 @@ local loaded = loadstring("answer = answer + 1; return answer")
 setfenv(loaded, environment)
 local first = loaded()
 local second = loaded()
-return first == 41 and second == 42 and environment.answer == 42
+local ok = pcall(load, "return 1")
+return first == 41 and second == 42 and environment.answer == 42 and not ok
     and getfenv(read) == environment and getfenv(loaded) == environment
 "#;
 const LUA51_ENVIRONMENT_REFERENCE_SOURCE: &str = r#"
@@ -693,7 +880,8 @@ local loaded = loadstring("answer = answer + 1; return answer")
 setfenv(loaded, environment)
 local first = loaded()
 local second = loaded()
-local result = first == 41 and second == 42 and environment.answer == 42
+local ok = pcall(load, "return 1")
+local result = first == 41 and second == 42 and environment.answer == 42 and not ok
     and getfenv(read) == environment and getfenv(loaded) == environment
 print(type(result) .. ":" .. tostring(result))
 "#;
@@ -1248,6 +1436,56 @@ fn run() -> Result<(), String> {
             executable,
             temporary.path(),
         )?;
+        verify_owned_program_case(
+            &format!("package searcher dispatch ({name})"),
+            PACKAGE_SEARCHER_SOURCE,
+            PACKAGE_SEARCHER_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+    }
+    for (profile, (name, executable)) in [
+        (SemanticProfile::Lua53, &lua_references[2]),
+        (SemanticProfile::Lua54, &lua_references[3]),
+        (SemanticProfile::Lua55, &lua_references[4]),
+    ] {
+        verify_owned_program_case(
+            &format!("utf8 library ({name})"),
+            UTF8_SOURCE,
+            UTF8_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+    }
+    for (profile, (name, executable)) in [
+        (SemanticProfile::Lua53, &lua_references[2]),
+        (SemanticProfile::Lua54, &lua_references[3]),
+        (SemanticProfile::Lua55, &lua_references[4]),
+    ] {
+        verify_owned_program_case(
+            &format!("utf8 codes ({name})"),
+            UTF8_CODES_SOURCE,
+            UTF8_CODES_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+    }
+    for (profile, (name, executable)) in [
+        (SemanticProfile::Lua53, &lua_references[2]),
+        (SemanticProfile::Lua54, &lua_references[3]),
+        (SemanticProfile::Lua55, &lua_references[4]),
+    ] {
+        verify_owned_program_case(
+            &format!("utf8 offset ({name})"),
+            UTF8_OFFSET_SOURCE,
+            UTF8_OFFSET_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
     }
     for (profile, (name, executable)) in [
         (SemanticProfile::Lua54, &lua_references[3]),
@@ -1367,7 +1605,7 @@ fn run() -> Result<(), String> {
     println!("bytecode version: {bytecode_version}");
     println!("scalar differential corpus: pass ({scalar_count} cases)");
     println!(
-        "program differential corpus: pass (tables, loops, iteration, methods, metamethods, closures, captures, varargs, multret, coroutines, default/lexical environments, environment-aware load, package.preload require, to-be-closed error/reverse/yield paths)"
+        "program differential corpus: pass (tables, loops, iteration, methods, metamethods, closures, captures, varargs, multret, coroutines, default/lexical environments, environment-aware/reader-function load, package.preload/searcher require, utf8/offset/codes, to-be-closed error/reverse/yield paths)"
     );
     println!("owned callback differential corpus: pass (Luau, Lua 5.1-5.5 profiles)");
     println!("portable reference matrix: pass (Luau, Lua 5.1-5.5)");

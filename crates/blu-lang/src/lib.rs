@@ -203,10 +203,22 @@ impl Engine {
         execution_limits: bytecode::blu::BluLimits,
     ) -> Result<(), RuntimeError> {
         let load = self.vm.try_register_function(move |vm, arguments| {
+            let profile = vm.active_semantic_profile()?;
             let source_value = arguments.first().ok_or(RuntimeError::Argument {
                 function: "load",
                 index: 1,
             })?;
+            let loadstring_call = matches!(arguments.get(4), Some(Value::Boolean(true)));
+            if profile == SemanticProfile::Lua51
+                && !loadstring_call
+                && matches!(source_value, Value::String(_))
+            {
+                return Err(RuntimeError::Type {
+                    operation: "load",
+                    expected: "function",
+                    actual: "string",
+                });
+            }
             let source = match source_value {
                 Value::String(source) => source.to_vec(),
                 Value::Closure(_) | Value::NativeFunction(_) => {
@@ -223,6 +235,9 @@ impl Engine {
                         match chunk {
                             Value::Nil => break,
                             Value::String(chunk) => {
+                                if chunk.is_empty() {
+                                    break;
+                                }
                                 let required = source.len().checked_add(chunk.len()).ok_or(
                                     RuntimeError::StringLimit {
                                         required: usize::MAX,
@@ -268,6 +283,31 @@ impl Engine {
                     });
                 }
             };
+            if profile != SemanticProfile::Lua51 {
+                let text_mode = match arguments.get(2) {
+                    None | Some(Value::Nil) => true,
+                    Some(Value::String(mode)) => {
+                        !mode.is_empty()
+                            && mode.iter().all(|byte| matches!(byte, b'b' | b't'))
+                            && mode.contains(&b't')
+                    }
+                    Some(value) => {
+                        return Err(RuntimeError::Type {
+                            operation: "load",
+                            expected: "string",
+                            actual: value.type_name(),
+                        });
+                    }
+                };
+                if !text_mode {
+                    return Ok(vec![
+                        Value::Nil,
+                        Value::String(Arc::from(
+                            b"attempt to load a text chunk (mode is 'b')".as_slice(),
+                        )),
+                    ]);
+                }
+            }
             let chunk_name = match arguments.get(1) {
                 None | Some(Value::Nil) => "=(load)".to_owned(),
                 Some(Value::String(name)) => String::from_utf8_lossy(name).into_owned(),
@@ -290,7 +330,6 @@ impl Engine {
                     });
                 }
             };
-            let profile = vm.active_semantic_profile()?;
             let compilation =
                 match compile_owned_source(&source, chunk_name, profile, compile_limits) {
                     Ok(compilation) => compilation,
@@ -310,8 +349,38 @@ impl Engine {
         })?;
         self.vm
             .try_set_global(&b"load"[..], Value::NativeFunction(load))?;
+        let loadstring = self.vm.try_register_function(move |vm, arguments| {
+            let source = arguments.first().ok_or(RuntimeError::Argument {
+                function: "loadstring",
+                index: 1,
+            })?;
+            if !matches!(source, Value::String(_)) {
+                return Err(RuntimeError::Type {
+                    operation: "loadstring",
+                    expected: "string",
+                    actual: source.type_name(),
+                });
+            }
+            let mut forwarded = Vec::new();
+            forwarded
+                .try_reserve(arguments.len().saturating_add(5))
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "loadstring arguments",
+                })?;
+            forwarded.extend_from_slice(arguments);
+            while forwarded.len() < 4 {
+                forwarded.push(Value::Nil);
+            }
+            forwarded.push(Value::Boolean(true));
+            vm.invoke_native_callback_without_yield(
+                "loadstring",
+                "nested loadstring invocation",
+                Value::NativeFunction(load),
+                &forwarded,
+            )
+        })?;
         self.vm
-            .try_set_global(&b"loadstring"[..], Value::NativeFunction(load))?;
+            .try_set_global(&b"loadstring"[..], Value::NativeFunction(loadstring))?;
         Ok(())
     }
 
@@ -1529,11 +1598,188 @@ return value"#
                 index = index + 1
                 return chunks[index]
             end)
-            return loaded ~= nil and message == nil and loaded() == 42 and index == 3
+            local empty_chunks = { "return 7", "", " + 2" }
+            local empty_index = 0
+            local empty_loaded = load(function()
+                empty_index = empty_index + 1
+                return empty_chunks[empty_index]
+            end)
+            return loaded ~= nil
+                and message == nil
+                and loaded() == 42
+                and index == 3
+                and empty_loaded() == 7
+                and empty_index == 2
         "#;
         for profile in [
             SemanticProfile::Lua51,
             SemanticProfile::Lua52,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            let values = Engine::default()
+                .execute_owned_source(source, profile)
+                .unwrap_or_else(|error| panic!("profile {profile:?}: {error:?}"));
+            assert_eq!(values, vec![Value::Boolean(true)], "profile {profile:?}");
+        }
+    }
+
+    #[test]
+    fn owned_load_modes_and_lua51_loadstring_follow_profile_signatures() {
+        let modern = Engine::default()
+            .execute_owned_source(
+                r#"
+                    local binary, message = load("return 1", "chunk", "b")
+                    local text = load("return 42", "chunk", "t")
+                    return binary == nil and type(message) == "string" and text() == 42
+                "#,
+                SemanticProfile::Lua54,
+            )
+            .unwrap();
+        assert_eq!(modern, vec![Value::Boolean(true)]);
+
+        let lua51 = Engine::default()
+            .execute_owned_source(
+                r#"
+                    local ok = pcall(load, "return 1")
+                    local loaded = loadstring("return 42")
+                    return not ok and loaded() == 42
+                "#,
+                SemanticProfile::Lua51,
+            )
+            .unwrap();
+        assert_eq!(lua51, vec![Value::Boolean(true)]);
+    }
+
+    #[test]
+    fn utf8_library_is_profile_gated_and_handles_valid_and_invalid_bytes() {
+        let source = br#"
+            local text = utf8.char(65, 233, 0x1F600)
+            local first, second, third = utf8.codepoint(text, 1, #text)
+            local invalid, position = utf8.len("\255")
+            local surrogate = utf8.char(0xD800)
+            local surrogate_codepoint = 0
+            if _VERSION == "Lua 5.3" or _VERSION == "Blu" then
+                surrogate_codepoint = utf8.codepoint(surrogate)
+            end
+            local surrogate_length, surrogate_position = utf8.len(surrogate)
+            local valid_surrogate = pcall(utf8.char, 0xD800)
+            return utf8.len(text) == 3
+                and first == 65
+                and second == 233
+                and third == 0x1F600
+                and type(utf8.charpattern) == "string"
+                and invalid == nil
+                and position == 1
+                and #surrogate == 3
+                and ((_VERSION == "Lua 5.3" or _VERSION == "Blu")
+                    and surrogate_codepoint == 0xD800
+                    and surrogate_length == 1
+                    or (_VERSION == "Lua 5.4" or _VERSION == "Lua 5.5")
+                    and surrogate_length == nil
+                    and surrogate_position == 1)
+                and valid_surrogate
+        "#;
+        for profile in [
+            SemanticProfile::Blu,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            let values = Engine::default()
+                .execute_owned_source(source, profile)
+                .unwrap_or_else(|error| panic!("profile {profile:?}: {error:?}"));
+            assert_eq!(values, vec![Value::Boolean(true)], "profile {profile:?}");
+        }
+        for profile in [SemanticProfile::Lua51, SemanticProfile::Lua52] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source("return type(utf8)", profile)
+                    .unwrap(),
+                vec![Value::String(Arc::from(&b"nil"[..]))],
+                "profile {profile:?}"
+            );
+        }
+        assert!(
+            Engine::default()
+                .execute_owned_source("return utf8.codepoint(\"\\255\")", SemanticProfile::Blu)
+                .is_err()
+        );
+        assert!(
+            Engine::default()
+                .execute_owned_source("return utf8.char(0x110000)", SemanticProfile::Blu)
+                .is_err()
+        );
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source("return utf8.char(0xD800)", SemanticProfile::Blu,)
+                .unwrap(),
+            vec![Value::String(Arc::from(&[0xED, 0xA0, 0x80][..]))]
+        );
+    }
+
+    #[test]
+    fn utf8_offset_tracks_character_boundaries_and_lua55_end_positions() {
+        let source = br#"
+            local text = "A" .. utf8.char(233) .. utf8.char(0x1F600) .. "Z"
+            local first = utf8.offset(text, 1)
+            local second = utf8.offset(text, 2)
+            local inside = utf8.offset(text, 0, 3)
+            local previous, previous_end = utf8.offset(text, -1)
+            return first == 1
+                and second == 2
+                and inside == 2
+                and previous == 8
+                and ((_VERSION == "Lua 5.5" and previous_end == 8)
+                    or (_VERSION ~= "Lua 5.5" and previous_end == nil))
+        "#;
+        for profile in [
+            SemanticProfile::Blu,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+        assert!(
+            Engine::default()
+                .execute_owned_source(
+                    "return utf8.offset(\"\\195\\169\", 1, 2)",
+                    SemanticProfile::Blu,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn utf8_codes_returns_a_bounded_stateful_iterator() {
+        let source = br#"
+            local text = "A" .. utf8.char(233) .. utf8.char(0x1F600)
+            local iterator, state, control = utf8.codes(text)
+            local first_position, first_codepoint = iterator(state, control)
+            local second_position, second_codepoint = iterator(state, first_position)
+            local third_position, third_codepoint = iterator(state, second_position)
+            local finished = iterator(state, third_position)
+            return type(iterator) == "function"
+                and state == text
+                and control == 0
+                and first_position == 1
+                and first_codepoint == 65
+                and second_position == 2
+                and second_codepoint == 233
+                and third_position == 4
+                and third_codepoint == 0x1F600
+                and finished == nil
+        "#;
+        for profile in [
+            SemanticProfile::Blu,
             SemanticProfile::Lua53,
             SemanticProfile::Lua54,
             SemanticProfile::Lua55,
@@ -1825,6 +2071,44 @@ return value"#
                 and calls == 1
                 and require("empty") == true
                 and package.loaded.empty == true
+        "#;
+        for profile in [
+            SemanticProfile::Lua51,
+            SemanticProfile::Lua52,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn require_dispatches_through_profile_package_searcher_tables() {
+        let source = br#"
+            local calls = 0
+            local key = _VERSION == "Lua 5.1" and "loaders" or "searchers"
+            local searchers = {}
+            searchers[1] = function(name)
+                calls = calls + 1
+                if name == "guest" then
+                    return function(module_name)
+                        return { name = module_name, answer = 42 }
+                    end
+                end
+            end
+            package[key] = searchers
+            local value = require("guest")
+            return value.name == "guest"
+                and value.answer == 42
+                and value == package.loaded.guest
+                and calls == 1
         "#;
         for profile in [
             SemanticProfile::Lua51,

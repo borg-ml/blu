@@ -719,6 +719,18 @@ impl Vm {
         {
             return Ok(Value::Nil);
         }
+        if name == b"utf8"
+            && !matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Luau
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            )
+        {
+            return Ok(Value::Nil);
+        }
         if let Some(value) = self.globals.get(name) {
             return Ok(value.clone());
         }
@@ -760,6 +772,27 @@ impl Vm {
                 &GcRoots::default(),
             )?;
         }
+        let utf8 = if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Luau
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            self.globals
+                .get(b"utf8".as_slice())
+                .cloned()
+                .unwrap_or(Value::Nil)
+        } else {
+            Value::Nil
+        };
+        self.table_set(
+            environment,
+            Value::String(Arc::from(b"utf8".as_slice())),
+            utf8,
+            &GcRoots::default(),
+        )?;
         Ok(())
     }
 
@@ -6948,7 +6981,13 @@ impl Vm {
         let loaded = self.allocate_table(0, 0, &GcRoots::default())?;
         let roots = GcRoots::from_values(&[Value::Table(loaded)])?;
         let preload = self.allocate_table(0, 0, &roots)?;
-        let package = self.allocate_table(0, 2, &roots)?;
+        let package = self.allocate_table(0, 4, &roots)?;
+        let roots = GcRoots::from_values(&[
+            Value::Table(loaded),
+            Value::Table(preload),
+            Value::Table(package),
+        ])?;
+        let searchers = self.allocate_table(2, 0, &roots)?;
         self.package_table = Some(package);
         self.heap.table_set(
             package,
@@ -6960,9 +6999,83 @@ impl Vm {
             Value::String(Arc::from(&b"preload"[..])),
             Value::Table(preload),
         )?;
+        self.heap.table_set(
+            package,
+            Value::String(Arc::from(&b"searchers"[..])),
+            Value::Table(searchers),
+        )?;
+        self.heap.table_set(
+            package,
+            Value::String(Arc::from(&b"loaders"[..])),
+            Value::Table(searchers),
+        )?;
         self.set_global(&b"package"[..], Value::Table(package));
 
+        let preload_searcher = self.register_function(|vm, arguments| {
+            let name = arguments.first().ok_or(RuntimeError::Argument {
+                function: "package.preload searcher",
+                index: 1,
+            })?;
+            let name = Arc::<[u8]>::from(string_bytes(name, "package.preload searcher")?);
+            let preload = vm
+                .global(b"package")
+                .and_then(|package| table_id(package).ok())
+                .and_then(|package| {
+                    vm.heap
+                        .table_get(package, &Value::String(Arc::from(&b"preload"[..])))
+                        .ok()
+                })
+                .and_then(|preload| table_id(&preload).ok());
+            let Some(preload) = preload else {
+                return Ok(vec![Value::String(Arc::from(
+                    b"no field package.preload".as_slice(),
+                ))]);
+            };
+            let loader = vm
+                .heap
+                .table_get(preload, &Value::String(Arc::clone(&name)))?;
+            if matches!(loader, Value::Nil) {
+                Ok(vec![Value::String(Arc::from(
+                    b"no field package.preload".as_slice(),
+                ))])
+            } else {
+                Ok(vec![loader])
+            }
+        });
+        let host_loader = self.register_function(|vm, arguments| {
+            let name = arguments.first().ok_or(RuntimeError::Argument {
+                function: "package host loader",
+                index: 1,
+            })?;
+            let name = Arc::<[u8]>::from(string_bytes(name, "package host loader")?);
+            let loader = vm
+                .module_loader
+                .clone()
+                .ok_or(RuntimeError::ModuleLoaderMissing)?;
+            Ok(vec![loader(vm, &name)?])
+        });
+        let host_searcher = self.register_function(move |vm, _arguments| {
+            if vm.module_loader.is_some() {
+                Ok(vec![Value::NativeFunction(host_loader)])
+            } else {
+                Ok(vec![Value::String(Arc::from(
+                    b"no host module loader".as_slice(),
+                ))])
+            }
+        });
+        self.heap.table_set(
+            searchers,
+            Value::Integer(1),
+            Value::NativeFunction(preload_searcher),
+        )?;
+        self.heap.table_set(
+            searchers,
+            Value::Integer(2),
+            Value::NativeFunction(host_searcher),
+        )?;
+
         let require = self.register_function(|vm, arguments| {
+            let profile = vm.active_semantic_profile()?;
             let name = arguments.first().ok_or(RuntimeError::Argument {
                 function: "require",
                 index: 1,
@@ -6978,13 +7091,19 @@ impl Vm {
                         .ok()
                 })
                 .and_then(|loaded| table_id(&loaded).ok());
-            let preload = package
-                .and_then(|package| {
+            let searcher_names = if profile == SemanticProfile::Lua51 {
+                [b"loaders".as_slice(), b"searchers".as_slice()]
+            } else {
+                [b"searchers".as_slice(), b"loaders".as_slice()]
+            };
+            let searchers = package.and_then(|package| {
+                searcher_names.into_iter().find_map(|name| {
                     vm.heap
-                        .table_get(package, &Value::String(Arc::from(&b"preload"[..])))
+                        .table_get(package, &Value::String(Arc::from(name)))
                         .ok()
+                        .and_then(|searchers| table_id(&searchers).ok())
                 })
-                .and_then(|loaded| table_id(&loaded).ok());
+            });
             if let Some(loaded) = loaded {
                 let cached = vm
                     .heap
@@ -7005,33 +7124,49 @@ impl Vm {
                     what: "loading module set",
                 })?;
             vm.loading_modules.insert(name.clone());
-            let result = if let Some(preload) = preload {
-                let loader = vm
-                    .heap
-                    .table_get(preload, &Value::String(Arc::clone(&name)))?;
-                if matches!(loader, Value::Nil) {
-                    match vm.module_loader.clone() {
-                        Some(loader) => loader(vm, &name),
-                        None => Err(RuntimeError::ModuleLoaderMissing),
+            let result = if let Some(searchers) = searchers {
+                let mut loader = None;
+                let searcher_count = vm.heap.table_length(searchers)?;
+                for index in 1..=searcher_count {
+                    let searcher = vm
+                        .heap
+                        .table_get(searchers, &Value::Integer(index as i64))?;
+                    if matches!(searcher, Value::Nil) {
+                        continue;
                     }
-                } else {
-                    let callback_result = vm.invoke_native_callback(
+                    let values = vm.invoke_native_callback_without_yield(
                         "require",
-                        loader,
+                        "yielding package searchers",
+                        searcher,
                         &[Value::String(Arc::clone(&name))],
-                    );
-                    match callback_result {
-                        Ok(values) => Ok(values.into_iter().next().unwrap_or(Value::Boolean(true))),
-                        Err(RuntimeError::CoroutineYield(_)) => {
-                            vm.captured_blu_continuation.take();
-                            Err(RuntimeError::UnsupportedLibraryFeature {
-                                function: "require",
-                                feature: "yielding package.preload loaders",
-                            })
+                    )?;
+                    match values.into_iter().next() {
+                        Some(Value::Closure(function)) => {
+                            loader = Some(Value::Closure(function));
+                            break;
                         }
-                        Err(error) => Err(error),
+                        Some(Value::NativeFunction(function)) => {
+                            loader = Some(Value::NativeFunction(function));
+                            break;
+                        }
+                        Some(Value::String(_)) | None => {}
+                        Some(value) => {
+                            return Err(RuntimeError::Type {
+                                operation: "require searcher",
+                                expected: "function or string",
+                                actual: value.type_name(),
+                            });
+                        }
                     }
                 }
+                let loader = loader.ok_or(RuntimeError::ModuleLoaderMissing)?;
+                let values = vm.invoke_native_callback_without_yield(
+                    "require",
+                    "yielding package loaders",
+                    loader,
+                    &[Value::String(Arc::clone(&name))],
+                )?;
+                Ok(values.into_iter().next().unwrap_or(Value::Boolean(true)))
             } else {
                 match vm.module_loader.clone() {
                     Some(loader) => loader(vm, &name),
@@ -8559,7 +8694,313 @@ impl Vm {
         self.install_table_library()?;
         self.install_math_library()?;
         self.install_bit32_library()?;
+        self.install_utf8_library()?;
         self.install_coroutine_library()?;
+        Ok(())
+    }
+
+    fn install_utf8_library(&mut self) -> Result<(), RuntimeError> {
+        let len = self.register_function(|vm, arguments| {
+            utf8_profile(vm, "utf8.len")?;
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "utf8.len",
+                index: 1,
+            })?;
+            let bytes = string_bytes(value, "utf8.len")?;
+            let start = arguments
+                .get(1)
+                .map(|_| integer_argument(arguments, 1, "utf8.len"))
+                .transpose()?
+                .unwrap_or(1);
+            let end = arguments
+                .get(2)
+                .map(|_| integer_argument(arguments, 2, "utf8.len"))
+                .transpose()?
+                .unwrap_or(-1);
+            let start = relative_index(start, bytes.len()).clamp(1, bytes.len() as i64 + 1);
+            let end = relative_index(end, bytes.len()).clamp(0, bytes.len() as i64);
+            if start > end {
+                return Ok(vec![profiled_integral_math_result(vm, "utf8.len", 0.0)?]);
+            }
+            let range_start = (start - 1) as usize;
+            let range_end = end as usize;
+            let mut offset = range_start;
+            let mut count = 0usize;
+            let allow_surrogates = matches!(
+                vm.active_profile()?,
+                SemanticProfile::Blu | SemanticProfile::Lua53
+            );
+            while offset < range_end {
+                let Some((_, width)) = decode_utf8_codepoint(bytes, offset, allow_surrogates)
+                else {
+                    return Ok(vec![
+                        Value::Nil,
+                        profiled_integral_math_result(vm, "utf8.len", (offset + 1) as f64)?,
+                    ]);
+                };
+                offset += width;
+                count += 1;
+            }
+            Ok(vec![profiled_integral_math_result(
+                vm,
+                "utf8.len",
+                count as f64,
+            )?])
+        });
+        let codepoint = self.register_function(|vm, arguments| {
+            utf8_profile(vm, "utf8.codepoint")?;
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "utf8.codepoint",
+                index: 1,
+            })?;
+            let bytes = string_bytes(value, "utf8.codepoint")?;
+            let start = arguments
+                .get(1)
+                .map(|_| integer_argument(arguments, 1, "utf8.codepoint"))
+                .transpose()?
+                .unwrap_or(1);
+            let end = arguments
+                .get(2)
+                .map(|_| integer_argument(arguments, 2, "utf8.codepoint"))
+                .transpose()?
+                .unwrap_or(start);
+            let start = relative_index(start, bytes.len()).clamp(1, bytes.len() as i64 + 1);
+            let end = relative_index(end, bytes.len()).clamp(0, bytes.len() as i64);
+            if start > end {
+                return Ok(Vec::new());
+            }
+            let range_start = (start - 1) as usize;
+            let range_end = end as usize;
+            let mut values =
+                try_vec_with_capacity(range_end - range_start, "utf8.codepoint results")?;
+            let mut offset = range_start;
+            let allow_surrogates = matches!(
+                vm.active_profile()?,
+                SemanticProfile::Blu | SemanticProfile::Lua53
+            );
+            while offset < range_end {
+                let Some((codepoint, width)) =
+                    decode_utf8_codepoint(bytes, offset, allow_surrogates)
+                else {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "utf8.codepoint",
+                        feature: "invalid UTF-8 sequence",
+                    });
+                };
+                values.push(profiled_integral_math_result(
+                    vm,
+                    "utf8.codepoint",
+                    codepoint as f64,
+                )?);
+                offset += width;
+            }
+            Ok(values)
+        });
+        let character = self.register_function(|vm, arguments| {
+            utf8_profile(vm, "utf8.char")?;
+            let mut result =
+                try_vec_with_capacity(arguments.len().saturating_mul(4), "utf8.char result")?;
+            for index in 0..arguments.len() {
+                let codepoint = integer_argument(arguments, index, "utf8.char")?;
+                if !(0..=0x10FFFF).contains(&codepoint) {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "utf8.char",
+                        feature: "invalid Unicode code point",
+                    });
+                }
+                let codepoint = codepoint as u32;
+                let mut encoded = [0; 4];
+                let width = if codepoint <= 0x7F {
+                    encoded[0] = codepoint as u8;
+                    1
+                } else if codepoint <= 0x7FF {
+                    encoded[0] = 0xC0 | (codepoint >> 6) as u8;
+                    encoded[1] = 0x80 | (codepoint & 0x3F) as u8;
+                    2
+                } else if codepoint <= 0xFFFF {
+                    encoded[0] = 0xE0 | (codepoint >> 12) as u8;
+                    encoded[1] = 0x80 | ((codepoint >> 6) & 0x3F) as u8;
+                    encoded[2] = 0x80 | (codepoint & 0x3F) as u8;
+                    3
+                } else {
+                    encoded[0] = 0xF0 | (codepoint >> 18) as u8;
+                    encoded[1] = 0x80 | ((codepoint >> 12) & 0x3F) as u8;
+                    encoded[2] = 0x80 | ((codepoint >> 6) & 0x3F) as u8;
+                    encoded[3] = 0x80 | (codepoint & 0x3F) as u8;
+                    4
+                };
+                result.extend_from_slice(&encoded[..width]);
+            }
+            ensure_string_result_length(result.len())?;
+            Ok(vec![Value::String(Arc::from(result))])
+        });
+        let offset = self.register_function(|vm, arguments| {
+            utf8_profile(vm, "utf8.offset")?;
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "utf8.offset",
+                index: 1,
+            })?;
+            let bytes = string_bytes(value, "utf8.offset")?;
+            let count = integer_argument(arguments, 1, "utf8.offset")?;
+            let length = i64::try_from(bytes.len()).map_err(|_| RuntimeError::Allocation {
+                what: "utf8.offset string length",
+            })?;
+            let position = arguments
+                .get(2)
+                .map(|_| integer_argument(arguments, 2, "utf8.offset"))
+                .transpose()?
+                .unwrap_or(if count >= 0 { 1 } else { length + 1 });
+            if !(1..=length + 1).contains(&position) {
+                return Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "utf8.offset",
+                    feature: "position out of range",
+                });
+            }
+            let allow_surrogates = matches!(
+                vm.active_profile()?,
+                SemanticProfile::Blu | SemanticProfile::Lua53
+            );
+            let mut characters = try_vec_with_capacity(bytes.len(), "utf8.offset characters")?;
+            let mut cursor = 0usize;
+            while cursor < bytes.len() {
+                let Some((_, width)) = decode_utf8_codepoint(bytes, cursor, allow_surrogates)
+                else {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "utf8.offset",
+                        feature: "invalid UTF-8 sequence",
+                    });
+                };
+                let end = cursor + width;
+                characters.push((cursor, end));
+                cursor = end;
+            }
+            let byte_position = usize::try_from(position - 1).map_err(|_| {
+                RuntimeError::UnsupportedLibraryFeature {
+                    function: "utf8.offset",
+                    feature: "position out of range",
+                }
+            })?;
+            if count != 0 && position <= length && bytes[byte_position] & 0xC0 == 0x80 {
+                return Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "utf8.offset",
+                    feature: "initial position is a continuation byte",
+                });
+            }
+            let target = if count == 0 {
+                if position == length + 1 {
+                    return utf8_offset_values(vm, position as usize, position as usize);
+                }
+                characters
+                    .iter()
+                    .find(|(start, end)| *start <= byte_position && byte_position < *end)
+                    .copied()
+            } else if count > 0 {
+                if position == length + 1 {
+                    None
+                } else {
+                    let index = characters
+                        .iter()
+                        .position(|(start, _)| *start == byte_position);
+                    index.and_then(|index| {
+                        usize::try_from(count - 1)
+                            .ok()
+                            .and_then(|delta| index.checked_add(delta))
+                            .and_then(|index| characters.get(index).copied())
+                    })
+                }
+            } else {
+                let index = if position == length + 1 {
+                    Some(characters.len())
+                } else {
+                    characters
+                        .iter()
+                        .position(|(start, _)| *start == byte_position)
+                };
+                index.and_then(|index| {
+                    count
+                        .checked_neg()
+                        .and_then(|magnitude| usize::try_from(magnitude).ok())
+                        .and_then(|magnitude| index.checked_sub(magnitude))
+                        .and_then(|index| characters.get(index).copied())
+                })
+            };
+            target.map_or_else(
+                || Ok(vec![Value::Nil]),
+                |(start, end)| utf8_offset_values(vm, start + 1, end),
+            )
+        });
+        let codes = self.register_function(|vm, arguments| {
+            utf8_profile(vm, "utf8.codes")?;
+            let subject = match arguments.first().ok_or(RuntimeError::Argument {
+                function: "utf8.codes",
+                index: 1,
+            })? {
+                Value::String(value) => Arc::clone(value),
+                other => {
+                    return Err(RuntimeError::Type {
+                        operation: "utf8.codes",
+                        expected: "string",
+                        actual: other.type_name(),
+                    });
+                }
+            };
+            let state = Arc::new(Mutex::new(Utf8CodesState {
+                subject: Arc::clone(&subject),
+                next_start: 0,
+            }));
+            let iterator_state = Arc::clone(&state);
+            let iterator = vm.try_register_function(move |vm, _arguments| {
+                let mut state =
+                    iterator_state
+                        .lock()
+                        .map_err(|_| RuntimeError::UnsupportedLibraryFeature {
+                            function: "utf8.codes",
+                            feature: "iterator state unavailable",
+                        })?;
+                if state.next_start >= state.subject.len() {
+                    return Ok(vec![Value::Nil]);
+                }
+                let allow_surrogates = matches!(
+                    vm.active_profile()?,
+                    SemanticProfile::Blu | SemanticProfile::Lua53
+                );
+                let Some((codepoint, width)) =
+                    decode_utf8_codepoint(&state.subject, state.next_start, allow_surrogates)
+                else {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "utf8.codes",
+                        feature: "invalid UTF-8 sequence",
+                    });
+                };
+                let position = state.next_start + 1;
+                state.next_start += width;
+                Ok(vec![
+                    profiled_integral_math_result(vm, "utf8.codes", position as f64)?,
+                    profiled_integral_math_result(vm, "utf8.codes", codepoint as f64)?,
+                ])
+            })?;
+            Ok(vec![
+                Value::NativeFunction(iterator),
+                Value::String(subject),
+                profiled_integral_math_result(vm, "utf8.codes", 0.0)?,
+            ])
+        });
+        let table = self.heap.allocate_table(0, 6)?;
+        for (name, value) in [
+            (&b"len"[..], Value::NativeFunction(len)),
+            (&b"codepoint"[..], Value::NativeFunction(codepoint)),
+            (&b"char"[..], Value::NativeFunction(character)),
+            (&b"offset"[..], Value::NativeFunction(offset)),
+            (&b"codes"[..], Value::NativeFunction(codes)),
+            (
+                &b"charpattern"[..],
+                Value::String(Arc::from(&b"[\\0-\\x7F\\xC2-\\xF4][\\x80-\\xBF]*"[..])),
+            ),
+        ] {
+            self.heap
+                .table_set(table, Value::String(Arc::from(name)), value)?;
+        }
+        self.set_global(&b"utf8"[..], Value::Table(table));
         Ok(())
     }
 
@@ -10669,6 +11110,25 @@ impl Vm {
     }
 }
 
+fn utf8_profile(vm: &Vm, function: &'static str) -> Result<(), RuntimeError> {
+    let profile = vm.active_profile()?;
+    if matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Luau
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    ) {
+        Ok(())
+    } else {
+        Err(RuntimeError::UnsupportedSemanticProfile {
+            operation: function,
+            profile,
+        })
+    }
+}
+
 fn string_bytes<'a>(value: &'a Value, operation: &'static str) -> Result<&'a [u8], RuntimeError> {
     match value {
         Value::String(value) => Ok(value),
@@ -10677,6 +11137,56 @@ fn string_bytes<'a>(value: &'a Value, operation: &'static str) -> Result<&'a [u8
             expected: "string",
             actual: other.type_name(),
         }),
+    }
+}
+
+fn decode_utf8_codepoint(
+    bytes: &[u8],
+    offset: usize,
+    allow_surrogates: bool,
+) -> Option<(u32, usize)> {
+    let first = *bytes.get(offset)?;
+    let (width, minimum) = match first {
+        0x00..=0x7F => (1, 0),
+        0xC0..=0xDF => (2, 0x80),
+        0xE0..=0xEF => (3, 0x800),
+        0xF0..=0xF7 => (4, 0x10000),
+        _ => return None,
+    };
+    let end = offset.checked_add(width)?;
+    let sequence = bytes.get(offset..end)?;
+    let mask = match width {
+        1 => 0x7F,
+        2 => 0x1F,
+        3 => 0x0F,
+        _ => 0x07,
+    };
+    let mut codepoint = u32::from(first & mask);
+    for byte in &sequence[1..] {
+        if byte & 0xC0 != 0x80 {
+            return None;
+        }
+        codepoint = (codepoint << 6) | u32::from(byte & 0x3F);
+    }
+    if codepoint < minimum
+        || codepoint > 0x10FFFF
+        || (!allow_surrogates && (0xD800..=0xDFFF).contains(&codepoint))
+    {
+        return None;
+    }
+    Some((codepoint, width))
+}
+
+fn utf8_offset_values(vm: &Vm, start: usize, end: usize) -> Result<Vec<Value>, RuntimeError> {
+    let profile = vm.active_profile()?;
+    let start = profiled_integral_math_result(vm, "utf8.offset", start as f64)?;
+    if profile == SemanticProfile::Lua55 {
+        Ok(vec![
+            start,
+            profiled_integral_math_result(vm, "utf8.offset", end as f64)?,
+        ])
+    } else {
+        Ok(vec![start])
     }
 }
 
@@ -11557,6 +12067,11 @@ struct GmatchState {
     pattern: Arc<[u8]>,
     next_start: usize,
     exhausted: bool,
+}
+
+struct Utf8CodesState {
+    subject: Arc<[u8]>,
+    next_start: usize,
 }
 
 const MAX_PATTERN_WORK: usize = 10_000_000;
@@ -15985,6 +16500,20 @@ mod tests {
         assert_eq!(
             vm.heap.table_get(garbage, &Value::Integer(1)),
             Err(HeapError::StaleTable(garbage))
+        );
+    }
+
+    #[test]
+    fn lua_utf8_decoder_accepts_surrogate_sequences_but_rejects_invalid_forms() {
+        assert_eq!(
+            decode_utf8_codepoint(&[0xED, 0xA0, 0x80], 0, true),
+            Some((0xD800, 3))
+        );
+        assert_eq!(decode_utf8_codepoint(&[0xED, 0xA0, 0x80], 0, false), None);
+        assert_eq!(decode_utf8_codepoint(&[0xC0, 0x80], 0, true), None);
+        assert_eq!(
+            decode_utf8_codepoint(&[0xF4, 0x90, 0x80, 0x80], 0, true),
+            None
         );
     }
 }

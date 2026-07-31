@@ -273,10 +273,10 @@ default environment), and the embedding facade exposes the equivalent
 `load_owned_source` API. This slice is differentially checked against the
 pinned Lua references. Lua 5.1 additionally supports string `loadstring` and
 function-targeted `getfenv`/`setfenv`. Owned `load` also accepts a reader
-function and concatenates its bounded string chunks, including empty chunks;
-yielding readers, binary chunks, and exact mode-string behavior remain
-unsupported. Stack-level environment rebinding and 5.5 declaration modes
-remain unsupported.
+function and concatenates its bounded string chunks; an empty string terminates
+the reader as in the reference runtimes. Yielding readers, binary chunks, and
+exact mode-string behavior remain unsupported. Stack-level environment
+rebinding and 5.5 declaration modes remain unsupported.
 When no explicit registry value shadows it, `_VERSION` is resolved from the
 active frame as `Blu`, `Luau`, or `Lua 5.1` through `Lua 5.5`. This avoids
 leaking the VM's configured fallback dialect into an explicitly profiled
@@ -444,6 +444,18 @@ direct `coroutine.yield` calls resume repeatedly, preserve captured state, and
 remain GC-rooted while suspended. Native library operations that invoke
 yielding callbacks still require operation-specific continuations and remain
 explicit unsupported features.
+
+The owned standard-library slice now includes profile-gated `utf8.len`,
+`utf8.codepoint`, `utf8.char`, `utf8.offset`, `utf8.codes`, and
+`utf8.charpattern` for Blu and Lua 5.3–5.5. `utf8.offset` follows the
+byte-boundary rules of the selected reference; Lua 5.5 additionally returns
+the final byte position. `utf8.codes` is a bounded stateful iterator over byte
+positions and code points.
+Invalid UTF-8 is reported through the Lua-compatible `utf8.len` result pair;
+invalid sequences passed to `utf8.codepoint` and invalid Unicode scalar values
+passed to `utf8.char` remain structured library errors. Lua 5.1–5.2 do not
+expose this global. Filesystem, native-module, yielding-searcher, and other
+system-capability library surfaces remain explicitly incomplete.
 
 ## Semantic profiles
 
@@ -813,7 +825,11 @@ per-VM cache, circular-load detection, GC-rooted module results, and Lua-family
 owned `package.loaded`/`package.preload` tables. `require` invokes a configured
 Lua-family `package.preload[name]` function before consulting the host loader,
 caches its first result (or `true` when it returns no value), and passes the
-module name as its first argument. Portable
+module name as its first argument. Lua-family owned profiles also expose
+customizable `package.searchers` (and the Lua 5.1-compatible `package.loaders`)
+tables; `require` dispatches through the profile-selected table, with bounded
+preload and host-loader searchers installed by default. Filesystem path,
+native-library, and yielding searchers remain outside this slice. Portable
 V1 envelopes canonically declare identity, dialect, bytecode versions,
 imports, exports, schema digests, and authority requirements; decoding is
 bounded, integrity-checked, and validates the contained bytecode without
