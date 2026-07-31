@@ -1,9 +1,14 @@
 #![forbid(unsafe_code)]
 
-use blu_compiler::Compiler as SourceCompiler;
+use blu_compiler::{Compiler as SourceCompiler, owned::OwnedCompiler};
+use blu_core::{
+    CompilerId, CompilerIdentity, IdentityLimits, SemanticProfile, SourceFile, SourceId,
+    SourceLimits,
+};
+use blu_lang::Engine;
 use blu_runtime::{
     Dialect, Value, Vm,
-    bytecode::{LoadLimits, disassemble, load},
+    bytecode::{LoadLimits, blu::BluLimits, disassemble, load},
 };
 use std::{
     env, fs,
@@ -49,6 +54,35 @@ const SCALAR_CASES: [(&str, &str); 12] = [
     ("or", "false or 9"),
     ("comparison", "3 < 4"),
 ];
+const OWNED_CALLBACK_SOURCE: &str = r#"
+local values = { 2, 1 }
+table.sort(values, function(left, right) return left > right end)
+local transformed, count = string.gsub("a1b2", "(%a)(%d)", function(letter, digit)
+    return digit .. letter
+end)
+local iterator = string.gmatch("a1b2", "(%a)(%d)")
+local first, first_digit = iterator()
+local second, second_digit = iterator()
+local done = iterator()
+return values[1] == 2 and values[2] == 1 and transformed == "1a2b" and count == 2
+    and type(iterator) == "function" and first == "a" and first_digit == "1"
+    and second == "b" and second_digit == "2" and done == nil
+"#;
+const OWNED_CALLBACK_REFERENCE_SOURCE: &str = r#"
+local values = { 2, 1 }
+table.sort(values, function(left, right) return left > right end)
+local transformed, count = string.gsub("a1b2", "(%a)(%d)", function(letter, digit)
+    return digit .. letter
+end)
+local iterator = string.gmatch("a1b2", "(%a)(%d)")
+local first, first_digit = iterator()
+local second, second_digit = iterator()
+local done = iterator()
+local result = values[1] == 2 and values[2] == 1 and transformed == "1a2b" and count == 2
+    and type(iterator) == "function" and first == "a" and first_digit == "1"
+    and second == "b" and second_digit == "2" and done == nil
+print(type(result) .. ":" .. tostring(result))
+"#;
 const TABLE_SOURCE: &str = r#"
 local values = {}
 values[1] = 3
@@ -241,6 +275,48 @@ const BASE_LIBRARY_REFERENCE_SOURCE: &str = r#"
 local result = type(3) .. ":" .. tostring(3)
 print(type(result) .. ":" .. tostring(result))
 "#;
+const PACKAGE_SOURCE: &str = r#"
+return type(package.loaded) .. ":" .. type(package.preload)
+"#;
+const PACKAGE_REFERENCE_SOURCE: &str = r#"
+local result = type(package.loaded) .. ":" .. type(package.preload)
+print(type(result) .. ":" .. tostring(result))
+"#;
+const PACKAGE_PRELOAD_SOURCE: &str = r#"
+local calls = 0
+package.preload.answer = function(name)
+    calls = calls + 1
+    return { name = name, value = 42 }
+end
+package.preload.empty = function() end
+local first = require("answer")
+local second = require("answer")
+return first.name == "answer"
+    and first.value == 42
+    and first == second
+    and first == package.loaded.answer
+    and calls == 1
+    and require("empty") == true
+    and package.loaded.empty == true
+"#;
+const PACKAGE_PRELOAD_REFERENCE_SOURCE: &str = r#"
+local calls = 0
+package.preload.answer = function(name)
+    calls = calls + 1
+    return { name = name, value = 42 }
+end
+package.preload.empty = function() end
+local first = require("answer")
+local second = require("answer")
+local result = first.name == "answer"
+    and first.value == 42
+    and first == second
+    and first == package.loaded.answer
+    and calls == 1
+    and require("empty") == true
+    and package.loaded.empty == true
+print(type(result) .. ":" .. tostring(result))
+"#;
 const METATABLE_SOURCE: &str = r#"
 local prototype = { answer = 42 }
 local object = setmetatable({}, { __index = prototype })
@@ -417,6 +493,208 @@ local failed, message = pcall(function()
     error("boom")
 end)
 local result = ok and not failed and first == 4 and second == 5 and type(message) == "string"
+print(type(result) .. ":" .. tostring(result))
+"#;
+const CLOSE_ERROR_SOURCE: &str = r#"
+local error_type = ""
+local ok = pcall(function()
+    local resource <close> = setmetatable({}, {
+        __close = function(value, err)
+            error_type = type(err)
+        end,
+    })
+    error("body")
+end)
+return tostring(ok) .. ":" .. error_type
+"#;
+const CLOSE_ERROR_REFERENCE_SOURCE: &str = r#"
+local error_type = ""
+local ok = pcall(function()
+    local resource <close> = setmetatable({}, {
+        __close = function(value, err)
+            error_type = type(err)
+        end,
+    })
+    error("body")
+end)
+local result = tostring(ok) .. ":" .. error_type
+print(type(result) .. ":" .. tostring(result))
+"#;
+const CLOSE_REVERSE_SOURCE: &str = r#"
+local order = ""
+local ok = pcall(function()
+    local first <close> = setmetatable({}, {
+        __close = function()
+            order = order .. "a"
+            error("close")
+        end,
+    })
+    local second <close> = setmetatable({}, {
+        __close = function()
+            order = order .. "b"
+        end,
+    })
+    error("body")
+end)
+return tostring(ok) .. ":" .. order
+"#;
+const CLOSE_REVERSE_REFERENCE_SOURCE: &str = r#"
+local order = ""
+local ok = pcall(function()
+    local first <close> = setmetatable({}, {
+        __close = function()
+            order = order .. "a"
+            error("close")
+        end,
+    })
+    local second <close> = setmetatable({}, {
+        __close = function()
+            order = order .. "b"
+        end,
+    })
+    error("body")
+end)
+local result = tostring(ok) .. ":" .. order
+print(type(result) .. ":" .. tostring(result))
+"#;
+const CLOSE_YIELD_SOURCE: &str = r#"
+local wrapped = coroutine.wrap(function()
+    local resource <close> = setmetatable({}, {
+        __close = function()
+            return coroutine.yield("closing")
+        end,
+    })
+    return "done"
+end)
+local first = wrapped()
+local second = wrapped("resumed")
+return first .. ":" .. second
+"#;
+const CLOSE_YIELD_REFERENCE_SOURCE: &str = r#"
+local wrapped = coroutine.wrap(function()
+    local resource <close> = setmetatable({}, {
+        __close = function()
+            return coroutine.yield("closing")
+        end,
+    })
+    return "done"
+end)
+local first = wrapped()
+local second = wrapped("resumed")
+local result = first .. ":" .. second
+print(type(result) .. ":" .. tostring(result))
+"#;
+const ENVIRONMENT_SOURCE: &str = r#"
+local _ENV = { a = 1, b = 2, type = type, tostring = tostring, print = print }
+a, b = b, a
+function answer()
+    return a + b
+end
+return answer() .. ":" .. a .. ":" .. b
+"#;
+const ENVIRONMENT_REFERENCE_SOURCE: &str = r#"
+local _ENV = { a = 1, b = 2, type = type, tostring = tostring, print = print }
+a, b = b, a
+function answer()
+    return a + b
+end
+local result = answer() .. ":" .. a .. ":" .. b
+print(type(result) .. ":" .. tostring(result))
+"#;
+const DEFAULT_ENVIRONMENT_SOURCE: &str = r#"
+answer = 40
+local function make()
+    local function read()
+        answer = answer + 2
+        return answer
+    end
+    return read
+end
+local read = make()
+read()
+return answer .. ":" .. _ENV.answer
+"#;
+const DEFAULT_ENVIRONMENT_REFERENCE_SOURCE: &str = r#"
+answer = 40
+local function make()
+    local function read()
+        answer = answer + 2
+        return answer
+    end
+    return read
+end
+local read = make()
+read()
+local result = answer .. ":" .. _ENV.answer
+print(type(result) .. ":" .. tostring(result))
+"#;
+const LOAD_ENVIRONMENT_SOURCE: &str = r#"
+answer = 39
+local default_loaded = load("answer = answer + 1; return answer")
+local default_result = default_loaded()
+local environment = { answer = 40 }
+local loaded = load("answer = answer + 1; return answer", "chunk", "t", environment)
+local first = loaded()
+local second = loaded()
+return default_result == 40 and answer == 40 and first == 41 and second == 42
+    and environment.answer == 42
+"#;
+const LOAD_ENVIRONMENT_REFERENCE_SOURCE: &str = r#"
+answer = 39
+local default_loaded = load("answer = answer + 1; return answer")
+local default_result = default_loaded()
+local environment = { answer = 40 }
+local loaded = load("answer = answer + 1; return answer", "chunk", "t", environment)
+local first = loaded()
+local second = loaded()
+local result = default_result == 40 and answer == 40 and first == 41 and second == 42
+    and environment.answer == 42
+print(type(result) .. ":" .. tostring(result))
+"#;
+const LOAD_READER_SOURCE: &str = r#"
+    local chunks = { "return 40", " + 2" }
+local index = 0
+local loaded, message = load(function()
+    index = index + 1
+    return chunks[index]
+end)
+return loaded ~= nil and message == nil and loaded() == 42 and index == 3
+"#;
+const LOAD_READER_REFERENCE_SOURCE: &str = r#"
+local chunks = { "return 40", " + 2" }
+local index = 0
+local loaded, message = load(function()
+    index = index + 1
+    return chunks[index]
+end)
+local result = loaded ~= nil and message == nil and loaded() == 42 and index == 3
+print(type(result) .. ":" .. tostring(result))
+"#;
+const LUA51_ENVIRONMENT_SOURCE: &str = r#"
+local environment = { answer = 40 }
+local function read()
+    return answer
+end
+setfenv(read, environment)
+local loaded = loadstring("answer = answer + 1; return answer")
+setfenv(loaded, environment)
+local first = loaded()
+local second = loaded()
+return first == 41 and second == 42 and environment.answer == 42
+    and getfenv(read) == environment and getfenv(loaded) == environment
+"#;
+const LUA51_ENVIRONMENT_REFERENCE_SOURCE: &str = r#"
+local environment = { answer = 40 }
+local function read()
+    return answer
+end
+setfenv(read, environment)
+local loaded = loadstring("answer = answer + 1; return answer")
+setfenv(loaded, environment)
+local first = loaded()
+local second = loaded()
+local result = first == 41 and second == 42 and environment.answer == 42
+    and getfenv(read) == environment and getfenv(loaded) == environment
 print(type(result) .. ":" .. tostring(result))
 "#;
 const TABLE_STRING_LIBRARY_SOURCE: &str = r#"
@@ -923,6 +1201,120 @@ fn run() -> Result<(), String> {
         &args.upstream,
         temporary.path(),
     )?;
+    verify_owned_program_case(
+        "owned synchronous library callbacks",
+        OWNED_CALLBACK_SOURCE,
+        OWNED_CALLBACK_REFERENCE_SOURCE,
+        SemanticProfile::Luau,
+        &args.upstream,
+        temporary.path(),
+    )?;
+    for (profile, (name, executable)) in [
+        (SemanticProfile::Lua51, &lua_references[0]),
+        (SemanticProfile::Lua52, &lua_references[1]),
+        (SemanticProfile::Lua53, &lua_references[2]),
+        (SemanticProfile::Lua54, &lua_references[3]),
+        (SemanticProfile::Lua55, &lua_references[4]),
+    ] {
+        verify_owned_program_case(
+            &format!("owned synchronous library callbacks ({name})"),
+            OWNED_CALLBACK_SOURCE,
+            OWNED_CALLBACK_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+        verify_owned_program_case(
+            &format!("package.preload require ({name})"),
+            PACKAGE_PRELOAD_SOURCE,
+            PACKAGE_PRELOAD_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+        if profile == SemanticProfile::Lua51 {
+            verify_owned_environment_case(
+                &format!("Lua 5.1 function environments ({name})"),
+                LUA51_ENVIRONMENT_SOURCE,
+                LUA51_ENVIRONMENT_REFERENCE_SOURCE,
+                profile,
+                executable,
+                temporary.path(),
+            )?;
+        }
+        verify_owned_load_reader_case(
+            &format!("reader-function load ({name})"),
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+    }
+    for (profile, (name, executable)) in [
+        (SemanticProfile::Lua54, &lua_references[3]),
+        (SemanticProfile::Lua55, &lua_references[4]),
+    ] {
+        verify_owned_program_case(
+            &format!("to-be-closed error argument ({name})"),
+            CLOSE_ERROR_SOURCE,
+            CLOSE_ERROR_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+        verify_owned_program_case(
+            &format!("to-be-closed reverse error unwind ({name})"),
+            CLOSE_REVERSE_SOURCE,
+            CLOSE_REVERSE_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+        verify_owned_program_case(
+            &format!("yielding to-be-closed handler ({name})"),
+            CLOSE_YIELD_SOURCE,
+            CLOSE_YIELD_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+    }
+    for (profile, (name, executable)) in [
+        (SemanticProfile::Lua52, &lua_references[1]),
+        (SemanticProfile::Lua53, &lua_references[2]),
+        (SemanticProfile::Lua54, &lua_references[3]),
+        (SemanticProfile::Lua55, &lua_references[4]),
+    ] {
+        verify_owned_program_case(
+            &format!("lexical _ENV override ({name})"),
+            ENVIRONMENT_SOURCE,
+            ENVIRONMENT_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+        verify_owned_program_case(
+            &format!("default _ENV closure ({name})"),
+            DEFAULT_ENVIRONMENT_SOURCE,
+            DEFAULT_ENVIRONMENT_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+        verify_owned_load_case(
+            &format!("environment-aware load ({name})"),
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+        verify_owned_program_case(
+            &format!("package cache tables ({name})"),
+            PACKAGE_SOURCE,
+            PACKAGE_REFERENCE_SOURCE,
+            profile,
+            executable,
+            temporary.path(),
+        )?;
+    }
 
     let portable_source = temporary.path().join("portable.lua");
     fs::write(&portable_source, PORTABLE_SOURCE).map_err(|error| error.to_string())?;
@@ -975,8 +1367,9 @@ fn run() -> Result<(), String> {
     println!("bytecode version: {bytecode_version}");
     println!("scalar differential corpus: pass ({scalar_count} cases)");
     println!(
-        "program differential corpus: pass (tables, loops, iteration, methods, metamethods, closures, captures, varargs, multret, coroutines)"
+        "program differential corpus: pass (tables, loops, iteration, methods, metamethods, closures, captures, varargs, multret, coroutines, default/lexical environments, environment-aware load, package.preload require, to-be-closed error/reverse/yield paths)"
     );
+    println!("owned callback differential corpus: pass (Luau, Lua 5.1-5.5 profiles)");
     println!("portable reference matrix: pass (Luau, Lua 5.1-5.5)");
     Ok(())
 }
@@ -1029,6 +1422,169 @@ fn verify_program_case(
     if result != reference.trim() {
         return Err(format!(
             "program case {name:?} differs: Blu={result:?}, Luau={:?}",
+            reference.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_owned_program_case(
+    name: &str,
+    source: &str,
+    reference_source: &str,
+    profile: SemanticProfile,
+    upstream: &Path,
+    temporary: &Path,
+) -> Result<(), String> {
+    let source_file = SourceFile::new(
+        SourceId::new(1),
+        "owned-conformance.blu",
+        source.as_bytes().to_vec(),
+        SourceLimits::default(),
+    )
+    .map_err(|error| format!("owned source case {name:?} was invalid: {error}"))?;
+    let identity = CompilerIdentity::new(
+        CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
+        "blu-owned",
+        env!("CARGO_PKG_VERSION"),
+        None,
+        IdentityLimits::default(),
+    )
+    .map_err(|error| format!("owned compiler identity failed for {name:?}: {error}"))?;
+    let compilation = OwnedCompiler::default()
+        .compile(&source_file, profile, identity)
+        .map_err(|error| format!("owned compiler failed case {name:?}: {error}"))?;
+    let result = Vm::default()
+        .execute_blu_v1(compilation.into_validated_artifact(), BluLimits::default())
+        .map_err(|error| format!("owned runtime failed case {name:?}: {error}"))?;
+    if result.len() != 1 {
+        return Err(format!(
+            "owned runtime returned {} values for case {name:?}, expected one",
+            result.len()
+        ));
+    }
+    let result = canonical_value(&result[0])?;
+
+    let reference_path = temporary.join("owned-program-reference.luau");
+    fs::write(&reference_path, reference_source).map_err(|error| error.to_string())?;
+    let reference = Command::new(upstream)
+        .arg(&reference_path)
+        .output()
+        .map_err(|error| format!("failed to execute owned reference {upstream:?}: {error}"))?;
+    ensure_success(upstream, &reference)?;
+    let reference = String::from_utf8_lossy(&reference.stdout);
+    if result != reference.trim() {
+        return Err(format!(
+            "owned program case {name:?} differs: Blu={result:?}, Luau={:?}",
+            reference.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_owned_load_case(
+    name: &str,
+    profile: SemanticProfile,
+    upstream: &Path,
+    temporary: &Path,
+) -> Result<(), String> {
+    let result = Engine::default()
+        .execute_owned_source(LOAD_ENVIRONMENT_SOURCE, profile)
+        .map_err(|error| format!("owned load failed for case {name:?}: {error}"))?;
+    if result.len() != 1 {
+        return Err(format!(
+            "owned load returned {} values for case {name:?}, expected one",
+            result.len()
+        ));
+    }
+    let result = canonical_value(&result[0])?;
+
+    let reference_path = temporary.join("owned-load-reference.luau");
+    fs::write(&reference_path, LOAD_ENVIRONMENT_REFERENCE_SOURCE)
+        .map_err(|error| error.to_string())?;
+    let reference = Command::new(upstream)
+        .arg(&reference_path)
+        .output()
+        .map_err(|error| format!("failed to execute owned load reference {upstream:?}: {error}"))?;
+    ensure_success(upstream, &reference)?;
+    let reference = String::from_utf8_lossy(&reference.stdout);
+    if result != reference.trim() {
+        return Err(format!(
+            "owned load case {name:?} differs: Blu={result:?}, Lua={:?}",
+            reference.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_owned_load_reader_case(
+    name: &str,
+    profile: SemanticProfile,
+    upstream: &Path,
+    temporary: &Path,
+) -> Result<(), String> {
+    let result = Engine::default()
+        .execute_owned_source(LOAD_READER_SOURCE, profile)
+        .map_err(|error| format!("owned reader load failed for case {name:?}: {error}"))?;
+    if result.len() != 1 {
+        return Err(format!(
+            "owned reader load returned {} values for case {name:?}, expected one",
+            result.len()
+        ));
+    }
+    let result = canonical_value(&result[0])?;
+
+    let reference_path = temporary.join("owned-load-reader-reference.luau");
+    fs::write(&reference_path, LOAD_READER_REFERENCE_SOURCE).map_err(|error| error.to_string())?;
+    let reference = Command::new(upstream)
+        .arg(&reference_path)
+        .output()
+        .map_err(|error| {
+            format!("failed to execute owned reader load reference {upstream:?}: {error}")
+        })?;
+    ensure_success(upstream, &reference)?;
+    let reference = String::from_utf8_lossy(&reference.stdout);
+    if result != reference.trim() {
+        return Err(format!(
+            "owned reader load case {name:?} differs: Blu={result:?}, Lua={:?}",
+            reference.trim()
+        ));
+    }
+    Ok(())
+}
+
+fn verify_owned_environment_case(
+    name: &str,
+    source: &str,
+    reference_source: &str,
+    profile: SemanticProfile,
+    upstream: &Path,
+    temporary: &Path,
+) -> Result<(), String> {
+    let result = Engine::default()
+        .execute_owned_source(source, profile)
+        .map_err(|error| format!("owned environment case failed for {name:?}: {error}"))?;
+    if result.len() != 1 {
+        return Err(format!(
+            "owned environment case returned {} values for {name:?}, expected one",
+            result.len()
+        ));
+    }
+    let result = canonical_value(&result[0])?;
+
+    let reference_path = temporary.join("owned-environment-reference.luau");
+    fs::write(&reference_path, reference_source).map_err(|error| error.to_string())?;
+    let reference = Command::new(upstream)
+        .arg(&reference_path)
+        .output()
+        .map_err(|error| {
+            format!("failed to execute owned environment reference {upstream:?}: {error}")
+        })?;
+    ensure_success(upstream, &reference)?;
+    let reference = String::from_utf8_lossy(&reference.stdout);
+    if result != reference.trim() {
+        return Err(format!(
+            "owned environment case {name:?} differs: Blu={result:?}, Lua={:?}",
             reference.trim()
         ));
     }

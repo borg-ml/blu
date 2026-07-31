@@ -3,11 +3,12 @@ use crate::{
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement,
     CompoundAssignmentOperator, CompoundAssignmentStatement, ContinueStatement, DialectDirective,
     DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody,
-    FunctionExpression, FunctionId, FunctionStatement, GenericForStatement, Identifier, IfClause,
-    IfExpression, IfStatement, IndexExpression, LexError, Lexed, LexerLimits,
-    LocalFunctionStatement, LocalListStatement, LocalStatement, MethodCallExpression,
-    NumericForStatement, RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField,
-    Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement, lex,
+    FunctionExpression, FunctionId, FunctionStatement, GenericForStatement, GotoStatement,
+    Identifier, IfClause, IfExpression, IfStatement, IndexExpression, LabelStatement, LexError,
+    Lexed, LexerLimits, LocalAttribute, LocalFunctionStatement, LocalListStatement, LocalStatement,
+    MethodCallExpression, NumericForStatement, RepeatStatement, ReturnStatement, Statement,
+    TableConstructor, TableField, Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement,
+    lex, supports_local_attributes,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -362,11 +363,28 @@ impl<'a> Parser<'a> {
                 TokenKind::Local => self.parse_local()?,
                 TokenKind::Function => self.parse_function_statement()?,
                 TokenKind::Identifier => self.parse_assignment()?,
+                TokenKind::Nil
+                | TokenKind::True
+                | TokenKind::False
+                | TokenKind::DecimalInteger
+                | TokenKind::DecimalNumber
+                | TokenKind::HexInteger
+                | TokenKind::HexNumber
+                | TokenKind::BinaryInteger
+                | TokenKind::StringLiteral
+                | TokenKind::Not
+                | TokenKind::Minus
+                | TokenKind::BitwiseExclusiveOr
+                | TokenKind::Hash
+                | TokenKind::LeftParenthesis
+                | TokenKind::LeftBrace => self.parse_expression_statement()?,
                 TokenKind::If => self.parse_if()?,
                 TokenKind::While => self.parse_while()?,
                 TokenKind::Repeat => self.parse_repeat()?,
                 TokenKind::Do => self.parse_do()?,
                 TokenKind::For => self.parse_for()?,
+                TokenKind::ColonColon => self.parse_label()?,
+                TokenKind::Goto => self.parse_goto()?,
                 TokenKind::Break | TokenKind::Continue => {
                     let Some(keyword) = self.bump() else {
                         return Err(ParseError::InternalInvariant {
@@ -448,6 +466,8 @@ impl<'a> Parser<'a> {
                             "for",
                             "break",
                             "continue",
+                            "::label::",
+                            "goto",
                             "return",
                         ],
                     )?;
@@ -456,6 +476,69 @@ impl<'a> Parser<'a> {
             }
         }
         Ok(())
+    }
+
+    fn parse_label(&mut self) -> Result<(), ParseError> {
+        let Some(open) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "label parser entered without a current token",
+            });
+        };
+        if !self.at(TokenKind::Identifier) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0046",
+                "expected label name after `::`",
+                &["identifier"],
+            )?;
+            return Ok(());
+        }
+        let Some(name) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "label identifier check succeeded without a current token",
+            });
+        };
+        if !self.at(TokenKind::ColonColon) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0047",
+                "expected `::` after label name",
+                &["::"],
+            )?;
+            return Ok(());
+        }
+        let Some(close) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "label close check succeeded without a current token",
+            });
+        };
+        self.push_statement(Statement::Label(LabelStatement::new(
+            Identifier::new(name.span()),
+            open.span().merge(close.span())?,
+        )))
+    }
+
+    fn parse_goto(&mut self) -> Result<(), ParseError> {
+        let Some(keyword) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "goto parser entered without a current token",
+            });
+        };
+        if !self.at(TokenKind::Identifier) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0048",
+                "expected label name after `goto`",
+                &["identifier"],
+            )?;
+            return Ok(());
+        }
+        let Some(name) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "goto identifier check succeeded without a current token",
+            });
+        };
+        self.push_statement(Statement::Goto(GotoStatement::new(
+            Identifier::new(name.span()),
+            keyword.span().merge(name.span())?,
+        )))
     }
 
     fn parse_if(&mut self) -> Result<(), ParseError> {
@@ -1044,6 +1127,7 @@ impl<'a> Parser<'a> {
                 keyword.span().merge(body.span())?,
             )));
         }
+        let default_attribute = self.parse_local_attribute(LocalAttribute::Regular)?;
         let name = if self.at(TokenKind::Identifier) {
             let Some(identifier) = self.bump() else {
                 return Err(ParseError::InternalInvariant {
@@ -1057,8 +1141,10 @@ impl<'a> Parser<'a> {
         };
 
         let mut names = allocate_vec(1, "local name list")?;
+        let mut attributes = allocate_vec(1, "local attribute list")?;
         if let Some(name) = name {
             names.push(name);
+            attributes.push(self.parse_local_attribute(default_attribute)?);
         }
         while self.at(TokenKind::Comma) {
             self.bump();
@@ -1079,6 +1165,11 @@ impl<'a> Parser<'a> {
                 &mut names,
                 Identifier::new(identifier.span()),
                 "local name list",
+            )?;
+            push_fallible(
+                &mut attributes,
+                self.parse_local_attribute(default_attribute)?,
+                "local attribute list",
             )?;
         }
 
@@ -1119,14 +1210,92 @@ impl<'a> Parser<'a> {
             self.push_statement(Statement::Local(LocalStatement::new(
                 name,
                 values.first().copied(),
+                attributes
+                    .first()
+                    .copied()
+                    .unwrap_or(LocalAttribute::Regular),
                 span,
             )))?;
         } else {
             self.push_statement(Statement::LocalList(LocalListStatement::new(
-                names, values, span,
+                names, values, attributes, span,
             )))?;
         }
         Ok(())
+    }
+
+    fn parse_local_attribute(
+        &mut self,
+        default: LocalAttribute,
+    ) -> Result<LocalAttribute, ParseError> {
+        if !self.at(TokenKind::LessThan) {
+            return Ok(default);
+        }
+        let Some(open) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "local attribute opener check succeeded without a current token",
+            });
+        };
+        let Some(name) = self.current() else {
+            self.report_current_or_eof(
+                "BLU-PARSE-0050",
+                "expected `const` or `close` inside local attribute",
+                &["const", "close"],
+            )?;
+            return Ok(default);
+        };
+        if name.kind() != TokenKind::Identifier {
+            self.report_current_or_eof(
+                "BLU-PARSE-0050",
+                "expected `const` or `close` inside local attribute",
+                &["const", "close"],
+            )?;
+            return Ok(default);
+        }
+        let Some(name) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "local attribute name check succeeded without a current token",
+            });
+        };
+        if !self.at(TokenKind::GreaterThan) {
+            self.report_current_or_eof(
+                "BLU-PARSE-0051",
+                "expected `>` after local attribute",
+                &[">"],
+            )?;
+        } else {
+            self.bump();
+        }
+        let attribute = match self.source.slice(name.span())? {
+            b"const" => LocalAttribute::Const,
+            b"close" => LocalAttribute::Close,
+            _ => {
+                let diagnostic = parser_diagnostic(
+                    "BLU-PARSE-0052",
+                    self.lexed.profile(),
+                    open.span().merge(name.span())?,
+                    "local attribute must be `const` or `close`",
+                    &["const", "close"],
+                    Some(self.source.slice(name.span())?),
+                    self.limits.lexer.diagnostic_limits,
+                )?;
+                self.push_diagnostic(diagnostic)?;
+                return Ok(default);
+            }
+        };
+        if !supports_local_attributes(self.lexed.profile()) {
+            let diagnostic = parser_diagnostic(
+                "BLU-PARSE-0053",
+                self.lexed.profile(),
+                open.span().merge(name.span())?,
+                "local attributes are unavailable in this profile",
+                &["Lua 5.4", "Lua 5.5"],
+                Some(self.source.slice(name.span())?),
+                self.limits.lexer.diagnostic_limits,
+            )?;
+            self.push_diagnostic(diagnostic)?;
+        }
+        Ok(attribute)
     }
 
     fn parse_return(&mut self) -> Result<(), ParseError> {
@@ -1286,6 +1455,42 @@ impl<'a> Parser<'a> {
                 targets, values, span,
             )))
         }
+    }
+
+    fn parse_expression_statement(&mut self) -> Result<(), ParseError> {
+        let Some(expression) = self.parse_expression(0)? else {
+            return Ok(());
+        };
+        let kind = self.expression(expression.id)?.kind();
+        if matches!(
+            kind,
+            ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+        ) {
+            return self.push_statement(Statement::Call(CallStatement::new(
+                expression.id,
+                self.expression(expression.id)?.span(),
+            )));
+        }
+        let span = self.expression(expression.id)?.span();
+        let diagnostic = parser_diagnostic(
+            "BLU-PARSE-0049",
+            self.lexed.profile(),
+            span,
+            "expected a function or method call statement",
+            &["function call"],
+            Some(self.source.slice(span)?),
+            self.limits.lexer.diagnostic_limits,
+        )?;
+        self.push_diagnostic(diagnostic)?;
+        if self.current().is_some() && !self.at(TokenKind::Semicolon) {
+            self.report_current(
+                "BLU-PARSE-0001",
+                "unexpected token after expression statement",
+                &["semicolon", "end of block"],
+            )?;
+            self.bump();
+        }
+        Ok(())
     }
 
     fn parse_expression(

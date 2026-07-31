@@ -30,10 +30,11 @@ use blu_core::{
 use blu_syntax::{
     AssignmentListStatement, AssignmentStatement, AssignmentTarget, Ast, BinaryOperator,
     CallExpression, CompoundAssignmentOperator, CompoundAssignmentStatement, Expression,
-    ExpressionId, ExpressionKind, FunctionId, FunctionStatement, GenericForStatement, Identifier,
-    IfStatement, LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement,
-    ParseError, ParseLimits, ParseOutcome, Rejected, RepeatStatement, ReturnStatement, Statement,
-    TableConstructor, TableField, UnaryOperator, WhileStatement, parse,
+    ExpressionId, ExpressionKind, FunctionId, FunctionStatement, GenericForStatement,
+    GotoStatement, Identifier, IfStatement, LabelStatement, LocalAttribute, LocalListStatement,
+    LocalStatement, MethodCallExpression, NumericForStatement, ParseError, ParseLimits,
+    ParseOutcome, Rejected, RepeatStatement, ReturnStatement, Statement, TableConstructor,
+    TableField, UnaryOperator, WhileStatement, parse,
 };
 use core::fmt;
 use sha2::{Digest, Sha256};
@@ -277,6 +278,9 @@ pub enum OwnedCompileError {
     InternalInvariant {
         message: &'static str,
     },
+    ControlFlow {
+        message: &'static str,
+    },
 }
 
 impl OwnedCompileError {
@@ -337,6 +341,7 @@ impl fmt::Display for OwnedCompileError {
             Self::InternalInvariant { message } => {
                 write!(formatter, "owned compiler invariant failed: {message}")
             }
+            Self::ControlFlow { message } => formatter.write_str(message),
         }
     }
 }
@@ -356,7 +361,8 @@ impl std::error::Error for OwnedCompileError {
             | Self::Limit { .. }
             | Self::Allocation { .. }
             | Self::Diagnostic(_)
-            | Self::InternalInvariant { .. } => None,
+            | Self::InternalInvariant { .. }
+            | Self::ControlFlow { .. } => None,
         }
     }
 }
@@ -383,6 +389,7 @@ impl From<DiagnosticError> for OwnedCompileError {
 enum BindingName {
     Source(ByteSpan),
     ImplicitSelf,
+    ImplicitEnvironment,
 }
 
 impl BindingName {
@@ -390,6 +397,7 @@ impl BindingName {
         let expected = match self {
             Self::Source(span) => source.slice(span)?,
             Self::ImplicitSelf => b"self",
+            Self::ImplicitEnvironment => b"_ENV",
         };
         Ok(expected == source.slice(name)?)
     }
@@ -398,7 +406,12 @@ impl BindingName {
         match self {
             Self::Source(span) => Ok(source.slice(span)?),
             Self::ImplicitSelf => Ok(b"self"),
+            Self::ImplicitEnvironment => Ok(b"_ENV"),
         }
+    }
+
+    fn is_hidden(self) -> bool {
+        matches!(self, Self::ImplicitEnvironment)
     }
 }
 
@@ -406,13 +419,36 @@ impl BindingName {
 struct Binding {
     name: BindingName,
     register: u16,
+    constant: bool,
+    to_close: bool,
     start_pc: u32,
     end_pc: Option<u32>,
 }
 
 #[derive(Clone, Copy)]
+struct Label {
+    name: ByteSpan,
+    target: usize,
+    scope: usize,
+}
+
+#[derive(Clone, Copy)]
+struct Goto {
+    name: ByteSpan,
+    instruction: usize,
+    scope: usize,
+}
+
+#[derive(Clone, Copy)]
+struct PlannedLabel {
+    name: ByteSpan,
+    scope: usize,
+}
+
+#[derive(Clone, Copy)]
 struct OuterBinding {
     name: BindingName,
+    constant: bool,
     source: Upvalue,
 }
 
@@ -447,12 +483,16 @@ struct Lowerer<'a, 'prototypes> {
     closed_bindings: Vec<Binding>,
     loop_breaks: Vec<Vec<usize>>,
     loop_continues: Vec<Vec<usize>>,
+    labels: Vec<Label>,
+    gotos: Vec<Goto>,
+    planned_labels: Vec<PlannedLabel>,
     register_count: usize,
     constants: Vec<Constant>,
     constant_bytes: usize,
     code: Vec<Instruction>,
     source_map: Vec<ByteSpan>,
     children: Vec<u32>,
+    uses_environment: bool,
 }
 
 impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
@@ -491,16 +531,38 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             )?,
             loop_breaks: allocate_vec(8, "loop control stack")?,
             loop_continues: allocate_vec(8, "loop continue stack")?,
+            labels: allocate_vec(8, "labels")?,
+            gotos: allocate_vec(8, "goto branches")?,
+            planned_labels: allocate_vec(8, "planned labels")?,
             register_count: 0,
             constants: allocate_vec(capacity.min(limits.max_constants), "constants")?,
             constant_bytes: 0,
             code: allocate_vec(capacity.min(limits.max_instructions), "instructions")?,
             source_map: allocate_vec(capacity.min(limits.max_instructions), "source map")?,
             children: allocate_vec(4, "prototype children")?,
+            uses_environment: false,
         };
         if shape.implicit_self {
             let register = lowerer.allocate_register()?;
             lowerer.push_binding(BindingName::ImplicitSelf, register, 0)?;
+        }
+        if outer_bindings.is_empty()
+            && matches!(
+                lowerer.profile,
+                SemanticProfile::Lua52
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            )
+        {
+            let register = lowerer.allocate_register()?;
+            lowerer.push_binding(BindingName::ImplicitEnvironment, register, 0)?;
+            lowerer.emit(
+                Instruction::NewTable {
+                    destination: register,
+                },
+                source.span(0, 0)?,
+            )?;
         }
         for parameter in parameters {
             let register = lowerer.allocate_register()?;
@@ -510,17 +572,25 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     }
 
     fn run(mut self, statements: &[Statement]) -> Result<Prototype, OwnedCompileError> {
+        self.plan_labels(statements, self.bindings.len())?;
         if !self.lower_statements(statements)? {
+            self.emit_close_bindings(0, self.source.span(self.source.len(), self.source.len())?)?;
             let eof = self.source.span(self.source.len(), self.source.len())?;
             self.emit(Instruction::Return { first: 0, count: 0 }, eof)?;
         }
+        self.resolve_gotos()?;
 
         let end_pc =
             u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "instruction count passed limits but cannot fit a debug PC",
             })?;
         let mut debug_bytes = 0_usize;
-        for binding in self.closed_bindings.iter().chain(&self.bindings) {
+        for binding in self
+            .closed_bindings
+            .iter()
+            .chain(&self.bindings)
+            .filter(|binding| !binding.name.is_hidden())
+        {
             let name_len = binding.name.bytes(self.source)?.len();
             check_limit(
                 OwnedCompileLimit::DebugNameBytes,
@@ -542,10 +612,17 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         }
         let binding_count = self
             .closed_bindings
-            .len()
-            .saturating_add(self.bindings.len());
+            .iter()
+            .chain(&self.bindings)
+            .filter(|binding| !binding.name.is_hidden())
+            .count();
         let mut locals = allocate_vec(binding_count, "local debug entries")?;
-        for binding in self.closed_bindings.into_iter().chain(self.bindings) {
+        for binding in self
+            .closed_bindings
+            .into_iter()
+            .chain(self.bindings)
+            .filter(|binding| !binding.name.is_hidden())
+        {
             let name = copy_bytes(binding.name.bytes(self.source)?, "local debug name")?;
             locals.push(LocalDebug {
                 name,
@@ -594,11 +671,10 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         }) {
             required_features = required_features | FeatureBits::COMPARISONS;
         }
-        if self.code.iter().any(|instruction| {
-            matches!(
-                instruction,
-                Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. }
-            )
+        if self.code.iter().any(|instruction| match instruction {
+            Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. } => true,
+            Instruction::Jump { target } => *target as usize > 0,
+            _ => false,
         }) {
             required_features = required_features | FeatureBits::FORWARD_BRANCHES;
         }
@@ -615,19 +691,27 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 instruction,
                 Instruction::LoadGlobal { .. } | Instruction::StoreGlobal { .. }
             )
-        }) {
+        }) || self.uses_environment
+        {
             required_features = required_features | FeatureBits::GLOBALS;
         }
-        if self.code.iter().any(|instruction| {
+        if self.code.iter().enumerate().any(|(pc, instruction)| {
             matches!(
                 instruction,
-                Instruction::NewTable { .. }
-                    | Instruction::GetTable { .. }
+                Instruction::GetTable { .. }
                     | Instruction::SetTable { .. }
                     | Instruction::SetListVarargs { .. }
                     | Instruction::SetListCall { .. }
                     | Instruction::SetListCallVarargs { .. }
-            )
+            ) || (matches!(instruction, Instruction::NewTable { .. })
+                && !(pc == 0
+                    && matches!(
+                        self.profile,
+                        SemanticProfile::Lua52
+                            | SemanticProfile::Lua53
+                            | SemanticProfile::Lua54
+                            | SemanticProfile::Lua55
+                    )))
         }) {
             required_features = required_features | FeatureBits::TABLES;
         }
@@ -810,8 +894,16 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 Statement::Do(statement) => {
                     let scope = self.bindings.len();
                     let terminated = self.lower_statements(statement.body().statements())?;
+                    let ends_in_goto = statement
+                        .body()
+                        .statements()
+                        .last()
+                        .is_some_and(|statement| matches!(statement, Statement::Goto(_)));
+                    if !terminated && !ends_in_goto {
+                        self.emit_close_bindings(scope, statement.span())?;
+                    }
                     self.close_scope(scope)?;
-                    terminated
+                    terminated && !ends_in_goto
                 }
                 Statement::NumericFor(statement) => {
                     self.lower_numeric_for(statement)?;
@@ -828,6 +920,14 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 Statement::Continue(statement) => {
                     self.lower_continue(statement.span())?;
                     true
+                }
+                Statement::Label(statement) => {
+                    self.lower_label(statement)?;
+                    false
+                }
+                Statement::Goto(statement) => {
+                    self.lower_goto(statement)?;
+                    false
                 }
                 Statement::Return(return_statement) => {
                     self.lower_return(return_statement)?;
@@ -855,7 +955,15 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 clause.span(),
             )?;
             let scope = self.bindings.len();
-            let terminated = self.lower_statements(clause.body().statements())?;
+            let terminated = self.lower_statements(clause.body().statements())?
+                || clause
+                    .body()
+                    .statements()
+                    .last()
+                    .is_some_and(|statement| matches!(statement, Statement::Goto(_)));
+            if !terminated {
+                self.emit_close_bindings(scope, clause.span())?;
+            }
             self.close_scope(scope)?;
             all_clauses_terminate &= terminated;
             if !terminated {
@@ -869,6 +977,9 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         let else_terminates = if let Some(body) = statement.else_body() {
             let scope = self.bindings.len();
             let terminated = self.lower_statements(body.statements())?;
+            if !terminated {
+                self.emit_close_bindings(scope, statement.span())?;
+            }
             self.close_scope(scope)?;
             terminated
         } else {
@@ -910,29 +1021,41 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             .ok_or(OwnedCompileError::InternalInvariant {
                 message: "loop continue stack became empty during lowering",
             })?;
-        for branch in continues {
-            self.patch_forward_branch(branch, start)?;
-        }
         let breaks = self
             .loop_breaks
             .pop()
             .ok_or(OwnedCompileError::InternalInvariant {
                 message: "loop control stack became empty during lowering",
             })?;
-        let terminated = lowered?;
-        self.close_scope(scope)?;
-        if !terminated {
+        let terminated = lowered?
+            || statement
+                .body()
+                .statements()
+                .last()
+                .is_some_and(|statement| matches!(statement, Statement::Goto(_)));
+        let needs_loop_back = !terminated || !continues.is_empty();
+        let continue_target = self.code.len();
+        for branch in continues {
+            self.patch_forward_branch(branch, continue_target)?;
+        }
+        if needs_loop_back {
+            self.emit_close_bindings(scope, statement.span())?;
             let target =
                 u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
                     message: "loop target passed limits but cannot fit BluV1",
                 })?;
             self.emit(Instruction::Jump { target }, statement.span())?;
         }
+        if !breaks.is_empty() {
+            let break_target = self.code.len();
+            for branch in breaks {
+                self.patch_forward_branch(branch, break_target)?;
+            }
+            self.emit_close_bindings(scope, statement.span())?;
+        }
+        self.close_scope(scope)?;
         let end = self.code.len();
         self.patch_forward_branch(exit, end)?;
-        for branch in breaks {
-            self.patch_forward_branch(branch, end)?;
-        }
         Ok(())
     }
 
@@ -962,29 +1085,47 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             .ok_or(OwnedCompileError::InternalInvariant {
                 message: "loop control stack became empty during lowering",
             })?;
-        lowered?;
-        let condition_start = self.code.len();
-        for branch in continues {
-            self.patch_forward_branch(branch, condition_start)?;
+        let terminated = lowered?
+            || statement
+                .body()
+                .statements()
+                .last()
+                .is_some_and(|statement| matches!(statement, Statement::Goto(_)));
+        let needs_condition = !terminated || !continues.is_empty();
+        let mut exit = None;
+        if needs_condition {
+            self.emit_close_bindings(scope, statement.span())?;
+            let condition_start = self.code.len();
+            for branch in continues {
+                self.patch_forward_branch(branch, condition_start)?;
+            }
+            let condition = self.lower_expression(statement.condition())?;
+            let exit_branch = self.code.len();
+            self.emit(
+                Instruction::JumpIfTruthy {
+                    condition,
+                    target: 0,
+                },
+                statement.span(),
+            )?;
+            exit = Some(exit_branch);
+            let target =
+                u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
+                    message: "loop target passed limits but cannot fit BluV1",
+                })?;
+            self.emit(Instruction::Jump { target }, statement.span())?;
         }
-        let condition = self.lower_expression(statement.condition())?;
-        let exit = self.code.len();
-        self.emit(
-            Instruction::JumpIfTruthy {
-                condition,
-                target: 0,
-            },
-            statement.span(),
-        )?;
-        let target = u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
-            message: "loop target passed limits but cannot fit BluV1",
-        })?;
-        self.emit(Instruction::Jump { target }, statement.span())?;
+        if !breaks.is_empty() {
+            let break_target = self.code.len();
+            for branch in breaks {
+                self.patch_forward_branch(branch, break_target)?;
+            }
+            self.emit_close_bindings(scope, statement.span())?;
+        }
         self.close_scope(scope)?;
-        let end = self.code.len();
-        self.patch_forward_branch(exit, end)?;
-        for branch in breaks {
-            self.patch_forward_branch(branch, end)?;
+        if let Some(exit) = exit {
+            let end = self.code.len();
+            self.patch_forward_branch(exit, end)?;
         }
         Ok(())
     }
@@ -1114,6 +1255,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             Binding {
                 name: BindingName::Source(statement.name().span()),
                 register: index,
+                constant: false,
+                to_close: false,
                 start_pc,
                 end_pc: None,
             },
@@ -1212,29 +1355,45 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             .ok_or(OwnedCompileError::InternalInvariant {
                 message: "loop control stack became empty during lowering",
             })?;
-        lowered?;
-        self.close_scope(body_scope)?;
-        let increment = self.code.len();
+        let terminated = lowered?
+            || statement
+                .body()
+                .statements()
+                .last()
+                .is_some_and(|statement| matches!(statement, Statement::Goto(_)));
+        let needs_loop_back = !terminated || !continues.is_empty();
+        let continue_target = self.code.len();
         for branch in continues {
-            self.patch_forward_branch(branch, increment)?;
+            self.patch_forward_branch(branch, continue_target)?;
         }
-        self.emit(
-            Instruction::Add {
-                destination: index,
-                left: index,
-                right: step,
-            },
-            statement.span(),
-        )?;
-        let target = u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
-            message: "loop target passed limits but cannot fit BluV1",
-        })?;
-        self.emit(Instruction::Jump { target }, statement.span())?;
+        if needs_loop_back {
+            self.emit_close_bindings(body_scope, statement.span())?;
+        }
+        if needs_loop_back {
+            self.emit(
+                Instruction::Add {
+                    destination: index,
+                    left: index,
+                    right: step,
+                },
+                statement.span(),
+            )?;
+            let target =
+                u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
+                    message: "loop target passed limits but cannot fit BluV1",
+                })?;
+            self.emit(Instruction::Jump { target }, statement.span())?;
+        }
+        if !breaks.is_empty() {
+            let break_target = self.code.len();
+            for branch in breaks {
+                self.patch_forward_branch(branch, break_target)?;
+            }
+            self.emit_close_bindings(body_scope, statement.span())?;
+        }
+        self.close_scope(body_scope)?;
         let end = self.code.len();
         self.patch_forward_branch(exit, end)?;
-        for branch in breaks {
-            self.patch_forward_branch(branch, end)?;
-        }
         self.close_scope(loop_scope)
     }
 
@@ -1242,20 +1401,17 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         &mut self,
         statement: &GenericForStatement,
     ) -> Result<(), OwnedCompileError> {
-        if matches!(
+        let control_count = if matches!(
             self.profile,
             SemanticProfile::Lua54 | SemanticProfile::Lua55
         ) {
-            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
-                "BLU-COMPILE-0005",
-                Phase::Lower,
-                statement.span(),
-                "Lua 5.4-5.5 generic for requires an unimplemented to-be-closed fourth control",
-            )?));
-        }
-        let mut controls = allocate_vec(3, "generic for controls")?;
+            4
+        } else {
+            3
+        };
+        let mut controls = allocate_vec(control_count, "generic for controls")?;
         for (index, value) in statement.values().iter().copied().enumerate() {
-            let remaining = 3usize.saturating_sub(index);
+            let remaining = control_count.saturating_sub(index);
             let is_last = index + 1 == statement.values().len();
             let mut lowered = if is_last && remaining > 1 {
                 self.lower_call_expression_results(value, remaining)?
@@ -1278,12 +1434,17 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 controls.push(snapshot);
             }
         }
-        while controls.len() < 3 {
+        while controls.len() < control_count {
             controls.push(self.lower_constant(Constant::Nil, statement.span())?);
         }
         let iterator = controls[0];
         let state = controls[1];
         let control = controls[2];
+        let to_close = controls.get(3).copied();
+
+        if let Some(to_close) = to_close {
+            self.emit_mark_close_value(to_close, statement.span())?;
+        }
 
         let loop_scope = self.bindings.len();
         let start = self.code.len();
@@ -1356,22 +1517,86 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             .ok_or(OwnedCompileError::InternalInvariant {
                 message: "loop control stack became empty during lowering",
             })?;
-        lowered?;
-        self.close_scope(body_scope)?;
+        let terminated = lowered?
+            || statement
+                .body()
+                .statements()
+                .last()
+                .is_some_and(|statement| matches!(statement, Statement::Goto(_)));
+        let needs_loop_back = !terminated || !continues.is_empty();
         let continue_target = self.code.len();
         for branch in continues {
             self.patch_forward_branch(branch, continue_target)?;
         }
-        let target = u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
-            message: "loop target passed limits but cannot fit BluV1",
-        })?;
-        self.emit(Instruction::Jump { target }, statement.span())?;
-        let end = self.code.len();
-        self.patch_forward_branch(exit, end)?;
-        for branch in breaks {
-            self.patch_forward_branch(branch, end)?;
+        if needs_loop_back {
+            self.emit_close_bindings(body_scope, statement.span())?;
+            let target =
+                u32::try_from(start).map_err(|_| OwnedCompileError::InternalInvariant {
+                    message: "loop target passed limits but cannot fit BluV1",
+                })?;
+            self.emit(Instruction::Jump { target }, statement.span())?;
+        }
+        if !breaks.is_empty() {
+            let break_target = self.code.len();
+            for branch in breaks {
+                self.patch_forward_branch(branch, break_target)?;
+            }
+            self.emit_close_bindings(body_scope, statement.span())?;
+        }
+        self.close_scope(body_scope)?;
+        let close_start = self.code.len();
+        self.patch_forward_branch(exit, close_start)?;
+        if let Some(to_close) = to_close {
+            let close = self.lower_global_name(b"__blu_internal_close", statement.span())?;
+            let arguments = self.allocate_register()?;
+            self.emit(
+                Instruction::Move {
+                    destination: arguments,
+                    source: to_close,
+                },
+                statement.span(),
+            )?;
+            let result = self.allocate_register()?;
+            self.emit(
+                Instruction::Call {
+                    destination: result,
+                    function: close,
+                    arguments,
+                    argument_count: 1,
+                },
+                statement.span(),
+            )?;
         }
         self.close_scope(loop_scope)
+    }
+
+    fn lower_global_name(&mut self, name: &[u8], span: ByteSpan) -> Result<u16, OwnedCompileError> {
+        let constant = self.push_constant(Constant::String(name.to_vec()))?;
+        let destination = self.allocate_register()?;
+        self.emit(
+            Instruction::LoadGlobal {
+                destination,
+                name: constant,
+            },
+            span,
+        )?;
+        Ok(destination)
+    }
+
+    fn lower_environment_key(&mut self, span: ByteSpan) -> Result<u16, OwnedCompileError> {
+        let constant = self.push_constant(Constant::String(copy_bytes(
+            self.source.slice(span)?,
+            "lexical environment key",
+        )?))?;
+        let destination = self.allocate_register()?;
+        self.emit(
+            Instruction::LoadConstant {
+                destination,
+                constant,
+            },
+            span,
+        )?;
+        Ok(destination)
     }
 
     fn numeric_for_step_sign(
@@ -1437,6 +1662,129 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         push_fallible(continues, branch, "loop continue branches")
     }
 
+    fn lower_label(&mut self, statement: &LabelStatement) -> Result<(), OwnedCompileError> {
+        let name = statement.name().span();
+        if self
+            .labels
+            .iter()
+            .any(|label| self.source.slice(label.name).ok() == self.source.slice(name).ok())
+        {
+            return Err(OwnedCompileError::ControlFlow {
+                message: "duplicate label in one function",
+            });
+        }
+        push_fallible(
+            &mut self.labels,
+            Label {
+                name,
+                target: self.code.len(),
+                scope: self.bindings.len(),
+            },
+            "labels",
+        )
+    }
+
+    fn lower_goto(&mut self, statement: &GotoStatement) -> Result<(), OwnedCompileError> {
+        if let Some(target_scope) = self
+            .planned_labels
+            .iter()
+            .find(|label| {
+                self.source.slice(label.name).ok()
+                    == self.source.slice(statement.name().span()).ok()
+            })
+            .map(|label| label.scope)
+        {
+            if target_scope > self.bindings.len() {
+                return Err(OwnedCompileError::ControlFlow {
+                    message: "goto enters a local scope",
+                });
+            }
+            if target_scope < self.bindings.len() {
+                self.emit_close_bindings(target_scope, statement.span())?;
+            }
+        }
+        let instruction = self.code.len();
+        self.emit(Instruction::Jump { target: 0 }, statement.span())?;
+        push_fallible(
+            &mut self.gotos,
+            Goto {
+                name: statement.name().span(),
+                instruction,
+                scope: self.bindings.len(),
+            },
+            "goto branches",
+        )
+    }
+
+    fn resolve_gotos(&mut self) -> Result<(), OwnedCompileError> {
+        for goto in self.gotos.clone() {
+            let Some(label) = self.labels.iter().find(|label| {
+                self.source.slice(label.name).ok() == self.source.slice(goto.name).ok()
+            }) else {
+                return Err(OwnedCompileError::ControlFlow {
+                    message: "goto target label is not defined",
+                });
+            };
+            if label.scope > goto.scope {
+                return Err(OwnedCompileError::ControlFlow {
+                    message: "goto enters a local scope",
+                });
+            }
+            self.patch_forward_branch(goto.instruction, label.target)?;
+        }
+        Ok(())
+    }
+
+    fn plan_labels(
+        &mut self,
+        statements: &[Statement],
+        mut scope: usize,
+    ) -> Result<(), OwnedCompileError> {
+        for statement in statements {
+            match statement {
+                Statement::Label(label) => push_fallible(
+                    &mut self.planned_labels,
+                    PlannedLabel {
+                        name: label.name().span(),
+                        scope,
+                    },
+                    "planned labels",
+                )?,
+                Statement::Goto(_) => {}
+                Statement::Local(_) => scope = scope.saturating_add(1),
+                Statement::LocalList(local) => scope = scope.saturating_add(local.names().len()),
+                Statement::Do(statement) => {
+                    self.plan_labels(statement.body().statements(), scope)?;
+                }
+                Statement::If(statement) => {
+                    for clause in statement.clauses() {
+                        self.plan_labels(clause.body().statements(), scope)?;
+                    }
+                    if let Some(body) = statement.else_body() {
+                        self.plan_labels(body.statements(), scope)?;
+                    }
+                }
+                Statement::While(statement) => {
+                    self.plan_labels(statement.body().statements(), scope)?;
+                }
+                Statement::Repeat(statement) => {
+                    self.plan_labels(statement.body().statements(), scope)?;
+                }
+                Statement::NumericFor(statement) => {
+                    self.plan_labels(statement.body().statements(), scope.saturating_add(1))?;
+                }
+                Statement::GenericFor(statement) => {
+                    self.plan_labels(
+                        statement.body().statements(),
+                        scope.saturating_add(statement.names().len()),
+                    )?;
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
     fn close_scope(&mut self, start: usize) -> Result<(), OwnedCompileError> {
         let end_pc =
             u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
@@ -1458,6 +1806,75 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         Ok(())
     }
 
+    fn emit_close_bindings(
+        &mut self,
+        start: usize,
+        span: ByteSpan,
+    ) -> Result<(), OwnedCompileError> {
+        let mut registers = allocate_vec(2, "to-be-closed local registers")?;
+        for binding in self.bindings[start..].iter().rev() {
+            if binding.to_close {
+                push_fallible(
+                    &mut registers,
+                    binding.register,
+                    "to-be-closed local registers",
+                )?;
+            }
+        }
+        for register in registers {
+            self.emit_close_value(register, span)?;
+        }
+        Ok(())
+    }
+
+    fn emit_close_value(&mut self, value: u16, span: ByteSpan) -> Result<(), OwnedCompileError> {
+        let close = self.lower_global_name(b"__blu_internal_close", span)?;
+        let arguments = self.allocate_register()?;
+        self.emit(
+            Instruction::Move {
+                destination: arguments,
+                source: value,
+            },
+            span,
+        )?;
+        let result = self.allocate_register()?;
+        self.emit(
+            Instruction::Call {
+                destination: result,
+                function: close,
+                arguments,
+                argument_count: 1,
+            },
+            span,
+        )
+    }
+
+    fn emit_mark_close_value(
+        &mut self,
+        value: u16,
+        span: ByteSpan,
+    ) -> Result<(), OwnedCompileError> {
+        let mark = self.lower_global_name(b"__blu_internal_mark_close", span)?;
+        let arguments = self.allocate_register()?;
+        self.emit(
+            Instruction::Move {
+                destination: arguments,
+                source: value,
+            },
+            span,
+        )?;
+        let result = self.allocate_register()?;
+        self.emit(
+            Instruction::Call {
+                destination: result,
+                function: mark,
+                arguments,
+                argument_count: 1,
+            },
+            span,
+        )
+    }
+
     fn lower_local(&mut self, statement: LocalStatement) -> Result<(), OwnedCompileError> {
         let register = match statement.value() {
             Some(value) => {
@@ -1470,11 +1887,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "instruction count passed limits but cannot fit a debug PC",
             })?;
-        self.push_binding(
+        let to_close = statement.attribute() == LocalAttribute::Close;
+        self.push_binding_with_flags(
             BindingName::Source(statement.name().span()),
             register,
             start_pc,
-        )
+            statement.attribute() == LocalAttribute::Const,
+            to_close,
+        )?;
+        if to_close {
+            self.emit_mark_close_value(register, statement.span())?;
+        }
+        Ok(())
     }
 
     fn push_binding(
@@ -1482,6 +1906,17 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         name: BindingName,
         register: u16,
         start_pc: u32,
+    ) -> Result<(), OwnedCompileError> {
+        self.push_binding_with_flags(name, register, start_pc, false, false)
+    }
+
+    fn push_binding_with_flags(
+        &mut self,
+        name: BindingName,
+        register: u16,
+        start_pc: u32,
+        constant: bool,
+        to_close: bool,
     ) -> Result<(), OwnedCompileError> {
         let limit = self
             .limits
@@ -1501,6 +1936,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             Binding {
                 name,
                 register,
+                constant,
+                to_close,
                 start_pc,
                 end_pc: None,
             },
@@ -1530,6 +1967,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         for (upvalue, binding) in self.upvalues.iter().enumerate() {
             outer_bindings.push(OuterBinding {
                 name: binding.name,
+                constant: binding.constant,
                 source: Upvalue::ParentUpvalue(u16::try_from(upvalue).map_err(|_| {
                     OwnedCompileError::InternalInvariant {
                         message: "upvalue count passed limits but cannot fit BluV1",
@@ -1539,6 +1977,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         }
         outer_bindings.extend(self.bindings.iter().map(|binding| OuterBinding {
             name: binding.name,
+            constant: binding.constant,
             source: Upvalue::ParentRegister(binding.register),
         }));
 
@@ -1607,6 +2046,17 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 statement.span(),
                 statement.is_method(),
             )?;
+            if let Some(environment) = self.resolve_environment(statement.span())? {
+                let key = self.lower_environment_key(root.span())?;
+                return self.emit(
+                    Instruction::SetTable {
+                        table: environment,
+                        key,
+                        value: closure,
+                    },
+                    statement.span(),
+                );
+            }
             let name = self.global_name_constant(root.span())?;
             return self.emit(
                 Instruction::StoreGlobal {
@@ -1682,6 +2132,16 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 },
                 span,
             )?;
+        } else if let Some(environment) = self.resolve_environment(span)? {
+            let key = self.lower_environment_key(identifier.span())?;
+            self.emit(
+                Instruction::GetTable {
+                    destination,
+                    table: environment,
+                    key,
+                },
+                span,
+            )?;
         } else {
             let name = self.global_name_constant(identifier.span())?;
             self.emit(Instruction::LoadGlobal { destination, name }, span)?;
@@ -1695,6 +2155,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     ) -> Result<(), OwnedCompileError> {
         match statement.target() {
             AssignmentTarget::Identifier(identifier) => {
+                self.ensure_writable(identifier.span())?;
                 let source = self.lower_expression(statement.value())?;
                 if let Some(destination) = self.resolve_local(identifier.span())? {
                     self.emit(
@@ -1707,6 +2168,16 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 } else if let Some(upvalue) = self.resolve_upvalue(identifier.span())? {
                     self.emit(
                         Instruction::SetUpvalue { upvalue, source },
+                        statement.span(),
+                    )
+                } else if let Some(environment) = self.resolve_environment(statement.span())? {
+                    let key = self.lower_environment_key(identifier.span())?;
+                    self.emit(
+                        Instruction::SetTable {
+                            table: environment,
+                            key,
+                            value: source,
+                        },
                         statement.span(),
                     )
                 } else {
@@ -1747,11 +2218,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     ) -> Result<(), OwnedCompileError> {
         let (current, destination) = match statement.target() {
             AssignmentTarget::Identifier(identifier) => {
+                self.ensure_writable(identifier.span())?;
                 let current = self.lower_identifier(identifier, identifier.span())?;
                 let destination = if let Some(register) = self.resolve_local(identifier.span())? {
                     AssignmentDestination::Local(register)
                 } else if let Some(upvalue) = self.resolve_upvalue(identifier.span())? {
                     AssignmentDestination::Upvalue(upvalue)
+                } else if let Some(environment) = self.resolve_environment(identifier.span())? {
+                    let key = self.lower_environment_key(identifier.span())?;
+                    AssignmentDestination::Table {
+                        table: environment,
+                        key,
+                    }
                 } else {
                     AssignmentDestination::Global(self.global_name_constant(identifier.span())?)
                 };
@@ -1928,17 +2406,29 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "instruction count passed limits but cannot fit a debug PC",
             })?;
-        for (name, register) in statement.names().iter().copied().zip(binding_registers) {
+        for ((name, register), attribute) in statement
+            .names()
+            .iter()
+            .copied()
+            .zip(binding_registers)
+            .zip(statement.attributes().iter().copied())
+        {
+            let to_close = attribute == LocalAttribute::Close;
             push_fallible(
                 &mut self.bindings,
                 Binding {
                     name: BindingName::Source(name.span()),
                     register,
+                    constant: attribute == LocalAttribute::Const,
+                    to_close,
                     start_pc,
                     end_pc: None,
                 },
                 "local bindings",
             )?;
+            if to_close {
+                self.emit_mark_close_value(register, statement.span())?;
+            }
         }
         Ok(())
     }
@@ -1951,10 +2441,17 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         for target in statement.targets() {
             let destination = match *target {
                 AssignmentTarget::Identifier(target) => {
+                    self.ensure_writable(target.span())?;
                     if let Some(register) = self.resolve_local(target.span())? {
                         AssignmentDestination::Local(register)
                     } else if let Some(upvalue) = self.resolve_upvalue(target.span())? {
                         AssignmentDestination::Upvalue(upvalue)
+                    } else if let Some(environment) = self.resolve_environment(target.span())? {
+                        let key = self.lower_environment_key(target.span())?;
+                        AssignmentDestination::Table {
+                            table: environment,
+                            key,
+                        }
                     } else {
                         AssignmentDestination::Global(self.global_name_constant(target.span())?)
                     }
@@ -2070,9 +2567,11 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
 
     fn lower_return(&mut self, statement: &ReturnStatement) -> Result<(), OwnedCompileError> {
         let values = statement.values();
+        let has_to_close = self.bindings.iter().any(|binding| binding.to_close);
         let limit = self.limits.max_return_values.min(u16::MAX as usize);
         check_limit(OwnedCompileLimit::ReturnValues, values.len(), limit)?;
         if values.is_empty() {
+            self.emit_close_bindings(0, statement.span())?;
             return self.emit(Instruction::Return { first: 0, count: 0 }, statement.span());
         }
         let last = values[values.len() - 1];
@@ -2085,6 +2584,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             }
             let first = if prefix_registers.is_empty() {
                 0
+            } else if has_to_close {
+                self.copy_return_values(prefix_expressions, &prefix_registers)?
             } else if prefix_registers
                 .windows(2)
                 .all(|pair| pair[0].checked_add(1) == Some(pair[1]))
@@ -2098,15 +2599,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     message: "vararg return prefix passed limits but cannot fit BluV1",
                 }
             })?;
+            self.emit_close_bindings(0, statement.span())?;
             return self.emit(
                 Instruction::ReturnVarargs { first, count },
                 statement.span(),
             );
         }
-        if matches!(
-            self.expression(last)?.kind(),
-            ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
-        ) {
+        if !has_to_close
+            && matches!(
+                self.expression(last)?.kind(),
+                ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+            )
+        {
             if values.len() == 1 {
                 if self.lower_return_call_expression(last, None)? {
                     return Ok(());
@@ -2143,7 +2647,9 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         let contiguous = registers
             .windows(2)
             .all(|pair| pair[0].checked_add(1) == Some(pair[1]));
-        let first = if contiguous {
+        let first = if has_to_close {
+            self.copy_return_values(values, &registers)?
+        } else if contiguous {
             registers[0]
         } else {
             self.copy_return_values(values, &registers)?
@@ -2152,6 +2658,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             u16::try_from(values.len()).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "return count passed limits but cannot fit BluV1",
             })?;
+        self.emit_close_bindings(0, statement.span())?;
         self.emit(Instruction::Return { first, count }, statement.span())
     }
 
@@ -3121,6 +3628,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                         expression.span(),
                     )?;
                     Ok(destination)
+                } else if let Some(environment) = self.resolve_environment(expression.span())? {
+                    let key = self.lower_environment_key(identifier.span())?;
+                    let destination = self.allocate_register()?;
+                    self.emit(
+                        Instruction::GetTable {
+                            destination,
+                            table: environment,
+                            key,
+                        },
+                        expression.span(),
+                    )?;
+                    Ok(destination)
                 } else {
                     let name = self.global_name_constant(identifier.span())?;
                     let destination = self.allocate_register()?;
@@ -3858,6 +4377,106 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             }
         }
         Ok(None)
+    }
+
+    fn resolve_environment(&mut self, span: ByteSpan) -> Result<Option<u16>, OwnedCompileError> {
+        if !matches!(
+            self.profile,
+            SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            return Ok(None);
+        }
+        for binding in self.bindings.iter().rev() {
+            if binding.name.bytes(self.source)? == b"_ENV" {
+                self.uses_environment = true;
+                return Ok(Some(binding.register));
+            }
+        }
+        for (index, binding) in self.upvalues.iter().enumerate().rev() {
+            if binding.name.bytes(self.source)? == b"_ENV" {
+                let upvalue =
+                    u16::try_from(index).map_err(|_| OwnedCompileError::InternalInvariant {
+                        message: "upvalue count passed limits but cannot fit BluV1",
+                    })?;
+                let destination = self.allocate_register()?;
+                self.emit(
+                    Instruction::GetUpvalue {
+                        destination,
+                        upvalue,
+                    },
+                    span,
+                )?;
+                self.uses_environment = true;
+                return Ok(Some(destination));
+            }
+        }
+        let mut outer = None;
+        for binding in self.outer_bindings.iter().rev() {
+            if binding.name.bytes(self.source)? == b"_ENV" {
+                outer = Some(*binding);
+                break;
+            }
+        }
+        if let Some(binding) = outer {
+            let upvalue = self.push_upvalue(binding)?;
+            let destination = self.allocate_register()?;
+            self.emit(
+                Instruction::GetUpvalue {
+                    destination,
+                    upvalue,
+                },
+                span,
+            )?;
+            self.uses_environment = true;
+            return Ok(Some(destination));
+        }
+        Ok(None)
+    }
+
+    fn ensure_writable(&self, name: ByteSpan) -> Result<(), OwnedCompileError> {
+        for binding in self.bindings.iter().rev() {
+            if binding.name.matches(self.source, name)? {
+                if binding.constant {
+                    return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0011",
+                        Phase::Lower,
+                        name,
+                        "cannot assign to a const local",
+                    )?));
+                }
+                return Ok(());
+            }
+        }
+        for binding in self.upvalues.iter().rev() {
+            if binding.name.matches(self.source, name)? {
+                if binding.constant {
+                    return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0011",
+                        Phase::Lower,
+                        name,
+                        "cannot assign to a const local",
+                    )?));
+                }
+                return Ok(());
+            }
+        }
+        for binding in self.outer_bindings.iter().rev() {
+            if binding.name.matches(self.source, name)? {
+                if binding.constant {
+                    return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                        "BLU-COMPILE-0011",
+                        Phase::Lower,
+                        name,
+                        "cannot assign to a const local",
+                    )?));
+                }
+                return Ok(());
+            }
+        }
+        Ok(())
     }
 
     fn resolve_upvalue(&mut self, name: ByteSpan) -> Result<Option<u16>, OwnedCompileError> {

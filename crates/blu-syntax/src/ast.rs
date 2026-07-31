@@ -454,9 +454,17 @@ impl Expression {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum LocalAttribute {
+    Regular,
+    Const,
+    Close,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct LocalStatement {
     name: Identifier,
     value: Option<ExpressionId>,
+    attribute: LocalAttribute,
     span: ByteSpan,
 }
 
@@ -745,8 +753,18 @@ impl AssignmentListStatement {
 }
 
 impl LocalStatement {
-    pub(crate) const fn new(name: Identifier, value: Option<ExpressionId>, span: ByteSpan) -> Self {
-        Self { name, value, span }
+    pub(crate) const fn new(
+        name: Identifier,
+        value: Option<ExpressionId>,
+        attribute: LocalAttribute,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            name,
+            value,
+            attribute,
+            span,
+        }
     }
 
     #[must_use]
@@ -760,6 +778,11 @@ impl LocalStatement {
     }
 
     #[must_use]
+    pub const fn attribute(self) -> LocalAttribute {
+        self.attribute
+    }
+
+    #[must_use]
     pub const fn span(self) -> ByteSpan {
         self.span
     }
@@ -769,6 +792,7 @@ impl LocalStatement {
 pub struct LocalListStatement {
     names: Vec<Identifier>,
     values: Vec<ExpressionId>,
+    attributes: Vec<LocalAttribute>,
     span: ByteSpan,
 }
 
@@ -776,11 +800,13 @@ impl LocalListStatement {
     pub(crate) const fn new(
         names: Vec<Identifier>,
         values: Vec<ExpressionId>,
+        attributes: Vec<LocalAttribute>,
         span: ByteSpan,
     ) -> Self {
         Self {
             names,
             values,
+            attributes,
             span,
         }
     }
@@ -793,6 +819,11 @@ impl LocalListStatement {
     #[must_use]
     pub fn values(&self) -> &[ExpressionId] {
         &self.values
+    }
+
+    #[must_use]
+    pub fn attributes(&self) -> &[LocalAttribute] {
+        &self.attributes
     }
 
     #[must_use]
@@ -1091,6 +1122,50 @@ pub struct ContinueStatement {
     span: ByteSpan,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct LabelStatement {
+    name: Identifier,
+    span: ByteSpan,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GotoStatement {
+    name: Identifier,
+    span: ByteSpan,
+}
+
+impl LabelStatement {
+    pub(crate) const fn new(name: Identifier, span: ByteSpan) -> Self {
+        Self { name, span }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> Identifier {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
+impl GotoStatement {
+    pub(crate) const fn new(name: Identifier, span: ByteSpan) -> Self {
+        Self { name, span }
+    }
+
+    #[must_use]
+    pub const fn name(self) -> Identifier {
+        self.name
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
 impl ContinueStatement {
     pub(crate) const fn new(span: ByteSpan) -> Self {
         Self { span }
@@ -1131,6 +1206,8 @@ pub enum Statement {
     GenericFor(GenericForStatement),
     Break(BreakStatement),
     Continue(ContinueStatement),
+    Label(LabelStatement),
+    Goto(GotoStatement),
     Return(ReturnStatement),
 }
 
@@ -1154,6 +1231,8 @@ impl Statement {
             Self::GenericFor(statement) => statement.span(),
             Self::Break(statement) => statement.span(),
             Self::Continue(statement) => statement.span(),
+            Self::Label(statement) => statement.span(),
+            Self::Goto(statement) => statement.span(),
             Self::Return(statement) => statement.span(),
         }
     }

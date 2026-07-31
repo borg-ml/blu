@@ -11,7 +11,12 @@ pub use blu_compiler::{
 };
 pub use blu_core::SemanticProfile;
 pub use blu_package as package;
-pub use blu_runtime::{Dialect, InterruptHandle, RuntimeError, Value, Vm};
+pub use blu_runtime::{Dialect, InterruptHandle, RuntimeError, TableId, Value, Vm};
+
+use blu_core::{
+    CompilerId, CompilerIdentity, IdentityError, IdentityLimits, SourceError, SourceFile, SourceId,
+    SourceLimits,
+};
 
 /// Explicit, Blu-owned source frontend APIs.
 ///
@@ -29,8 +34,9 @@ pub mod frontend {
     };
 }
 
-use blu_package::{AuthorityProfile, Package, PackageDialect};
+use blu_package::{AuthorityProfile, CapabilityRequirement, Package, PackageDialect};
 use core::fmt;
+use std::sync::Arc;
 
 #[derive(Clone, Debug, Default)]
 pub struct Engine {
@@ -112,6 +118,203 @@ impl Engine {
             .execute_blu_v1(compilation.into_validated_artifact(), execution_limits)
     }
 
+    /// Compiles and executes source through the explicitly selected Blu-owned
+    /// frontend. This is the public source entry point for the experimental
+    /// profile-aware frontend slice, including Lua 5.1–5.5.
+    ///
+    /// The established [`Self::execute`] path remains on the legacy Luau
+    /// compiler for compatibility. Callers using this method opt into the
+    /// owned frontend and receive structured source, compilation, or runtime
+    /// errors rather than an implicit compiler fallback.
+    pub fn execute_owned_source(
+        &mut self,
+        source: impl AsRef<[u8]>,
+        profile: SemanticProfile,
+    ) -> Result<Vec<Value>, OwnedExecuteError> {
+        self.execute_owned_source_with_limits(
+            source,
+            profile,
+            frontend::OwnedCompileLimits::default(),
+            bytecode::blu::BluLimits::default(),
+        )
+    }
+
+    /// Variant of [`Self::execute_owned_source`] with explicit compiler and
+    /// artifact execution limits.
+    pub fn execute_owned_source_with_limits(
+        &mut self,
+        source: impl AsRef<[u8]>,
+        profile: SemanticProfile,
+        compile_limits: frontend::OwnedCompileLimits,
+        execution_limits: bytecode::blu::BluLimits,
+    ) -> Result<Vec<Value>, OwnedExecuteError> {
+        self.install_owned_load(compile_limits, execution_limits)
+            .map_err(OwnedExecuteError::Runtime)?;
+        let compilation =
+            compile_owned_source(source.as_ref(), "source.blu", profile, compile_limits)?;
+        self.execute_owned_compilation(compilation, execution_limits)
+            .map_err(OwnedExecuteError::Runtime)
+    }
+
+    /// Compiles source into a callable owned chunk using the supplied Lua
+    /// 5.2+ environment. The returned closure preserves that environment for
+    /// every invocation, matching the observable state behavior of `load`.
+    pub fn load_owned_source(
+        &mut self,
+        source: impl AsRef<[u8]>,
+        profile: SemanticProfile,
+        environment: TableId,
+    ) -> Result<Value, OwnedExecuteError> {
+        self.load_owned_source_with_limits(
+            source,
+            "=(load)",
+            profile,
+            environment,
+            frontend::OwnedCompileLimits::default(),
+            bytecode::blu::BluLimits::default(),
+        )
+    }
+
+    /// Variant of [`Self::load_owned_source`] with explicit chunk name and
+    /// compiler/runtime limits.
+    pub fn load_owned_source_with_limits(
+        &mut self,
+        source: impl AsRef<[u8]>,
+        chunk_name: impl Into<String>,
+        profile: SemanticProfile,
+        environment: TableId,
+        compile_limits: frontend::OwnedCompileLimits,
+        execution_limits: bytecode::blu::BluLimits,
+    ) -> Result<Value, OwnedExecuteError> {
+        let compilation =
+            compile_owned_source(source.as_ref(), chunk_name, profile, compile_limits)?;
+        self.vm
+            .create_blu_v1_closure_in_environment(
+                compilation.into_validated_artifact(),
+                execution_limits,
+                environment,
+            )
+            .map_err(OwnedExecuteError::Runtime)
+    }
+
+    fn install_owned_load(
+        &mut self,
+        compile_limits: frontend::OwnedCompileLimits,
+        execution_limits: bytecode::blu::BluLimits,
+    ) -> Result<(), RuntimeError> {
+        let load = self.vm.try_register_function(move |vm, arguments| {
+            let source_value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "load",
+                index: 1,
+            })?;
+            let source = match source_value {
+                Value::String(source) => source.to_vec(),
+                Value::Closure(_) | Value::NativeFunction(_) => {
+                    let reader = source_value.clone();
+                    let mut source = Vec::new();
+                    loop {
+                        let values = vm.invoke_native_callback_without_yield(
+                            "load",
+                            "yielding reader functions",
+                            reader.clone(),
+                            &[],
+                        )?;
+                        let chunk = values.first().cloned().unwrap_or(Value::Nil);
+                        match chunk {
+                            Value::Nil => break,
+                            Value::String(chunk) => {
+                                let required = source.len().checked_add(chunk.len()).ok_or(
+                                    RuntimeError::StringLimit {
+                                        required: usize::MAX,
+                                        limit: SourceLimits::default().max_bytes,
+                                    },
+                                )?;
+                                if required > SourceLimits::default().max_bytes {
+                                    return Ok(vec![
+                                        Value::Nil,
+                                        Value::String(Arc::from(
+                                            b"load reader exceeded source byte limit".as_slice(),
+                                        )),
+                                    ]);
+                                }
+                                source.try_reserve(chunk.len()).map_err(|_| {
+                                    RuntimeError::Allocation {
+                                        what: "load reader source",
+                                    }
+                                })?;
+                                source.extend_from_slice(&chunk);
+                            }
+                            value => {
+                                return Ok(vec![
+                                    Value::Nil,
+                                    Value::String(Arc::from(
+                                        format!(
+                                            "load reader must return a string, got {}",
+                                            value.type_name()
+                                        )
+                                        .as_bytes(),
+                                    )),
+                                ]);
+                            }
+                        }
+                    }
+                    source
+                }
+                value => {
+                    return Err(RuntimeError::Type {
+                        operation: "load",
+                        expected: "string or function",
+                        actual: value.type_name(),
+                    });
+                }
+            };
+            let chunk_name = match arguments.get(1) {
+                None | Some(Value::Nil) => "=(load)".to_owned(),
+                Some(Value::String(name)) => String::from_utf8_lossy(name).into_owned(),
+                Some(value) => {
+                    return Err(RuntimeError::Type {
+                        operation: "load",
+                        expected: "string",
+                        actual: value.type_name(),
+                    });
+                }
+            };
+            let environment = match arguments.get(3) {
+                None | Some(Value::Nil) => vm.default_environment()?,
+                Some(Value::Table(environment)) => *environment,
+                Some(value) => {
+                    return Err(RuntimeError::Type {
+                        operation: "load",
+                        expected: "table",
+                        actual: value.type_name(),
+                    });
+                }
+            };
+            let profile = vm.active_semantic_profile()?;
+            let compilation =
+                match compile_owned_source(&source, chunk_name, profile, compile_limits) {
+                    Ok(compilation) => compilation,
+                    Err(error) => {
+                        return Ok(vec![
+                            Value::Nil,
+                            Value::String(Arc::from(error.to_string().as_bytes())),
+                        ]);
+                    }
+                };
+            let closure = vm.create_blu_v1_closure_in_environment(
+                compilation.into_validated_artifact(),
+                execution_limits,
+                environment,
+            )?;
+            Ok(vec![closure])
+        })?;
+        self.vm
+            .try_set_global(&b"load"[..], Value::NativeFunction(load))?;
+        self.vm
+            .try_set_global(&b"loadstring"[..], Value::NativeFunction(load))?;
+        Ok(())
+    }
+
     pub fn execute_package(
         &mut self,
         package: Package,
@@ -145,10 +348,16 @@ impl Engine {
                 granted: policy.authority,
             });
         }
-        if !package.manifest().authority.capabilities.is_empty() {
-            return Err(ExecutePackageError::CapabilitiesUnsupported(
-                package.manifest().authority.capabilities.len(),
-            ));
+        for requirement in &package.manifest().authority.capabilities {
+            if !policy
+                .capabilities
+                .iter()
+                .any(|grant| grant.name == requirement.name && grant.scope == requirement.scope)
+            {
+                return Err(ExecutePackageError::CapabilityNotGranted(
+                    requirement.clone(),
+                ));
+            }
         }
         if !package.manifest().imports.is_empty() {
             return Err(ExecutePackageError::ImportsUnsupported(
@@ -161,15 +370,89 @@ impl Engine {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+fn compile_owned_source(
+    source: &[u8],
+    chunk_name: impl Into<String>,
+    profile: SemanticProfile,
+    compile_limits: frontend::OwnedCompileLimits,
+) -> Result<frontend::OwnedCompilation, OwnedExecuteError> {
+    let source = SourceFile::new(
+        SourceId::new(1),
+        chunk_name,
+        source.to_vec(),
+        SourceLimits::default(),
+    )
+    .map_err(OwnedExecuteError::Source)?;
+    let compiler_identity = CompilerIdentity::new(
+        CompilerId::new(*b"blu-owned-v1\0\0\0\0"),
+        "blu-owned",
+        env!("CARGO_PKG_VERSION"),
+        None,
+        IdentityLimits::default(),
+    )
+    .map_err(OwnedExecuteError::Identity)?;
+    frontend::OwnedCompiler::new(compile_limits)
+        .compile(&source, profile, compiler_identity)
+        .map_err(|error| OwnedExecuteError::Compile(Box::new(error)))
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct HostPolicy {
     pub authority: AuthorityProfile,
+    /// Exact capability grants available to packages executed under this policy.
+    ///
+    /// A grant never widens a package declaration: its name and scope must both
+    /// exactly match a manifest requirement. Capability handles, delegation,
+    /// revocation, and service linking remain outside this first policy gate.
+    pub capabilities: Vec<CapabilityGrant>,
 }
 
 impl Default for HostPolicy {
     fn default() -> Self {
         Self {
             authority: AuthorityProfile::Pure,
+            capabilities: Vec::new(),
+        }
+    }
+}
+
+impl HostPolicy {
+    #[must_use]
+    pub fn new(authority: AuthorityProfile) -> Self {
+        Self {
+            authority,
+            capabilities: Vec::new(),
+        }
+    }
+
+    /// Adds exact capability grants to this host policy.
+    #[must_use]
+    pub fn with_capabilities(
+        mut self,
+        capabilities: impl IntoIterator<Item = CapabilityGrant>,
+    ) -> Self {
+        self.capabilities.extend(capabilities);
+        self
+    }
+}
+
+/// A host-side capability grant.
+///
+/// Capability scopes are opaque to Blu. Matching is deliberately exact until
+/// each capability family defines its own safe attenuation and containment
+/// rules.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CapabilityGrant {
+    pub name: blu_package::Name,
+    pub scope: Vec<u8>,
+}
+
+impl CapabilityGrant {
+    #[must_use]
+    pub fn new(name: blu_package::Name, scope: impl Into<Vec<u8>>) -> Self {
+        Self {
+            name,
+            scope: scope.into(),
         }
     }
 }
@@ -185,7 +468,7 @@ pub enum ExecutePackageError {
         required: AuthorityProfile,
         granted: AuthorityProfile,
     },
-    CapabilitiesUnsupported(usize),
+    CapabilityNotGranted(CapabilityRequirement),
     ImportsUnsupported(usize),
     Runtime(RuntimeError),
 }
@@ -210,9 +493,10 @@ impl fmt::Display for ExecutePackageError {
                 f,
                 "package requires {required:?} authority but host grants {granted:?}"
             ),
-            Self::CapabilitiesUnsupported(count) => write!(
+            Self::CapabilityNotGranted(requirement) => write!(
                 f,
-                "package declares {count} capability requirements but capability matching is not implemented"
+                "package requires ungranted capability {} with scope {:?}",
+                requirement.name, requirement.scope
             ),
             Self::ImportsUnsupported(count) => write!(
                 f,
@@ -241,6 +525,36 @@ pub enum ExecuteError {
         configured: Dialect,
         source: Dialect,
     },
+}
+
+#[derive(Debug)]
+pub enum OwnedExecuteError {
+    Source(SourceError),
+    Identity(IdentityError),
+    Compile(Box<frontend::OwnedCompileError>),
+    Runtime(RuntimeError),
+}
+
+impl fmt::Display for OwnedExecuteError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Source(error) => write!(f, "owned source preparation failed: {error}"),
+            Self::Identity(error) => write!(f, "owned compiler identity failed: {error}"),
+            Self::Compile(error) => write!(f, "owned source compilation failed: {error}"),
+            Self::Runtime(error) => write!(f, "owned source execution failed: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for OwnedExecuteError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Source(error) => Some(error),
+            Self::Identity(error) => Some(error),
+            Self::Compile(error) => Some(error.as_ref()),
+            Self::Runtime(error) => Some(error),
+        }
+    }
 }
 
 impl fmt::Display for ExecuteError {
@@ -1126,6 +1440,191 @@ return value"#
     }
 
     #[test]
+    fn owned_source_entry_point_executes_the_baseline_for_every_profile() {
+        for profile in SemanticProfile::ALL {
+            let result = Engine::default()
+                .execute_owned_source(b"return 40 + 2", profile)
+                .unwrap();
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) {
+                Value::Integer(42)
+            } else {
+                Value::Number(42.0)
+            };
+            assert_eq!(result, vec![expected], "{profile}");
+        }
+
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(b"--!dialect lua54\nreturn 40 + 2", SemanticProfile::Lua54,)
+                .unwrap(),
+            vec![Value::Integer(42)]
+        );
+    }
+
+    #[test]
+    fn owned_load_returns_a_stateful_closure_in_the_requested_environment() {
+        let source = br#"
+            answer = 39
+            local default_loaded = load("answer = answer + 1; return answer")
+            local default_result = default_loaded()
+            local environment = { answer = 40 }
+            local loaded = load("answer = answer + 1; return answer", "chunk", "t", environment)
+            local first = loaded()
+            local second = loaded()
+            return default_result, answer, first, second, environment.answer
+        "#;
+        for profile in [
+            SemanticProfile::Lua52,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            let result = Engine::default()
+                .execute_owned_source(source, profile)
+                .unwrap();
+            let default = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(40)
+            } else {
+                Value::Number(40.0)
+            };
+            let expected = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(41)
+            } else {
+                Value::Number(41.0)
+            };
+            let second = if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(42)
+            } else {
+                Value::Number(42.0)
+            };
+            assert_eq!(
+                result,
+                vec![default.clone(), default, expected, second.clone(), second],
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn owned_load_accepts_chunked_reader_functions_for_every_lua_profile() {
+        let source = br#"
+            local chunks = { "return 40", " + 2" }
+            local index = 0
+            local loaded, message = load(function()
+                index = index + 1
+                return chunks[index]
+            end)
+            return loaded ~= nil and message == nil and loaded() == 42 and index == 3
+        "#;
+        for profile in [
+            SemanticProfile::Lua51,
+            SemanticProfile::Lua52,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn public_owned_load_api_returns_a_callable_environment_bound_chunk() {
+        let mut engine = Engine::default();
+        let environment = engine.vm_mut().default_environment().unwrap();
+        let loaded = engine
+            .load_owned_source(
+                "answer = 40 + 2; return answer",
+                SemanticProfile::Lua52,
+                environment,
+            )
+            .unwrap();
+        engine.vm_mut().set_global(&b"loaded"[..], loaded);
+        assert_eq!(
+            engine
+                .execute_owned_source("return loaded()", SemanticProfile::Lua52)
+                .unwrap(),
+            vec![Value::Number(42.0)]
+        );
+    }
+
+    #[test]
+    fn lua51_loadstring_and_function_environments_are_profile_compatible() {
+        let source = br#"
+            local environment = { answer = 40 }
+            local function read()
+                return answer
+            end
+            setfenv(read, environment)
+            local loaded = loadstring("answer = answer + 1; return answer")
+            setfenv(loaded, environment)
+            local first = loaded()
+            local second = loaded()
+            return first == 41 and second == 42 and environment.answer == 42
+                and getfenv(read) == environment and getfenv(loaded) == environment
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua51)
+                .unwrap(),
+            vec![Value::Boolean(true)]
+        );
+    }
+
+    #[test]
+    fn legacy_environment_names_are_absent_from_modern_owned_profiles() {
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(
+                    "return type(getfenv), type(setfenv), type(loadstring)",
+                    SemanticProfile::Lua52,
+                )
+                .unwrap(),
+            vec![
+                Value::String(Arc::from(&b"nil"[..])),
+                Value::String(Arc::from(&b"nil"[..])),
+                Value::String(Arc::from(&b"nil"[..])),
+            ]
+        );
+    }
+
+    #[test]
+    fn owned_load_reports_source_errors_as_lua_style_second_results() {
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(
+                    "local loaded, message = load(\"local =\"); return loaded == nil, type(message)",
+                    SemanticProfile::Lua52,
+                )
+                .unwrap(),
+            vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"string"[..])),
+            ]
+        );
+    }
+
+    #[test]
     fn compiled_portable_packages_round_trip_and_execute_under_host_policy() {
         let compiled = Compiler::default()
             .compile_bytecode(b"return 40 + 2")
@@ -1153,6 +1652,70 @@ return value"#
         let decoded = Package::decode(&encoded, PackageLimits::default()).unwrap();
         assert_eq!(
             Engine::default().execute_package(decoded, &HostPolicy::default()),
+            Ok(vec![Value::Number(42.0)])
+        );
+    }
+
+    #[test]
+    fn package_capabilities_require_exact_host_grants() {
+        let compiled = Compiler::default()
+            .compile_bytecode(b"return 40 + 2")
+            .unwrap();
+        let manifest = Manifest {
+            package: PackageIdentity {
+                name: Name::new("example.capability").unwrap(),
+                version: Version::new(1, 0, 0),
+            },
+            dialect: PackageDialect::Blu,
+            bytecode: BytecodeDescriptor {
+                format: BytecodeFormat::Luau,
+                version: compiled.chunk.version,
+                typeinfo_version: compiled.chunk.typeinfo_version,
+            },
+            authority: AuthorityRequirement {
+                profile: AuthorityProfile::Confined,
+                capabilities: vec![CapabilityRequirement {
+                    name: Name::new("fs.read").unwrap(),
+                    scope: b"workspace".to_vec(),
+                }],
+            },
+            imports: Vec::new(),
+            exports: Vec::new(),
+        };
+        let package = Package::new(manifest, compiled.bytes, PackageLimits::default()).unwrap();
+        let encoded = package.encode();
+
+        let missing = Package::decode(&encoded, PackageLimits::default()).unwrap();
+        assert_eq!(
+            Engine::default()
+                .execute_package(missing, &HostPolicy::new(AuthorityProfile::Confined)),
+            Err(ExecutePackageError::CapabilityNotGranted(
+                CapabilityRequirement {
+                    name: Name::new("fs.read").unwrap(),
+                    scope: b"workspace".to_vec(),
+                }
+            ))
+        );
+
+        let wrong_scope = Package::decode(&encoded, PackageLimits::default()).unwrap();
+        assert!(matches!(
+            Engine::default().execute_package(
+                wrong_scope,
+                &HostPolicy::new(AuthorityProfile::Confined).with_capabilities([
+                    CapabilityGrant::new(Name::new("fs.read").unwrap(), b"other".to_vec()),
+                ])
+            ),
+            Err(ExecutePackageError::CapabilityNotGranted(_))
+        ));
+
+        let granted = Package::decode(&encoded, PackageLimits::default()).unwrap();
+        assert_eq!(
+            Engine::default().execute_package(
+                granted,
+                &HostPolicy::new(AuthorityProfile::Confined).with_capabilities([
+                    CapabilityGrant::new(Name::new("fs.read").unwrap(), b"workspace".to_vec()),
+                ])
+            ),
             Ok(vec![Value::Number(42.0)])
         );
     }
@@ -1222,6 +1785,62 @@ return value"#
             Ok(vec![Value::Number(43.0)])
         );
         assert_eq!(loads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn require_exposes_the_host_cache_through_package_loaded() {
+        let mut engine = Engine::default();
+        engine
+            .vm_mut()
+            .set_module_loader(|_, name| Ok(Value::String(Arc::from(name))));
+        assert_eq!(
+            engine
+                .execute(
+                    b"local value = require('answer'); return value == package.loaded.answer, type(package.loaded), type(package.preload)"
+                )
+                .unwrap(),
+            vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"table"[..])),
+                Value::String(Arc::from(&b"table"[..])),
+            ]
+        );
+    }
+
+    #[test]
+    fn require_executes_and_caches_profile_package_preload_loaders() {
+        let source = br#"
+            local calls = 0
+            package.preload.answer = function(name)
+                calls = calls + 1
+                return { name = name, value = 42 }
+            end
+            package.preload.empty = function() end
+            local first = require("answer")
+            local second = require("answer")
+            return first.name == "answer"
+                and first.value == 42
+                and first == second
+                and first == package.loaded.answer
+                and calls == 1
+                and require("empty") == true
+                and package.loaded.empty == true
+        "#;
+        for profile in [
+            SemanticProfile::Lua51,
+            SemanticProfile::Lua52,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
     }
 
     #[test]

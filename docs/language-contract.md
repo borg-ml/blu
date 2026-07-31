@@ -40,11 +40,13 @@ an initial source directive such as `--!dialect lua54`. `auto` may be offered
 by import tooling, but imported packages must be locked to the resolved
 dialect.
 
-Current implementation status: the public engine defaults to `blu`, accepts
-`blu` and `luau` source through the pinned Luau compiler, and rejects a source
-directive that conflicts with the configured engine. The Lua 5.1–5.5 profiles
-remain explicit, structured `not implemented` errors until their own frontends
-and runtime semantics exist. The separate `blu-syntax` crate now implements a
+Current implementation status: the legacy public engine defaults to `blu`,
+accepts `blu` and `luau` source through the pinned Luau compiler, and rejects a
+source directive that conflicts with the configured engine. The separate
+profile-aware `Engine::execute_owned_source` entry point compiles and directly
+executes the bounded owned baseline for all seven profiles, including Lua
+5.1–5.5; this does not promote those profiles beyond the covered slice. The
+separate `blu-syntax` crate now implements a
 bounded byte lexer and small parser/AST slice for the first owned-frontend
 program. It includes byte-zero dialect directives, stable raw-byte spans,
 retained trivia, the documented `//` profile gate, `local name = expression`,
@@ -89,8 +91,9 @@ tail call; preceding fixed return expressions are retained in a GC-rooted
 bounded caller continuation and prepended after the final call completes. Call
 arguments and table constructors propagate final dynamic result tails through
 bounded continuations.
-Identifier targets resolve to active locals, enclosing upvalues,
-or the VM global registry in that order. Semicolons are retained tokens and
+Identifier targets resolve to active locals, enclosing upvalues, or (when an
+explicit lexical `_ENV` is active in Lua 5.2–5.5) fields of that environment;
+otherwise they use the VM global registry. Semicolons are retained tokens and
 act as optional statement separators or empty statements, including after
 `return`. Lua 5.3--5.5 artifacts store literals through `i64::MAX` as exact
 BluV1 Integer constants and use normal IEEE-754 parsing above that; Lua 5.1,
@@ -216,6 +219,13 @@ loops or lexical scopes.
 5.1–5.5 rather than being treated as an identifier or silently accepted.
 Within a loop it terminates the current block path and transfers to the
 innermost loop condition.
+Labels and `goto` are assigned to Blu and Lua 5.2–5.5. Labels use the Lua
+`::name::` spelling and resolve within one owned function. Forward and
+backward jumps are validated as ordinary BluV1 branches. A jump that crosses
+a local-binding scope is rejected until the compiler has explicit upvalue
+closing and to-be-closed unwinding for that edge; unresolved and duplicate
+labels are structured compile errors. Luau and Lua 5.1 reject the syntax
+during lexing.
 `repeat`/`until` is shared by every profile. Its body executes before its
 condition, and body-local bindings remain in scope through that condition.
 For Blu and Luau, `continue` inside `repeat` transfers to the trailing
@@ -234,24 +244,39 @@ direction at runtime for Luau and Lua 5.1–5.3. Blu and Lua 5.4–5.5 reject
 dynamic steps with `BLU-COMPILE-0003` because they can reach an unassigned or
 erroring zero case.
 The owned generic-for slice accepts
-`for name [, name ...] in expression [, expression ...] do ... end` for Blu,
-Luau, and Lua 5.1–5.3. Its expression list is evaluated once and adjusted to
-the iterator, state, and control triplet; the final call supplies remaining
-controls through bounded fixed MULTRET. Each step calls the iterator with
-state and control, binds its fixed results, and terminates only when the first
-result is `nil`. `break` and profile-available `continue` use the same
-structured loop scopes as numeric `for`. Blu deliberately selects this
-triplet contract. Lua 5.4–5.5 generic loops are rejected with
-`BLU-COMPILE-0005` until their fourth to-be-closed control and `__close`
-unwinding are implemented; it is not silently discarded.
+`for name [, name ...] in expression [, expression ...] do ... end` in every
+profile. Its expression list is evaluated once and adjusted to the iterator,
+state, and control triplet; Lua 5.4/5.5 additionally retain the fourth
+to-be-closed control. The final call supplies remaining controls through
+bounded fixed MULTRET. Each step calls the iterator with state and control,
+binds its fixed results, and terminates only when the first result is `nil`.
+`break` and profile-available `continue` use structured loop scopes. The
+owned compiler also parses Lua 5.4/5.5 `<const>` and `<close>` local
+attributes, rejects const writes, and executes `__close` on normal scope exit,
+`break`, return, `goto`, and protected errors. Error objects are passed to
+handlers, reverse-order cleanup continues after a handler error, and yielding
+handlers resume through owned coroutine continuations. Full finalizer/GC and
+abandoned-coroutine semantics remain unimplemented.
 BluV1 global load/store instructions use byte-string constants as names and
 require the `GLOBALS` feature bit. Validation rejects non-string name
 references and reads from uninitialized registers. Direct execution reads and
 writes the VM embedding registry; an absent name produces `nil`. The owned
 frontend resolves lexical locals first and otherwise lowers scalar identifier
-reads and assignments as globals. Assignment lists preserve simultaneous
-right-hand-side evaluation across mixed local, captured, and global identifier
-targets. Versioned `_ENV`/`getfenv`/`setfenv` behavior remains unsupported.
+reads and assignments as globals. Lua 5.2–5.5 additionally lower an explicit
+`local _ENV = table` to lexical environment field reads/writes, capture that
+environment through nested closures, and route assignment lists and global
+function declarations through it; Lua 5.2–5.5 also use a rooted default chunk
+environment synchronized with the embedding registry. The owned Lua 5.2–5.5
+source entry point installs an environment-aware `load`: string chunks return
+callable closures with a persistent fourth-argument environment (or the
+default environment), and the embedding facade exposes the equivalent
+`load_owned_source` API. This slice is differentially checked against the
+pinned Lua references. Lua 5.1 additionally supports string `loadstring` and
+function-targeted `getfenv`/`setfenv`. Owned `load` also accepts a reader
+function and concatenates its bounded string chunks, including empty chunks;
+yielding readers, binary chunks, and exact mode-string behavior remain
+unsupported. Stack-level environment rebinding and 5.5 declaration modes
+remain unsupported.
 When no explicit registry value shadows it, `_VERSION` is resolved from the
 active frame as `Blu`, `Luau`, or `Lua 5.1` through `Lua 5.5`. This avoids
 leaking the VM's configured fallback dialect into an explicitly profiled
@@ -413,11 +438,12 @@ yields through `pcall`. Errors raised after resumption unwind through saved
 explicit frames to the nearest suspended `pcall` or `xpcall`; `xpcall` handlers
 may themselves yield without losing outer callers. Luau `running` returns one
 value and reports the main thread as yieldable; Blu follows modern Lua by
-returning `(thread, is_main)` and making the main thread non-yieldable.
-Owned BluV1 closures are not yet converted into this legacy continuation
-representation; resuming or yielding them remains part of the explicit
-resumable-continuation milestone rather than silently using the wrong frame
-format.
+returning `(thread, is_main)` and making the main thread non-yieldable. Owned
+BluV1 coroutine entry closures now have a native continuation representation:
+direct `coroutine.yield` calls resume repeatedly, preserve captured state, and
+remain GC-rooted while suspended. Native library operations that invoke
+yielding callbacks still require operation-specific continuations and remain
+explicit unsupported features.
 
 ## Semantic profiles
 
@@ -540,11 +566,19 @@ dispatch is implemented. Returned indices follow the active profile's
 legacy-number or modern-integer policy.
 `string.find` appends captures after its two indices. `string.match` returns
 captures when present and otherwise returns the full matched byte slice.
-`string.gsub` supports string, numeric, and direct table replacements. Table
-replacement keys use the first capture or the full match, position captures
-use the active profile's numeric subtype, and nil or false values retain the
-original match. Resumable callback replacements and table `__index`
-replacement handlers remain explicit unsupported features.
+`string.gmatch` returns a real function iterator. Each invocation resumes from
+the previous non-overlapping match, returns captures or the full match, and
+advances by one byte after an empty match so iteration terminates.
+`string.gsub` supports string, numeric, direct table, and function replacements.
+Table replacement keys use the first
+capture or the full match, position captures use the active profile's numeric
+subtype, and nil or false values retain the original match. Function
+replacements receive the captures, or the full match when there are no
+captures. Synchronous table `__index` replacement handlers are supported. In
+the owned BluV1 path, a callback may yield once per match: the callback frame,
+match cursor, accumulated output, and replacement count are retained as one
+GC-rooted pending operation and resume with the callback's supplied values.
+Other yielding library callbacks remain explicit unsupported features.
 Nested substring captures and `()` position captures are bounded to 32 and
 execute through linked capture events rather than recursive host calls.
 `%1` through `%9` match completed substring captures byte-for-byte under the
@@ -561,7 +595,9 @@ position-capture expansion. Lua 5.1 preserves its permissive behavior for
 other `%x` replacement escapes by emitting `x`; Blu, Luau, and Lua 5.2–5.5
 reject them. The second result is the profile-typed
 replacement count. Direct table replacements select by the first capture or
-full match; callback replacements and table `__index` handlers fail
+full match; table `__index` handlers use the same bounded callback bridge as
+`table.sort`. The owned callback continuation described above preserves this
+operation across yields; other yielding callbacks and handlers remain
 explicitly pending resumable calls.
 `string.format` implements the profile-common unmodified conversion core:
 `%%`, `%s` for string or numeric values, `%d`, `%i`, `%u`, `%x`, `%X`, `%o`,
@@ -598,6 +634,12 @@ Legacy `table.getn` is available in Blu, Luau, and Lua 5.1; `table.maxn` is
 available in Blu, Luau, and Lua 5.1–5.2. Later Lua profiles reject these names
 explicitly. Blu returns an exact integer from `getn`; `maxn` remains a number
 because fractional numeric keys participate in its upstream contract.
+The Lua 5.1 `table.foreach` and `table.foreachi` callbacks are available in
+Lua 5.1 and Blu. They invoke callbacks with key/value or index/value pairs,
+return the first non-nil callback result, and otherwise return nil. Owned
+callbacks retain iteration state across yields, including terminal return
+calls. In profiles that define it, `pairs` also invokes `__pairs`; owned
+handlers have the same resumable operation boundary.
 Legacy `gcinfo` is available in Blu, Luau, and Lua 5.1 and reports the
 runtime's accounted live memory in whole KiB. Blu returns an integer; the
 number-only compatibility profiles return a number. Lua 5.2–5.5 reject the
@@ -616,8 +658,10 @@ commands differ by upstream version and fail explicitly until profile-dispatched
 `table.sort` supports bounded default ascending order for uniform numeric
 sequences without NaN and uniform byte-string sequences. It returns no values
 and accepts an omitted or nil comparator. Numeric sorting uses exact mixed
-integer/number ordering without `f64` round-trip loss. Custom comparator callbacks and
-metamethod ordering fail explicitly until native operations can resume calls.
+integer/number ordering without `f64` round-trip loss. Custom comparator
+callbacks and `__lt` metamethod ordering use the bounded callback bridge;
+owned callbacks retain insertion-sort state across yields, including GC roots
+and terminal return calls.
 `table.pack` and `table.unpack` are available in Blu, Luau, and Lua 5.2–5.5;
 Lua 5.1 rejects those table-library names explicitly. The legacy global
 `unpack` is available in Blu, Luau, and Lua 5.1 and is rejected in Lua
@@ -765,14 +809,22 @@ Roblox datatypes/services. Blu may provide adapters, but language compatibility
 does not fabricate those environments.
 
 The initial embedding surface exposes a host-configured `require` loader with a
-per-VM cache, circular-load detection, and GC-rooted module results. Portable
+per-VM cache, circular-load detection, GC-rooted module results, and Lua-family
+owned `package.loaded`/`package.preload` tables. `require` invokes a configured
+Lua-family `package.preload[name]` function before consulting the host loader,
+caches its first result (or `true` when it returns no value), and passes the
+module name as its first argument. Portable
 V1 envelopes canonically declare identity, dialect, bytecode versions,
 imports, exports, schema digests, and authority requirements; decoding is
 bounded, integrity-checked, and validates the contained bytecode without
-executing it. The public engine executes only dialect-matched pure packages
-with no imports. Capability matching, linking, filesystem resolution,
-dependency locks, signatures, LuaRocks resolution, and native module loading
-are not yet implemented and fail explicitly where exposed.
+executing it. `Engine::execute_package` now admits a package whose authority
+profile is covered by the host policy when every declared capability has an
+exact host grant for the same opaque name and scope. This is a policy gate,
+not a capability handle: delegation, attenuation, revocation, auditing,
+filesystem resolution, and effectful bindings remain future work. The public
+engine still executes only dialect-matched packages with no imports; required
+service linking, dependency locks, signatures, LuaRocks resolution, and native
+module loading fail explicitly where exposed.
 
 ## Native modules
 

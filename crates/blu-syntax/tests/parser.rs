@@ -3,8 +3,8 @@ use blu_core::{
     SourceId, SourceLimits,
 };
 use blu_syntax::{
-    BinaryOperator, ExpressionId, ExpressionKind, ParseError, ParseLimit, ParseLimits,
-    ParseOutcome, Statement, TokenKind, UnaryOperator, parse,
+    BinaryOperator, ExpressionId, ExpressionKind, LocalAttribute, ParseError, ParseLimit,
+    ParseLimits, ParseOutcome, Statement, TokenKind, UnaryOperator, parse,
 };
 
 fn source(bytes: impl Into<Vec<u8>>) -> SourceFile {
@@ -88,6 +88,14 @@ fn vertical_slice_preserves_profile_spans_and_trivia_for_all_profiles() {
             b"return answer + 2"
         );
     }
+}
+
+#[test]
+fn labels_and_goto_parse_as_control_flow_statements() {
+    let source = source(b"::again:: goto again".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Lua54, ParseLimits::default());
+    assert!(matches!(parsed.ast().statements()[0], Statement::Label(_)));
+    assert!(matches!(parsed.ast().statements()[1], Statement::Goto(_)));
 }
 
 #[test]
@@ -225,6 +233,16 @@ fn postfix_calls_retain_callee_arguments_and_chaining() {
         parsed.ast().expression(outer.function()).unwrap().kind(),
         ExpressionKind::Call(_)
     ));
+}
+
+#[test]
+fn parenthesized_call_is_valid_as_a_statement() {
+    let parsed = accepted(
+        &source(b"local f=function() end; (f)()".to_vec()),
+        SemanticProfile::Blu,
+        ParseLimits::default(),
+    );
+    assert!(matches!(parsed.ast().statements()[1], Statement::Call(_)));
 }
 
 #[test]
@@ -1369,4 +1387,21 @@ fn lua51_and_lua52_floor_divide_rejection_is_inherited_from_lexing() {
             b"//"
         );
     }
+}
+
+#[test]
+fn lua54_local_attributes_are_preserved_and_profile_gated() {
+    let input = source(b"local <close> resource, value<const> = nil, 1".to_vec());
+    let parsed = accepted(&input, SemanticProfile::Lua54, ParseLimits::default());
+    let [Statement::LocalList(statement)] = parsed.ast().statements() else {
+        panic!("expected local list");
+    };
+    assert_eq!(
+        statement.attributes(),
+        &[LocalAttribute::Close, LocalAttribute::Const]
+    );
+
+    let outcome = parse(&input, SemanticProfile::Lua53, ParseLimits::default()).unwrap();
+    let rejected = outcome.rejected().unwrap();
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0053");
 }

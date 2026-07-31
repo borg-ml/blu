@@ -22,10 +22,16 @@ at most 4096 returned heap-handle occurrences; configure that bound with
 existing VM root. Host-side `Value` clones do not create additional retention
 entries; release exactly once per returned or explicitly retained occurrence.
 
-Blu is under active compatibility development. The current source path uses a
-pinned Luau compiler and a Blu VM implemented without unsafe Rust. Explicit Lua
-5.1–5.5 profiles are declared but are not yet implemented; unsupported
-behavior fails explicitly.
+Blu is under active compatibility development. The legacy source path uses a
+pinned Luau compiler and a Blu VM implemented without unsafe Rust. The
+profile-aware `Engine::execute_owned_source` path exposes the bounded owned
+frontend baseline for Lua 5.1–5.5 as well as Blu and Luau; unsupported behavior
+still fails explicitly outside that implemented slice.
 
 See the [repository README](https://github.com/borg-ml/blu) for current
 capabilities, embedding details, compatibility scope, and upstream attribution.
+
+Portable package execution checks declared capability requirements against the
+host policy using exact opaque name-and-scope matches. This permits a confined
+or trusted package to pass its authority gate, but does not yet create
+delegable capability handles or link imported services.

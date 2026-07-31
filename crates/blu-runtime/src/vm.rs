@@ -19,7 +19,7 @@ use std::{
     collections::{HashMap, HashSet},
     fmt::Write as _,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     time::Instant,
@@ -43,6 +43,7 @@ type ModuleLoader = Arc<dyn Fn(&mut Vm, &[u8]) -> Result<Value, RuntimeError> + 
 enum ThreadState {
     New(Value),
     Suspended(Continuation),
+    SuspendedBlu(Box<BluContinuation>),
     Running,
     Dead(Option<Value>),
 }
@@ -50,6 +51,7 @@ enum ThreadState {
 enum Resumable {
     New(Value),
     Continuation(Continuation),
+    BluContinuation(Box<BluContinuation>),
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -64,7 +66,14 @@ struct GcRoots {
     upvalues: Vec<UpvalueId>,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
+struct NativeCallContext {
+    remaining: u64,
+    depth: usize,
+    roots: GcRoots,
+}
+
+#[derive(Clone, Debug)]
 struct BluCaller {
     artifact: Arc<BluArtifact>,
     prototype: usize,
@@ -77,14 +86,105 @@ struct BluCaller {
     result: BluCallResult,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum BluCallResult {
     Fixed { destination: u16, count: u16 },
     Truthy { destination: u16, negate: bool },
     ReturnPrefix { first: u16, count: u16 },
+    Return { prefix: Option<(u16, u16)> },
     TableList { table: TableId, start: u32 },
     Dynamic,
     ReadyDynamic(Vec<Value>),
+}
+
+#[derive(Clone, Debug)]
+enum BluResume {
+    Fixed {
+        destination: u16,
+        count: u16,
+    },
+    Dynamic,
+    Native {
+        result: BluCallResult,
+        operation: Box<PendingBluOperation>,
+    },
+}
+
+#[derive(Clone, Debug)]
+enum PendingBluOperation {
+    StringGsub(Box<PendingStringGsub>),
+    TableForeach(PendingTableForeach),
+    TableForeachi(PendingTableForeachi),
+    TableSort(PendingTableSort),
+    Pairs(PendingPairs),
+}
+
+#[derive(Clone, Debug)]
+struct PendingStringGsub {
+    haystack: Arc<[u8]>,
+    pattern: Arc<[u8]>,
+    callback: Value,
+    result: Vec<u8>,
+    search_start: usize,
+    copied_until: usize,
+    replacements: usize,
+    replacement_limit: usize,
+    explicit_limit: bool,
+    found: BasicPatternMatch,
+    continuation: Box<BluContinuation>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTableForeach {
+    table: TableId,
+    callback: Value,
+    previous_key: Value,
+    current_key: Value,
+    current_value: Value,
+    continuation: Box<BluContinuation>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTableForeachi {
+    table: TableId,
+    callback: Value,
+    index: usize,
+    length: usize,
+    current_value: Value,
+    continuation: Box<BluContinuation>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingTableSort {
+    table: TableId,
+    comparator: Option<Value>,
+    values: Vec<Value>,
+    index: usize,
+    position: usize,
+    current: Value,
+    continuation: Box<BluContinuation>,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPairs {
+    continuation: Box<BluContinuation>,
+}
+
+#[derive(Clone, Debug)]
+struct BluContinuation {
+    artifact: Arc<BluArtifact>,
+    prototype: usize,
+    constants: Vec<Value>,
+    registers: Vec<Value>,
+    varargs: Vec<Value>,
+    dynamic_results: Vec<Value>,
+    open_upvalues: Vec<Option<UpvalueId>>,
+    callers: Vec<BluCaller>,
+    closure: Option<ClosureId>,
+    pc: usize,
+    depth: usize,
+    close_marker: usize,
+    resume: BluResume,
 }
 
 enum BluReturnDisposition {
@@ -196,6 +296,8 @@ pub struct Vm {
     call_limit: usize,
     heap_object_limit: usize,
     heap: Heap,
+    global_environment: Option<TableId>,
+    package_table: Option<TableId>,
     globals: HashMap<Arc<[u8]>, Value>,
     native_functions: Vec<NativeFunction>,
     protected_call: Option<NativeFunctionId>,
@@ -211,6 +313,11 @@ pub struct Vm {
     output: Vec<u8>,
     output_limit: usize,
     active_roots: Vec<GcRoots>,
+    native_contexts: Vec<NativeCallContext>,
+    close_values: HashMap<ThreadId, Vec<Value>>,
+    captured_blu_continuation: Option<BluContinuation>,
+    capture_blu_continuation: bool,
+    pending_blu_operation: Option<PendingBluOperation>,
     host_roots: HashMap<HostRoot, usize>,
     host_root_count: usize,
     host_value_limit: usize,
@@ -258,6 +365,8 @@ impl Vm {
             call_limit: 1_000,
             heap_object_limit: 1_000_000,
             heap,
+            global_environment: None,
+            package_table: None,
             globals: HashMap::new(),
             native_functions: Vec::new(),
             protected_call: None,
@@ -273,6 +382,11 @@ impl Vm {
             output: Vec::new(),
             output_limit: MAX_STRING_BYTES,
             active_roots: Vec::new(),
+            native_contexts: Vec::new(),
+            close_values: HashMap::new(),
+            captured_blu_continuation: None,
+            capture_blu_continuation: false,
+            pending_blu_operation: None,
             host_roots: HashMap::new(),
             host_root_count: 0,
             host_value_limit: DEFAULT_HOST_VALUE_LIMIT,
@@ -467,6 +581,14 @@ impl Vm {
         self.active_profile()
     }
 
+    /// Returns the VM's lazily-created default Lua 5.2+ environment table.
+    ///
+    /// The table is the backing store for the VM global registry when a
+    /// modern owned chunk executes without an explicit environment.
+    pub fn default_environment(&mut self) -> Result<TableId, RuntimeError> {
+        self.ensure_global_environment()
+    }
+
     /// Compatibility helper for registering a native callback.
     ///
     /// This panics when registry growth is rejected. Strict embedders should
@@ -547,6 +669,14 @@ impl Vm {
                     what: "global registry",
                 })?;
         }
+        if let Some(environment) = self.global_environment {
+            self.table_set(
+                environment,
+                Value::String(Arc::clone(&name)),
+                value.clone(),
+                &GcRoots::default(),
+            )?;
+        }
         Ok(self.globals.insert(name, value))
     }
 
@@ -576,6 +706,19 @@ impl Vm {
         name: &[u8],
         profile: SemanticProfile,
     ) -> Result<Value, RuntimeError> {
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
+            && name == b"package"
+            && self.package_table.is_some_and(|package| {
+                matches!(self.globals.get(name), Some(Value::Table(value)) if *value == package)
+            })
+        {
+            return Ok(Value::Nil);
+        }
+        if profile != SemanticProfile::Lua51
+            && matches!(name, b"getfenv" | b"setfenv" | b"loadstring")
+        {
+            return Ok(Value::Nil);
+        }
         if let Some(value) = self.globals.get(name) {
             return Ok(value.clone());
         }
@@ -583,6 +726,90 @@ impl Vm {
             return Ok(Value::String(Arc::from(profile_version(profile)?)));
         }
         Ok(Value::Nil)
+    }
+
+    fn sync_default_environment_version(
+        &mut self,
+        profile: SemanticProfile,
+    ) -> Result<(), RuntimeError> {
+        let environment = self.ensure_global_environment()?;
+        let value = self
+            .globals
+            .get(b"_VERSION".as_slice())
+            .cloned()
+            .map_or_else(
+                || profile_version(profile).map(|version| Value::String(Arc::from(version))),
+                Ok,
+            )?;
+        self.table_set(
+            environment,
+            Value::String(Arc::from(b"_VERSION".as_slice())),
+            value,
+            &GcRoots::default(),
+        )?;
+        for name in [b"getfenv".as_slice(), b"setfenv", b"loadstring"] {
+            let value = if profile == SemanticProfile::Lua51 {
+                self.globals.get(name).cloned().unwrap_or(Value::Nil)
+            } else {
+                Value::Nil
+            };
+            self.table_set(
+                environment,
+                Value::String(Arc::from(name)),
+                value,
+                &GcRoots::default(),
+            )?;
+        }
+        Ok(())
+    }
+
+    fn ensure_global_environment(&mut self) -> Result<TableId, RuntimeError> {
+        if let Some(environment) = self.global_environment {
+            return Ok(environment);
+        }
+        let environment = self.allocate_table(0, 0, &GcRoots::default())?;
+        self.global_environment = Some(environment);
+        let mut entries = try_vec_with_capacity(self.globals.len(), "global environment entries")?;
+        for (name, value) in &self.globals {
+            entries.push((Arc::clone(name), value.clone()));
+        }
+        for (name, value) in entries {
+            self.table_set(environment, Value::String(name), value, &GcRoots::default())?;
+        }
+        Ok(environment)
+    }
+
+    fn mirror_global_environment_write(
+        &mut self,
+        key: &Value,
+        value: &Value,
+    ) -> Result<(), RuntimeError> {
+        let Value::String(name) = key else {
+            return Ok(());
+        };
+        if !self.globals.contains_key(name.as_ref()) {
+            let required = self
+                .globals
+                .len()
+                .checked_add(1)
+                .ok_or(RuntimeError::GlobalLimit {
+                    required: usize::MAX,
+                    limit: self.global_limit,
+                })?;
+            if required > self.global_limit {
+                return Err(RuntimeError::GlobalLimit {
+                    required,
+                    limit: self.global_limit,
+                });
+            }
+            self.globals
+                .try_reserve(1)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "global registry",
+                })?;
+        }
+        self.globals.insert(Arc::clone(name), value.clone());
+        Ok(())
     }
 
     pub fn take_output(&mut self) -> Vec<u8> {
@@ -685,24 +912,64 @@ impl Vm {
                     what: "collection roots",
                 })
         })?;
+        let native_value_count =
+            self.native_contexts
+                .iter()
+                .try_fold(0usize, |count, context| {
+                    count
+                        .checked_add(context.roots.values.len())
+                        .ok_or(RuntimeError::Allocation {
+                            what: "collection roots",
+                        })
+                })?;
+        let close_value_count = self
+            .close_values
+            .values()
+            .try_fold(0usize, |count, values| {
+                count
+                    .checked_add(values.len())
+                    .ok_or(RuntimeError::Allocation {
+                        what: "collection roots",
+                    })
+            })?;
         let root_capacity = self
             .globals
             .len()
             .checked_add(1)
+            .and_then(|count| count.checked_add(usize::from(self.global_environment.is_some())))
+            .and_then(|count| count.checked_add(usize::from(self.running_thread.is_some())))
             .and_then(|count| count.checked_add(self.module_cache.len()))
             .and_then(|count| count.checked_add(active_value_count))
+            .and_then(|count| count.checked_add(native_value_count))
+            .and_then(|count| count.checked_add(close_value_count))
             .and_then(|count| count.checked_add(self.host_roots.len()))
             .ok_or(RuntimeError::Allocation {
                 what: "collection roots",
             })?;
         let mut all_roots = try_vec_with_capacity(root_capacity, "collection roots")?;
         all_roots.extend(self.globals.values().cloned());
+        if let Some(environment) = self.global_environment {
+            all_roots.push(Value::Table(environment));
+        }
         all_roots.push(Value::Thread(self.main_thread));
+        if let Some(thread) = self.running_thread {
+            all_roots.push(Value::Thread(thread));
+        }
         all_roots.extend(self.module_cache.values().cloned());
         all_roots.extend(
             self.active_roots
                 .iter()
                 .flat_map(|roots| roots.values.iter().cloned()),
+        );
+        all_roots.extend(
+            self.native_contexts
+                .iter()
+                .flat_map(|context| context.roots.values.iter().cloned()),
+        );
+        all_roots.extend(
+            self.close_values
+                .values()
+                .flat_map(|values| values.iter().cloned()),
         );
         all_roots.extend(self.host_roots.keys().copied().map(HostRoot::to_value));
         for root in roots {
@@ -713,9 +980,14 @@ impl Vm {
             .active_roots
             .iter()
             .flat_map(|roots| roots.upvalues.iter().copied());
-        let stats = self
-            .heap
-            .collect_with_upvalues(&all_roots, active_upvalues.chain(upvalues))?;
+        let native_upvalues = self
+            .native_contexts
+            .iter()
+            .flat_map(|context| context.roots.upvalues.iter().copied());
+        let stats = self.heap.collect_with_upvalues(
+            &all_roots,
+            active_upvalues.chain(native_upvalues).chain(upvalues),
+        )?;
         self.threads
             .retain(|thread, _| self.heap.contains_thread(*thread));
         Ok(stats)
@@ -972,6 +1244,70 @@ impl Vm {
         artifact: ValidatedBluArtifact,
         execution_limits: BluLimits,
     ) -> Result<Vec<Value>, RuntimeError> {
+        self.execute_blu_v1_with_environment(artifact, execution_limits, None)
+    }
+
+    /// Executes an owned chunk with an explicitly supplied Lua 5.2+ `_ENV`
+    /// table. The table must remain retained by the host for the duration of
+    /// the call. This is the execution primitive used by environment-aware
+    /// source loading; it does not mutate the VM's default global registry.
+    pub fn execute_blu_v1_in_environment(
+        &mut self,
+        artifact: ValidatedBluArtifact,
+        execution_limits: BluLimits,
+        environment: TableId,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        self.execute_blu_v1_with_environment(artifact, execution_limits, Some(environment))
+    }
+
+    /// Creates a callable owned chunk closure whose Lua 5.2+ `_ENV` is the
+    /// supplied table. The returned closure retains that table through the
+    /// heap graph and can be stored in globals or tables like any other value.
+    pub fn create_blu_v1_closure_in_environment(
+        &mut self,
+        artifact: ValidatedBluArtifact,
+        execution_limits: BluLimits,
+        environment: TableId,
+    ) -> Result<Value, RuntimeError> {
+        let artifact = ValidatedBluArtifact::new(artifact.into_artifact(), execution_limits)
+            .map_err(RuntimeError::BluValidation)?
+            .into_artifact();
+        let main = usize::try_from(artifact.main)
+            .map_err(|_| RuntimeError::InvalidMainPrototype(usize::MAX))?;
+        let prototype = artifact
+            .prototypes
+            .get(main)
+            .ok_or(RuntimeError::InvalidMainPrototype(main))?;
+        let profile = prototype.profile;
+        if !matches!(
+            profile,
+            SemanticProfile::Lua51
+                | SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            return Err(RuntimeError::UnsupportedSemanticProfile {
+                operation: "environment-aware owned closure",
+                profile: prototype.profile,
+            });
+        }
+        self.heap.table_get(
+            environment,
+            &Value::String(Arc::from(&b"__blu_environment_check"[..])),
+        )?;
+        let roots = GcRoots::from_values(&[Value::Table(environment)])?;
+        let closure = self.allocate_blu_closure(Arc::new(artifact), main, profile, 0, &roots)?;
+        self.heap.closure_set_environment(closure, environment)?;
+        Ok(Value::Closure(closure))
+    }
+
+    fn execute_blu_v1_with_environment(
+        &mut self,
+        artifact: ValidatedBluArtifact,
+        execution_limits: BluLimits,
+        environment: Option<TableId>,
+    ) -> Result<Vec<Value>, RuntimeError> {
         let artifact = ValidatedBluArtifact::new(artifact.into_artifact(), execution_limits)
             .map_err(RuntimeError::BluValidation)?
             .into_artifact();
@@ -987,8 +1323,25 @@ impl Vm {
             });
         }
 
+        if environment.is_none()
+            && matches!(
+                prototype.profile,
+                SemanticProfile::Lua51
+                    | SemanticProfile::Lua52
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            )
+        {
+            self.sync_default_environment_version(prototype.profile)?;
+        }
+        let environment = environment.or_else(|| {
+            (prototype.profile == SemanticProfile::Lua51).then_some(self.global_environment?)
+        });
+
         let previous_profile = self.active_profile.replace(prototype.profile);
-        let result = self.run_blu_v1_artifact(Arc::new(artifact), main);
+        let close_marker = self.close_depth();
+        let result = self.run_blu_v1_artifact(Arc::new(artifact), main, close_marker, environment);
         self.active_profile = previous_profile;
         match result {
             Ok(values) => {
@@ -1006,7 +1359,15 @@ impl Vm {
         &mut self,
         artifact: Arc<BluArtifact>,
         main: usize,
+        close_marker: usize,
+        environment: Option<TableId>,
     ) -> Result<Vec<Value>, RuntimeError> {
+        if let Some(environment) = environment {
+            self.heap.table_get(
+                environment,
+                &Value::String(Arc::from(&b"__blu_environment_check"[..])),
+            )?;
+        }
         let charge = artifact
             .prototypes
             .iter()
@@ -1018,50 +1379,145 @@ impl Vm {
         let roots = GcRoots::default();
         self.collect_if_needed(charge, &roots, core::iter::empty(), core::iter::empty())?;
         self.heap.charge_external(charge)?;
-        let result = self.run_charged_blu_v1_artifact(artifact, main);
+        let mut remaining = self.instruction_limit;
+        let result = self.run_blu_v1_frame(
+            artifact,
+            main,
+            &[],
+            None,
+            &mut remaining,
+            0,
+            true,
+            close_marker,
+            environment,
+        );
         self.heap.release_external(charge)?;
-        result
+        match result {
+            Ok(values) => Ok(values),
+            Err(error) => Err(self.unwind_close_values(close_marker, error, &mut remaining, 0)),
+        }
     }
 
-    fn run_charged_blu_v1_artifact(
+    #[allow(clippy::too_many_arguments)]
+    fn run_blu_v1_frame(
         &mut self,
         artifact: Arc<BluArtifact>,
         main: usize,
+        arguments: &[Value],
+        closure: Option<ClosureId>,
+        remaining: &mut u64,
+        depth: usize,
+        allow_suspend: bool,
+        close_marker: usize,
+        environment: Option<TableId>,
     ) -> Result<Vec<Value>, RuntimeError> {
-        let mut artifact = artifact;
-        let mut prototype_index = main;
-        let mut constants = materialize_blu_constants(&artifact.prototypes[main])?;
+        let constants = materialize_blu_constants(&artifact.prototypes[main])?;
         let prototype = &artifact.prototypes[main];
         let register_count = usize::from(prototype.register_count);
         let mut registers = try_vec_with_capacity(register_count, "BluV1 runtime registers")?;
         registers.resize(register_count, Value::Nil);
-        let mut varargs = Vec::new();
-        let mut dynamic_results = Vec::new();
+        if (closure.is_none() || environment.is_some())
+            && matches!(
+                prototype.profile,
+                SemanticProfile::Lua52
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            )
+            && let Some(environment_register) = registers.first_mut()
+        {
+            if let Some(environment_id) = environment.or(self.global_environment) {
+                *environment_register = Value::Table(environment_id);
+            }
+        }
+        let copied = arguments.len().min(usize::from(prototype.parameter_count));
+        registers[..copied].clone_from_slice(&arguments[..copied]);
+        let varargs = if prototype.is_vararg {
+            try_clone_values(
+                arguments
+                    .get(usize::from(prototype.parameter_count)..)
+                    .unwrap_or_default(),
+                "BluV1 frame varargs",
+            )?
+        } else {
+            Vec::new()
+        };
         let mut open_upvalues = try_vec_with_capacity(register_count, "BluV1 open upvalues")?;
         open_upvalues.resize(register_count, None);
-        let mut closure = None;
-        let mut callers =
-            try_vec_with_capacity(self.call_limit.min(16), "BluV1 caller frame stack")?;
-        let mut remaining = self.instruction_limit;
-        let mut pc = 0usize;
+        let callers = try_vec_with_capacity(self.call_limit.min(16), "BluV1 caller frame stack")?;
+        self.run_blu_v1_loop(
+            artifact,
+            main,
+            constants,
+            registers,
+            varargs,
+            Vec::new(),
+            open_upvalues,
+            callers,
+            0,
+            closure,
+            remaining,
+            depth,
+            allow_suspend,
+            close_marker,
+            environment,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn run_blu_v1_loop(
+        &mut self,
+        mut artifact: Arc<BluArtifact>,
+        mut prototype_index: usize,
+        mut constants: Vec<Value>,
+        mut registers: Vec<Value>,
+        mut varargs: Vec<Value>,
+        mut dynamic_results: Vec<Value>,
+        mut open_upvalues: Vec<Option<UpvalueId>>,
+        mut callers: Vec<BluCaller>,
+        mut pc: usize,
+        mut closure: Option<ClosureId>,
+        remaining: &mut u64,
+        depth: usize,
+        allow_suspend: bool,
+        close_marker: usize,
+        environment: Option<TableId>,
+    ) -> Result<Vec<Value>, RuntimeError> {
         loop {
             self.check_execution()?;
+            let active_environment = match closure {
+                Some(closure) => self.heap.blu_closure_environment(closure)?,
+                None => environment,
+            };
             let prototype = artifact
                 .prototypes
                 .get(prototype_index)
                 .ok_or(RuntimeError::InvalidPrototype(prototype_index))?;
+            if pc == 0
+                && matches!(
+                    prototype.profile,
+                    SemanticProfile::Lua52
+                        | SemanticProfile::Lua53
+                        | SemanticProfile::Lua54
+                        | SemanticProfile::Lua55
+                )
+                && let Some(environment_id) = active_environment
+                && let Some(environment_register) = registers.first_mut()
+            {
+                *environment_register = Value::Table(environment_id);
+            }
             let Some(instruction) = prototype.code.get(pc).copied() else {
                 return Err(RuntimeError::InvalidProgramCounter {
                     pc,
                     code_words: prototype.code.len(),
                 });
             };
-            if remaining == 0 {
+            if *remaining == 0 {
                 return Err(RuntimeError::InstructionLimit {
                     limit: self.instruction_limit,
                 });
             }
-            remaining -= 1;
+            *remaining -= 1;
             match instruction {
                 BluInstruction::LoadConstant {
                     destination,
@@ -1073,13 +1529,27 @@ impl Vm {
                             count: constants.len(),
                         },
                     )?;
-                    set_blu_register(
-                        &mut self.heap,
-                        &mut registers,
-                        &open_upvalues,
-                        destination,
-                        value,
-                    )?;
+                    let root_environment_initialization = (closure.is_none()
+                        || active_environment.is_some())
+                        && pc == 0
+                        && destination == 0
+                        && matches!(
+                            prototype.profile,
+                            SemanticProfile::Lua52
+                                | SemanticProfile::Lua53
+                                | SemanticProfile::Lua54
+                                | SemanticProfile::Lua55
+                        )
+                        && matches!(&value, Value::Nil);
+                    if !root_environment_initialization {
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            destination,
+                            value,
+                        )?;
+                    }
                 }
                 BluInstruction::Varargs { destination, count } => {
                     for offset in 0..count {
@@ -1111,7 +1581,16 @@ impl Vm {
                             what: "validated global name is not a string",
                         });
                     };
-                    let value = self.global_for_profile(name, prototype.profile)?;
+                    let value = if prototype.profile == SemanticProfile::Lua51 {
+                        if let Some(environment) = active_environment {
+                            self.heap
+                                .table_get(environment, &Value::String(Arc::clone(name)))?
+                        } else {
+                            self.global_for_profile(name, prototype.profile)?
+                        }
+                    } else {
+                        self.global_for_profile(name, prototype.profile)?
+                    };
                     set_blu_register(
                         &mut self.heap,
                         &mut registers,
@@ -1132,9 +1611,51 @@ impl Vm {
                         });
                     };
                     let value = blu_register(&registers, source)?.clone();
-                    self.set_global(name.clone(), value);
+                    if prototype.profile == SemanticProfile::Lua51 {
+                        if let Some(environment) = active_environment {
+                            let mut roots = blu_frame_roots(
+                                &registers,
+                                &varargs,
+                                &open_upvalues,
+                                closure,
+                                &callers,
+                            )?;
+                            roots.push_value(Value::Table(environment))?;
+                            self.table_set(
+                                environment,
+                                Value::String(Arc::clone(name)),
+                                value.clone(),
+                                &roots,
+                            )?;
+                            if self.global_environment == Some(environment) {
+                                self.mirror_global_environment_write(
+                                    &Value::String(Arc::clone(name)),
+                                    &value,
+                                )?;
+                            }
+                        } else {
+                            self.set_global(name.clone(), value);
+                        }
+                    } else {
+                        self.set_global(name.clone(), value);
+                    }
                 }
                 BluInstruction::NewTable { destination } => {
+                    let root_environment_initialization = (closure.is_none()
+                        || active_environment.is_some())
+                        && pc == 0
+                        && destination == 0
+                        && matches!(
+                            prototype.profile,
+                            SemanticProfile::Lua52
+                                | SemanticProfile::Lua53
+                                | SemanticProfile::Lua54
+                                | SemanticProfile::Lua55
+                        );
+                    if root_environment_initialization {
+                        pc += 1;
+                        continue;
+                    }
                     let roots =
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
                     let table = self.allocate_table(0, 0, &roots)?;
@@ -1178,7 +1699,7 @@ impl Vm {
                             if let Value::Closure(child_closure) = &function
                                 && self.heap.is_blu_closure(*child_closure)?
                             {
-                                if callers.len() >= self.call_limit {
+                                if depth + callers.len() >= self.call_limit {
                                     return Err(RuntimeError::CallLimit {
                                         limit: self.call_limit,
                                     });
@@ -1253,8 +1774,8 @@ impl Vm {
                                 .call_value(
                                     function,
                                     &arguments,
-                                    &mut remaining,
-                                    callers.len(),
+                                    remaining,
+                                    depth + callers.len(),
                                     roots,
                                 )?
                                 .into_iter()
@@ -1291,7 +1812,10 @@ impl Vm {
                                 closure,
                                 &callers,
                             )?;
-                            self.table_set(target, key, value, &roots)?;
+                            self.table_set(target, key.clone(), value.clone(), &roots)?;
+                            if self.global_environment == Some(target) {
+                                self.mirror_global_environment_write(&key, &value)?;
+                            }
                         }
                         BluNewIndexResolution::Call { function, receiver } => {
                             let mut arguments =
@@ -1302,7 +1826,7 @@ impl Vm {
                             if let Value::Closure(child_closure) = &function
                                 && self.heap.is_blu_closure(*child_closure)?
                             {
-                                if callers.len() >= self.call_limit {
+                                if depth + callers.len() >= self.call_limit {
                                     return Err(RuntimeError::CallLimit {
                                         limit: self.call_limit,
                                     });
@@ -1380,8 +1904,8 @@ impl Vm {
                             self.call_value(
                                 function,
                                 &arguments,
-                                &mut remaining,
-                                callers.len(),
+                                remaining,
+                                depth + callers.len(),
                                 roots,
                             )?;
                         }
@@ -1477,7 +2001,7 @@ impl Vm {
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
-                        if callers.len() >= self.call_limit {
+                        if depth + callers.len() >= self.call_limit {
                             return Err(RuntimeError::CallLimit {
                                 limit: self.call_limit,
                             });
@@ -1541,8 +2065,8 @@ impl Vm {
                     let values = self.call_value(
                         function,
                         &arguments,
-                        &mut remaining,
-                        callers.len(),
+                        remaining,
+                        depth + callers.len(),
                         roots,
                     )?;
                     let mut roots =
@@ -1576,7 +2100,7 @@ impl Vm {
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
-                        if callers.len() >= self.call_limit {
+                        if depth + callers.len() >= self.call_limit {
                             return Err(RuntimeError::CallLimit {
                                 limit: self.call_limit,
                             });
@@ -1640,13 +2164,51 @@ impl Vm {
                     for argument in &arguments {
                         roots.push_value(argument.clone())?;
                     }
-                    let values = self.call_value(
+                    let values = match self.call_value(
                         function,
                         &arguments,
-                        &mut remaining,
-                        callers.len(),
+                        remaining,
+                        depth + callers.len(),
                         roots,
-                    )?;
+                    ) {
+                        Ok(values) => values,
+                        Err(error @ RuntimeError::CoroutineYield(_)) => {
+                            if allow_suspend {
+                                let resume = self
+                                    .pending_blu_operation
+                                    .take()
+                                    .map(|operation| BluResume::Native {
+                                        result: BluCallResult::Fixed {
+                                            destination,
+                                            count: 1,
+                                        },
+                                        operation: Box::new(operation),
+                                    })
+                                    .unwrap_or(BluResume::Fixed {
+                                        destination,
+                                        count: 1,
+                                    });
+                                self.suspend_blu_v1(BluContinuation {
+                                    artifact,
+                                    prototype: prototype_index,
+                                    constants,
+                                    registers,
+                                    varargs,
+                                    dynamic_results,
+                                    open_upvalues,
+                                    callers,
+                                    closure,
+                                    pc,
+                                    depth,
+                                    close_marker,
+                                    resume,
+                                })?;
+                            }
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    refresh_blu_open_upvalues(&self.heap, &mut registers, &open_upvalues)?;
                     let value = values.into_iter().next().unwrap_or(Value::Nil);
                     set_blu_register(
                         &mut self.heap,
@@ -1718,7 +2280,7 @@ impl Vm {
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
-                        if callers.len() >= self.call_limit {
+                        if depth + callers.len() >= self.call_limit {
                             return Err(RuntimeError::CallLimit {
                                 limit: self.call_limit,
                             });
@@ -1782,13 +2344,50 @@ impl Vm {
                     for argument in &arguments {
                         roots.push_value(argument.clone())?;
                     }
-                    let values = self.call_value(
+                    let values = match self.call_value(
                         function,
                         &arguments,
-                        &mut remaining,
-                        callers.len(),
+                        remaining,
+                        depth + callers.len(),
                         roots,
-                    )?;
+                    ) {
+                        Ok(values) => values,
+                        Err(error @ RuntimeError::CoroutineYield(_)) => {
+                            if allow_suspend {
+                                let resume = self
+                                    .pending_blu_operation
+                                    .take()
+                                    .map(|operation| BluResume::Native {
+                                        result: BluCallResult::Fixed {
+                                            destination,
+                                            count: result_count,
+                                        },
+                                        operation: Box::new(operation),
+                                    })
+                                    .unwrap_or(BluResume::Fixed {
+                                        destination,
+                                        count: result_count,
+                                    });
+                                self.suspend_blu_v1(BluContinuation {
+                                    artifact,
+                                    prototype: prototype_index,
+                                    constants,
+                                    registers,
+                                    varargs,
+                                    dynamic_results,
+                                    open_upvalues,
+                                    callers,
+                                    closure,
+                                    pc,
+                                    depth,
+                                    close_marker,
+                                    resume,
+                                })?;
+                            }
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
                     let mut values = values.into_iter();
                     for offset in 0..result_count {
                         let target =
@@ -1868,7 +2467,7 @@ impl Vm {
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
-                        if callers.len() >= self.call_limit {
+                        if depth + callers.len() >= self.call_limit {
                             return Err(RuntimeError::CallLimit {
                                 limit: self.call_limit,
                             });
@@ -1926,13 +2525,44 @@ impl Vm {
                     }
                     let roots =
                         blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
-                    dynamic_results = self.call_value(
+                    dynamic_results = match self.call_value(
                         function,
                         &arguments,
-                        &mut remaining,
-                        callers.len(),
+                        remaining,
+                        depth + callers.len(),
                         roots,
-                    )?;
+                    ) {
+                        Ok(values) => values,
+                        Err(error @ RuntimeError::CoroutineYield(_)) => {
+                            if allow_suspend {
+                                let resume = self
+                                    .pending_blu_operation
+                                    .take()
+                                    .map(|operation| BluResume::Native {
+                                        result: BluCallResult::Dynamic,
+                                        operation: Box::new(operation),
+                                    })
+                                    .unwrap_or(BluResume::Dynamic);
+                                self.suspend_blu_v1(BluContinuation {
+                                    artifact,
+                                    prototype: prototype_index,
+                                    constants,
+                                    registers,
+                                    varargs,
+                                    dynamic_results,
+                                    open_upvalues,
+                                    callers,
+                                    closure,
+                                    pc,
+                                    depth,
+                                    close_marker,
+                                    resume,
+                                })?;
+                            }
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if dynamic_results.len() > MAX_DYNAMIC_REGISTERS {
                         return Err(RuntimeError::StackLimit {
                             required: dynamic_results.len(),
@@ -2046,7 +2676,7 @@ impl Vm {
                     if let Value::Closure(child_closure) = &function
                         && self.heap.is_blu_closure(*child_closure)?
                     {
-                        if prefix.is_some() && callers.len() >= self.call_limit {
+                        if prefix.is_some() && depth + callers.len() >= self.call_limit {
                             return Err(RuntimeError::CallLimit {
                                 limit: self.call_limit,
                             });
@@ -2119,13 +2749,44 @@ impl Vm {
                     for argument in &arguments {
                         roots.push_value(argument.clone())?;
                     }
-                    let mut values = self.call_value(
+                    let mut values = match self.call_value(
                         function,
                         &arguments,
-                        &mut remaining,
-                        callers.len(),
+                        remaining,
+                        depth + callers.len(),
                         roots,
-                    )?;
+                    ) {
+                        Ok(values) => values,
+                        Err(error @ RuntimeError::CoroutineYield(_)) => {
+                            if allow_suspend {
+                                let resume = self.pending_blu_operation.take().map(|operation| {
+                                    BluResume::Native {
+                                        result: BluCallResult::Return { prefix },
+                                        operation: Box::new(operation),
+                                    }
+                                });
+                                if let Some(resume) = resume {
+                                    self.suspend_blu_v1(BluContinuation {
+                                        artifact,
+                                        prototype: prototype_index,
+                                        constants,
+                                        registers,
+                                        varargs,
+                                        dynamic_results,
+                                        open_upvalues,
+                                        callers,
+                                        closure,
+                                        pc,
+                                        depth,
+                                        close_marker,
+                                        resume,
+                                    })?;
+                                }
+                            }
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
                     if let Some((first, count)) = prefix {
                         let start = usize::from(first);
                         let end = start.checked_add(usize::from(count)).ok_or(
@@ -2197,6 +2858,10 @@ impl Vm {
                         child_prototype.upvalues.len(),
                         &roots,
                     )?;
+                    if let Some(environment) = active_environment {
+                        self.heap
+                            .closure_set_environment(child_closure, environment)?;
+                    }
                     roots.push_value(Value::Closure(child_closure))?;
                     let parent_upvalues = if child_prototype.upvalues.iter().any(|capture| {
                         matches!(capture, blu_bytecode::blu::Upvalue::ParentUpvalue(_))
@@ -2365,7 +3030,7 @@ impl Vm {
                         if let Value::Closure(child_closure) = &function
                             && self.heap.is_blu_closure(*child_closure)?
                         {
-                            if callers.len() >= self.call_limit {
+                            if depth + callers.len() >= self.call_limit {
                                 return Err(RuntimeError::CallLimit {
                                     limit: self.call_limit,
                                 });
@@ -2438,7 +3103,13 @@ impl Vm {
                             &callers,
                         )?;
                         let value = self
-                            .call_value(function, &arguments, &mut remaining, callers.len(), roots)?
+                            .call_value(
+                                function,
+                                &arguments,
+                                remaining,
+                                depth + callers.len(),
+                                roots,
+                            )?
                             .into_iter()
                             .next()
                             .unwrap_or(Value::Nil);
@@ -2537,7 +3208,7 @@ impl Vm {
                         if let Value::Closure(child_closure) = &function
                             && self.heap.is_blu_closure(*child_closure)?
                         {
-                            if callers.len() >= self.call_limit {
+                            if depth + callers.len() >= self.call_limit {
                                 return Err(RuntimeError::CallLimit {
                                     limit: self.call_limit,
                                 });
@@ -2610,7 +3281,13 @@ impl Vm {
                             &callers,
                         )?;
                         let value = self
-                            .call_value(function, &arguments, &mut remaining, callers.len(), roots)?
+                            .call_value(
+                                function,
+                                &arguments,
+                                remaining,
+                                depth + callers.len(),
+                                roots,
+                            )?
                             .into_iter()
                             .next()
                             .unwrap_or(Value::Nil);
@@ -2672,7 +3349,7 @@ impl Vm {
                             if let Value::Closure(child_closure) = &function
                                 && self.heap.is_blu_closure(*child_closure)?
                             {
-                                if callers.len() >= self.call_limit {
+                                if depth + callers.len() >= self.call_limit {
                                     return Err(RuntimeError::CallLimit {
                                         limit: self.call_limit,
                                     });
@@ -2746,8 +3423,8 @@ impl Vm {
                             self.call_value(
                                 function,
                                 &arguments,
-                                &mut remaining,
-                                callers.len(),
+                                remaining,
+                                depth + callers.len(),
                                 roots,
                             )?
                             .into_iter()
@@ -2795,7 +3472,7 @@ impl Vm {
                         if let Value::Closure(child_closure) = &function
                             && self.heap.is_blu_closure(*child_closure)?
                         {
-                            if callers.len() >= self.call_limit {
+                            if depth + callers.len() >= self.call_limit {
                                 return Err(RuntimeError::CallLimit {
                                     limit: self.call_limit,
                                 });
@@ -2864,7 +3541,13 @@ impl Vm {
                             &callers,
                         )?;
                         let value = self
-                            .call_value(function, &arguments, &mut remaining, callers.len(), roots)?
+                            .call_value(
+                                function,
+                                &arguments,
+                                remaining,
+                                depth + callers.len(),
+                                roots,
+                            )?
                             .into_iter()
                             .next()
                             .unwrap_or(Value::Nil);
@@ -2913,7 +3596,7 @@ impl Vm {
                         let value = self.concat_value(
                             left,
                             right,
-                            CallContext::new(&mut remaining, 0, GcRoots::default()),
+                            CallContext::new(remaining, 0, GcRoots::default()),
                         )?;
                         set_blu_register(
                             &mut self.heap,
@@ -2939,7 +3622,7 @@ impl Vm {
                         if let Value::Closure(child_closure) = &function
                             && self.heap.is_blu_closure(*child_closure)?
                         {
-                            if callers.len() >= self.call_limit {
+                            if depth + callers.len() >= self.call_limit {
                                 return Err(RuntimeError::CallLimit {
                                     limit: self.call_limit,
                                 });
@@ -3008,7 +3691,13 @@ impl Vm {
                             &callers,
                         )?;
                         let value = self
-                            .call_value(function, &arguments, &mut remaining, callers.len(), roots)?
+                            .call_value(
+                                function,
+                                &arguments,
+                                remaining,
+                                depth + callers.len(),
+                                roots,
+                            )?
                             .into_iter()
                             .next()
                             .unwrap_or(Value::Nil);
@@ -3151,7 +3840,7 @@ impl Vm {
                         if let Value::Closure(child_closure) = &function
                             && self.heap.is_blu_closure(*child_closure)?
                         {
-                            if callers.len() >= self.call_limit {
+                            if depth + callers.len() >= self.call_limit {
                                 return Err(RuntimeError::CallLimit {
                                     limit: self.call_limit,
                                 });
@@ -3220,7 +3909,13 @@ impl Vm {
                             &callers,
                         )?;
                         let value = self
-                            .call_value(function, &arguments, &mut remaining, callers.len(), roots)?
+                            .call_value(
+                                function,
+                                &arguments,
+                                remaining,
+                                depth + callers.len(),
+                                roots,
+                            )?
                             .first()
                             .is_some_and(Value::is_truthy)
                             != negate;
@@ -3465,6 +4160,9 @@ impl Vm {
                 caller.result = BluCallResult::ReadyDynamic(values);
                 Ok(BluReturnDisposition::Resume(caller))
             }
+            BluCallResult::Return { .. } => Err(RuntimeError::UnsupportedBluV1Structure {
+                what: "native return marker in caller frame",
+            }),
             BluCallResult::ReadyDynamic(_) => Err(RuntimeError::UnsupportedBluV1Structure {
                 what: "completed dynamic call continuation",
             }),
@@ -4552,6 +5250,897 @@ impl Vm {
         }
     }
 
+    fn suspend_blu_v1(&mut self, continuation: BluContinuation) -> Result<(), RuntimeError> {
+        if self.capture_blu_continuation {
+            self.captured_blu_continuation = Some(continuation);
+            return Ok(());
+        }
+        let thread = self
+            .running_thread
+            .ok_or(RuntimeError::CoroutineYieldOutside)?;
+        let roots = blu_continuation_roots(&continuation)?;
+        self.thread_set_roots(thread, &roots, &GcRoots::default())?;
+        self.threads
+            .insert(thread, ThreadState::SuspendedBlu(Box::new(continuation)));
+        Ok(())
+    }
+
+    fn resume_blu_v1(
+        &mut self,
+        continuation: BluContinuation,
+        arguments: &[Value],
+        remaining: &mut u64,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let BluContinuation {
+            mut artifact,
+            mut prototype,
+            mut registers,
+            mut constants,
+            mut varargs,
+            mut dynamic_results,
+            mut open_upvalues,
+            mut callers,
+            mut closure,
+            mut pc,
+            depth,
+            close_marker,
+            resume,
+        } = continuation;
+        let environment = closure
+            .map(|closure| self.heap.blu_closure_environment(closure))
+            .transpose()?
+            .flatten();
+        refresh_blu_open_upvalues(&self.heap, &mut registers, &open_upvalues)?;
+        let mut native_resume = None;
+        match resume {
+            BluResume::Fixed { destination, count } => {
+                let mut values = arguments.iter();
+                for offset in 0..count {
+                    let target = destination
+                        .checked_add(offset)
+                        .ok_or(RuntimeError::Register {
+                            register: usize::MAX,
+                            count: registers.len(),
+                        })?;
+                    set_blu_register(
+                        &mut self.heap,
+                        &mut registers,
+                        &open_upvalues,
+                        target,
+                        values.next().cloned().unwrap_or(Value::Nil),
+                    )?;
+                }
+            }
+            BluResume::Dynamic => {
+                dynamic_results = try_clone_values(arguments, "BluV1 resumed results")?;
+                if dynamic_results.len() > MAX_DYNAMIC_REGISTERS {
+                    return Err(RuntimeError::StackLimit {
+                        required: dynamic_results.len(),
+                        limit: MAX_DYNAMIC_REGISTERS,
+                    });
+                }
+            }
+            resume @ BluResume::Native { .. } => {
+                native_resume = Some(resume);
+            }
+        }
+        if let Some(BluResume::Native { result, operation }) = native_resume {
+            let roots = blu_frame_roots(&registers, &varargs, &open_upvalues, closure, &callers)?;
+            try_reserve_exact(&mut self.native_contexts, 1, "native callback contexts")?;
+            self.native_contexts.push(NativeCallContext {
+                remaining: *remaining,
+                depth: depth + callers.len(),
+                roots,
+            });
+            let operation_result = self.resume_blu_operation(*operation, arguments, remaining);
+            let context = self
+                .native_contexts
+                .pop()
+                .expect("native operation context must exist");
+            *remaining = (*remaining).min(context.remaining);
+            let values = match operation_result {
+                Ok(values) => values,
+                Err(error @ RuntimeError::CoroutineYield(_)) => {
+                    let operation = self.pending_blu_operation.take().ok_or(
+                        RuntimeError::UnsupportedLibraryFeature {
+                            function: "BluV1 native operation",
+                            feature: "a callback continuation without operation state",
+                        },
+                    )?;
+                    self.suspend_blu_v1(BluContinuation {
+                        artifact,
+                        prototype,
+                        constants,
+                        registers,
+                        varargs,
+                        dynamic_results,
+                        open_upvalues,
+                        callers,
+                        closure,
+                        pc,
+                        depth,
+                        close_marker,
+                        resume: BluResume::Native {
+                            result,
+                            operation: Box::new(operation),
+                        },
+                    })?;
+                    return Err(error);
+                }
+                Err(error) => {
+                    return Err(self.unwind_close_values(close_marker, error, remaining, depth));
+                }
+            };
+            if let BluCallResult::Return { prefix } = &result {
+                let mut values = values;
+                if let Some((first, count)) = *prefix {
+                    let start = usize::from(first);
+                    let end =
+                        start
+                            .checked_add(usize::from(count))
+                            .ok_or(RuntimeError::Register {
+                                register: usize::MAX,
+                                count: registers.len(),
+                            })?;
+                    let prefix = registers.get(start..end).ok_or(RuntimeError::Register {
+                        register: end.saturating_sub(1),
+                        count: registers.len(),
+                    })?;
+                    let mut combined = try_clone_values(prefix, "BluV1 return prefix")?;
+                    try_reserve_exact(&mut combined, values.len(), "BluV1 dynamic return values")?;
+                    combined.append(&mut values);
+                    values = combined;
+                }
+                let mut caller = loop {
+                    let Some(caller) = callers.pop() else {
+                        return Ok(values);
+                    };
+                    match self.apply_blu_return(caller, values, &callers)? {
+                        BluReturnDisposition::Resume(caller) => break caller,
+                        BluReturnDisposition::Propagate(next) => values = next,
+                    }
+                };
+                dynamic_results =
+                    match core::mem::replace(&mut caller.result, BluCallResult::Dynamic) {
+                        BluCallResult::ReadyDynamic(values) => values,
+                        _ => Vec::new(),
+                    };
+                artifact = caller.artifact;
+                prototype = caller.prototype;
+                registers = caller.registers;
+                constants = caller.constants;
+                varargs = caller.varargs;
+                open_upvalues = caller.open_upvalues;
+                closure = caller.closure;
+                pc = caller.pc;
+                self.active_profile = Some(
+                    artifact
+                        .prototypes
+                        .get(prototype)
+                        .ok_or(RuntimeError::InvalidPrototype(prototype))?
+                        .profile,
+                );
+                return self.run_blu_v1_loop(
+                    artifact,
+                    prototype,
+                    constants,
+                    registers,
+                    varargs,
+                    dynamic_results,
+                    open_upvalues,
+                    callers,
+                    pc,
+                    closure,
+                    remaining,
+                    depth,
+                    true,
+                    close_marker,
+                    environment,
+                );
+            }
+            match result {
+                BluCallResult::Fixed { destination, count } => {
+                    let mut values = values.into_iter();
+                    for offset in 0..count {
+                        let target =
+                            destination
+                                .checked_add(offset)
+                                .ok_or(RuntimeError::Register {
+                                    register: usize::MAX,
+                                    count: registers.len(),
+                                })?;
+                        set_blu_register(
+                            &mut self.heap,
+                            &mut registers,
+                            &open_upvalues,
+                            target,
+                            values.next().unwrap_or(Value::Nil),
+                        )?;
+                    }
+                }
+                BluCallResult::Dynamic => {
+                    dynamic_results = values;
+                    if dynamic_results.len() > MAX_DYNAMIC_REGISTERS {
+                        return Err(RuntimeError::StackLimit {
+                            required: dynamic_results.len(),
+                            limit: MAX_DYNAMIC_REGISTERS,
+                        });
+                    }
+                }
+                _ => {
+                    return Err(RuntimeError::UnsupportedBluV1Structure {
+                        what: "native operation result mode",
+                    });
+                }
+            }
+        }
+        let pc = pc
+            .checked_add(1)
+            .ok_or(RuntimeError::InvalidProgramCounter {
+                pc: usize::MAX,
+                code_words: artifact
+                    .prototypes
+                    .get(prototype)
+                    .map_or(0, |prototype| prototype.code.len()),
+            })?;
+        let profile = artifact
+            .prototypes
+            .get(prototype)
+            .ok_or(RuntimeError::InvalidPrototype(prototype))?
+            .profile;
+        let previous_profile = self.active_profile.replace(profile);
+        let result = self.run_blu_v1_loop(
+            artifact,
+            prototype,
+            constants,
+            registers,
+            varargs,
+            dynamic_results,
+            open_upvalues,
+            callers,
+            pc,
+            closure,
+            remaining,
+            depth,
+            true,
+            close_marker,
+            environment,
+        );
+        self.active_profile = previous_profile;
+        match result {
+            Ok(values) => Ok(values),
+            Err(RuntimeError::CoroutineYield(values)) => Err(RuntimeError::CoroutineYield(values)),
+            Err(error) => Err(self.unwind_close_values(close_marker, error, remaining, depth)),
+        }
+    }
+
+    fn resume_detached_blu(
+        &mut self,
+        continuation: BluContinuation,
+        arguments: &[Value],
+        remaining: &mut u64,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let previous_capture = self.capture_blu_continuation;
+        let previous_continuation = self.captured_blu_continuation.take();
+        self.capture_blu_continuation = true;
+        let result = self.resume_blu_v1(continuation, arguments, remaining);
+        let captured = self.captured_blu_continuation.take();
+        self.capture_blu_continuation = previous_capture;
+        if previous_continuation.is_some() {
+            return Err(RuntimeError::UnsupportedLibraryFeature {
+                function: "BluV1 native operation",
+                feature: "nested captured callback continuations",
+            });
+        }
+        match result {
+            Err(error @ RuntimeError::CoroutineYield(_)) if captured.is_none() => {
+                Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "BluV1 native operation",
+                    feature: "a yielding callback without a resumable owned frame",
+                })
+            }
+            other => {
+                if let Some(captured) = captured {
+                    self.captured_blu_continuation = Some(captured);
+                }
+                other
+            }
+        }
+    }
+
+    fn resume_detached_comparison(
+        &mut self,
+        continuation: BluContinuation,
+        arguments: &[Value],
+        remaining: &mut u64,
+    ) -> Result<bool, RuntimeError> {
+        let values = self.resume_detached_blu(continuation, arguments, remaining)?;
+        Ok(values.first().is_some_and(Value::is_truthy))
+    }
+
+    fn resume_blu_operation(
+        &mut self,
+        operation: PendingBluOperation,
+        arguments: &[Value],
+        remaining: &mut u64,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        match operation {
+            PendingBluOperation::StringGsub(operation) => {
+                let mut operation = *operation;
+                let callback_result = self.resume_detached_blu(
+                    (*operation.continuation).clone(),
+                    arguments,
+                    remaining,
+                );
+                let callback_value = match callback_result {
+                    Ok(mut values) => values.pop().unwrap_or(Value::Nil),
+                    Err(error @ RuntimeError::CoroutineYield(_)) => {
+                        let continuation = self.captured_blu_continuation.take().ok_or(
+                            RuntimeError::UnsupportedLibraryFeature {
+                                function: "string.gsub",
+                                feature: "yielding callback replacements",
+                            },
+                        )?;
+                        operation.continuation = Box::new(continuation);
+                        self.pending_blu_operation =
+                            Some(PendingBluOperation::StringGsub(Box::new(operation)));
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                self.sync_native_operation_remaining(remaining);
+                self.append_gsub_callback_result(
+                    &mut operation.result,
+                    callback_value,
+                    &operation.haystack,
+                    &operation.found,
+                )?;
+                advance_gsub_operation(&mut operation);
+
+                while operation.replacements < operation.replacement_limit
+                    && operation.search_start <= operation.haystack.len()
+                {
+                    let Some(found) = find_basic_lua_pattern(
+                        &operation.haystack,
+                        &operation.pattern,
+                        operation.search_start,
+                        "string.gsub",
+                        self.active_profile()?,
+                    )?
+                    else {
+                        break;
+                    };
+                    let first = found.start;
+                    let end = found.end;
+                    append_limited_string(
+                        &mut operation.result,
+                        &operation.haystack[operation.copied_until..first],
+                    )?;
+                    let mut callback_arguments = try_vec_with_capacity(
+                        found.capture_count.max(1),
+                        "string.gsub callback arguments",
+                    )?;
+                    if found.capture_count == 0 {
+                        callback_arguments.push(limited_string_value(
+                            &operation.haystack[found.start..found.end],
+                        )?);
+                    } else {
+                        append_basic_capture_values(
+                            &mut callback_arguments,
+                            self,
+                            &operation.haystack,
+                            &found,
+                            "string.gsub",
+                        )?;
+                    }
+                    self.sync_native_operation_remaining(remaining);
+                    let callback_result = self.invoke_native_callback(
+                        "string.gsub",
+                        operation.callback.clone(),
+                        &callback_arguments,
+                    );
+                    let callback_value = match callback_result {
+                        Ok(mut values) => values.pop().unwrap_or(Value::Nil),
+                        Err(error @ RuntimeError::CoroutineYield(_)) => {
+                            let continuation = self.captured_blu_continuation.take().ok_or(
+                                RuntimeError::UnsupportedLibraryFeature {
+                                    function: "string.gsub",
+                                    feature: "yielding callback replacements",
+                                },
+                            )?;
+                            operation.found = found;
+                            operation.continuation = Box::new(continuation);
+                            self.pending_blu_operation =
+                                Some(PendingBluOperation::StringGsub(Box::new(operation)));
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    if let Some(context) = self.native_contexts.last() {
+                        *remaining = context.remaining;
+                    }
+                    operation.found = found;
+                    self.append_gsub_callback_result(
+                        &mut operation.result,
+                        callback_value,
+                        &operation.haystack,
+                        &operation.found,
+                    )?;
+                    operation.replacements += 1;
+                    if end > first {
+                        operation.search_start = end;
+                        operation.copied_until = end;
+                    } else if first < operation.haystack.len() {
+                        append_limited_string(
+                            &mut operation.result,
+                            &operation.haystack[first..first + 1],
+                        )?;
+                        operation.search_start = first + 1;
+                        operation.copied_until = operation.search_start;
+                    } else {
+                        operation.search_start = operation.haystack.len() + 1;
+                        operation.copied_until = operation.haystack.len();
+                    }
+                }
+                if !operation.explicit_limit
+                    && operation.replacements == MAX_DYNAMIC_REGISTERS
+                    && find_basic_lua_pattern(
+                        &operation.haystack,
+                        &operation.pattern,
+                        operation.search_start,
+                        "string.gsub",
+                        self.active_profile()?,
+                    )?
+                    .is_some()
+                {
+                    return Err(RuntimeError::StackLimit {
+                        required: MAX_DYNAMIC_REGISTERS + 1,
+                        limit: MAX_DYNAMIC_REGISTERS,
+                    });
+                }
+                append_limited_string(
+                    &mut operation.result,
+                    &operation.haystack[operation.copied_until..],
+                )?;
+                Ok(vec![
+                    Value::String(Arc::from(operation.result)),
+                    profiled_integral_math_result(
+                        self,
+                        "string.gsub",
+                        operation.replacements as f64,
+                    )?,
+                ])
+            }
+            PendingBluOperation::TableForeach(operation) => {
+                self.resume_table_foreach(operation, arguments, remaining)
+            }
+            PendingBluOperation::TableForeachi(operation) => {
+                self.resume_table_foreachi(operation, arguments, remaining)
+            }
+            PendingBluOperation::TableSort(operation) => {
+                self.resume_table_sort(operation, arguments, remaining)
+            }
+            PendingBluOperation::Pairs(operation) => {
+                let values = self.resume_detached_blu(
+                    (*operation.continuation).clone(),
+                    arguments,
+                    remaining,
+                );
+                match values {
+                    Ok(values) => {
+                        self.sync_native_operation_remaining(remaining);
+                        Ok(values)
+                    }
+                    Err(error @ RuntimeError::CoroutineYield(_)) => {
+                        let continuation = self.captured_blu_continuation.take().ok_or(
+                            RuntimeError::UnsupportedLibraryFeature {
+                                function: "pairs",
+                                feature: "yielding __pairs handlers",
+                            },
+                        )?;
+                        self.pending_blu_operation =
+                            Some(PendingBluOperation::Pairs(PendingPairs {
+                                continuation: Box::new(continuation),
+                            }));
+                        Err(error)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+        }
+    }
+
+    fn resume_table_foreach(
+        &mut self,
+        mut operation: PendingTableForeach,
+        arguments: &[Value],
+        remaining: &mut u64,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let callback_result =
+            self.resume_detached_blu((*operation.continuation).clone(), arguments, remaining);
+        let callback_result = match callback_result {
+            Ok(mut values) => values.pop().unwrap_or(Value::Nil),
+            Err(error @ RuntimeError::CoroutineYield(_)) => {
+                let continuation = self.captured_blu_continuation.take().ok_or(
+                    RuntimeError::UnsupportedLibraryFeature {
+                        function: "table.foreach",
+                        feature: "yielding callbacks",
+                    },
+                )?;
+                operation.continuation = Box::new(continuation);
+                self.pending_blu_operation = Some(PendingBluOperation::TableForeach(operation));
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.sync_native_operation_remaining(remaining);
+        if !matches!(callback_result, Value::Nil) {
+            return Ok(vec![callback_result]);
+        }
+        let mut key = operation.current_key;
+        loop {
+            let Some((next_key, value)) = self.heap.table_next(operation.table, &key)? else {
+                return Ok(vec![Value::Nil]);
+            };
+            self.sync_native_operation_remaining(remaining);
+            let callback_result = self.invoke_native_callback(
+                "table.foreach",
+                operation.callback.clone(),
+                &[next_key.clone(), value.clone()],
+            );
+            let callback_result = match callback_result {
+                Ok(mut values) => values.pop().unwrap_or(Value::Nil),
+                Err(error @ RuntimeError::CoroutineYield(_)) => {
+                    let continuation = self.captured_blu_continuation.take().ok_or(
+                        RuntimeError::UnsupportedLibraryFeature {
+                            function: "table.foreach",
+                            feature: "yielding callbacks",
+                        },
+                    )?;
+                    operation.previous_key = key;
+                    operation.current_key = next_key;
+                    operation.current_value = value;
+                    operation.continuation = Box::new(continuation);
+                    self.pending_blu_operation = Some(PendingBluOperation::TableForeach(operation));
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            if !matches!(callback_result, Value::Nil) {
+                return Ok(vec![callback_result]);
+            }
+            key = next_key;
+        }
+    }
+
+    fn resume_table_foreachi(
+        &mut self,
+        mut operation: PendingTableForeachi,
+        arguments: &[Value],
+        remaining: &mut u64,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let callback_result =
+            self.resume_detached_blu((*operation.continuation).clone(), arguments, remaining);
+        let callback_result = match callback_result {
+            Ok(mut values) => values.pop().unwrap_or(Value::Nil),
+            Err(error @ RuntimeError::CoroutineYield(_)) => {
+                let continuation = self.captured_blu_continuation.take().ok_or(
+                    RuntimeError::UnsupportedLibraryFeature {
+                        function: "table.foreachi",
+                        feature: "yielding callbacks",
+                    },
+                )?;
+                operation.continuation = Box::new(continuation);
+                self.pending_blu_operation = Some(PendingBluOperation::TableForeachi(operation));
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.sync_native_operation_remaining(remaining);
+        if !matches!(callback_result, Value::Nil) {
+            return Ok(vec![callback_result]);
+        }
+        for index in operation.index.saturating_add(1)..=operation.length {
+            let value = self
+                .heap
+                .table_get(operation.table, &Value::Integer(index as i64))?;
+            self.sync_native_operation_remaining(remaining);
+            let callback_result = self.invoke_native_callback(
+                "table.foreachi",
+                operation.callback.clone(),
+                &[Value::Number(index as f64), value.clone()],
+            );
+            let callback_result = match callback_result {
+                Ok(mut values) => values.pop().unwrap_or(Value::Nil),
+                Err(error @ RuntimeError::CoroutineYield(_)) => {
+                    let continuation = self.captured_blu_continuation.take().ok_or(
+                        RuntimeError::UnsupportedLibraryFeature {
+                            function: "table.foreachi",
+                            feature: "yielding callbacks",
+                        },
+                    )?;
+                    operation.index = index;
+                    operation.current_value = value;
+                    operation.continuation = Box::new(continuation);
+                    self.pending_blu_operation =
+                        Some(PendingBluOperation::TableForeachi(operation));
+                    return Err(error);
+                }
+                Err(error) => return Err(error),
+            };
+            if !matches!(callback_result, Value::Nil) {
+                return Ok(vec![callback_result]);
+            }
+        }
+        Ok(vec![Value::Nil])
+    }
+
+    fn resume_table_sort(
+        &mut self,
+        mut operation: PendingTableSort,
+        arguments: &[Value],
+        remaining: &mut u64,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let callback_result = if operation.comparator.is_some() {
+            self.resume_detached_blu((*operation.continuation).clone(), arguments, remaining)
+                .map(|values| values.first().is_some_and(Value::is_truthy))
+        } else {
+            self.resume_detached_comparison((*operation.continuation).clone(), arguments, remaining)
+        };
+        let callback_result = match callback_result {
+            Ok(result) => result,
+            Err(error @ RuntimeError::CoroutineYield(_)) => {
+                let continuation = self.captured_blu_continuation.take().ok_or(
+                    RuntimeError::UnsupportedLibraryFeature {
+                        function: "table.sort",
+                        feature: if operation.comparator.is_some() {
+                            "yielding custom comparators"
+                        } else {
+                            "yielding metamethod ordering"
+                        },
+                    },
+                )?;
+                operation.continuation = Box::new(continuation);
+                self.pending_blu_operation = Some(PendingBluOperation::TableSort(operation));
+                return Err(error);
+            }
+            Err(error) => return Err(error),
+        };
+        self.sync_native_operation_remaining(remaining);
+        if callback_result {
+            operation.values[operation.position] = operation.values[operation.position - 1].clone();
+            operation.position -= 1;
+        } else {
+            operation.values[operation.position] = operation.current.clone();
+            operation.index += 1;
+            if operation.index >= operation.values.len() {
+                return self.finish_table_sort(operation.table, operation.values);
+            }
+            operation.current = operation.values[operation.index].clone();
+            operation.position = operation.index;
+        }
+
+        loop {
+            while operation.position > 0 {
+                self.sync_native_operation_remaining(remaining);
+                let callback_result = if let Some(comparator) = operation.comparator.clone() {
+                    self.invoke_native_callback(
+                        "table.sort",
+                        comparator,
+                        &[
+                            operation.current.clone(),
+                            operation.values[operation.position - 1].clone(),
+                        ],
+                    )
+                    .map(|values| values.first().is_some_and(Value::is_truthy))
+                } else {
+                    self.invoke_native_comparison(
+                        "table.sort",
+                        operation.current.clone(),
+                        operation.values[operation.position - 1].clone(),
+                    )
+                };
+                let callback_result = match callback_result {
+                    Ok(result) => result,
+                    Err(error @ RuntimeError::CoroutineYield(_)) => {
+                        let continuation = self.captured_blu_continuation.take().ok_or(
+                            RuntimeError::UnsupportedLibraryFeature {
+                                function: "table.sort",
+                                feature: if operation.comparator.is_some() {
+                                    "yielding custom comparators"
+                                } else {
+                                    "yielding metamethod ordering"
+                                },
+                            },
+                        )?;
+                        operation.continuation = Box::new(continuation);
+                        self.pending_blu_operation =
+                            Some(PendingBluOperation::TableSort(operation));
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(context) = self.native_contexts.last() {
+                    *remaining = context.remaining;
+                }
+                if callback_result {
+                    operation.values[operation.position] =
+                        operation.values[operation.position - 1].clone();
+                    operation.position -= 1;
+                } else {
+                    break;
+                }
+            }
+            operation.values[operation.position] = operation.current.clone();
+            operation.index += 1;
+            if operation.index >= operation.values.len() {
+                return self.finish_table_sort(operation.table, operation.values);
+            }
+            operation.current = operation.values[operation.index].clone();
+            operation.position = operation.index;
+        }
+    }
+
+    fn finish_table_sort(
+        &mut self,
+        table: TableId,
+        values: Vec<Value>,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let mut roots = GcRoots::from_values(&[Value::Table(table)])?;
+        roots.extend(GcRoots::from_values(&values)?)?;
+        for (offset, value) in values.into_iter().enumerate() {
+            self.table_set(table, Value::Integer((offset + 1) as i64), value, &roots)?;
+        }
+        Ok(Vec::new())
+    }
+
+    fn append_gsub_callback_result(
+        &self,
+        result: &mut Vec<u8>,
+        callback_result: Value,
+        haystack: &[u8],
+        found: &BasicPatternMatch,
+    ) -> Result<(), RuntimeError> {
+        match callback_result {
+            Value::Nil | Value::Boolean(false) => {
+                append_limited_string(result, &haystack[found.start..found.end])?;
+            }
+            Value::String(value) => append_limited_string(result, &value)?,
+            Value::Integer(_) | Value::Number(_) => {
+                let value = try_concat_bytes(&callback_result)
+                    .expect("numeric callback replacements are concatenable")
+                    .expect("numeric callback replacements are concatenable");
+                append_limited_string(result, &value)?;
+            }
+            other => {
+                return Err(RuntimeError::Type {
+                    operation: "string.gsub callback replacement",
+                    expected: "string, number, false, or nil",
+                    actual: other.type_name(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn sync_native_operation_remaining(&mut self, remaining: &mut u64) {
+        if let Some(context) = self.native_contexts.last_mut() {
+            if context.remaining < *remaining {
+                *remaining = context.remaining;
+            } else {
+                context.remaining = *remaining;
+            }
+        }
+    }
+
+    fn current_close_thread(&self) -> ThreadId {
+        self.running_thread.unwrap_or(self.main_thread)
+    }
+
+    fn close_depth(&self) -> usize {
+        self.close_values
+            .get(&self.current_close_thread())
+            .map_or(0, Vec::len)
+    }
+
+    fn register_close_value(&mut self, value: Value) -> Result<(), RuntimeError> {
+        if !value.is_truthy() {
+            return Ok(());
+        }
+        let thread = self.current_close_thread();
+        if !self.close_values.contains_key(&thread) {
+            self.close_values
+                .try_reserve(1)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "to-be-closed value registry",
+                })?;
+            self.close_values.insert(thread, Vec::new());
+        }
+        let values = self
+            .close_values
+            .get_mut(&thread)
+            .expect("close value registry entry was inserted");
+        values
+            .try_reserve(1)
+            .map_err(|_| RuntimeError::Allocation {
+                what: "to-be-closed values",
+            })?;
+        values.push(value);
+        Ok(())
+    }
+
+    fn take_close_value(&mut self, value: &Value) {
+        let thread = self.current_close_thread();
+        let Some(values) = self.close_values.get_mut(&thread) else {
+            return;
+        };
+        if values.last() == Some(value) {
+            values.pop();
+        }
+        if values.is_empty() {
+            self.close_values.remove(&thread);
+        }
+    }
+
+    fn unwind_close_values(
+        &mut self,
+        marker: usize,
+        error: RuntimeError,
+        remaining: &mut u64,
+        depth: usize,
+    ) -> RuntimeError {
+        let thread = self.current_close_thread();
+        let mut final_error = error;
+        loop {
+            let value = {
+                let Some(values) = self.close_values.get_mut(&thread) else {
+                    break;
+                };
+                if values.len() <= marker {
+                    break;
+                }
+                values.pop().expect("close value length was checked")
+            };
+            if self.close_values.get(&thread).is_some_and(Vec::is_empty) {
+                self.close_values.remove(&thread);
+            }
+            let handler = match self.metamethod(&value, "__close") {
+                Ok(Some(handler)) => handler,
+                Ok(None) => {
+                    final_error = RuntimeError::Type {
+                        operation: "close",
+                        expected: "value with a __close metamethod",
+                        actual: value.type_name(),
+                    };
+                    continue;
+                }
+                Err(error) => {
+                    final_error = error;
+                    continue;
+                }
+            };
+            let error_value = runtime_error_value(final_error.clone());
+            let arguments = [value.clone(), error_value.clone()];
+            let roots = match GcRoots::from_values(&[handler.clone(), value, error_value]) {
+                Ok(roots) => roots,
+                Err(error) => {
+                    final_error = error;
+                    continue;
+                }
+            };
+            if let Err(error) = self.call_value(handler, &arguments, remaining, depth, roots) {
+                final_error = match error {
+                    RuntimeError::CoroutineYield(_) => RuntimeError::UnsupportedLibraryFeature {
+                        function: "__close",
+                        feature: "yielding close handlers during error unwinding",
+                    },
+                    error => error,
+                };
+            }
+        }
+        final_error
+    }
+
     fn call_value(
         &mut self,
         function: Value,
@@ -4562,6 +6151,9 @@ impl Vm {
     ) -> Result<Vec<Value>, RuntimeError> {
         match function {
             Value::Closure(closure) => {
+                if self.heap.is_blu_closure(closure)? {
+                    return self.call_blu_closure(closure, arguments, remaining, depth, roots);
+                }
                 let (closure_chunk, child, profile, _) = self.heap.closure_parts(closure)?;
                 self.push_active_roots(roots)?;
                 let result = self.execute_frame(
@@ -4683,9 +6275,23 @@ impl Vm {
                     .get(function.0 as usize)
                     .cloned()
                     .ok_or(RuntimeError::NativeFunction(function.0))?;
-                self.push_active_roots(roots)?;
+                try_reserve_exact(&mut self.native_contexts, 1, "native callback contexts")?;
+                self.native_contexts.push(NativeCallContext {
+                    remaining: *remaining,
+                    depth,
+                    roots: roots.try_clone()?,
+                });
+                if let Err(error) = self.push_active_roots(roots) {
+                    self.native_contexts.pop();
+                    return Err(error);
+                }
                 let result = function(self, arguments);
                 self.active_roots.pop();
+                let context = self
+                    .native_contexts
+                    .pop()
+                    .expect("native callback context must outlive its callback");
+                *remaining = context.remaining;
                 let values = result?;
                 if values.len() > self.native_result_limit {
                     return Err(RuntimeError::NativeResultLimit {
@@ -4713,6 +6319,185 @@ impl Vm {
                 actual: other.type_name(),
             }),
         }
+    }
+
+    fn call_blu_closure(
+        &mut self,
+        closure: ClosureId,
+        arguments: &[Value],
+        remaining: &mut u64,
+        depth: usize,
+        roots: GcRoots,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        self.call_blu_closure_with_suspend(closure, arguments, remaining, depth, roots, false)
+    }
+
+    fn call_blu_closure_with_suspend(
+        &mut self,
+        closure: ClosureId,
+        arguments: &[Value],
+        remaining: &mut u64,
+        depth: usize,
+        roots: GcRoots,
+        allow_suspend: bool,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if depth + 1 > self.call_limit {
+            return Err(RuntimeError::CallLimit {
+                limit: self.call_limit,
+            });
+        }
+        let (artifact, prototype, profile, _) = self.heap.blu_closure_parts(closure)?;
+        let environment = self.heap.blu_closure_environment(closure)?;
+        let close_marker = self.close_depth();
+        let active_root_count = self.active_roots.len();
+        self.push_active_roots(roots)?;
+        let previous_profile = self.active_profile.replace(profile);
+        let result = self.run_blu_v1_frame(
+            artifact,
+            prototype,
+            arguments,
+            Some(closure),
+            remaining,
+            depth + 1,
+            allow_suspend,
+            close_marker,
+            environment,
+        );
+        self.active_roots.truncate(active_root_count);
+        self.active_profile = previous_profile;
+        match result {
+            Ok(values) => Ok(values),
+            Err(RuntimeError::CoroutineYield(values)) => Err(RuntimeError::CoroutineYield(values)),
+            Err(error) => Err(self.unwind_close_values(close_marker, error, remaining, depth + 1)),
+        }
+    }
+
+    /// Invokes a guest callback from an embedding-provided native function
+    /// when the host operation cannot suspend across the callback boundary.
+    ///
+    /// This is the bounded counterpart to the runtime's resumable callback
+    /// machinery: a guest yield is converted into a structured unsupported
+    /// feature error and any captured continuation is discarded.
+    pub fn invoke_native_callback_without_yield(
+        &mut self,
+        operation: &'static str,
+        feature: &'static str,
+        function: Value,
+        arguments: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        match self.invoke_native_callback(operation, function, arguments) {
+            Err(RuntimeError::CoroutineYield(_)) => {
+                self.captured_blu_continuation.take();
+                Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: operation,
+                    feature,
+                })
+            }
+            result => result,
+        }
+    }
+
+    fn invoke_native_callback(
+        &mut self,
+        operation: &'static str,
+        function: Value,
+        arguments: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let Some(mut context) = self.native_contexts.pop() else {
+            return Err(RuntimeError::UnsupportedLibraryFeature {
+                function: operation,
+                feature: "callback outside a native execution context",
+            });
+        };
+        let result = (|| {
+            let mut roots = context.roots.try_clone()?;
+            roots.extend(GcRoots::from_values(arguments)?)?;
+            if let Value::Closure(closure) = function
+                && self.heap.is_blu_closure(closure)?
+            {
+                let previous_capture = self.capture_blu_continuation;
+                let previous_continuation = self.captured_blu_continuation.take();
+                self.capture_blu_continuation = true;
+                let result = self.call_blu_closure_with_suspend(
+                    closure,
+                    arguments,
+                    &mut context.remaining,
+                    context.depth,
+                    roots,
+                    true,
+                );
+                self.capture_blu_continuation = previous_capture;
+                if previous_continuation.is_some() {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: operation,
+                        feature: "nested captured callback continuations",
+                    });
+                }
+                result
+            } else {
+                self.call_value(
+                    function,
+                    arguments,
+                    &mut context.remaining,
+                    context.depth,
+                    roots,
+                )
+            }
+        })();
+        self.native_contexts.push(context);
+        result
+    }
+
+    fn invoke_native_comparison(
+        &mut self,
+        operation: &'static str,
+        left: Value,
+        right: Value,
+    ) -> Result<bool, RuntimeError> {
+        let Some(mut context) = self.native_contexts.pop() else {
+            return Err(RuntimeError::UnsupportedLibraryFeature {
+                function: operation,
+                feature: "comparison outside a native execution context",
+            });
+        };
+        let result = (|| {
+            let mut roots = context.roots.try_clone()?;
+            roots.push_value(left.clone())?;
+            roots.push_value(right.clone())?;
+            if let Some(function) = self.shared_metamethod(&left, &right, "__lt")? {
+                if let Value::Closure(closure) = function
+                    && self.heap.is_blu_closure(closure)?
+                {
+                    let previous_capture = self.capture_blu_continuation;
+                    let previous_continuation = self.captured_blu_continuation.take();
+                    self.capture_blu_continuation = true;
+                    let result = self.call_blu_closure_with_suspend(
+                        closure,
+                        &[left, right],
+                        &mut context.remaining,
+                        context.depth,
+                        roots,
+                        true,
+                    );
+                    self.capture_blu_continuation = previous_capture;
+                    if previous_continuation.is_some() {
+                        return Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: operation,
+                            feature: "nested captured callback continuations",
+                        });
+                    }
+                    return result.map(|values| values.first().is_some_and(Value::is_truthy));
+                }
+            }
+            self.compare_value(
+                Opcode::JumpIfLt,
+                left,
+                right,
+                CallContext::new(&mut context.remaining, context.depth, roots),
+            )
+        })();
+        self.native_contexts.push(context);
+        result
     }
 
     fn index_value(
@@ -5160,12 +6945,54 @@ impl Vm {
     }
 
     fn install_base_library(&mut self) -> Result<(), RuntimeError> {
+        let loaded = self.allocate_table(0, 0, &GcRoots::default())?;
+        let roots = GcRoots::from_values(&[Value::Table(loaded)])?;
+        let preload = self.allocate_table(0, 0, &roots)?;
+        let package = self.allocate_table(0, 2, &roots)?;
+        self.package_table = Some(package);
+        self.heap.table_set(
+            package,
+            Value::String(Arc::from(&b"loaded"[..])),
+            Value::Table(loaded),
+        )?;
+        self.heap.table_set(
+            package,
+            Value::String(Arc::from(&b"preload"[..])),
+            Value::Table(preload),
+        )?;
+        self.set_global(&b"package"[..], Value::Table(package));
+
         let require = self.register_function(|vm, arguments| {
             let name = arguments.first().ok_or(RuntimeError::Argument {
                 function: "require",
                 index: 1,
             })?;
             let name = Arc::<[u8]>::from(string_bytes(name, "require")?);
+            let package = vm
+                .global(b"package")
+                .and_then(|package| table_id(package).ok());
+            let loaded = package
+                .and_then(|package| {
+                    vm.heap
+                        .table_get(package, &Value::String(Arc::from(&b"loaded"[..])))
+                        .ok()
+                })
+                .and_then(|loaded| table_id(&loaded).ok());
+            let preload = package
+                .and_then(|package| {
+                    vm.heap
+                        .table_get(package, &Value::String(Arc::from(&b"preload"[..])))
+                        .ok()
+                })
+                .and_then(|loaded| table_id(&loaded).ok());
+            if let Some(loaded) = loaded {
+                let cached = vm
+                    .heap
+                    .table_get(loaded, &Value::String(Arc::clone(&name)))?;
+                if !matches!(cached, Value::Nil) {
+                    return Ok(vec![cached]);
+                }
+            }
             if let Some(value) = vm.module_cache.get(&name) {
                 return Ok(vec![value.clone()]);
             }
@@ -5178,9 +7005,38 @@ impl Vm {
                     what: "loading module set",
                 })?;
             vm.loading_modules.insert(name.clone());
-            let result = match vm.module_loader.clone() {
-                Some(loader) => loader(vm, &name),
-                None => Err(RuntimeError::ModuleLoaderMissing),
+            let result = if let Some(preload) = preload {
+                let loader = vm
+                    .heap
+                    .table_get(preload, &Value::String(Arc::clone(&name)))?;
+                if matches!(loader, Value::Nil) {
+                    match vm.module_loader.clone() {
+                        Some(loader) => loader(vm, &name),
+                        None => Err(RuntimeError::ModuleLoaderMissing),
+                    }
+                } else {
+                    let callback_result = vm.invoke_native_callback(
+                        "require",
+                        loader,
+                        &[Value::String(Arc::clone(&name))],
+                    );
+                    match callback_result {
+                        Ok(values) => Ok(values.into_iter().next().unwrap_or(Value::Boolean(true))),
+                        Err(RuntimeError::CoroutineYield(_)) => {
+                            vm.captured_blu_continuation.take();
+                            Err(RuntimeError::UnsupportedLibraryFeature {
+                                function: "require",
+                                feature: "yielding package.preload loaders",
+                            })
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
+            } else {
+                match vm.module_loader.clone() {
+                    Some(loader) => loader(vm, &name),
+                    None => Err(RuntimeError::ModuleLoaderMissing),
+                }
             };
             vm.loading_modules.remove(&name);
             let value = result?;
@@ -5190,9 +7046,103 @@ impl Vm {
                     what: "module cache",
                 })?;
             vm.module_cache.insert(name, value.clone());
+            if let Some(loaded) = loaded {
+                let mut roots = GcRoots::from_values(arguments)?;
+                roots.push_value(value.clone())?;
+                vm.table_set(
+                    loaded,
+                    Value::String(Arc::clone(
+                        arguments
+                            .first()
+                            .and_then(|value| match value {
+                                Value::String(name) => Some(name),
+                                _ => None,
+                            })
+                            .expect("require validated a string name"),
+                    )),
+                    value.clone(),
+                    &roots,
+                )?;
+            }
             Ok(vec![value])
         });
         self.set_global(&b"require"[..], Value::NativeFunction(require));
+
+        let getfenv = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if profile != SemanticProfile::Lua51 {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "getfenv",
+                    profile,
+                });
+            }
+            let value = arguments.first();
+            let environment = match value {
+                None => vm.default_environment()?,
+                Some(Value::Closure(closure)) if vm.heap.is_blu_closure(*closure)? => vm
+                    .heap
+                    .blu_closure_environment(*closure)?
+                    .unwrap_or(vm.default_environment()?),
+                Some(Value::NativeFunction(_)) => vm.default_environment()?,
+                Some(Value::Integer(_)) | Some(Value::Number(_)) => {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "getfenv",
+                        feature: "stack-level environments",
+                    });
+                }
+                Some(value) => {
+                    return Err(RuntimeError::Type {
+                        operation: "getfenv",
+                        expected: "function",
+                        actual: value.type_name(),
+                    });
+                }
+            };
+            Ok(vec![Value::Table(environment)])
+        });
+        self.set_global(&b"getfenv"[..], Value::NativeFunction(getfenv));
+
+        let setfenv = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if profile != SemanticProfile::Lua51 {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "setfenv",
+                    profile,
+                });
+            }
+            let function = arguments.first().ok_or(RuntimeError::Argument {
+                function: "setfenv",
+                index: 1,
+            })?;
+            let environment = arguments.get(1).ok_or(RuntimeError::Argument {
+                function: "setfenv",
+                index: 2,
+            })?;
+            let environment = table_id(environment)?;
+            let Value::Closure(closure) = function else {
+                if matches!(function, Value::Integer(_) | Value::Number(_)) {
+                    return Err(RuntimeError::UnsupportedLibraryFeature {
+                        function: "setfenv",
+                        feature: "stack-level environments",
+                    });
+                }
+                return Err(RuntimeError::Type {
+                    operation: "setfenv",
+                    expected: "Lua function",
+                    actual: function.type_name(),
+                });
+            };
+            if !vm.heap.is_blu_closure(*closure)? {
+                return Err(RuntimeError::Type {
+                    operation: "setfenv",
+                    expected: "Lua function",
+                    actual: "function",
+                });
+            }
+            vm.heap.closure_set_environment(*closure, environment)?;
+            Ok(vec![function.clone()])
+        });
+        self.set_global(&b"setfenv"[..], Value::NativeFunction(setfenv));
 
         let next = self.register_function(|vm, arguments| {
             let table = arguments.first().ok_or(RuntimeError::Argument {
@@ -5212,12 +7162,35 @@ impl Vm {
         });
         self.set_global(&b"next"[..], Value::NativeFunction(next));
 
-        let pairs = self.register_function(move |_, arguments| {
+        let pairs = self.register_function(move |vm, arguments| {
             let table = arguments.first().ok_or(RuntimeError::Argument {
                 function: "pairs",
                 index: 1,
             })?;
-            table_id(table)?;
+            let _table = table_id(table)?;
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Lua51)
+                && let Some(handler) = vm.metamethod(table, "__pairs")?
+            {
+                let result =
+                    vm.invoke_native_callback("pairs", handler, std::slice::from_ref(table));
+                return match result {
+                    Ok(values) => Ok(values),
+                    Err(error @ RuntimeError::CoroutineYield(_)) => {
+                        let continuation = vm.captured_blu_continuation.take().ok_or(
+                            RuntimeError::UnsupportedLibraryFeature {
+                                function: "pairs",
+                                feature: "yielding __pairs handlers",
+                            },
+                        )?;
+                        vm.pending_blu_operation = Some(PendingBluOperation::Pairs(PendingPairs {
+                            continuation: Box::new(continuation),
+                        }));
+                        Err(error)
+                    }
+                    Err(error) => Err(error),
+                };
+            }
             Ok(vec![Value::NativeFunction(next), table.clone(), Value::Nil])
         });
         self.set_global(&b"pairs"[..], Value::NativeFunction(pairs));
@@ -5631,6 +7604,39 @@ impl Vm {
         });
         self.set_global(&b"print"[..], Value::NativeFunction(print));
 
+        let mark_close = self.register_function(|vm, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "__blu_internal_mark_close",
+                index: 1,
+            })?;
+            vm.register_close_value(value.clone())?;
+            Ok(Vec::new())
+        });
+        self.set_global(
+            &b"__blu_internal_mark_close"[..],
+            Value::NativeFunction(mark_close),
+        );
+
+        let close = self.register_function(|vm, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "__blu_internal_close",
+                index: 1,
+            })?;
+            if !value.is_truthy() {
+                return Ok(Vec::new());
+            }
+            vm.take_close_value(value);
+            let handler = vm.metamethod(value, "__close")?.ok_or(RuntimeError::Type {
+                operation: "close",
+                expected: "value with a __close metamethod",
+                actual: value.type_name(),
+            })?;
+            let callback_arguments = [value.clone(), Value::Nil];
+            vm.invoke_native_callback("__blu_internal_close", handler, &callback_arguments)?;
+            Ok(Vec::new())
+        });
+        self.set_global(&b"__blu_internal_close"[..], Value::NativeFunction(close));
+
         let string_sub = self.register_function(|_, arguments| {
             let string = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.sub",
@@ -5766,6 +7772,103 @@ impl Vm {
                 Ok(values)
             }
         });
+        let string_gmatch = self.register_function(|vm, arguments| {
+            let subject = match arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.gmatch",
+                index: 1,
+            })? {
+                Value::String(value) => value.clone(),
+                other => {
+                    return Err(RuntimeError::Type {
+                        operation: "string.gmatch",
+                        expected: "string",
+                        actual: other.type_name(),
+                    });
+                }
+            };
+            let pattern = match arguments.get(1).ok_or(RuntimeError::Argument {
+                function: "string.gmatch",
+                index: 2,
+            })? {
+                Value::String(value) => value.clone(),
+                other => {
+                    return Err(RuntimeError::Type {
+                        operation: "string.gmatch",
+                        expected: "string",
+                        actual: other.type_name(),
+                    });
+                }
+            };
+            let initial = arguments
+                .get(2)
+                .map(|_| integer_argument(arguments, 2, "string.gmatch"))
+                .transpose()?
+                .unwrap_or(1);
+            let initial = relative_index(initial, subject.len()).max(1);
+            let subject_len = subject.len();
+            let state = Arc::new(Mutex::new(GmatchState {
+                subject,
+                pattern,
+                next_start: usize::try_from(initial.saturating_sub(1)).unwrap_or(usize::MAX),
+                exhausted: initial > subject_len as i64 + 1,
+            }));
+            let iterator_state = state.clone();
+            let iterator = vm.try_register_function(move |vm, _arguments| {
+                let mut state =
+                    iterator_state
+                        .lock()
+                        .map_err(|_| RuntimeError::UnsupportedLibraryFeature {
+                            function: "string.gmatch",
+                            feature: "iterator state unavailable",
+                        })?;
+                if state.exhausted {
+                    return Ok(vec![Value::Nil]);
+                }
+                let profile = vm.active_profile()?;
+                let Some(found) = find_basic_lua_pattern(
+                    &state.subject,
+                    &state.pattern,
+                    state.next_start,
+                    "string.gmatch",
+                    profile,
+                )?
+                else {
+                    state.exhausted = true;
+                    return Ok(vec![Value::Nil]);
+                };
+                let values = if found.capture_count == 0 {
+                    vec![limited_string_value(
+                        &state.subject[found.start..found.end],
+                    )?]
+                } else {
+                    let mut values =
+                        try_vec_with_capacity(found.capture_count, "string.gmatch captures")?;
+                    append_basic_capture_values(
+                        &mut values,
+                        vm,
+                        &state.subject,
+                        &found,
+                        "string.gmatch",
+                    )?;
+                    values
+                };
+                if found.end > found.start {
+                    state.next_start = found.end;
+                } else if found.start < state.subject.len() {
+                    state.next_start = found.start + 1;
+                } else {
+                    state.exhausted = true;
+                }
+                if values.len() > vm.native_result_limit {
+                    return Err(RuntimeError::NativeResultLimit {
+                        required: values.len(),
+                        limit: vm.native_result_limit,
+                    });
+                }
+                Ok(values)
+            })?;
+            Ok(vec![Value::NativeFunction(iterator)])
+        });
         let string_gsub = self.register_function(|vm, arguments| {
             let haystack = string_bytes(
                 arguments.first().ok_or(RuntimeError::Argument {
@@ -5789,12 +7892,7 @@ impl Vm {
             let replacement_table = match (replacement.as_ref(), replacement_value) {
                 (Some(_), _) => None,
                 (None, Value::Table(table)) => Some(*table),
-                (None, Value::Closure(_) | Value::NativeFunction(_)) => {
-                    return Err(RuntimeError::UnsupportedLibraryFeature {
-                        function: "string.gsub",
-                        feature: "callback replacements",
-                    });
-                }
+                (None, Value::Closure(_) | Value::NativeFunction(_)) => None,
                 (None, other) => {
                     return Err(RuntimeError::Type {
                         operation: "string.gsub",
@@ -5844,18 +7942,83 @@ impl Vm {
                         &found,
                         vm.active_profile()?,
                     )?;
+                } else if matches!(
+                    replacement_value,
+                    Value::Closure(_) | Value::NativeFunction(_)
+                ) {
+                    let mut callback_arguments = try_vec_with_capacity(
+                        found.capture_count.max(1),
+                        "string.gsub callback arguments",
+                    )?;
+                    if found.capture_count == 0 {
+                        callback_arguments
+                            .push(limited_string_value(&haystack[found.start..found.end])?);
+                    } else {
+                        append_basic_capture_values(
+                            &mut callback_arguments,
+                            vm,
+                            haystack,
+                            &found,
+                            "string.gsub",
+                        )?;
+                    }
+                    let callback_result = vm.invoke_native_callback(
+                        "string.gsub",
+                        replacement_value.clone(),
+                        &callback_arguments,
+                    );
+                    let callback_result = match callback_result {
+                        Ok(mut values) => values.pop().unwrap_or(Value::Nil),
+                        Err(error @ RuntimeError::CoroutineYield(_)) => {
+                            let continuation = vm.captured_blu_continuation.take().ok_or(
+                                RuntimeError::UnsupportedLibraryFeature {
+                                    function: "string.gsub",
+                                    feature: "yielding callback replacements",
+                                },
+                            )?;
+                            vm.pending_blu_operation = Some(PendingBluOperation::StringGsub(
+                                Box::new(PendingStringGsub {
+                                    haystack: Arc::from(haystack),
+                                    pattern: Arc::from(pattern),
+                                    callback: replacement_value.clone(),
+                                    result,
+                                    search_start,
+                                    copied_until,
+                                    replacements,
+                                    replacement_limit,
+                                    explicit_limit,
+                                    found,
+                                    continuation: Box::new(continuation),
+                                }),
+                            ));
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                    match callback_result {
+                        Value::Nil | Value::Boolean(false) => {
+                            append_limited_string(&mut result, &haystack[found.start..found.end])?;
+                        }
+                        Value::String(value) => append_limited_string(&mut result, &value)?,
+                        Value::Integer(_) | Value::Number(_) => {
+                            let value = try_concat_bytes(&callback_result)?
+                                .expect("numeric callback replacements are concatenable");
+                            append_limited_string(&mut result, &value)?;
+                        }
+                        other => {
+                            return Err(RuntimeError::Type {
+                                operation: "string.gsub callback replacement",
+                                expected: "string, number, false, or nil",
+                                actual: other.type_name(),
+                            });
+                        }
+                    }
                 } else {
                     let table = replacement_table.expect("replacement kind was validated");
                     let key = gsub_table_key(vm, haystack, &found)?;
-                    let value = vm.heap.table_get(table, &key)?;
+                    let value = gsub_table_value(vm, table, key)?;
                     match value {
                         Value::Nil => {
-                            if vm.metamethod(&Value::Table(table), "__index")?.is_some() {
-                                return Err(RuntimeError::UnsupportedLibraryFeature {
-                                    function: "string.gsub",
-                                    feature: "table replacement __index metamethods",
-                                });
-                            }
                             append_limited_string(&mut result, &haystack[found.start..found.end])?;
                         }
                         Value::Boolean(false) => {
@@ -5926,6 +8089,11 @@ impl Vm {
             string,
             Value::String(Arc::from(&b"match"[..])),
             Value::NativeFunction(string_match),
+        )?;
+        self.heap.table_set(
+            string,
+            Value::String(Arc::from(&b"gmatch"[..])),
+            Value::NativeFunction(string_gmatch),
         )?;
         self.heap.table_set(
             string,
@@ -6424,7 +8592,9 @@ impl Vm {
         let status = self.register_function(|vm, arguments| {
             let thread = thread_argument(arguments, 0, "coroutine.status")?;
             let status = match vm.threads.get(&thread) {
-                Some(ThreadState::New(_) | ThreadState::Suspended(_)) => b"suspended".as_slice(),
+                Some(
+                    ThreadState::New(_) | ThreadState::Suspended(_) | ThreadState::SuspendedBlu(_),
+                ) => b"suspended".as_slice(),
                 Some(ThreadState::Running) => b"running".as_slice(),
                 Some(ThreadState::Dead(_)) => b"dead".as_slice(),
                 None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
@@ -6514,7 +8684,9 @@ impl Vm {
                     Some(error) => vec![Value::Boolean(false), error.clone()],
                     None => vec![Value::Boolean(true)],
                 },
-                Some(ThreadState::New(_) | ThreadState::Suspended(_)) => {
+                Some(
+                    ThreadState::New(_) | ThreadState::Suspended(_) | ThreadState::SuspendedBlu(_),
+                ) => {
                     let empty = GcRoots::default();
                     let roots = GcRoots::from_values(arguments)?;
                     vm.thread_set_roots(thread, &empty, &roots)?;
@@ -6562,7 +8734,9 @@ impl Vm {
                     Value::String(Arc::from(&b"cannot resume non-suspended coroutine"[..])),
                 ]);
             }
-            Some(ThreadState::New(_) | ThreadState::Suspended(_)) => {}
+            Some(
+                ThreadState::New(_) | ThreadState::Suspended(_) | ThreadState::SuspendedBlu(_),
+            ) => {}
         }
         let mut thread_roots = roots;
         thread_roots.push_value(Value::Thread(thread))?;
@@ -6582,6 +8756,7 @@ impl Vm {
         let resumable = match state {
             ThreadState::New(function) => Resumable::New(function),
             ThreadState::Suspended(continuation) => Resumable::Continuation(continuation),
+            ThreadState::SuspendedBlu(continuation) => Resumable::BluContinuation(continuation),
             ThreadState::Running | ThreadState::Dead(_) => {
                 unreachable!("resumable thread state changed without re-entry")
             }
@@ -6589,13 +8764,43 @@ impl Vm {
         self.threads.insert(thread, ThreadState::Running);
         let previous_thread = self.running_thread.replace(thread);
         let result = match resumable {
-            Resumable::New(function) => self.call_value(
-                function,
-                arguments.get(1..).unwrap_or_default(),
-                remaining,
-                depth,
-                thread_roots,
-            ),
+            Resumable::New(function) => {
+                let entry_arguments = arguments.get(1..).unwrap_or_default();
+                if let Value::Closure(closure) = function
+                    && self.heap.is_blu_closure(closure)?
+                {
+                    let (artifact, prototype, profile, _) = self.heap.blu_closure_parts(closure)?;
+                    let environment = self.heap.blu_closure_environment(closure)?;
+                    let close_marker = self.close_depth();
+                    let active_root_count = self.active_roots.len();
+                    self.push_active_roots(thread_roots)?;
+                    let previous_profile = self.active_profile.replace(profile);
+                    let result = self.run_blu_v1_frame(
+                        artifact,
+                        prototype,
+                        entry_arguments,
+                        Some(closure),
+                        remaining,
+                        depth + 1,
+                        true,
+                        close_marker,
+                        environment,
+                    );
+                    self.active_roots.truncate(active_root_count);
+                    self.active_profile = previous_profile;
+                    match result {
+                        Ok(values) => Ok(values),
+                        Err(RuntimeError::CoroutineYield(values)) => {
+                            Err(RuntimeError::CoroutineYield(values))
+                        }
+                        Err(error) => {
+                            Err(self.unwind_close_values(close_marker, error, remaining, depth + 1))
+                        }
+                    }
+                } else {
+                    self.call_value(function, entry_arguments, remaining, depth, thread_roots)
+                }
+            }
             Resumable::Continuation(mut continuation) => {
                 let active_root_count = self.active_roots.len();
                 let result = (|| {
@@ -6621,6 +8826,11 @@ impl Vm {
                 self.active_roots.truncate(active_root_count);
                 result
             }
+            Resumable::BluContinuation(continuation) => self.resume_blu_v1(
+                *continuation,
+                arguments.get(1..).unwrap_or_default(),
+                remaining,
+            ),
         };
         self.running_thread = previous_thread;
         let finalized = match result {
@@ -6642,7 +8852,10 @@ impl Vm {
                 resumed
             }
             Err(RuntimeError::CoroutineYield(values))
-                if matches!(self.threads.get(&thread), Some(ThreadState::Suspended(_))) =>
+                if matches!(
+                    self.threads.get(&thread),
+                    Some(ThreadState::Suspended(_) | ThreadState::SuspendedBlu(_))
+                ) =>
             {
                 match try_prepend_value(values, Value::Boolean(true), "coroutine yield results") {
                     Ok(yielded) => yielded,
@@ -7090,15 +9303,9 @@ impl Vm {
                 index: 1,
             })?;
             let table = table_id(table)?;
-            if arguments
+            let comparator = arguments
                 .get(1)
-                .is_some_and(|value| !matches!(value, Value::Nil))
-            {
-                return Err(RuntimeError::UnsupportedLibraryFeature {
-                    function: "table.sort",
-                    feature: "custom comparators",
-                });
-            }
+                .filter(|value| !matches!(value, Value::Nil));
             let length = vm.heap.table_length(table)?;
             if length > MAX_DYNAMIC_REGISTERS {
                 return Err(RuntimeError::StackLimit {
@@ -7114,24 +9321,60 @@ impl Vm {
                 .iter()
                 .all(|value| value.as_number().is_some_and(|value| !value.is_nan()));
             let strings = values.iter().all(|value| matches!(value, Value::String(_)));
-            if !numeric && !strings {
-                let actual = values
-                    .iter()
-                    .find(|value| {
-                        if numeric {
-                            value.as_number().is_none()
+            if let Some(comparator) = comparator {
+                let mut callback_roots = GcRoots::from_values(&values)?;
+                callback_roots.extend(GcRoots::from_values(arguments)?)?;
+                vm.native_contexts
+                    .last_mut()
+                    .ok_or(RuntimeError::UnsupportedLibraryFeature {
+                        function: "table.sort",
+                        feature: "callback outside a native execution context",
+                    })?
+                    .roots
+                    .extend(callback_roots)?;
+                for index in 1..values.len() {
+                    let value = values[index].clone();
+                    let mut position = index;
+                    while position > 0 {
+                        let previous = values[position - 1].clone();
+                        let result = vm.invoke_native_callback(
+                            "table.sort",
+                            comparator.clone(),
+                            &[value.clone(), previous],
+                        );
+                        let result = match result {
+                            Ok(result) => result,
+                            Err(error @ RuntimeError::CoroutineYield(_)) => {
+                                let continuation = vm.captured_blu_continuation.take().ok_or(
+                                    RuntimeError::UnsupportedLibraryFeature {
+                                        function: "table.sort",
+                                        feature: "yielding custom comparators",
+                                    },
+                                )?;
+                                vm.pending_blu_operation =
+                                    Some(PendingBluOperation::TableSort(PendingTableSort {
+                                        table,
+                                        comparator: Some(comparator.clone()),
+                                        values,
+                                        index,
+                                        position,
+                                        current: value,
+                                        continuation: Box::new(continuation),
+                                    }));
+                                return Err(error);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        if result.first().is_some_and(Value::is_truthy) {
+                            values[position] = values[position - 1].clone();
+                            position -= 1;
                         } else {
-                            !matches!(value, Value::String(_))
+                            break;
                         }
-                    })
-                    .map_or("nil", Value::type_name);
-                return Err(RuntimeError::Type {
-                    operation: "table.sort",
-                    expected: "uniform ordered numbers or strings",
-                    actual,
-                });
-            }
-            if numeric {
+                    }
+                    values[position] = value;
+                }
+            } else if numeric {
                 values.sort_unstable_by(|left, right| {
                     if left.numeric_less(right) == Some(true) {
                         core::cmp::Ordering::Less
@@ -7141,11 +9384,61 @@ impl Vm {
                         core::cmp::Ordering::Equal
                     }
                 });
-            } else {
+            } else if strings {
                 values.sort_unstable_by(|left, right| match (left, right) {
                     (Value::String(left), Value::String(right)) => left.cmp(right),
                     _ => unreachable!("string sort values were validated"),
                 });
+            } else {
+                let mut callback_roots = GcRoots::from_values(&values)?;
+                callback_roots.extend(GcRoots::from_values(arguments)?)?;
+                vm.native_contexts
+                    .last_mut()
+                    .ok_or(RuntimeError::UnsupportedLibraryFeature {
+                        function: "table.sort",
+                        feature: "comparison outside a native execution context",
+                    })?
+                    .roots
+                    .extend(callback_roots)?;
+                for index in 1..values.len() {
+                    let value = values[index].clone();
+                    let mut position = index;
+                    while position > 0 {
+                        let previous = values[position - 1].clone();
+                        let result =
+                            vm.invoke_native_comparison("table.sort", value.clone(), previous);
+                        let result = match result {
+                            Ok(result) => result,
+                            Err(error @ RuntimeError::CoroutineYield(_)) => {
+                                let continuation = vm.captured_blu_continuation.take().ok_or(
+                                    RuntimeError::UnsupportedLibraryFeature {
+                                        function: "table.sort",
+                                        feature: "yielding metamethod ordering",
+                                    },
+                                )?;
+                                vm.pending_blu_operation =
+                                    Some(PendingBluOperation::TableSort(PendingTableSort {
+                                        table,
+                                        comparator: None,
+                                        values,
+                                        index,
+                                        position,
+                                        current: value,
+                                        continuation: Box::new(continuation),
+                                    }));
+                                return Err(error);
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        if result {
+                            values[position] = values[position - 1].clone();
+                            position -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                    values[position] = value;
+                }
             }
             let mut roots = GcRoots::from_values(arguments)?;
             roots.extend(GcRoots::from_values(&values)?)?;
@@ -7383,8 +9676,144 @@ impl Vm {
             let maximum = vm.heap.table_max_numeric_key(table_id(table)?)?;
             Ok(vec![Value::Number(maximum)])
         });
+        let foreach = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Lua51) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.foreach",
+                    profile,
+                });
+            }
+            let table = table_id(arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.foreach",
+                index: 1,
+            })?)?;
+            let callback = arguments.get(1).cloned().ok_or(RuntimeError::Argument {
+                function: "table.foreach",
+                index: 2,
+            })?;
+            if !matches!(
+                callback,
+                Value::Closure(_) | Value::CoroutineFunction(_) | Value::NativeFunction(_)
+            ) {
+                return Err(RuntimeError::Type {
+                    operation: "table.foreach",
+                    expected: "function",
+                    actual: callback.type_name(),
+                });
+            }
+            let mut key = Value::Nil;
+            while let Some((next_key, value)) = vm.heap.table_next(table, &key)? {
+                let result = vm.invoke_native_callback(
+                    "table.foreach",
+                    callback.clone(),
+                    &[next_key.clone(), value.clone()],
+                );
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error @ RuntimeError::CoroutineYield(_)) => {
+                        let continuation = vm.captured_blu_continuation.take().ok_or(
+                            RuntimeError::UnsupportedLibraryFeature {
+                                function: "table.foreach",
+                                feature: "yielding callbacks",
+                            },
+                        )?;
+                        vm.pending_blu_operation =
+                            Some(PendingBluOperation::TableForeach(PendingTableForeach {
+                                table,
+                                callback: callback.clone(),
+                                previous_key: key,
+                                current_key: next_key,
+                                current_value: value,
+                                continuation: Box::new(continuation),
+                            }));
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(result) = result
+                    .into_iter()
+                    .next()
+                    .filter(|value| !matches!(value, Value::Nil))
+                {
+                    return Ok(vec![result]);
+                }
+                key = next_key;
+            }
+            Ok(vec![Value::Nil])
+        });
+        let foreachi = self.register_function(|vm, arguments| {
+            let profile = vm.active_profile()?;
+            if !matches!(profile, SemanticProfile::Blu | SemanticProfile::Lua51) {
+                return Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "table.foreachi",
+                    profile,
+                });
+            }
+            let table = table_id(arguments.first().ok_or(RuntimeError::Argument {
+                function: "table.foreachi",
+                index: 1,
+            })?)?;
+            let callback = arguments.get(1).cloned().ok_or(RuntimeError::Argument {
+                function: "table.foreachi",
+                index: 2,
+            })?;
+            if !matches!(
+                callback,
+                Value::Closure(_) | Value::CoroutineFunction(_) | Value::NativeFunction(_)
+            ) {
+                return Err(RuntimeError::Type {
+                    operation: "table.foreachi",
+                    expected: "function",
+                    actual: callback.type_name(),
+                });
+            }
+            let length = vm.heap.table_length(table)?;
+            for index in 1..=length {
+                let result = vm.invoke_native_callback(
+                    "table.foreachi",
+                    callback.clone(),
+                    &[
+                        Value::Number(index as f64),
+                        vm.heap.table_get(table, &Value::Integer(index as i64))?,
+                    ],
+                );
+                let result = match result {
+                    Ok(result) => result,
+                    Err(error @ RuntimeError::CoroutineYield(_)) => {
+                        let continuation = vm.captured_blu_continuation.take().ok_or(
+                            RuntimeError::UnsupportedLibraryFeature {
+                                function: "table.foreachi",
+                                feature: "yielding callbacks",
+                            },
+                        )?;
+                        vm.pending_blu_operation =
+                            Some(PendingBluOperation::TableForeachi(PendingTableForeachi {
+                                table,
+                                callback: callback.clone(),
+                                index,
+                                length,
+                                current_value: vm
+                                    .heap
+                                    .table_get(table, &Value::Integer(index as i64))?,
+                                continuation: Box::new(continuation),
+                            }));
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(result) = result
+                    .into_iter()
+                    .next()
+                    .filter(|value| !matches!(value, Value::Nil))
+                {
+                    return Ok(vec![result]);
+                }
+            }
+            Ok(vec![Value::Nil])
+        });
 
-        let table = self.heap.allocate_table(0, 15)?;
+        let table = self.heap.allocate_table(0, 17)?;
         for (name, function) in [
             (&b"insert"[..], insert),
             (&b"remove"[..], remove),
@@ -7401,6 +9830,8 @@ impl Vm {
             (&b"isfrozen"[..], is_frozen),
             (&b"getn"[..], getn),
             (&b"maxn"[..], maxn),
+            (&b"foreach"[..], foreach),
+            (&b"foreachi"[..], foreachi),
         ] {
             self.heap.table_set(
                 table,
@@ -9113,11 +11544,19 @@ struct BasicPatternCapture {
     set: bool,
 }
 
+#[derive(Clone, Copy, Debug)]
 struct BasicPatternMatch {
     start: usize,
     end: usize,
     captures: [BasicPatternCapture; 32],
     capture_count: usize,
+}
+
+struct GmatchState {
+    subject: Arc<[u8]>,
+    pattern: Arc<[u8]>,
+    next_start: usize,
+    exhausted: bool,
 }
 
 const MAX_PATTERN_WORK: usize = 10_000_000;
@@ -9876,6 +12315,60 @@ fn gsub_table_key(
     } else {
         limited_string_value(&haystack[capture.start..capture.end])
     }
+}
+
+fn advance_gsub_operation(operation: &mut PendingStringGsub) {
+    operation.replacements += 1;
+    let found = operation.found;
+    if found.end > found.start {
+        operation.search_start = found.end;
+        operation.copied_until = found.end;
+    } else if found.start < operation.haystack.len() {
+        operation.search_start = found.start + 1;
+        operation.copied_until = operation.search_start;
+    } else {
+        operation.search_start = operation.haystack.len() + 1;
+        operation.copied_until = operation.haystack.len();
+    }
+}
+
+fn gsub_table_value(vm: &mut Vm, table: TableId, key: Value) -> Result<Value, RuntimeError> {
+    let mut table = table;
+    let limit = metatable_loop_limit(vm.active_profile()?);
+    for _ in 0..limit {
+        let value = vm.heap.table_get(table, &key)?;
+        if !matches!(value, Value::Nil) {
+            return Ok(value);
+        }
+        let Some(metatable) = vm.heap.table_metatable(table)? else {
+            return Ok(Value::Nil);
+        };
+        let index = vm
+            .heap
+            .table_get(metatable, &Value::String(Arc::from(&b"__index"[..])))?;
+        match index {
+            Value::Nil => return Ok(Value::Nil),
+            Value::Table(next) => table = next,
+            function @ (Value::Closure(_) | Value::NativeFunction(_)) => {
+                return Ok(vm
+                    .invoke_native_callback(
+                        "string.gsub",
+                        function,
+                        &[Value::Table(table), key.clone()],
+                    )?
+                    .into_iter()
+                    .next()
+                    .unwrap_or(Value::Nil));
+            }
+            other => {
+                return Err(RuntimeError::UnsupportedMetamethod {
+                    name: "__index",
+                    actual: other.type_name(),
+                });
+            }
+        }
+    }
+    Err(RuntimeError::MetatableLoop)
 }
 
 fn append_gsub_replacement(
@@ -10661,6 +13154,63 @@ fn continuation_roots(
         roots.extend(caller.gc_roots(heap)?)?;
     }
     Ok(roots)
+}
+
+fn blu_continuation_roots(continuation: &BluContinuation) -> Result<GcRoots, RuntimeError> {
+    let mut roots = blu_frame_roots(
+        &continuation.registers,
+        &continuation.varargs,
+        &continuation.open_upvalues,
+        continuation.closure,
+        &continuation.callers,
+    )?;
+    roots.extend(GcRoots::from_values(&continuation.constants)?)?;
+    roots.extend(GcRoots::from_values(&continuation.dynamic_results)?)?;
+    if let BluResume::Native { operation, .. } = &continuation.resume {
+        roots.extend(pending_blu_operation_roots(operation)?)?;
+    }
+    Ok(roots)
+}
+
+fn pending_blu_operation_roots(operation: &PendingBluOperation) -> Result<GcRoots, RuntimeError> {
+    match operation {
+        PendingBluOperation::StringGsub(operation) => {
+            let mut roots = GcRoots::from_values(std::slice::from_ref(&operation.callback))?;
+            roots.extend(blu_continuation_roots(&operation.continuation)?)?;
+            Ok(roots)
+        }
+        PendingBluOperation::TableForeach(operation) => {
+            let mut roots = GcRoots::from_values(&[
+                Value::Table(operation.table),
+                operation.callback.clone(),
+                operation.previous_key.clone(),
+                operation.current_key.clone(),
+                operation.current_value.clone(),
+            ])?;
+            roots.extend(blu_continuation_roots(&operation.continuation)?)?;
+            Ok(roots)
+        }
+        PendingBluOperation::TableForeachi(operation) => {
+            let mut roots = GcRoots::from_values(&[
+                Value::Table(operation.table),
+                operation.callback.clone(),
+                operation.current_value.clone(),
+            ])?;
+            roots.extend(blu_continuation_roots(&operation.continuation)?)?;
+            Ok(roots)
+        }
+        PendingBluOperation::TableSort(operation) => {
+            let mut roots =
+                GcRoots::from_values(&[Value::Table(operation.table), operation.current.clone()])?;
+            if let Some(comparator) = &operation.comparator {
+                roots.push_value(comparator.clone())?;
+            }
+            roots.extend(GcRoots::from_values(&operation.values)?)?;
+            roots.extend(blu_continuation_roots(&operation.continuation)?)?;
+            Ok(roots)
+        }
+        PendingBluOperation::Pairs(operation) => blu_continuation_roots(&operation.continuation),
+    }
 }
 
 fn materialize_constants(chunk: &Chunk, prototype: &Prototype) -> Result<Vec<Value>, RuntimeError> {
@@ -11519,6 +14069,115 @@ mod tests {
             3,
         );
         translate_baseline_to_luau(artifact, profile, BluLimits::default()).unwrap()
+    }
+
+    #[test]
+    fn direct_owned_chunks_can_execute_against_an_explicit_environment_table() {
+        let artifact = validated_blu_program(
+            SemanticProfile::Lua52,
+            vec![BluConstant::String(b"answer".to_vec())],
+            vec![
+                BluInstruction::NewTable { destination: 0 },
+                BluInstruction::LoadConstant {
+                    destination: 1,
+                    constant: 0,
+                },
+                BluInstruction::GetTable {
+                    destination: 2,
+                    table: 0,
+                    key: 1,
+                },
+                BluInstruction::Return { first: 2, count: 1 },
+            ],
+            FeatureBits::BASELINE | FeatureBits::TABLES,
+            3,
+        );
+        let mut vm = Vm::new(Dialect::Blu);
+        let environment = vm.heap.allocate_table(0, 1).unwrap();
+        vm.heap
+            .table_set(
+                environment,
+                Value::String(Arc::from(&b"answer"[..])),
+                Value::Integer(42),
+            )
+            .unwrap();
+        assert_eq!(
+            vm.execute_blu_v1_in_environment(artifact, BluLimits::default(), environment),
+            Ok(vec![Value::Number(42.0)])
+        );
+        assert_eq!(vm.global(b"answer"), None);
+    }
+
+    #[test]
+    fn owned_closure_created_with_an_environment_retains_loaded_chunk_state() {
+        let artifact = validated_blu_program(
+            SemanticProfile::Lua52,
+            vec![
+                BluConstant::String(b"answer".to_vec()),
+                BluConstant::Number(1.0),
+            ],
+            vec![
+                BluInstruction::NewTable { destination: 0 },
+                BluInstruction::LoadConstant {
+                    destination: 1,
+                    constant: 0,
+                },
+                BluInstruction::GetTable {
+                    destination: 2,
+                    table: 0,
+                    key: 1,
+                },
+                BluInstruction::LoadConstant {
+                    destination: 3,
+                    constant: 1,
+                },
+                BluInstruction::Add {
+                    destination: 4,
+                    left: 2,
+                    right: 3,
+                },
+                BluInstruction::SetTable {
+                    table: 0,
+                    key: 1,
+                    value: 4,
+                },
+                BluInstruction::Return { first: 4, count: 1 },
+            ],
+            FeatureBits::BASELINE | FeatureBits::TABLES,
+            5,
+        );
+        let mut vm = Vm::new(Dialect::Blu);
+        let environment = vm.heap.allocate_table(0, 1).unwrap();
+        vm.heap
+            .table_set(
+                environment,
+                Value::String(Arc::from(&b"answer"[..])),
+                Value::Integer(42),
+            )
+            .unwrap();
+        let Value::Closure(closure) = vm
+            .create_blu_v1_closure_in_environment(artifact, BluLimits::default(), environment)
+            .unwrap()
+        else {
+            panic!("environment-aware owned closure should be a closure value");
+        };
+        vm.set_global(&b"loaded"[..], Value::Closure(closure));
+
+        let mut remaining = 100;
+        assert_eq!(
+            vm.call_blu_closure(closure, &[], &mut remaining, 0, GcRoots::default()),
+            Ok(vec![Value::Number(43.0)])
+        );
+        assert_eq!(
+            vm.call_blu_closure(closure, &[], &mut remaining, 0, GcRoots::default()),
+            Ok(vec![Value::Number(44.0)])
+        );
+        assert_eq!(vm.global(b"answer"), None);
+        assert_eq!(
+            vm.heap
+                .table_get(environment, &Value::String(Arc::from(&b"answer"[..]))),
+            Ok(Value::Integer(44))
+        );
     }
 
     fn native(vm: &Vm, table: &[u8], name: &[u8]) -> NativeFunction {

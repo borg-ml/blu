@@ -77,6 +77,30 @@ fn floor_division_gate_covers_all_seven_profiles() {
 }
 
 #[test]
+fn labels_and_goto_follow_the_lua52_profile_gate() {
+    let source = source(b"::again:: goto again".to_vec());
+    for profile in SemanticProfile::ALL {
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        assert_eq!(
+            significant_kinds(&lexed),
+            [
+                TokenKind::ColonColon,
+                TokenKind::Identifier,
+                TokenKind::ColonColon,
+                TokenKind::Goto,
+                TokenKind::Identifier
+            ],
+            "{profile}"
+        );
+        assert_eq!(
+            lexed.has_errors(),
+            matches!(profile, SemanticProfile::Luau | SemanticProfile::Lua51),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn grouping_parentheses_are_profile_neutral_tokens() {
     for profile in SemanticProfile::ALL {
         let source = source(b"return (1 + 2)".to_vec());

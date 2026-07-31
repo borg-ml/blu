@@ -1536,16 +1536,23 @@ fn validate_prototype(
             feature: "closures",
         });
     }
-    if prototype.code.iter().any(|instruction| {
+    if prototype.code.iter().enumerate().any(|(pc, instruction)| {
         matches!(
             instruction,
-            Instruction::NewTable { .. }
-                | Instruction::GetTable { .. }
+            Instruction::GetTable { .. }
                 | Instruction::SetTable { .. }
                 | Instruction::SetListVarargs { .. }
                 | Instruction::SetListCall { .. }
                 | Instruction::SetListCallVarargs { .. }
-        )
+        ) || (matches!(instruction, Instruction::NewTable { .. })
+            && !(pc == 0
+                && matches!(
+                    prototype.profile,
+                    SemanticProfile::Lua52
+                        | SemanticProfile::Lua53
+                        | SemanticProfile::Lua54
+                        | SemanticProfile::Lua55
+                )))
     }) && !prototype.required_features.contains(FeatureBits::TABLES)
     {
         return Err(ValidationError::MissingFeature {

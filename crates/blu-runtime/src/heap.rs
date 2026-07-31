@@ -245,6 +245,7 @@ impl Heap {
                 profile,
                 upvalues,
                 upvalue_capacity,
+                environment: None,
             }))
         })?;
         Ok(ClosureId {
@@ -270,6 +271,7 @@ impl Heap {
                 profile,
                 upvalues,
                 upvalue_capacity,
+                environment: None,
             }))
         })?;
         Ok(ClosureId {
@@ -543,6 +545,37 @@ impl Heap {
         Ok(matches!(self.closure(closure)?.code, ClosureCode::Blu(_)))
     }
 
+    pub(crate) fn blu_closure_environment(
+        &self,
+        closure: ClosureId,
+    ) -> Result<Option<TableId>, HeapError> {
+        let closure_value = self.closure(closure)?;
+        if !matches!(closure_value.code, ClosureCode::Blu(_)) {
+            return Err(HeapError::ClosureFormat {
+                closure,
+                expected: "BluV1",
+            });
+        }
+        Ok(closure_value.environment)
+    }
+
+    pub(crate) fn closure_set_environment(
+        &mut self,
+        closure: ClosureId,
+        environment: TableId,
+    ) -> Result<(), HeapError> {
+        self.table(environment)?;
+        let closure_value = self.closure_mut(closure)?;
+        if !matches!(closure_value.code, ClosureCode::Blu(_)) {
+            return Err(HeapError::ClosureFormat {
+                closure,
+                expected: "BluV1",
+            });
+        }
+        closure_value.environment = Some(environment);
+        Ok(())
+    }
+
     pub(crate) fn closure_push_upvalue(
         &mut self,
         closure: ClosureId,
@@ -669,6 +702,9 @@ impl Heap {
                 }
                 Object::Closure(closure) => {
                     queue.extend(closure.upvalues.iter().copied().map(ObjectId::from));
+                    if let Some(environment) = closure.environment {
+                        queue.push_back(environment.into());
+                    }
                 }
                 Object::Upvalue(value) => enqueue_value(value, &mut queue),
                 Object::Thread(thread) => {
@@ -818,6 +854,13 @@ impl Heap {
             _ => Err(HeapError::StaleClosure(id)),
         }
     }
+
+    fn closure_mut(&mut self, id: ClosureId) -> Result<&mut Closure, HeapError> {
+        match self.object_mut(id.into()) {
+            Some(Object::Closure(closure)) => Ok(closure),
+            _ => Err(HeapError::StaleClosure(id)),
+        }
+    }
 }
 
 fn object_mut_in_slots(slots: &mut [Slot], id: ObjectId) -> Option<&mut Object> {
@@ -895,6 +938,7 @@ struct Closure {
     profile: SemanticProfile,
     upvalues: Vec<UpvalueId>,
     upvalue_capacity: usize,
+    environment: Option<TableId>,
 }
 
 #[derive(Clone, Debug)]

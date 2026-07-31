@@ -61,6 +61,11 @@ extraction, and field replacement in Blu, Luau, Lua 5.2, and Lua 5.3 profiles,
 with explicit profile-specific input conversion and result subtypes.
 Legacy `table.getn` and `table.maxn` are also profile-gated to the pinned
 versions that retain them, while Blu exposes both for migration.
+The Lua 5.1 `table.foreach` and `table.foreachi` callbacks are available in
+the Lua 5.1 and Blu profiles; callback results short-circuit iteration, and
+owned callbacks can yield and resume without restarting iteration. `pairs`
+honors profile-available `__pairs` handlers, including resumable owned
+handlers.
 The legacy `gcinfo` memory counter is likewise available only in Blu, Luau,
 and Lua 5.1 profiles.
 Core `tonumber` conversion preserves profile subtypes, hexadecimal integer and
@@ -79,10 +84,14 @@ All four Lua repetition suffixes are bounded: greedy `*`/`+`/`?` and minimal
 captures from the same byte-pattern engine, including `%1` through `%9`
 backreferences to completed substring captures and bounded `%bxy` nested byte
 pairs. Zero-width `%f[set]` byte frontiers share the bracket-set engine.
-`string.gsub` adds bounded string, number, and direct-table replacement,
-`%0`, `%1`–`%9`, `%%`, empty-match progress, replacement counts,
-profile-specific Lua 5.1 escape handling, and explicit rejection of callback
-and table-`__index` replacement paths that require resumable calls.
+`string.gmatch` returns a stateful function iterator with the same bounded
+pattern and capture behavior, including correct empty-match progress.
+`string.gsub` adds bounded string, number, direct-table, and function
+replacement, `%0`, `%1`–`%9`, `%%`, empty-match progress, replacement counts,
+and profile-specific Lua 5.1 escape handling. Synchronous table-`__index`
+replacement handlers are included. Owned coroutine callbacks can now yield
+once per match and resume with explicit operation state and GC roots; other
+native library callbacks remain pending.
 Blu/Luau `string.split` produces bounded byte-string arrays with Luau-compatible
 default, empty-separator, consecutive-separator, and empty-field behavior.
 Blu/Luau `table.create` and `table.find` provide bounded preallocation/fill and
@@ -97,8 +106,9 @@ yieldability.
 The base library exposes GC-safe `collectgarbage("collect")` and accounted-heap
 `collectgarbage("count")`; other version-specific commands fail explicitly.
 `table.sort` provides bounded, exact default ordering for uniform number and
-byte-string sequences; custom comparator callbacks remain explicit pending
-resumable calls.
+byte-string sequences, plus custom comparator callbacks and metamethod ordering.
+Owned comparators and ordering metamethods can yield and resume with explicit
+sort state and GC roots.
 Overlap-safe bounded `table.move` is available for Blu, Luau, and Lua 5.3–5.5,
 with explicit rejection in Lua 5.1–5.2 profiles.
 Ordinary bytecode calls use a bounded explicit VM frame stack; saved callers
@@ -106,18 +116,24 @@ remain GC roots. Initial generational coroutine threads implement
 `create`/`resume`/`yield`/`status`/`wrap`/`running`/`isyieldable`/`close`,
 including nested calls, resume arguments, successful protected-call
 suspension, resumed `pcall`/`xpcall` error unwinding, yielding error handlers,
-and GC-traced continuations.
+and GC-traced continuations. Owned BluV1 coroutine entry closures also
+suspend, resume repeatedly, and retain their frames through collection; native
+library operations that invoke yielding callbacks still need operation-specific
+continuations.
 Owned sole-call returns replace the current closure frame, providing proper
 tail recursion independently of the configured ordinary call-depth limit.
 Portable V1 package envelopes provide bounded canonical decoding, SHA-256
 identity, explicit dialect and authority requirements, and an opaque validated
 bytecode payload. The public engine currently executes only dialect-matched
-pure packages without imports; capability matching and linking fail
-explicitly until their host policies exist.
-The default engine selects `blu`; `--!dialect` directives are checked against
-the configured engine. Lua 5.1–5.5 profiles are declared but still fail
-explicitly as unimplemented. This is meaningful execution coverage, not yet a
-claim of complete Luau, Lua, or Blu compatibility.
+packages without imports when their authority profile and exact capability
+requirements are covered by the host policy; service linking still fails
+explicitly until its host bindings exist.
+The default legacy engine selects `blu`; `--!dialect` directives are checked
+against the configured engine. The public `Engine::execute_owned_source`
+entry point now exposes the bounded Blu-owned baseline for all seven profiles,
+including Lua 5.1–5.5, while the legacy bytecode path still rejects those
+profiles. This is meaningful execution coverage, not yet a claim of complete
+Luau, Lua, or Blu compatibility.
 
 The first Blu-owned frontend substrate is also present: `blu-syntax` performs
 bounded byte-oriented lexing and parses the initial local/assignment-list/return arithmetic
@@ -191,6 +207,9 @@ return are not emitted.
 Block-scoped `while` loops add separately feature-gated backward branches;
 validation records the target's definite-initialization state, and runtime
 execution remains subject to the VM instruction limit.
+Blu and Lua 5.2–5.5 also support owned `::label::` declarations and validated
+same-scope `goto` branches. Cross-scope jumps remain rejected until explicit
+upvalue-closing control flow is available.
 Embedders can also request persistent cooperative interruption from another
 thread through `Vm::interrupt_handle` or `Engine::interrupt_handle`; both
 execution engines stop with a structured error at an instruction boundary.
@@ -214,15 +233,29 @@ non-positive classification; Blu remains unassigned and Lua 5.4–5.5 reject
 zero explicitly. Dynamic steps execute for Luau and Lua 5.1–5.3 with
 single-evaluation snapshots and runtime direction selection; Blu and Lua
 5.4–5.5 reject them until their possible zero case is executable.
-Generic `for` now executes iterator/state/control triples in Blu, Luau, and
-Lua 5.1–5.3, including bounded final-call adjustment, lexical result
-variables, and nil-only termination. Lua 5.4–5.5 reject this syntax during
-lowering until their fourth to-be-closed control has real `__close` unwinding.
+Generic `for` executes iterator/state/control triples in every owned profile,
+including bounded final-call adjustment, lexical result variables, and nil-only
+termination. Lua 5.4–5.5 also preserve the fourth to-be-closed control and
+close it on normal loop exit and `break`. Lua 5.4/5.5 `<const>` and `<close>`
+local attributes are parsed; const writes are rejected and close locals run
+their `__close` handler on normal scope exit, `break`, return, `goto`, and
+protected errors, including reverse-order cleanup and resumable yielding
+handlers. Full finalizer/GC and abandoned-coroutine semantics remain incomplete.
 Canonical BluV1 global loads and stores connect the owned frontend to the VM's
 embedding registry. Unknown scalar reads produce `nil`, and scalar writes
-persist in the VM; identifier assignment lists can mix locals, captures, and
-globals while preserving simultaneous assignment. Environment-rebinding APIs
-remain explicitly unsupported.
+persist in the VM; Lua 5.2–5.5 owned chunks additionally use a rooted default
+environment synchronized with that registry, while explicit `_ENV` tables are
+captured through nested closures. Identifier assignment lists can mix locals,
+captures, and globals while preserving simultaneous assignment. Owned Lua
+5.2–5.5 source execution installs an environment-aware `load`: string chunks
+return callable closures rooted to the supplied fourth-argument table (or the
+default environment), and `Engine::load_owned_source` exposes the same
+closure primitive to embedders. Complete environment-rebinding APIs remain
+unsupported. The Lua 5.1 owned path additionally supports string
+`loadstring` plus function-targeted `getfenv`/`setfenv`; stack-level
+environment rebinding remains unsupported; owned `load` accepts bounded
+string-producing reader functions, while yielding readers, binary chunks, and
+exact mode-string behavior remain unsupported.
 The owned frontend also supports bounded table constructors with sequential
 array, identifier-keyed, and bracket-keyed fields, plus bracket and dot-name
 reads and single-target writes. These execute directly through the generational

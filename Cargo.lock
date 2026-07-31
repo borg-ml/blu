@@ -42,6 +42,8 @@ name = "blu-conformance"
 version = "0.1.0"
 dependencies = [
  "blu-compiler",
+ "blu-core",
+ "blu-lang",
  "blu-runtime",
  "tempfile",
 ]

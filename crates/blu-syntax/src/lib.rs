@@ -16,10 +16,11 @@ pub use ast::{
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement,
     CompoundAssignmentOperator, CompoundAssignmentStatement, ContinueStatement, DoStatement,
     Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody, FunctionExpression,
-    FunctionId, FunctionStatement, GenericForStatement, Identifier, IfClause, IfExpression,
-    IfStatement, IndexExpression, LocalFunctionStatement, LocalListStatement, LocalStatement,
-    MethodCallExpression, NumericForStatement, RepeatStatement, ReturnStatement, Statement,
-    TableConstructor, TableField, UnaryExpression, UnaryOperator, WhileStatement,
+    FunctionId, FunctionStatement, GenericForStatement, GotoStatement, Identifier, IfClause,
+    IfExpression, IfStatement, IndexExpression, LabelStatement, LocalAttribute,
+    LocalFunctionStatement, LocalListStatement, LocalStatement, MethodCallExpression,
+    NumericForStatement, RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField,
+    UnaryExpression, UnaryOperator, WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
@@ -149,6 +150,8 @@ pub enum TokenKind {
     Until,
     For,
     In,
+    Goto,
+    ColonColon,
     Break,
     Continue,
     Nil,
@@ -502,8 +505,24 @@ pub fn lex(
                 TokenKind::Semicolon
             }
             b':' => {
-                offset += 1;
-                TokenKind::Colon
+                let label = bytes.get(offset + 1) == Some(&b':');
+                offset += 1 + usize::from(label);
+                if label && !supports_goto(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "labels and goto are unavailable in this profile",
+                    )?;
+                }
+                if label {
+                    TokenKind::ColonColon
+                } else {
+                    TokenKind::Colon
+                }
             }
             byte @ (b'+' | b'-' | b'*' | b'%' | b'^') if bytes.get(offset + 1) == Some(&b'=') => {
                 offset += 2;
@@ -1047,6 +1066,25 @@ pub fn lex(
                     b"until" => TokenKind::Until,
                     b"for" => TokenKind::For,
                     b"in" => TokenKind::In,
+                    b"goto" => {
+                        if !supports_goto(explicit_profile) {
+                            let span = source.span(start, offset)?;
+                            let diagnostic = diagnostic(
+                                "BLU-LEX-0019",
+                                explicit_profile,
+                                span,
+                                "`goto` is unavailable in this profile",
+                                limits.diagnostic_limits,
+                            )?
+                            .try_with_found(&bytes[start..offset])?
+                            .try_with_note_parts(&[
+                                "selected profile: ",
+                                explicit_profile.as_str(),
+                            ])?;
+                            push_diagnostic(&mut diagnostics, diagnostic, limits.max_diagnostics)?;
+                        }
+                        TokenKind::Goto
+                    }
                     b"break" => TokenKind::Break,
                     b"continue" => {
                         if !supports_continue(explicit_profile) {
@@ -1335,6 +1373,24 @@ const fn supports_compound_assignment(profile: SemanticProfile) -> bool {
 
 const fn supports_continue(profile: SemanticProfile) -> bool {
     matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
+}
+
+const fn supports_goto(profile: SemanticProfile) -> bool {
+    matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Lua52
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    )
+}
+
+const fn supports_local_attributes(profile: SemanticProfile) -> bool {
+    matches!(
+        profile,
+        SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
+    )
 }
 
 const fn supports_numeric_separators(profile: SemanticProfile) -> bool {
