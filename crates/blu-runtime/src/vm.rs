@@ -36,6 +36,11 @@ const MAX_BLU_COROUTINE_ACTIVATIONS: usize = 256;
 // the remaining native bridge from consuming the host stack. It is deliberately
 // independent of the guest call limit.
 const MAX_PROTECTED_CALL_ACTIVATIONS: usize = 8;
+// Lua retries an xpcall message handler when the handler itself raises.  The
+// native C-call budget leaves room for the xpcall machinery; with the VM's
+// default limit, the observable boundary is 195 handler failures (196 raises
+// report "C stack overflow").
+const MAX_XPCALL_HANDLER_ERRORS: usize = 195;
 // A native coroutine root can retain a protected Blu continuation across
 // repeated yields. Bound its retained caller chain before resumptions become
 // quadratic; `coroutine.wrap` observes the resulting protected failure on the
@@ -58,7 +63,7 @@ const EXECUTION_DEADLINE_CHECK_INTERVAL: usize = 256;
 // trigger the normal memory-threshold collection path.
 const BLU_WEAK_STRING_COLLECTION_INTERVAL: usize = 64;
 const MAX_STRING_BYTES: usize = 64 * 1024 * 1024;
-const MAX_PACKSIZE_BYTES: usize = 1 << 30;
+const MAX_PACKSIZE_BYTES: usize = i32::MAX as usize;
 const MAX_LUAU_UNPACK_RESULTS: usize = 7_999;
 const DEFAULT_HOST_VALUE_LIMIT: usize = 4096;
 const DEFAULT_NATIVE_RESULT_LIMIT: usize = MAX_DYNAMIC_REGISTERS;
@@ -1025,14 +1030,15 @@ fn blu_callee_debug_name_parts(
                             _ => None,
                         })
                 };
-                let is_method = call_arguments
-                    .and_then(|(arguments, argument_count)| {
-                        (argument_count > 0).then(|| {
-                            registers.get(usize::from(arguments))
-                                == registers.get(usize::from(*table))
+                let is_method = blu_lua_method_available(prototype)
+                    && call_arguments
+                        .and_then(|(arguments, argument_count)| {
+                            (argument_count > 0).then(|| {
+                                registers.get(usize::from(arguments))
+                                    == registers.get(usize::from(*table))
+                            })
                         })
-                    })
-                    .unwrap_or(false);
+                        .unwrap_or(false);
                 let (namewhat, name) = match static_name {
                     Some(name) if is_method => (b"method".as_slice(), name),
                     Some(name)
@@ -1107,6 +1113,289 @@ fn blu_direct_native_debug_name(
     )))
 }
 
+fn blu_constant_debug_name(prototype: &BluPrototype, constant: u32) -> Option<Arc<[u8]>> {
+    match prototype.constants.get(usize::try_from(constant).ok()?) {
+        Some(BluConstant::String(name)) => Some(Arc::from(name.as_slice())),
+        _ => None,
+    }
+}
+
+fn blu_debug_constants(prototype: &BluPrototype) -> Result<Vec<Value>, RuntimeError> {
+    let mut constants =
+        try_vec_with_capacity(prototype.constants.len(), "Lua diagnostic constants")?;
+    for constant in &prototype.constants {
+        constants.push(match constant {
+            BluConstant::Nil => Value::Nil,
+            BluConstant::Boolean(value) => Value::Boolean(*value),
+            BluConstant::Number(value) => Value::Number(*value),
+            BluConstant::Integer(value) => Value::Integer(*value),
+            BluConstant::String(value) => Value::String(Arc::from(value.as_slice())),
+        });
+    }
+    Ok(constants)
+}
+
+fn blu_static_register_debug_name(
+    artifact: &BluArtifact,
+    prototype_index: usize,
+    register: u16,
+    pc: usize,
+    registers: &[Value],
+) -> BluDebugName {
+    let Some(prototype) = artifact.prototypes.get(prototype_index) else {
+        return (None, None);
+    };
+    let Ok(call_pc) = u32::try_from(pc) else {
+        return (None, None);
+    };
+    if let Some(local) = prototype.locals.iter().find(|local| {
+        local.start_pc <= call_pc && call_pc < local.end_pc && local.register == register
+    }) {
+        return (
+            Some(Arc::from(&b"local"[..])),
+            Some(Arc::from(local.name.as_slice())),
+        );
+    }
+    let mut source_register = register;
+    for (previous_pc, instruction) in prototype.code[..pc].iter().enumerate().rev() {
+        match instruction {
+            BluInstruction::LoadGlobal { destination, name } if *destination == source_register => {
+                return (
+                    Some(Arc::from(&b"global"[..])),
+                    blu_constant_debug_name(prototype, *name),
+                );
+            }
+            BluInstruction::GetUpvalue {
+                destination,
+                upvalue,
+            } if *destination == source_register => {
+                return prototype
+                    .upvalue_debug
+                    .get(usize::from(*upvalue))
+                    .filter(|debug| !debug.name.is_empty())
+                    .map_or((None, None), |debug| {
+                        (
+                            Some(Arc::from(&b"upvalue"[..])),
+                            Some(Arc::from(debug.name.as_slice())),
+                        )
+                    });
+            }
+            BluInstruction::GetTable {
+                destination,
+                table,
+                key,
+            } if *destination == source_register => {
+                let result_is_nil = registers
+                    .get(usize::from(source_register))
+                    .is_some_and(|value| matches!(value, Value::Nil));
+                let base_is_nil = registers
+                    .get(usize::from(*table))
+                    .is_some_and(|value| matches!(value, Value::Nil));
+                if result_is_nil && base_is_nil && *table != source_register {
+                    return blu_static_register_debug_name(
+                        artifact,
+                        prototype_index,
+                        *table,
+                        previous_pc,
+                        registers,
+                    );
+                }
+                let name = registers
+                    .get(usize::from(*key))
+                    .and_then(|value| match value {
+                        Value::String(name) => Some(Arc::clone(name)),
+                        _ => None,
+                    })
+                    .or_else(|| blu_static_key_debug_name(prototype, *key, previous_pc));
+                let table_is_environment = *table == 0
+                    || u32::try_from(previous_pc).ok().is_some_and(|pc| {
+                        prototype.locals.iter().any(|local| {
+                            local.register == *table
+                                && local.start_pc <= pc
+                                && pc < local.end_pc
+                                && local.name == b"_ENV"
+                        })
+                    });
+                let namewhat = if matches!(
+                    prototype.profile,
+                    SemanticProfile::Lua52
+                        | SemanticProfile::Lua53
+                        | SemanticProfile::Lua54
+                        | SemanticProfile::Lua55
+                ) && table_is_environment
+                {
+                    b"global".as_slice()
+                } else {
+                    b"field".as_slice()
+                };
+                return (Some(Arc::from(namewhat)), name);
+            }
+            BluInstruction::Move {
+                destination,
+                source,
+            } if *destination == source_register => source_register = *source,
+            _ if blu_instruction_destination(instruction) == Some(source_register) => break,
+            _ => {}
+        }
+    }
+    (None, None)
+}
+
+fn blu_static_key_debug_name(prototype: &BluPrototype, key: u16, pc: usize) -> Option<Arc<[u8]>> {
+    for instruction in prototype.code[..pc].iter().rev() {
+        match instruction {
+            BluInstruction::LoadConstant {
+                destination,
+                constant,
+            } if *destination == key => return blu_constant_debug_name(prototype, *constant),
+            BluInstruction::Move {
+                destination,
+                source,
+            } if *destination == key => {
+                return blu_static_key_debug_name(prototype, *source, pc);
+            }
+            _ if blu_instruction_destination(instruction) == Some(key) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn blu_static_callee_debug_name(
+    artifact: &BluArtifact,
+    prototype_index: usize,
+    pc: usize,
+) -> BluDebugName {
+    let Some(prototype) = artifact.prototypes.get(prototype_index) else {
+        return (None, None);
+    };
+    let Some(instruction) = prototype.code.get(pc) else {
+        return (None, None);
+    };
+    let Some(function) = blu_call_function_register(instruction) else {
+        return (None, None);
+    };
+    if let Ok(call_pc) = u32::try_from(pc)
+        && let Some(local) = prototype.locals.iter().find(|local| {
+            local.start_pc <= call_pc && call_pc < local.end_pc && local.register == function
+        })
+    {
+        return (
+            Some(Arc::from(&b"local"[..])),
+            Some(Arc::from(local.name.as_slice())),
+        );
+    }
+    let (arguments, argument_count) = blu_call_arguments(instruction).unwrap_or((0, 0));
+    let mut source_register = function;
+    for previous in prototype.code[..pc].iter().rev() {
+        match previous {
+            BluInstruction::LoadGlobal { destination, name } if *destination == source_register => {
+                return (
+                    Some(Arc::from(&b"global"[..])),
+                    blu_constant_debug_name(prototype, *name),
+                );
+            }
+            BluInstruction::GetUpvalue {
+                destination,
+                upvalue,
+            } if *destination == source_register => {
+                return prototype
+                    .upvalue_debug
+                    .get(usize::from(*upvalue))
+                    .filter(|debug| !debug.name.is_empty())
+                    .map_or((None, None), |debug| {
+                        (
+                            Some(Arc::from(&b"upvalue"[..])),
+                            Some(Arc::from(debug.name.as_slice())),
+                        )
+                    });
+            }
+            BluInstruction::GetTable {
+                destination,
+                table,
+                key,
+            } if *destination == source_register => {
+                let Some(name) = blu_static_key_debug_name(prototype, *key, pc) else {
+                    return (None, None);
+                };
+                let is_method = blu_lua_method_available(prototype)
+                    && argument_count > 0
+                    && blu_call_argument_origin(prototype, arguments, pc)
+                        .is_some_and(|origin| origin == *table);
+                let namewhat = if is_method {
+                    b"method".as_slice()
+                } else if matches!(
+                    prototype.profile,
+                    SemanticProfile::Lua52
+                        | SemanticProfile::Lua53
+                        | SemanticProfile::Lua54
+                        | SemanticProfile::Lua55
+                ) && *table == 0
+                {
+                    b"global".as_slice()
+                } else {
+                    b"field".as_slice()
+                };
+                return (Some(Arc::from(namewhat)), Some(name));
+            }
+            BluInstruction::Move {
+                destination,
+                source,
+            } if *destination == source_register => {
+                source_register = *source;
+            }
+            _ if blu_instruction_destination(previous) == Some(source_register) => break,
+            _ => {}
+        }
+    }
+    (None, None)
+}
+
+fn blu_call_argument_origin(prototype: &BluPrototype, argument: u16, pc: usize) -> Option<u16> {
+    for instruction in prototype.code[..pc].iter().rev() {
+        match instruction {
+            BluInstruction::Move {
+                destination,
+                source,
+            } if *destination == argument => return Some(*source),
+            _ if blu_instruction_destination(instruction) == Some(argument) => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+fn blu_lua_method_available(prototype: &BluPrototype) -> bool {
+    prototype.profile != SemanticProfile::Lua55 || prototype.register_count <= 255
+}
+
+fn blu_instruction_may_type_error(instruction: &BluInstruction) -> bool {
+    blu_call_function_register(instruction).is_some()
+        || matches!(
+            instruction,
+            BluInstruction::GetTable { .. }
+                | BluInstruction::SetTable { .. }
+                | BluInstruction::Negate { .. }
+                | BluInstruction::Length { .. }
+                | BluInstruction::Add { .. }
+                | BluInstruction::Subtract { .. }
+                | BluInstruction::Multiply { .. }
+                | BluInstruction::Divide { .. }
+                | BluInstruction::Modulo { .. }
+                | BluInstruction::Power { .. }
+                | BluInstruction::FloorDivide { .. }
+                | BluInstruction::BitwiseAnd { .. }
+                | BluInstruction::BitwiseOr { .. }
+                | BluInstruction::BitwiseExclusiveOr { .. }
+                | BluInstruction::ShiftLeft { .. }
+                | BluInstruction::ShiftRight { .. }
+                | BluInstruction::BitwiseNot { .. }
+                | BluInstruction::Concatenate { .. }
+                | BluInstruction::LessThan { .. }
+                | BluInstruction::LessEqual { .. }
+        )
+}
+
 #[derive(Clone, Debug)]
 enum BluCallResult {
     Fixed {
@@ -1166,6 +1455,7 @@ enum BluResume {
 #[derive(Clone, Debug)]
 enum PendingBluOperation {
     ResumeValues,
+    Close(PendingClose),
     ProtectedCall(Box<PendingProtectedCall>),
     LoadReader(Box<PendingLoadReader>),
     RequireSearcher(Box<PendingRequireSearcher>),
@@ -1178,6 +1468,16 @@ enum PendingBluOperation {
     TableSort(PendingTableSort),
     Pairs(PendingPairs),
     Ipairs(PendingPairs),
+}
+
+#[derive(Clone, Debug)]
+struct PendingClose {
+    continuation: Option<Box<BluContinuation>>,
+    values: Vec<Value>,
+    thread: Option<ThreadId>,
+    marker: usize,
+    depth: usize,
+    error: Option<RuntimeError>,
 }
 
 #[derive(Clone, Debug)]
@@ -1418,6 +1718,7 @@ pub struct Vm {
     dialect: Dialect,
     active_profile: Option<SemanticProfile>,
     prefix_luau_errors: bool,
+    prefix_lua_errors: bool,
     instruction_limit: u64,
     interrupted: Arc<AtomicBool>,
     deadline: Option<Instant>,
@@ -1450,6 +1751,7 @@ pub struct Vm {
     debug_tail_call_pending: bool,
     debug_native_call_name: Option<BluDebugName>,
     debug_metamethod_name: Option<Arc<[u8]>>,
+    debug_close_caller: Option<BluDebugFrame>,
     active_native_closures: Vec<ClosureId>,
     package_table: Option<TableId>,
     luau_os_table: Option<TableId>,
@@ -1482,6 +1784,7 @@ pub struct Vm {
     io_stream_opener: Option<IoStreamOpener>,
     io_file_handles: HashMap<UserDataId, IoFileState>,
     io_file_iterators: HashMap<ClosureId, UserDataId>,
+    io_file_metatable: Option<TableId>,
     io_file_lines_function: Option<NativeFunctionId>,
     io_file_setvbuf_function: Option<NativeFunctionId>,
     io_stdin: Option<UserDataId>,
@@ -1509,6 +1812,7 @@ pub struct Vm {
     thread_debug_frames: HashMap<ThreadId, Vec<BluDebugFrame>>,
     main_thread: ThreadId,
     running_thread: Option<ThreadId>,
+    call_metamethod_depth: usize,
     coroutine_resume_depth: usize,
     coroutine_delivery: Option<Vec<Value>>,
     output: Vec<u8>,
@@ -1521,10 +1825,12 @@ pub struct Vm {
     protected_call_scheduler_active: bool,
     protected_call_capture_active: bool,
     protected_call_target_depth: usize,
+    protected_call_handler_depth: usize,
     protected_native_target_depth: usize,
     protected_coroutine_target_depth: usize,
     protected_call_request: Option<ProtectedCallRequest>,
     close_values: HashMap<ThreadId, Vec<Value>>,
+    closing_threads: HashSet<ThreadId>,
     captured_blu_continuation: Option<BluContinuation>,
     capture_blu_continuation: bool,
     pending_blu_operation: Option<PendingBluOperation>,
@@ -1578,6 +1884,7 @@ impl Vm {
             dialect,
             active_profile: None,
             prefix_luau_errors: false,
+            prefix_lua_errors: false,
             instruction_limit: 10_000_000,
             interrupted: Arc::new(AtomicBool::new(false)),
             deadline: None,
@@ -1610,6 +1917,7 @@ impl Vm {
             debug_tail_call_pending: false,
             debug_native_call_name: None,
             debug_metamethod_name: None,
+            debug_close_caller: None,
             active_native_closures: Vec::new(),
             package_table: None,
             luau_os_table: None,
@@ -1642,6 +1950,7 @@ impl Vm {
             io_stream_opener: None,
             io_file_handles: HashMap::new(),
             io_file_iterators: HashMap::new(),
+            io_file_metatable: None,
             io_file_lines_function: None,
             io_file_setvbuf_function: None,
             io_stdin: None,
@@ -1669,6 +1978,7 @@ impl Vm {
             thread_debug_frames: HashMap::new(),
             main_thread,
             running_thread: None,
+            call_metamethod_depth: 0,
             coroutine_resume_depth: 0,
             coroutine_delivery: None,
             output: Vec::new(),
@@ -1681,10 +1991,12 @@ impl Vm {
             protected_call_scheduler_active: false,
             protected_call_capture_active: false,
             protected_call_target_depth: 0,
+            protected_call_handler_depth: 0,
             protected_native_target_depth: 0,
             protected_coroutine_target_depth: 0,
             protected_call_request: None,
             close_values: HashMap::new(),
+            closing_threads: HashSet::new(),
             captured_blu_continuation: None,
             capture_blu_continuation: false,
             pending_blu_operation: None,
@@ -1993,6 +2305,53 @@ impl Vm {
         append_limited_string(&mut prefix, source.as_bytes())?;
         append_formatted_string(&mut prefix, format_args!(":{line}: "))?;
         Ok(Some(prefix))
+    }
+
+    fn lua_family_frame_error(&self, error: RuntimeError) -> Result<RuntimeError, RuntimeError> {
+        if !matches!(
+            self.active_profile,
+            Some(
+                SemanticProfile::Lua51
+                    | SemanticProfile::Lua52
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            )
+        ) {
+            return Ok(error);
+        }
+        let Some(frame) = self.blu_debug_frames.last() else {
+            return Ok(error);
+        };
+        let prototype = frame
+            .artifact
+            .prototypes
+            .get(frame.prototype)
+            .ok_or(RuntimeError::InvalidPrototype(frame.prototype))?;
+        let line_pc = frame.pc;
+        let Some(line) = prototype
+            .line_info
+            .get(line_pc)
+            .copied()
+            .filter(|line| *line != 0)
+        else {
+            return Ok(error);
+        };
+        let Some(source) = frame
+            .artifact
+            .sources
+            .iter()
+            .find(|source| source.identity.id() == prototype.source)
+            .map(|source| source.identity.name())
+        else {
+            return Ok(error);
+        };
+        let source = lua_short_source(source);
+        let mut prefix = try_vec_with_capacity(source.len() + 16, "Lua error source prefix")?;
+        prefix.extend_from_slice(&source);
+        append_formatted_string(&mut prefix, format_args!(":{line}: "))?;
+        prefix.extend_from_slice(error.to_string().as_bytes());
+        Ok(RuntimeError::Raised(Value::String(Arc::from(prefix))))
     }
 
     /// Returns the active caller's semantic profile, or the VM's configured
@@ -3015,7 +3374,7 @@ impl Vm {
         profile: SemanticProfile,
     ) -> Result<(), RuntimeError> {
         let environment = self.ensure_global_environment()?;
-        let roots = GcRoots::from_values(&[Value::Table(environment)])?;
+        let mut roots = GcRoots::from_values(&[Value::Table(environment)])?;
         self.table_set(
             environment,
             Value::String(Arc::from(b"_G".as_slice())),
@@ -3101,9 +3460,24 @@ impl Vm {
         self.table_set(
             environment,
             Value::String(Arc::from(b"utf8".as_slice())),
-            utf8,
+            utf8.clone(),
             &GcRoots::default(),
         )?;
+        if let Value::Table(utf8_table) = utf8 {
+            roots.push_value(Value::Table(utf8_table))?;
+            let charpattern = if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55)
+            {
+                &b"[\0-\x7F\xC2-\xFD][\x80-\xBF]*"[..]
+            } else {
+                &b"[\0-\x7F\xC2-\xF4][\x80-\xBF]*"[..]
+            };
+            self.table_set(
+                utf8_table,
+                Value::String(Arc::from(b"charpattern".as_slice())),
+                Value::String(Arc::from(charpattern)),
+                &roots,
+            )?;
+        }
         let warn = if matches!(
             profile,
             SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
@@ -3463,6 +3837,7 @@ impl Vm {
             .and_then(|count| count.checked_add(usize::from(self.global_environment.is_some())))
             .and_then(|count| count.checked_add(usize::from(self.package_table.is_some())))
             .and_then(|count| count.checked_add(usize::from(self.luau_os_table.is_some())))
+            .and_then(|count| count.checked_add(usize::from(self.io_file_metatable.is_some())))
             .and_then(|count| count.checked_add(1))
             .and_then(|count| {
                 count.checked_add(
@@ -3509,6 +3884,14 @@ impl Vm {
                         count.checked_add(frame.registers.len())
                     })
             })
+            .and_then(|count| {
+                count.checked_add(usize::from(
+                    self.debug_close_caller
+                        .as_ref()
+                        .and_then(|frame| frame.closure)
+                        .is_some(),
+                ))
+            })
             .and_then(|count| count.checked_add(self.pending_debug_local_writes.len()))
             .and_then(|count| count.checked_add(self.module_cache.len()))
             .and_then(|count| count.checked_add(active_value_count))
@@ -3543,6 +3926,9 @@ impl Vm {
         }
         if let Some(os) = self.luau_os_table {
             all_roots.push(Value::Table(os));
+        }
+        if let Some(file_metatable) = self.io_file_metatable {
+            all_roots.push(Value::Table(file_metatable));
         }
         all_roots.push(Value::Table(self.registry));
         all_roots.extend(
@@ -3591,6 +3977,13 @@ impl Vm {
                 frame.pc,
                 &frame.registers,
             )?);
+        }
+        if let Some(closure) = self
+            .debug_close_caller
+            .as_ref()
+            .and_then(|frame| frame.closure)
+        {
+            all_roots.push(Value::Closure(closure));
         }
         all_roots.extend(
             self.pending_debug_local_writes
@@ -3906,6 +4299,7 @@ impl Vm {
                 what: "io file handle registry",
             })?;
         let userdata = self.allocate_userdata(Arc::from(&b"file"[..]), roots)?;
+        self.attach_io_file_metatable(userdata)?;
         self.io_file_handles.insert(
             userdata,
             IoFileState {
@@ -3929,6 +4323,14 @@ impl Vm {
             IoStreamKind::Stderr => self.io_stderr = Some(userdata),
         }
         Ok(userdata)
+    }
+
+    fn attach_io_file_metatable(&mut self, userdata: UserDataId) -> Result<(), RuntimeError> {
+        if let Some(metatable) = self.io_file_metatable {
+            self.heap
+                .set_userdata_metatable(userdata, Some(metatable))?;
+        }
+        Ok(())
     }
 
     fn current_io_stream(
@@ -4334,6 +4736,23 @@ impl Vm {
         result
     }
 
+    /// Executes an owned chunk with source-facing diagnostics for Luau and
+    /// Lua-family profiles. Direct [`Self::execute_blu_v1`] callers retain the
+    /// structured [`RuntimeError`] surface; source engines opt into the
+    /// profile-specific textual diagnostics through this method.
+    pub fn execute_blu_v1_with_source_errors(
+        &mut self,
+        artifact: ValidatedBluArtifact,
+        execution_limits: BluLimits,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let previous_luau = core::mem::replace(&mut self.prefix_luau_errors, true);
+        let previous_lua = core::mem::replace(&mut self.prefix_lua_errors, true);
+        let result = self.execute_blu_v1_with_environment(artifact, execution_limits, None);
+        self.prefix_luau_errors = previous_luau;
+        self.prefix_lua_errors = previous_lua;
+        result
+    }
+
     /// Executes an owned chunk with an explicitly supplied profile environment
     /// table. The table must remain retained by the host for the duration of
     /// the call. This is the execution primitive used by environment-aware
@@ -4356,9 +4775,11 @@ impl Vm {
         execution_limits: BluLimits,
         environment: TableId,
     ) -> Result<Value, RuntimeError> {
-        let artifact = ValidatedBluArtifact::new(artifact.into_artifact(), execution_limits)
-            .map_err(RuntimeError::BluValidation)?
-            .into_artifact();
+        let artifact = Arc::new(
+            ValidatedBluArtifact::new(artifact.into_artifact(), execution_limits)
+                .map_err(RuntimeError::BluValidation)?
+                .into_artifact(),
+        );
         let main = usize::try_from(artifact.main)
             .map_err(|_| RuntimeError::InvalidMainPrototype(usize::MAX))?;
         let prototype = artifact
@@ -4388,11 +4809,26 @@ impl Vm {
         let upvalue_count = prototype.upvalues.len();
         let mut roots = GcRoots::from_values(&[Value::Table(environment)])?;
         let closure =
-            self.allocate_blu_closure(Arc::new(artifact), main, profile, upvalue_count, &roots)?;
+            self.allocate_blu_closure(Arc::clone(&artifact), main, profile, upvalue_count, &roots)?;
         self.heap.closure_set_environment(closure, environment)?;
         roots.push_value(Value::Closure(closure))?;
         for index in 0..upvalue_count {
-            let value = if index == 0 && profile != SemanticProfile::Lua51 {
+            let dumped_function = prototype
+                .required_features
+                .contains(FeatureBits::DUMPED_FUNCTION);
+            let dumped_environment = dumped_function
+                && index == 0
+                && prototype
+                    .upvalue_debug
+                    .get(index)
+                    .is_none_or(|debug| debug.name.is_empty());
+            let value = if profile != SemanticProfile::Lua51
+                && (dumped_environment
+                    || prototype
+                        .upvalue_debug
+                        .get(index)
+                        .is_some_and(|debug| debug.name.as_slice() == b"_ENV"))
+            {
                 Value::Table(environment)
             } else {
                 Value::Nil
@@ -4801,16 +5237,31 @@ impl Vm {
             close_marker,
             environment,
         );
-        self.protected_call_target_depth = self.protected_call_target_depth.saturating_sub(1);
         self.active_roots.truncate(active_root_count);
         self.active_profile = previous_profile;
         self.active_blu_environment = previous_environment;
         match result {
-            Ok(values) => Ok(values),
-            Err(error @ RuntimeError::ProtectedCallActivation) => Err(error),
-            Err(error @ RuntimeError::CoroutineYield(_)) => Err(error),
+            Ok(values) => {
+                self.protected_call_target_depth =
+                    self.protected_call_target_depth.saturating_sub(1);
+                Ok(values)
+            }
+            Err(error @ RuntimeError::ProtectedCallActivation) => {
+                self.protected_call_target_depth =
+                    self.protected_call_target_depth.saturating_sub(1);
+                Err(error)
+            }
+            Err(error @ RuntimeError::CoroutineYield(_)) => {
+                self.protected_call_target_depth =
+                    self.protected_call_target_depth.saturating_sub(1);
+                Err(error)
+            }
             Err(error) => {
-                Err(self.unwind_close_values(close_marker, error, remaining, request.depth + 1))
+                let error =
+                    self.unwind_close_values(close_marker, error, remaining, request.depth + 1);
+                self.protected_call_target_depth =
+                    self.protected_call_target_depth.saturating_sub(1);
+                Err(error)
             }
         }
     }
@@ -4824,12 +5275,10 @@ impl Vm {
         match result {
             Ok(values) => try_prepend_value(values, Value::Boolean(true), "protected call results"),
             Err(error @ RuntimeError::CoroutineYield(_)) => Err(error),
-            Err(RuntimeError::ProtectedCallActivation) => {
-                Err(RuntimeError::UnsupportedLibraryFeature {
-                    function: "xpcall",
-                    feature: "protected activation from an error handler",
-                })
-            }
+            Err(RuntimeError::ProtectedCallActivation) => Ok(vec![
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"error in error handling"[..])),
+            ]),
             Err(error) if request.handler.is_some() => {
                 let handler = request
                     .handler
@@ -4838,20 +5287,16 @@ impl Vm {
                     .clone();
                 let source_memory_error =
                     guest_memory_diagnostic(request.profile) && is_guest_memory_error(&error);
-                let error_value = xpcall_runtime_error_value(error, request.profile);
-                let mut roots = request.roots.try_clone()?;
-                roots.push_value(handler.clone())?;
-                roots.push_value(error_value.clone())?;
-                match self.call_value(
+                let handler_result = self.call_xpcall_handler(
                     handler,
-                    &[error_value],
+                    error,
+                    request.profile,
+                    false,
                     remaining,
-                    request
-                        .depth
-                        .saturating_add(PROTECTED_CALL_BASE_DEPTH)
-                        .min(self.call_limit.saturating_sub(1)),
-                    roots,
-                ) {
+                    request.depth.saturating_add(PROTECTED_CALL_BASE_DEPTH),
+                    &request.roots,
+                );
+                match handler_result {
                     Ok(values) => Ok(vec![
                         Value::Boolean(false),
                         values.into_iter().next().unwrap_or(Value::Nil),
@@ -4868,12 +5313,16 @@ impl Vm {
                     Err(RuntimeError::CoroutineYield(values)) => {
                         Err(RuntimeError::CoroutineYield(values))
                     }
-                    Err(RuntimeError::ProtectedCallActivation) => {
-                        Err(RuntimeError::UnsupportedLibraryFeature {
+                    Err(RuntimeError::ProtectedCallActivation) => Ok(vec![
+                        Value::Boolean(false),
+                        Value::String(Arc::from(&b"error in error handling"[..])),
+                    ]),
+                    Err(
+                        error @ RuntimeError::UnsupportedLibraryFeature {
                             function: "xpcall",
                             feature: "protected activation from an error handler",
-                        })
-                    }
+                        },
+                    ) => Err(error),
                     Err(handler_error)
                         if source_memory_error && is_guest_memory_error(&handler_error) =>
                     {
@@ -4882,6 +5331,11 @@ impl Vm {
                             Value::String(Arc::from(&b"not enough memory"[..])),
                         ])
                     }
+                    Err(error @ RuntimeError::CallLimit { .. })
+                    | Err(error @ RuntimeError::CStackOverflow { .. }) => Ok(vec![
+                        Value::Boolean(false),
+                        xpcall_runtime_error_value(error, request.profile),
+                    ]),
                     Err(_) => Ok(vec![
                         Value::Boolean(false),
                         Value::String(Arc::from(&b"error in error handling"[..])),
@@ -4896,6 +5350,58 @@ impl Vm {
                 Value::Boolean(false),
                 pcall_runtime_error_value(error, request.profile),
             ]),
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn call_xpcall_handler(
+        &mut self,
+        handler: Value,
+        initial_error: RuntimeError,
+        profile: SemanticProfile,
+        retry_handler_errors: bool,
+        remaining: &mut u64,
+        depth: usize,
+        roots: &GcRoots,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let mut error = initial_error;
+        let mut handler_errors = 0usize;
+        loop {
+            let error_value = xpcall_runtime_error_value(error.clone(), profile);
+            let mut handler_roots = roots.try_clone()?;
+            handler_roots.push_value(handler.clone())?;
+            handler_roots.push_value(error_value.clone())?;
+            self.protected_call_handler_depth = self.protected_call_handler_depth.saturating_add(1);
+            let result = self.call_value(
+                handler.clone(),
+                &[error_value],
+                remaining,
+                depth.min(self.call_limit.saturating_sub(1)),
+                handler_roots,
+            );
+            self.protected_call_handler_depth = self.protected_call_handler_depth.saturating_sub(1);
+            match result {
+                Ok(values) => return Ok(values),
+                Err(error @ RuntimeError::CoroutineYield(_))
+                | Err(error @ RuntimeError::CoroutineCloseYield(_))
+                | Err(error @ RuntimeError::ProtectedCallActivation)
+                | Err(error @ RuntimeError::CallLimit { .. })
+                | Err(error @ RuntimeError::CStackOverflow { .. }) => return Err(error),
+                Err(next_error) => {
+                    if !retry_handler_errors {
+                        return Err(next_error);
+                    }
+                    handler_errors = handler_errors.saturating_add(1);
+                    if handler_errors > MAX_XPCALL_HANDLER_ERRORS {
+                        return Err(RuntimeError::CStackOverflow {
+                            limit: MAX_XPCALL_HANDLER_ERRORS,
+                        });
+                    }
+                    // The next handler invocation receives the error raised by
+                    // this invocation, matching Lua's retry semantics.
+                    error = next_error;
+                }
+            }
         }
     }
 
@@ -5049,27 +5555,45 @@ impl Vm {
             close_marker,
             frame_environment,
         );
+        let result = self.prefix_lua_family_type_error(result);
         let result = self.prefix_luau_frame_error(result);
         let debug_snapshot =
             if result.is_err() && !matches!(&result, Err(RuntimeError::CoroutineYield(_))) {
-                self.running_thread
-                    .filter(|thread| {
-                        self.blu_debug_frames.len() > debug_frame_depth
-                            && !self.thread_debug_frames.contains_key(thread)
-                    })
-                    .map(|thread| {
-                        snapshot_blu_debug_frames(&self.blu_debug_frames[debug_frame_depth..])
-                            .map(|frames| (thread, frames))
-                    })
+                let thread = self.running_thread.unwrap_or(self.main_thread);
+                (self.blu_debug_frames.len() > debug_frame_depth).then(|| {
+                    snapshot_blu_debug_frames(&self.blu_debug_frames[debug_frame_depth..])
+                        .map(|frames| (thread, frames))
+                })
             } else {
                 None
             };
+        let stack_overflow = matches!(
+            &result,
+            Err(RuntimeError::CallLimit { .. } | RuntimeError::CStackOverflow { .. })
+        );
+        let debug_snapshot = debug_snapshot.map(|snapshot| {
+            snapshot.map(|(thread, mut frames)| {
+                if stack_overflow {
+                    for frame in &mut frames {
+                        frame.pc = frame.pc.saturating_sub(1);
+                    }
+                }
+                (thread, frames)
+            })
+        });
         self.blu_debug_frames.truncate(debug_frame_depth);
         self.active_blu_environment = previous_environment;
         self.active_blu_closure = previous_closure;
         if let Some(snapshot) = debug_snapshot {
-            let (thread, frames) = snapshot?;
-            if !self.thread_debug_frames.contains_key(&thread) {
+            let (thread, mut frames) = snapshot?;
+            if let Some(mut previous) = self.thread_debug_frames.remove(&thread) {
+                frames
+                    .try_reserve(previous.len())
+                    .map_err(|_| RuntimeError::Allocation {
+                        what: "coroutine debug frames",
+                    })?;
+                frames.append(&mut previous);
+            } else {
                 self.thread_debug_frames
                     .try_reserve(1)
                     .map_err(|_| RuntimeError::Allocation {
@@ -5112,11 +5636,368 @@ impl Vm {
         };
         let message = if matches!(error, RuntimeError::CallLimit { .. }) {
             b"stack overflow".to_vec()
+        } else if matches!(error, RuntimeError::CStackOverflow { .. }) {
+            b"C stack overflow".to_vec()
         } else {
             error.to_string().into_bytes()
         };
         prefix.extend_from_slice(&message);
         Err(RuntimeError::Raised(Value::String(Arc::from(prefix))))
+    }
+
+    fn prefix_lua_family_type_error(
+        &self,
+        result: Result<Vec<Value>, RuntimeError>,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let Err(error) = result else {
+            return result;
+        };
+        if !self.prefix_lua_errors {
+            return Err(error);
+        }
+        if matches!(
+            self.active_profile,
+            Some(SemanticProfile::Lua54 | SemanticProfile::Lua55)
+        ) && matches!(
+            &error,
+            RuntimeError::LuaMessage(message)
+                if message.starts_with(b"initial value expected ")
+                    || message.starts_with(b"limit expected ")
+                    || message.starts_with(b"step expected ")
+                    || message.as_ref() == b"attempt to perform 'n%0'"
+        ) {
+            return Err(self.lua_family_frame_error(error)?);
+        }
+        let integer_message = match &error {
+            RuntimeError::LuaIntegerConversion(message) => Some(message.to_vec()),
+            _ => None,
+        };
+        let (operation, expected, actual) = match error {
+            RuntimeError::Type {
+                operation,
+                expected,
+                actual,
+            } => (operation, expected, actual),
+            RuntimeError::LuaIntegerConversion(_) => (
+                "integer conversion",
+                "integer-representable number",
+                "number",
+            ),
+            error => return Err(error),
+        };
+        if expected == "integer" && actual == "number" {
+            return Err(
+                self.lua_family_frame_error(RuntimeError::LuaMessage(Arc::from(
+                    &b"number has no integer representation"[..],
+                )))?,
+            );
+        }
+        let fallback = || {
+            if let Some(message) = integer_message.as_deref() {
+                RuntimeError::LuaIntegerConversion(Arc::from(message))
+            } else {
+                RuntimeError::Type {
+                    operation,
+                    expected,
+                    actual,
+                }
+            }
+        };
+        let Some(frame) = self.blu_debug_frames.last() else {
+            return Err(fallback());
+        };
+        let Some(prototype) = frame.artifact.prototypes.get(frame.prototype) else {
+            return Err(fallback());
+        };
+        if !matches!(
+            prototype.profile,
+            SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            return Err(fallback());
+        }
+        let Some(instruction) = prototype.code.get(frame.pc) else {
+            return Err(fallback());
+        };
+        let mut offending_register = None;
+        let mut offending_type = actual;
+        let mut offending_value = None;
+        let mut debug_name = match instruction {
+            instruction if blu_call_function_register(instruction).is_some() => {
+                blu_debug_constants(prototype)
+                    .ok()
+                    .map(|constants| {
+                        blu_callee_debug_name_parts(
+                            &frame.artifact,
+                            frame.prototype,
+                            &constants,
+                            &frame.registers,
+                            frame.pc + 1,
+                        )
+                    })
+                    .unwrap_or_else(|| {
+                        blu_static_callee_debug_name(&frame.artifact, frame.prototype, frame.pc)
+                    })
+            }
+            _ if operation == "call" => match instruction {
+                BluInstruction::Add { .. } => blu_metamethod_debug_name("__add"),
+                BluInstruction::Subtract { .. } => blu_metamethod_debug_name("__sub"),
+                BluInstruction::Multiply { .. } => blu_metamethod_debug_name("__mul"),
+                BluInstruction::Divide { .. } => blu_metamethod_debug_name("__div"),
+                BluInstruction::Modulo { .. } => blu_metamethod_debug_name("__mod"),
+                BluInstruction::Power { .. } => blu_metamethod_debug_name("__pow"),
+                BluInstruction::FloorDivide { .. } => blu_metamethod_debug_name("__idiv"),
+                BluInstruction::BitwiseAnd { .. } => blu_metamethod_debug_name("__band"),
+                BluInstruction::BitwiseOr { .. } => blu_metamethod_debug_name("__bor"),
+                BluInstruction::BitwiseExclusiveOr { .. } => blu_metamethod_debug_name("__bxor"),
+                BluInstruction::ShiftLeft { .. } => blu_metamethod_debug_name("__shl"),
+                BluInstruction::ShiftRight { .. } => blu_metamethod_debug_name("__shr"),
+                BluInstruction::BitwiseNot { .. } => blu_metamethod_debug_name("__bnot"),
+                BluInstruction::Concatenate { .. } => blu_metamethod_debug_name("__concat"),
+                BluInstruction::Negate { .. } => blu_metamethod_debug_name("__unm"),
+                BluInstruction::Length { .. } => blu_metamethod_debug_name("__len"),
+                BluInstruction::LessThan { .. } => blu_metamethod_debug_name("__lt"),
+                BluInstruction::LessEqual { .. } => blu_metamethod_debug_name("__le"),
+                _ => (None, None),
+            },
+            BluInstruction::GetTable { table, key, .. }
+            | BluInstruction::SetTable { table, key, .. } => {
+                let key_name = frame.registers.get(usize::from(*key)).and_then(|value| {
+                    let Value::String(name) = value else {
+                        return None;
+                    };
+                    Some(Arc::clone(name))
+                });
+                if operation == "table index"
+                    || matches!(instruction, BluInstruction::SetTable { .. })
+                {
+                    blu_static_register_debug_name(
+                        &frame.artifact,
+                        frame.prototype,
+                        *table,
+                        frame.pc,
+                        &frame.registers,
+                    )
+                } else if let Some(name) = key_name {
+                    let namewhat = if matches!(
+                        prototype.profile,
+                        SemanticProfile::Lua52
+                            | SemanticProfile::Lua53
+                            | SemanticProfile::Lua54
+                            | SemanticProfile::Lua55
+                    ) && *table == 0
+                    {
+                        b"global".as_slice()
+                    } else {
+                        b"field".as_slice()
+                    };
+                    (Some(Arc::from(namewhat)), Some(name))
+                } else {
+                    blu_static_register_debug_name(
+                        &frame.artifact,
+                        frame.prototype,
+                        *table,
+                        frame.pc,
+                        &frame.registers,
+                    )
+                }
+            }
+            _ => (None, None),
+        };
+        let mut candidates = [0u16; 2];
+        let candidate_count = match instruction {
+            BluInstruction::Negate { source, .. }
+            | BluInstruction::Length { source, .. }
+            | BluInstruction::BitwiseNot { source, .. } => {
+                candidates[0] = *source;
+                1
+            }
+            BluInstruction::Add { left, right, .. }
+            | BluInstruction::Subtract { left, right, .. }
+            | BluInstruction::Multiply { left, right, .. }
+            | BluInstruction::Divide { left, right, .. }
+            | BluInstruction::Modulo { left, right, .. }
+            | BluInstruction::Power { left, right, .. }
+            | BluInstruction::FloorDivide { left, right, .. }
+            | BluInstruction::BitwiseAnd { left, right, .. }
+            | BluInstruction::BitwiseOr { left, right, .. }
+            | BluInstruction::BitwiseExclusiveOr { left, right, .. }
+            | BluInstruction::ShiftLeft { left, right, .. }
+            | BluInstruction::ShiftRight { left, right, .. }
+            | BluInstruction::Concatenate { left, right, .. }
+            | BluInstruction::LessThan { left, right, .. }
+            | BluInstruction::LessEqual { left, right, .. } => {
+                candidates[0] = *left;
+                candidates[1] = *right;
+                2
+            }
+            BluInstruction::GetTable { table, .. } | BluInstruction::SetTable { table, .. } => {
+                candidates[0] = *table;
+                1
+            }
+            _ => 0,
+        };
+        let candidate_order = if operation == "concatenation" {
+            [candidates[1], candidates[0]]
+        } else {
+            candidates
+        };
+        for candidate in candidate_order.into_iter().take(candidate_count) {
+            let Some(value) = frame.registers.get(usize::from(candidate)) else {
+                continue;
+            };
+            let offending = match operation {
+                "arithmetic" | "unary minus" => {
+                    arithmetic_numeric_value(value, prototype.profile).is_none()
+                }
+                "bitwise operation" => {
+                    blu_bitwise_integer(value, prototype.profile, "bitwise operation").is_err()
+                }
+                "concatenation" => !matches!(value, Value::String(_)),
+                "table index" | "table assignment" => value.type_name() == actual,
+                _ => true,
+            };
+            if offending {
+                offending_register = Some(candidate);
+                offending_type = value.type_name();
+                offending_value = Some(value.clone());
+                break;
+            }
+        }
+        if debug_name == (None, None)
+            && let Some(register) = offending_register
+        {
+            debug_name = blu_static_register_debug_name(
+                &frame.artifact,
+                frame.prototype,
+                register,
+                frame.pc,
+                &frame.registers,
+            );
+        }
+        if !matches!(operation, "table index" | "table assignment" | "call")
+            && debug_name.0.as_deref() == Some(&b"global"[..])
+            && prototype.code[..frame.pc].iter().any(|instruction| {
+                matches!(
+                    instruction,
+                    BluInstruction::JumpIfTruthy { .. } | BluInstruction::JumpIfFalsy { .. }
+                )
+            })
+        {
+            debug_name = (None, None);
+        }
+        let named_offending = offending_value
+            .as_ref()
+            .map(|value| self.lua_object_type_name(value, true))
+            .transpose()?;
+        let comparison_values = match instruction {
+            BluInstruction::LessThan { left, right, .. }
+            | BluInstruction::LessEqual { left, right, .. } => frame
+                .registers
+                .get(usize::from(*left))
+                .zip(frame.registers.get(usize::from(*right))),
+            _ => None,
+        };
+        let comparison_types = comparison_values
+            .map(|(left, right)| {
+                Ok::<_, RuntimeError>((
+                    self.lua_object_type_name(left, true)?,
+                    self.lua_object_type_name(right, true)?,
+                ))
+            })
+            .transpose()?;
+        let mut message = match operation {
+            "integer conversion" => {
+                let mut message = String::from_utf8_lossy(
+                    integer_message
+                        .as_deref()
+                        .unwrap_or(b"number has no integer representation"),
+                )
+                .into_owned();
+                if offending_register.is_some()
+                    && !message.contains(" (")
+                    && let (Some(namewhat), Some(name)) = &debug_name
+                {
+                    let marker = " has no integer representation";
+                    if let Some(index) = message.find(marker) {
+                        let suffix = message.split_off(index);
+                        let _ = write!(
+                            message,
+                            " ({} {})",
+                            String::from_utf8_lossy(namewhat),
+                            String::from_utf8_lossy(name)
+                        );
+                        message.push_str(&suffix);
+                    }
+                }
+                message
+            }
+            "call" => format!("attempt to call a {actual} value"),
+            "arithmetic" | "unary minus" => {
+                if let Some((name, true)) = &named_offending {
+                    format!("attempt to perform arithmetic on a {name} value")
+                } else {
+                    format!("attempt to perform arithmetic on a {offending_type} value")
+                }
+            }
+            "bitwise operation" => {
+                if let Some((name, true)) = &named_offending {
+                    format!("attempt to perform bitwise operation on a {name} value")
+                } else {
+                    format!("attempt to perform bitwise operation on a {offending_type} value")
+                }
+            }
+            "length" => format!("attempt to get length of a {actual} value"),
+            "table index" | "table assignment" => {
+                format!("attempt to index a {offending_type} value")
+            }
+            "concatenation" => format!("attempt to concatenate a {offending_type} value"),
+            "comparison"
+                if comparison_types
+                    .as_ref()
+                    .is_some_and(|((left, _), (right, _))| {
+                        left == "function" && right == "function"
+                    }) =>
+            {
+                "attempt to compare two function values".to_owned()
+            }
+            "comparison" => {
+                if let Some(((left, left_named), (right, right_named))) = &comparison_types
+                    && (*left_named || *right_named)
+                {
+                    if left == right {
+                        format!("attempt to compare two {left} values")
+                    } else {
+                        format!("attempt to compare {left} with {right}")
+                    }
+                } else {
+                    format!("attempt to compare {offending_type} values")
+                }
+            }
+            _ => return Err(self.lua_family_frame_error(fallback())?),
+        };
+        if operation != "integer conversion"
+            && let (Some(namewhat), Some(name)) = debug_name
+        {
+            let _ = write!(
+                message,
+                " ({} '{}')",
+                String::from_utf8_lossy(&namewhat),
+                String::from_utf8_lossy(&name)
+            );
+        }
+        if prototype
+            .required_features
+            .contains(FeatureBits::DUMPED_FUNCTION)
+            && prototype.line_info.iter().all(|line| *line == 0)
+        {
+            let source = if prototype.profile == SemanticProfile::Lua55 {
+                "?:?: "
+            } else {
+                "?:-1: "
+            };
+            message.insert_str(0, source);
+        }
+        Err(self.lua_family_frame_error(RuntimeError::LuaMessage(Arc::from(message.into_bytes())))?)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5303,7 +6184,8 @@ impl Vm {
         let Some(hook) = self.debug_hooks.get(&thread) else {
             return Ok(());
         };
-        if self.debug_hook_active || !hook.mask.contains(&b'r') {
+        if self.debug_hook_active || self.debug_close_caller.is_some() || !hook.mask.contains(&b'r')
+        {
             return Ok(());
         }
         let function = hook.function.clone();
@@ -5755,6 +6637,10 @@ impl Vm {
                     || prototype
                         .required_features
                         .contains(FeatureBits::IMPLICIT_ENVIRONMENT))
+                && (!prototype
+                    .required_features
+                    .contains(FeatureBits::DUMPED_FUNCTION)
+                    || prototype.parameter_count == 0)
                 && matches!(
                     prototype.profile,
                     SemanticProfile::Lua52
@@ -5773,6 +6659,17 @@ impl Vm {
                     code_words: prototype.code.len(),
                 });
             };
+            if !track_debug_registers
+                && matches!(
+                    prototype.profile,
+                    SemanticProfile::Lua54 | SemanticProfile::Lua55
+                )
+                && blu_instruction_may_type_error(&instruction)
+                && let Some(frame) = self.blu_debug_frames.last_mut()
+            {
+                frame.registers = try_clone_values(&registers, "Lua diagnostic registers")?;
+                frame.varargs = try_clone_values(&varargs, "Lua diagnostic varargs")?;
+            }
             let debug_native_call_requires_registers = blu_call_function_register(&instruction)
                 .and_then(|register| registers.get(usize::from(register)))
                 .is_some_and(|value| {
@@ -7519,6 +8416,7 @@ impl Vm {
                         }
                         Err(error) => return Err(error),
                     };
+                    refresh_blu_open_upvalues(&self.heap, &mut registers, &open_upvalues)?;
                     let mut values = values.into_iter();
                     for offset in 0..result_count {
                         let target =
@@ -7752,6 +8650,7 @@ impl Vm {
                         }
                         Err(error) => return Err(error),
                     };
+                    refresh_blu_open_upvalues(&self.heap, &mut registers, &open_upvalues)?;
                     if dynamic_results.len() > MAX_DYNAMIC_REGISTERS {
                         return Err(RuntimeError::StackLimit {
                             required: dynamic_results.len(),
@@ -8312,7 +9211,20 @@ impl Vm {
                             && let (Value::Integer(left), Value::Integer(right)) =
                                 (&numeric_left, &numeric_right)
                         {
-                            Value::Integer(integer_floor_mod(*left, *right)?)
+                            match integer_floor_mod(*left, *right) {
+                                Ok(value) => Value::Integer(value),
+                                Err(RuntimeError::DivideByZero)
+                                    if matches!(
+                                        prototype.profile,
+                                        SemanticProfile::Lua54 | SemanticProfile::Lua55
+                                    ) && self.prefix_lua_errors =>
+                                {
+                                    return Err(RuntimeError::LuaMessage(Arc::from(
+                                        &b"attempt to perform 'n%0'"[..],
+                                    )));
+                                }
+                                Err(error) => return Err(error),
+                            }
                         } else {
                             arithmetic(opcode, &numeric_left, &numeric_right)?
                         };
@@ -9281,23 +10193,37 @@ impl Vm {
                                 }
                             },
                             Opcode::JumpIfLt => {
-                                let function =
-                                    select(self, &left, &right, "__lt")?.ok_or_else(|| {
-                                        if prototype.profile == SemanticProfile::Luau {
-                                            luau_comparison_error(
-                                                "<",
-                                                &left,
-                                                &right,
-                                                self.prefix_luau_errors,
-                                            )
-                                        } else {
-                                            RuntimeError::Type {
-                                                operation: "comparison",
-                                                expected: "matching values or __lt metamethods",
-                                                actual: left.type_name(),
-                                            }
-                                        }
-                                    })?;
+                                let function = match select(self, &left, &right, "__lt")? {
+                                    Some(function) => function,
+                                    None if prototype.profile == SemanticProfile::Luau => {
+                                        return Err(luau_comparison_error(
+                                            "<",
+                                            &left,
+                                            &right,
+                                            self.prefix_luau_errors,
+                                        ));
+                                    }
+                                    None if matches!(
+                                        prototype.profile,
+                                        SemanticProfile::Lua51
+                                            | SemanticProfile::Lua52
+                                            | SemanticProfile::Lua53
+                                            | SemanticProfile::Lua54
+                                            | SemanticProfile::Lua55
+                                    ) =>
+                                    {
+                                        return Err(
+                                            self.lua_family_comparison_error(&left, &right)?
+                                        );
+                                    }
+                                    None => {
+                                        return Err(RuntimeError::Type {
+                                            operation: "comparison",
+                                            expected: "matching values or __lt metamethods",
+                                            actual: left.type_name(),
+                                        });
+                                    }
+                                };
                                 (function, [left, right], false)
                             }
                             Opcode::JumpIfLe => {
@@ -9315,6 +10241,15 @@ impl Vm {
                                             &right,
                                             self.prefix_luau_errors,
                                         )
+                                    } else if matches!(
+                                        prototype.profile,
+                                        SemanticProfile::Lua51
+                                            | SemanticProfile::Lua52
+                                            | SemanticProfile::Lua53
+                                            | SemanticProfile::Lua54
+                                            | SemanticProfile::Lua55
+                                    ) {
+                                        self.lua_family_comparison_error(&left, &right)?
                                     } else {
                                         RuntimeError::Type {
                                             operation: "comparison",
@@ -9478,6 +10413,137 @@ impl Vm {
                             code_words: prototype.code.len(),
                         });
                     }
+                    continue;
+                }
+                BluInstruction::ReturnDynamic | BluInstruction::ReturnDynamicPrefix { .. } => {
+                    let prefix = match instruction {
+                        BluInstruction::ReturnDynamicPrefix { first, count } => {
+                            Some((first, count))
+                        }
+                        BluInstruction::ReturnDynamic => None,
+                        _ => unreachable!(),
+                    };
+                    let mut values = core::mem::take(&mut dynamic_results);
+                    let debug_start = if let Some((first, count)) = prefix {
+                        let start = usize::from(first);
+                        let end = start.checked_add(usize::from(count)).ok_or(
+                            RuntimeError::Register {
+                                register: usize::MAX,
+                                count: registers.len(),
+                            },
+                        )?;
+                        let prefix = registers.get(start..end).ok_or(RuntimeError::Register {
+                            register: end.saturating_sub(1),
+                            count: registers.len(),
+                        })?;
+                        let mut combined = try_clone_values(prefix, "BluV1 dynamic return prefix")?;
+                        try_reserve_exact(
+                            &mut combined,
+                            values.len(),
+                            "BluV1 dynamic return values",
+                        )?;
+                        combined.append(&mut values);
+                        values = combined;
+                        start.saturating_add(1)
+                    } else {
+                        1
+                    };
+                    let roots = GcRoots::from_values(&values)?;
+                    self.push_active_roots(roots)?;
+                    let close_error = self.close_values_for_thread(
+                        self.current_close_thread(),
+                        close_marker,
+                        None,
+                        remaining,
+                        depth,
+                    );
+                    self.active_roots.pop();
+                    if let Some(error @ RuntimeError::CoroutineYield(_)) = close_error {
+                        if allow_suspend {
+                            let pending = PendingBluOperation::Close(PendingClose {
+                                continuation: self.captured_blu_continuation.take().map(Box::new),
+                                values: try_clone_values(
+                                    &values,
+                                    "BluV1 pending close return values",
+                                )?,
+                                thread: Some(self.current_close_thread()),
+                                marker: close_marker,
+                                depth,
+                                error: None,
+                            });
+                            self.suspend_blu_v1(BluContinuation {
+                                artifact,
+                                prototype: prototype_index,
+                                constants,
+                                registers,
+                                varargs,
+                                dynamic_results,
+                                open_upvalues,
+                                callers,
+                                closure,
+                                environment: active_environment,
+                                pc,
+                                depth,
+                                close_marker,
+                                resume: BluResume::Native {
+                                    result: BluCallResult::Return { prefix },
+                                    operation: Box::new(pending),
+                                },
+                            })?;
+                        }
+                        return Err(error);
+                    }
+                    if let Some(error) = close_error {
+                        return Err(error);
+                    }
+                    let transfer_values =
+                        try_clone_values(&values, "BluV1 dynamic return transfer values")?;
+                    self.run_debug_return_hook_if_needed(
+                        DebugTransfer {
+                            start: debug_start,
+                            values: transfer_values,
+                            istailcall: false,
+                        },
+                        &registers,
+                        &varargs,
+                        &open_upvalues,
+                        closure,
+                        &callers,
+                        remaining,
+                        depth,
+                    )?;
+                    let mut caller = loop {
+                        let Some(caller) = callers.pop() else {
+                            return Ok(values);
+                        };
+                        self.active_roots.pop();
+                        match self.apply_blu_return(caller, values, &callers)? {
+                            BluReturnDisposition::Resume(caller) => break caller,
+                            BluReturnDisposition::Propagate(next) => values = next,
+                        }
+                    };
+                    dynamic_results =
+                        match core::mem::replace(&mut caller.result, BluCallResult::Dynamic) {
+                            BluCallResult::ReadyDynamic(values) => values,
+                            _ => Vec::new(),
+                        };
+                    artifact = caller.artifact;
+                    prototype_index = caller.prototype;
+                    constants = caller.constants;
+                    registers = caller.registers;
+                    varargs = caller.varargs;
+                    named_vararg_table = caller.named_vararg_table;
+                    named_vararg_version = 0;
+                    open_upvalues = caller.open_upvalues;
+                    closure = caller.closure;
+                    pc = caller.pc;
+                    self.active_profile = Some(
+                        artifact
+                            .prototypes
+                            .get(prototype_index)
+                            .ok_or(RuntimeError::InvalidPrototype(prototype_index))?
+                            .profile,
+                    );
                     continue;
                 }
                 BluInstruction::Return { first, count } => {
@@ -11267,6 +12333,7 @@ impl Vm {
         let mut native_resume = None;
         match resume {
             BluResume::Fixed { destination, count } => {
+                self.run_debug_native_hook_if_needed(b"return", remaining, depth)?;
                 let mut values = arguments.iter();
                 for offset in 0..count {
                     let target = destination
@@ -11612,41 +12679,48 @@ impl Vm {
         completion_roots: &[Value],
     ) -> Result<Vec<Value>, RuntimeError> {
         let mut source = Vec::new();
-        loop {
-            let values = self.invoke_native_callback("load", reader.clone(), &[]);
-            let values = match values {
-                Ok(values) => values,
-                Err(error @ RuntimeError::CoroutineYield(_)) => {
-                    let continuation = self.captured_blu_continuation.take().ok_or(
-                        RuntimeError::UnsupportedLibraryFeature {
-                            function: "load",
-                            feature: "yielding reader functions",
-                        },
-                    )?;
-                    let roots = try_clone_values(completion_roots, "load reader completion roots")?;
-                    self.pending_blu_operation = Some(PendingBluOperation::LoadReader(Box::new(
-                        PendingLoadReader {
-                            reader,
-                            source,
-                            source_limit,
-                            completion,
-                            completion_roots: roots,
-                            continuation: Box::new(continuation),
-                        },
-                    )));
-                    return Err(error);
+        let root_count = self.active_roots.len();
+        self.push_active_roots(GcRoots::from_values(completion_roots)?)?;
+        let result = (|| {
+            loop {
+                let values = self.invoke_native_callback("load", reader.clone(), &[]);
+                let values = match values {
+                    Ok(values) => values,
+                    Err(error @ RuntimeError::CoroutineYield(_)) => {
+                        let continuation = self.captured_blu_continuation.take().ok_or(
+                            RuntimeError::UnsupportedLibraryFeature {
+                                function: "load",
+                                feature: "yielding reader functions",
+                            },
+                        )?;
+                        let roots =
+                            try_clone_values(completion_roots, "load reader completion roots")?;
+                        self.pending_blu_operation = Some(PendingBluOperation::LoadReader(
+                            Box::new(PendingLoadReader {
+                                reader: reader.clone(),
+                                source,
+                                source_limit,
+                                completion: completion.clone(),
+                                completion_roots: roots,
+                                continuation: Box::new(continuation),
+                            }),
+                        ));
+                        return Err(error);
+                    }
+                    Err(error) => return Err(error),
+                };
+                if let Some(result) = self.consume_load_reader_chunk(
+                    &mut source,
+                    source_limit,
+                    &completion,
+                    values.first().cloned().unwrap_or(Value::Nil),
+                )? {
+                    return Ok(result);
                 }
-                Err(error) => return Err(error),
-            };
-            if let Some(result) = self.consume_load_reader_chunk(
-                &mut source,
-                source_limit,
-                &completion,
-                values.first().cloned().unwrap_or(Value::Nil),
-            )? {
-                return Ok(result);
             }
-        }
+        })();
+        self.active_roots.truncate(root_count);
+        result
     }
 
     fn consume_load_reader_chunk(
@@ -11706,6 +12780,53 @@ impl Vm {
         match operation {
             PendingBluOperation::ResumeValues => {
                 try_clone_values(arguments, "BluV1 resumed return values")
+            }
+            PendingBluOperation::Close(mut operation) => {
+                let resumed = match operation.continuation.take() {
+                    Some(continuation) => {
+                        self.resume_detached_blu(*continuation, arguments, remaining)
+                    }
+                    None => Ok(Vec::new()),
+                };
+                let mut close_error_input = operation.error.take();
+                match resumed {
+                    Ok(_) => {}
+                    Err(error @ RuntimeError::CoroutineYield(_)) => {
+                        operation.continuation =
+                            self.captured_blu_continuation.take().map(Box::new);
+                        self.pending_blu_operation = Some(PendingBluOperation::Close(operation));
+                        return Err(error);
+                    }
+                    Err(error) => {
+                        if operation.thread.is_some() {
+                            operation.marker = 0;
+                        }
+                        close_error_input = Some(close_metamethod_error(error));
+                    }
+                }
+                if let Some(thread) = operation.thread {
+                    let close_error = self.close_values_for_thread(
+                        thread,
+                        operation.marker,
+                        close_error_input.clone(),
+                        remaining,
+                        operation.depth,
+                    );
+                    if let Some(error @ RuntimeError::CoroutineYield(_)) = close_error {
+                        operation.error = close_error_input;
+                        operation.continuation =
+                            self.captured_blu_continuation.take().map(Box::new);
+                        self.pending_blu_operation = Some(PendingBluOperation::Close(operation));
+                        return Err(error);
+                    }
+                    if let Some(error) = close_error {
+                        return Err(error);
+                    }
+                } else if let Some(error) = close_error_input {
+                    return Err(error);
+                }
+                self.sync_native_operation_remaining(remaining);
+                Ok(operation.values)
             }
             PendingBluOperation::ProtectedCall(operation) => {
                 let mut operation = *operation;
@@ -12444,16 +13565,15 @@ impl Vm {
         let callback_result = match callback_result {
             Ok(result) => result,
             Err(error @ RuntimeError::CoroutineYield(_)) => {
-                let continuation = self.captured_blu_continuation.take().ok_or(
-                    RuntimeError::UnsupportedLibraryFeature {
-                        function: "table.sort",
-                        feature: if operation.comparator.is_some() {
-                            "yielding custom comparators"
-                        } else {
-                            "yielding metamethod ordering"
-                        },
-                    },
-                )?;
+                let feature = if operation.comparator.is_some() {
+                    "yielding custom comparators"
+                } else {
+                    "yielding metamethod ordering"
+                };
+                let continuation = self
+                    .captured_blu_continuation
+                    .take()
+                    .ok_or_else(|| table_sort_yield_error(self.active_profile(), feature))?;
                 operation.continuation = Box::new(continuation);
                 self.pending_blu_operation = Some(PendingBluOperation::TableSort(operation));
                 return Err(error);
@@ -12497,16 +13617,15 @@ impl Vm {
                 let callback_result = match callback_result {
                     Ok(result) => result,
                     Err(error @ RuntimeError::CoroutineYield(_)) => {
-                        let continuation = self.captured_blu_continuation.take().ok_or(
-                            RuntimeError::UnsupportedLibraryFeature {
-                                function: "table.sort",
-                                feature: if operation.comparator.is_some() {
-                                    "yielding custom comparators"
-                                } else {
-                                    "yielding metamethod ordering"
-                                },
-                            },
-                        )?;
+                        let feature = if operation.comparator.is_some() {
+                            "yielding custom comparators"
+                        } else {
+                            "yielding metamethod ordering"
+                        };
+                        let continuation =
+                            self.captured_blu_continuation.take().ok_or_else(|| {
+                                table_sort_yield_error(self.active_profile(), feature)
+                            })?;
                         operation.continuation = Box::new(continuation);
                         self.pending_blu_operation =
                             Some(PendingBluOperation::TableSort(operation));
@@ -12643,14 +13762,26 @@ impl Vm {
         remaining: &mut u64,
         depth: usize,
     ) -> RuntimeError {
-        self.close_values_for_thread(
-            self.current_close_thread(),
-            marker,
-            Some(error),
-            remaining,
-            depth,
-        )
-        .expect("initial close error remains available")
+        let thread = self.current_close_thread();
+        let close_error =
+            self.close_values_for_thread(thread, marker, Some(error.clone()), remaining, depth);
+        match close_error {
+            Some(close_error @ RuntimeError::CoroutineYield(_)) => {
+                if let Some(continuation) = self.captured_blu_continuation.take() {
+                    self.pending_blu_operation = Some(PendingBluOperation::Close(PendingClose {
+                        continuation: Some(Box::new(continuation)),
+                        values: Vec::new(),
+                        thread: Some(thread),
+                        marker,
+                        depth,
+                        error: Some(error),
+                    }));
+                }
+                close_error
+            }
+            Some(close_error) => close_error,
+            None => error,
+        }
     }
 
     fn close_values_for_thread(
@@ -12678,11 +13809,23 @@ impl Vm {
             let handler = match self.metamethod(&value, "__close") {
                 Ok(Some(handler)) => handler,
                 Ok(None) => {
-                    final_error = Some(RuntimeError::Type {
-                        operation: "close",
-                        expected: "value with a __close metamethod",
-                        actual: value.type_name(),
-                    });
+                    final_error = Some(
+                        if matches!(
+                            self.active_profile().ok(),
+                            Some(SemanticProfile::Lua54 | SemanticProfile::Lua55)
+                        ) && self.prefix_lua_errors
+                        {
+                            RuntimeError::Raised(Value::String(Arc::from(
+                                &b"metamethod 'close' is not callable"[..],
+                            )))
+                        } else {
+                            RuntimeError::Type {
+                                operation: "close",
+                                expected: "value with a __close metamethod",
+                                actual: value.type_name(),
+                            }
+                        },
+                    );
                     continue;
                 }
                 Err(error) => {
@@ -12694,6 +13837,7 @@ impl Vm {
                 .as_ref()
                 .map_or(Value::Nil, |error| runtime_error_value(error.clone()));
             let arguments = [value.clone(), error_value.clone()];
+            let argument_count = if final_error.is_some() { 2 } else { 1 };
             let roots = match GcRoots::from_values(&[handler.clone(), value, error_value]) {
                 Ok(roots) => roots,
                 Err(error) => {
@@ -12701,13 +13845,117 @@ impl Vm {
                     continue;
                 }
             };
-            if let Err(error) = self.call_value(handler, &arguments, remaining, depth, roots) {
+            let capture_close_handler =
+                self.running_thread == Some(thread) && !self.closing_threads.contains(&thread);
+            let previous_capture = self.capture_blu_continuation;
+            let previous_continuation = if capture_close_handler {
+                self.capture_blu_continuation = true;
+                self.captured_blu_continuation.take()
+            } else {
+                None
+            };
+            let handler_result = if let Value::Closure(closure) = handler {
+                let is_blu_closure = match self.heap.is_blu_closure(closure) {
+                    Ok(is_blu_closure) => is_blu_closure,
+                    Err(error) => {
+                        final_error = Some(error.into());
+                        continue;
+                    }
+                };
+                if is_blu_closure {
+                    self.call_blu_closure_with_suspend(
+                        closure,
+                        &arguments[..argument_count],
+                        remaining,
+                        depth,
+                        roots,
+                        true,
+                    )
+                } else {
+                    self.call_value(
+                        Value::Closure(closure),
+                        &arguments[..argument_count],
+                        remaining,
+                        depth,
+                        roots,
+                    )
+                }
+            } else {
+                self.call_value(
+                    handler,
+                    &arguments[..argument_count],
+                    remaining,
+                    depth,
+                    roots,
+                )
+            };
+            let captured_continuation = if capture_close_handler {
+                self.capture_blu_continuation = previous_capture;
+                self.captured_blu_continuation.take()
+            } else {
+                None
+            };
+            if let Some(continuation) = previous_continuation {
+                self.captured_blu_continuation = Some(continuation);
+            }
+            if let Err(error) = handler_result {
+                if let Some(continuation) = captured_continuation {
+                    self.captured_blu_continuation = Some(continuation);
+                }
                 final_error = Some(match error {
+                    RuntimeError::CoroutineYield(values)
+                        if matches!(
+                            self.active_profile().ok(),
+                            Some(
+                                SemanticProfile::Lua51
+                                    | SemanticProfile::Lua52
+                                    | SemanticProfile::Lua53
+                                    | SemanticProfile::Lua54
+                                    | SemanticProfile::Lua55
+                            )
+                        ) && self.running_thread == Some(thread)
+                            && self.closing_threads.contains(&thread) =>
+                    {
+                        let _ = values;
+                        RuntimeError::CoroutineCloseYield(Arc::from(
+                            &b"attempt to yield across a C-call boundary"[..],
+                        ))
+                    }
+                    error @ RuntimeError::CoroutineYield(_)
+                        if matches!(
+                            self.active_profile().ok(),
+                            Some(
+                                SemanticProfile::Lua51
+                                    | SemanticProfile::Lua52
+                                    | SemanticProfile::Lua53
+                                    | SemanticProfile::Lua54
+                                    | SemanticProfile::Lua55
+                            )
+                        ) && self.running_thread == Some(thread) =>
+                    {
+                        return Some(error);
+                    }
+                    RuntimeError::CoroutineYield(_)
+                        if matches!(
+                            self.active_profile().ok(),
+                            Some(
+                                SemanticProfile::Lua51
+                                    | SemanticProfile::Lua52
+                                    | SemanticProfile::Lua53
+                                    | SemanticProfile::Lua54
+                                    | SemanticProfile::Lua55
+                            )
+                        ) =>
+                    {
+                        RuntimeError::Raised(Value::String(Arc::from(
+                            &b"attempt to yield across a C-call boundary"[..],
+                        )))
+                    }
                     RuntimeError::CoroutineYield(_) => RuntimeError::UnsupportedLibraryFeature {
                         function: "__close",
                         feature: "yielding close handlers during error unwinding",
                     },
-                    error => error,
+                    error => close_metamethod_error(error),
                 });
             }
         }
@@ -12828,6 +14076,12 @@ impl Vm {
                     return self.resume_thread(arguments, remaining, depth, roots);
                 }
                 if self.coroutine_yield == Some(function) {
+                    if self.running_thread.is_none() {
+                        return Err(RuntimeError::Raised(Value::String(Arc::from(
+                            &b"attempt to yield from outside a coroutine"[..],
+                        ))));
+                    }
+                    self.run_debug_native_hook_if_needed(b"call", remaining, depth)?;
                     return Err(RuntimeError::CoroutineYield(try_clone_values(
                         arguments,
                         "coroutine yield values",
@@ -12874,22 +14128,40 @@ impl Vm {
                         None,
                     );
                     self.debug_native_frames.pop();
-                    return Ok(match result {
+                    let protected = match result {
                         Ok(values) => try_prepend_value(
                             values,
                             Value::Boolean(true),
                             "protected call results",
                         )?,
                         Err(error @ RuntimeError::CoroutineYield(_)) => return Err(error),
+                        Err(error @ RuntimeError::CoroutineCloseYield(_)) => return Err(error),
+                        Err(RuntimeError::ProtectedCallActivation)
+                            if self.protected_call_handler_depth > 0 =>
+                        {
+                            self.protected_call_request = None;
+                            return Err(RuntimeError::UnsupportedLibraryFeature {
+                                function: "xpcall",
+                                feature: "protected activation from an error handler",
+                            });
+                        }
                         Err(error @ RuntimeError::ProtectedCallActivation) => return Err(error),
                         Err(RuntimeError::Raised(value)) => {
                             vec![Value::Boolean(false), pcall_error_value(value, profile)]
                         }
+                        Err(RuntimeError::UnsupportedLibraryFeature {
+                            function: "pcall",
+                            feature: "nested activation requests",
+                        }) if profile == SemanticProfile::Lua55 => vec![
+                            Value::Boolean(false),
+                            Value::String(Arc::from(&b"'__call' chain too long"[..])),
+                        ],
                         Err(error) => vec![
                             Value::Boolean(false),
                             pcall_runtime_error_value(error, profile),
                         ],
-                    });
+                    };
+                    return Ok(protected);
                 }
                 if self.error_handler_call == Some(function) {
                     let profile = self.active_profile()?;
@@ -12937,6 +14209,8 @@ impl Vm {
                     } else {
                         arguments.get(2..).unwrap_or_default()
                     };
+                    let retry_handler_errors = matches!(&target, Value::NativeFunction(_))
+                        && matches!(&handler, Value::Closure(_));
                     let result = self.call_protected_target(
                         target,
                         target_arguments,
@@ -12952,6 +14226,7 @@ impl Vm {
                             "protected call results",
                         )?,
                         Err(error @ RuntimeError::CoroutineYield(_)) => return Err(error),
+                        Err(error @ RuntimeError::CoroutineCloseYield(_)) => return Err(error),
                         Err(error @ RuntimeError::ProtectedCallActivation) => return Err(error),
                         Err(error) => {
                             let handler_service_depth = if self.running_thread.is_some()
@@ -12961,12 +14236,16 @@ impl Vm {
                             } else {
                                 0
                             };
-                            let handled = self.call_value(
+                            let source_memory_error =
+                                guest_memory_diagnostic(profile) && is_guest_memory_error(&error);
+                            let handled = self.call_xpcall_handler(
                                 handler,
-                                &[xpcall_runtime_error_value(error, profile)],
+                                error,
+                                profile,
+                                retry_handler_errors,
                                 remaining,
                                 depth.saturating_add(handler_service_depth),
-                                roots,
+                                &roots,
                             );
                             match handled {
                                 Ok(values) => vec![
@@ -12985,6 +14264,26 @@ impl Vm {
                                 Err(RuntimeError::CoroutineYield(values)) => {
                                     return Err(RuntimeError::CoroutineYield(values));
                                 }
+                                Err(handler_error)
+                                    if source_memory_error
+                                        && is_guest_memory_error(&handler_error) =>
+                                {
+                                    vec![
+                                        Value::Boolean(false),
+                                        Value::String(Arc::from(&b"not enough memory"[..])),
+                                    ]
+                                }
+                                Err(error @ RuntimeError::CallLimit { .. })
+                                | Err(error @ RuntimeError::CStackOverflow { .. }) => vec![
+                                    Value::Boolean(false),
+                                    xpcall_runtime_error_value(error, profile),
+                                ],
+                                Err(
+                                    error @ RuntimeError::UnsupportedLibraryFeature {
+                                        function: "xpcall",
+                                        feature: "protected activation from an error handler",
+                                    },
+                                ) => return Err(error),
                                 Err(_) => {
                                     vec![
                                         Value::Boolean(false),
@@ -13087,7 +14386,19 @@ impl Vm {
             }
             Value::Table(table) => {
                 let function = self
-                    .metamethod(&Value::Table(table), "__call")?
+                    .metamethod(&Value::Table(table), "__call")
+                    .map_err(|error| {
+                        if self.active_profile().ok() == Some(SemanticProfile::Lua55)
+                            && self.prefix_lua_errors
+                            && matches!(error, RuntimeError::MetatableLoop)
+                        {
+                            RuntimeError::Raised(Value::String(Arc::from(
+                                &b"'__call' chain too long"[..],
+                            )))
+                        } else {
+                            error
+                        }
+                    })?
                     .ok_or_else(|| {
                         if self.prefix_luau_errors
                             && self.active_profile == Some(SemanticProfile::Luau)
@@ -13105,7 +14416,19 @@ impl Vm {
                     })?;
                 let metamethod_arguments =
                     try_prefixed_values(Value::Table(table), arguments, "metamethod arguments")?;
-                self.call_value(function, &metamethod_arguments, remaining, depth, roots)
+                if self.active_profile()? == SemanticProfile::Lua55
+                    && self.prefix_lua_errors
+                    && self.call_metamethod_depth >= 15
+                {
+                    return Err(RuntimeError::Raised(Value::String(Arc::from(
+                        &b"'__call' chain too long"[..],
+                    ))));
+                }
+                self.call_metamethod_depth = self.call_metamethod_depth.saturating_add(1);
+                let result =
+                    self.call_value(function, &metamethod_arguments, remaining, depth, roots);
+                self.call_metamethod_depth = self.call_metamethod_depth.saturating_sub(1);
+                result
             }
             Value::UserData(userdata) => {
                 let value = Value::UserData(userdata);
@@ -13151,6 +14474,31 @@ impl Vm {
         roots: GcRoots,
         handler: Option<Value>,
     ) -> Result<Vec<Value>, RuntimeError> {
+        self.thread_debug_frames
+            .remove(&self.running_thread.unwrap_or(self.main_thread));
+        if self.protected_call_handler_depth > 0
+            && self.protected_call_scheduler_active
+            && self.running_thread.is_none()
+            && !self.debug_hook_active
+        {
+            // An xpcall handler executes synchronously while the outer
+            // protected-call scheduler is already servicing its target.  A
+            // second activation cannot be handed back to that same scheduler
+            // without losing the handler's continuation, so run this nested
+            // protected call through the bounded fallback path instead.  The
+            // fallback keeps its own activation budget and recursively applies
+            // the same rule to deeper pcall/xpcall calls.
+            let previous_scheduler = self.protected_call_scheduler_active;
+            let previous_capture = self.protected_call_capture_active;
+            self.protected_call_scheduler_active = false;
+            self.protected_call_capture_active = false;
+            let result = self.call_protected_target_fallback(
+                target, arguments, remaining, depth, roots, handler,
+            );
+            self.protected_call_capture_active = previous_capture;
+            self.protected_call_scheduler_active = previous_scheduler;
+            return result;
+        }
         if self.protected_call_scheduler_active
             && self.running_thread.is_none()
             && !self.debug_hook_active
@@ -13311,6 +14659,20 @@ impl Vm {
                     Err(error)
                 }
                 (Ok(values), None) => Ok(values),
+                (Err(error @ RuntimeError::CoroutineYield(_)), None)
+                    if self.pending_blu_operation.is_some() =>
+                {
+                    let operation = self.pending_blu_operation.take().map(Box::new);
+                    self.pending_blu_operation = Some(PendingBluOperation::ProtectedCall(
+                        Box::new(PendingProtectedCall {
+                            request,
+                            continuation: None,
+                            operation,
+                            resume_error: None,
+                        }),
+                    ));
+                    Err(error)
+                }
                 (Err(error), None) => Err(error),
                 (Ok(_), Some(_)) => Err(RuntimeError::UnsupportedLibraryFeature {
                     function: "pcall",
@@ -13984,6 +15346,64 @@ impl Vm {
         }
     }
 
+    fn lua_object_type_name(
+        &self,
+        value: &Value,
+        file_pointer: bool,
+    ) -> Result<(String, bool), RuntimeError> {
+        if let Value::UserData(userdata) = value
+            && self.io_file_handles.contains_key(userdata)
+        {
+            return Ok((
+                if file_pointer {
+                    "FILE*".to_owned()
+                } else {
+                    "FILE".to_owned()
+                },
+                true,
+            ));
+        }
+        let Some(metatable) = self.value_metatable(value)? else {
+            return Ok((value.type_name().to_owned(), false));
+        };
+        let name = self
+            .heap
+            .table_get(metatable, &Value::String(Arc::from(&b"__name"[..])))?;
+        if let Value::String(name) = name {
+            return Ok((String::from_utf8_lossy(&name).into_owned(), true));
+        }
+        Ok((value.type_name().to_owned(), false))
+    }
+
+    fn lua_family_comparison_error(
+        &self,
+        left: &Value,
+        right: &Value,
+    ) -> Result<RuntimeError, RuntimeError> {
+        let (left_name, left_named) = self.lua_object_type_name(left, true)?;
+        let (right_name, right_named) = self.lua_object_type_name(right, true)?;
+        let message = if left_name == "function" && right_name == "function" {
+            "attempt to compare two function values".to_owned()
+        } else if left_named || right_named {
+            if left_name == right_name {
+                format!("attempt to compare two {left_name} values")
+            } else {
+                format!("attempt to compare {left_name} with {right_name}")
+            }
+        } else {
+            format!("attempt to compare {left_name} with {right_name}")
+        };
+        if self.prefix_lua_errors {
+            Ok(RuntimeError::LuaMessage(Arc::from(message.into_bytes())))
+        } else {
+            Ok(RuntimeError::Type {
+                operation: "comparison",
+                expected: "matching values or comparison metamethods",
+                actual: left.type_name(),
+            })
+        }
+    }
+
     fn set_value_metatable(&mut self, value: &Value, metatable: Option<TableId>) {
         let slot = primitive_metatable_slot(value);
         self.primitive_metatables[slot] = metatable;
@@ -14019,7 +15439,13 @@ impl Vm {
             arguments =
                 try_prefixed_values(Value::Table(table), &arguments, "BluV1 __call arguments")?;
         }
-        Err(RuntimeError::MetatableLoop)
+        if profile == SemanticProfile::Lua55 && self.prefix_lua_errors {
+            Err(RuntimeError::Raised(Value::String(Arc::from(
+                &b"'__call' chain too long"[..],
+            ))))
+        } else {
+            Err(RuntimeError::MetatableLoop)
+        }
     }
 
     fn resolve_blu_index(
@@ -14056,10 +15482,20 @@ impl Vm {
                     });
                 }
                 other => {
-                    return Err(RuntimeError::UnsupportedMetamethod {
-                        name: "__index",
-                        actual: other.type_name(),
-                    });
+                    return Err(
+                        if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55) {
+                            RuntimeError::Type {
+                                operation: "table index",
+                                expected: "table",
+                                actual: other.type_name(),
+                            }
+                        } else {
+                            RuntimeError::UnsupportedMetamethod {
+                                name: "__index",
+                                actual: other.type_name(),
+                            }
+                        },
+                    );
                 }
             }
         }
@@ -14096,10 +15532,20 @@ impl Vm {
                     });
                 }
                 other => {
-                    return Err(RuntimeError::UnsupportedMetamethod {
-                        name: "__newindex",
-                        actual: other.type_name(),
-                    });
+                    return Err(
+                        if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55) {
+                            RuntimeError::Type {
+                                operation: "table assignment",
+                                expected: "table",
+                                actual: other.type_name(),
+                            }
+                        } else {
+                            RuntimeError::UnsupportedMetamethod {
+                                name: "__newindex",
+                                actual: other.type_name(),
+                            }
+                        },
+                    );
                 }
             }
         }
@@ -15211,7 +16657,29 @@ impl Vm {
                 function: "setmetatable",
                 index: 1,
             })?;
-            let table = table_id(value)?;
+            let table = match value {
+                Value::Table(table) => *table,
+                other
+                    if matches!(
+                        vm.active_profile()?,
+                        SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) =>
+                {
+                    return Err(lua_bad_argument(
+                        "setmetatable",
+                        1,
+                        "table",
+                        other.type_name(),
+                    ));
+                }
+                other => {
+                    return Err(RuntimeError::Type {
+                        operation: "table access",
+                        expected: "table",
+                        actual: other.type_name(),
+                    });
+                }
+            };
             if let Some(current) = vm.heap.table_metatable(table)? {
                 let protected = vm
                     .heap
@@ -15414,6 +16882,26 @@ impl Vm {
                 }
             };
             let Some(value) = arguments.first() else {
+                if matches!(
+                    profile,
+                    SemanticProfile::Lua51
+                        | SemanticProfile::Lua52
+                        | SemanticProfile::Lua53
+                        | SemanticProfile::Lua54
+                        | SemanticProfile::Lua55
+                ) {
+                    return Err(if vm.prefix_lua_errors {
+                        RuntimeError::LuaMessage(Arc::from(
+                            &b"bad argument #1 to 'assert' (value expected)"[..],
+                        ))
+                    } else {
+                        RuntimeError::Type {
+                            operation: "assert",
+                            expected: "value",
+                            actual: "missing",
+                        }
+                    });
+                }
                 return Err(RuntimeError::Raised(prefix_message(Value::String(
                     Arc::from(&b"missing argument #1"[..]),
                 ))?));
@@ -15421,11 +16909,11 @@ impl Vm {
             if value.is_truthy() {
                 try_clone_values(arguments, "assert results")
             } else {
-                let message = arguments
-                    .get(1)
-                    .cloned()
-                    .unwrap_or_else(|| Value::String(Arc::from(&b"assertion failed!"[..])));
-                Err(RuntimeError::Raised(prefix_message(message)?))
+                let message = match arguments.get(1).cloned() {
+                    Some(message) => prefix_message(message)?,
+                    None => prefix_message(Value::String(Arc::from(&b"assertion failed!"[..])))?,
+                };
+                Err(RuntimeError::Raised(message))
             }
         });
         self.set_global(&b"assert"[..], Value::NativeFunction(assert));
@@ -15656,6 +17144,25 @@ impl Vm {
                     }
                     Ok(vec![Value::Boolean(vm.gc_running)])
                 }
+                _ if matches!(
+                    profile,
+                    SemanticProfile::Lua51
+                        | SemanticProfile::Lua52
+                        | SemanticProfile::Lua53
+                        | SemanticProfile::Lua54
+                        | SemanticProfile::Lua55
+                ) =>
+                {
+                    if vm.prefix_lua_errors {
+                        Err(RuntimeError::LuaMessage(Arc::from(&b"invalid option"[..])))
+                    } else {
+                        Err(RuntimeError::Type {
+                            operation: "collectgarbage",
+                            expected: "valid option",
+                            actual: "string",
+                        })
+                    }
+                }
                 _ => Err(RuntimeError::UnsupportedLibraryFeature {
                     function: "collectgarbage",
                     feature: "this profile-specific command",
@@ -15815,6 +17322,31 @@ impl Vm {
                 function: "__blu_internal_mark_close",
                 index: 1,
             })?;
+            if value.is_truthy()
+                && matches!(
+                    vm.active_profile()?,
+                    SemanticProfile::Lua54 | SemanticProfile::Lua55
+                )
+                && vm.metamethod(value, "__close")?.is_none()
+            {
+                if let Some(name) = arguments.get(1) {
+                    let name = string_bytes(name, "__blu_internal_mark_close")?;
+                    if vm.prefix_lua_errors {
+                        return Err(RuntimeError::Raised(Value::String(Arc::from(
+                            format!(
+                                "variable '{}' got a non-closable value",
+                                String::from_utf8_lossy(name)
+                            )
+                            .into_bytes(),
+                        ))));
+                    }
+                    return Err(RuntimeError::Type {
+                        operation: "close",
+                        expected: "value with a __close metamethod",
+                        actual: value.type_name(),
+                    });
+                }
+            }
             vm.register_close_value(value.clone())?;
             Ok(Vec::new())
         });
@@ -15848,6 +17380,7 @@ impl Vm {
                 index: 1,
             })?;
             let profile = vm.active_profile()?;
+            let actual_name = vm.lua_object_type_name(value, false)?.0;
             let value = arithmetic_numeric_value(value, profile).ok_or_else(|| {
                 if profile == SemanticProfile::Luau {
                     let role = match arguments.get(1) {
@@ -15867,10 +17400,28 @@ impl Vm {
                         .into_bytes(),
                     ))
                 } else {
-                    RuntimeError::Type {
-                        operation: "numeric for",
-                        expected: "number",
-                        actual: value.type_name(),
+                    let role = match arguments.get(1) {
+                        Some(Value::String(role)) => String::from_utf8_lossy(role),
+                        _ => "value".into(),
+                    };
+                    let role = if role == "initial" {
+                        "initial value".to_owned()
+                    } else {
+                        role.to_string()
+                    };
+                    let actual = actual_name.clone();
+                    if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55)
+                        && vm.prefix_lua_errors
+                    {
+                        RuntimeError::LuaMessage(Arc::from(
+                            format!("{role} expected number, received {actual}").into_bytes(),
+                        ))
+                    } else {
+                        RuntimeError::Type {
+                            operation: "numeric for",
+                            expected: "number",
+                            actual: value.type_name(),
+                        }
                     }
                 }
             })?;
@@ -15968,7 +17519,6 @@ impl Vm {
             vm.take_close_value(value);
             if let Value::UserData(userdata) = value
                 && vm.io_file_handles.contains_key(userdata)
-                && vm.heap.userdata_metatable(*userdata)?.is_none()
             {
                 let closed = vm
                     .io_file_handles
@@ -15979,14 +17529,52 @@ impl Vm {
                 }
                 return Ok(Vec::new());
             }
-            let handler = vm.metamethod(value, "__close")?.ok_or(RuntimeError::Type {
-                operation: "close",
-                expected: "value with a __close metamethod",
-                actual: value.type_name(),
+            let modern_close = matches!(
+                vm.active_profile()?,
+                SemanticProfile::Lua54 | SemanticProfile::Lua55
+            );
+            let handler = vm.metamethod(value, "__close")?.ok_or_else(|| {
+                if modern_close && vm.prefix_lua_errors {
+                    RuntimeError::Raised(Value::String(Arc::from(
+                        &b"metamethod 'close' is not callable"[..],
+                    )))
+                } else {
+                    RuntimeError::Type {
+                        operation: "close",
+                        expected: "value with a __close metamethod",
+                        actual: value.type_name(),
+                    }
+                }
             })?;
+            let close_marker = vm.close_depth();
+            let close_thread = vm.current_close_thread();
+            let close_depth = vm
+                .native_contexts
+                .last()
+                .map_or(vm.blu_debug_frames.len(), |context| context.depth);
             let callback_arguments = [value.clone(), Value::Nil];
-            vm.invoke_native_callback("__blu_internal_close", handler, &callback_arguments)?;
-            Ok(Vec::new())
+            let callback_arguments = &callback_arguments[..1];
+            let close_caller = vm.blu_debug_frames.last().cloned();
+            let previous_close_caller =
+                core::mem::replace(&mut vm.debug_close_caller, close_caller);
+            let result =
+                vm.invoke_native_callback("__blu_internal_close", handler, callback_arguments);
+            vm.debug_close_caller = previous_close_caller;
+            match result {
+                Ok(_) => Ok(Vec::new()),
+                Err(error @ RuntimeError::CoroutineYield(_)) => {
+                    vm.pending_blu_operation = Some(PendingBluOperation::Close(PendingClose {
+                        continuation: vm.captured_blu_continuation.take().map(Box::new),
+                        values: Vec::new(),
+                        thread: Some(close_thread),
+                        marker: close_marker,
+                        depth: close_depth,
+                        error: None,
+                    }));
+                    Err(error)
+                }
+                Err(error) => Err(close_metamethod_error(error)),
+            }
         });
         self.set_global(&b"__blu_internal_close"[..], Value::NativeFunction(close));
 
@@ -15996,13 +17584,75 @@ impl Vm {
                 function: "string.sub",
                 index: 1,
             })?;
-            let string = string_bytes(string, "string.sub")?;
-            let start = profile_integer_argument(profile, arguments, 1, "string.sub")?;
-            let end = arguments
-                .get(2)
-                .map(|_| profile_integer_argument(profile, arguments, 2, "string.sub"))
-                .transpose()?
-                .unwrap_or(string.len() as i64);
+            let method_call = vm
+                .debug_native_frames
+                .last()
+                .and_then(|frame| frame.namewhat.as_deref())
+                == Some(&b"method"[..]);
+            let string = match string {
+                Value::String(string) => string,
+                other
+                    if matches!(
+                        profile,
+                        SemanticProfile::Lua51
+                            | SemanticProfile::Lua52
+                            | SemanticProfile::Lua53
+                            | SemanticProfile::Lua54
+                            | SemanticProfile::Lua55
+                    ) && method_call =>
+                {
+                    if vm.prefix_lua_errors {
+                        return Err(RuntimeError::LuaMessage(Arc::from(
+                            format!(
+                                "calling 'sub' on bad self (string expected, got {})",
+                                other.type_name()
+                            )
+                            .into_bytes(),
+                        )));
+                    }
+                    return Err(RuntimeError::Type {
+                        operation: "string.sub",
+                        expected: "string",
+                        actual: other.type_name(),
+                    });
+                }
+                other => {
+                    return Err(RuntimeError::Type {
+                        operation: "string.sub",
+                        expected: "string",
+                        actual: other.type_name(),
+                    });
+                }
+            };
+            let start = match arguments.get(1) {
+                Some(value)
+                    if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55)
+                        && value.as_number().is_none() =>
+                {
+                    return Err(lua_bad_argument(
+                        "sub",
+                        if method_call { 1 } else { 2 },
+                        "number",
+                        value.type_name(),
+                    ));
+                }
+                _ => profile_integer_argument(profile, arguments, 1, "string.sub")?,
+            };
+            let end = match arguments.get(2) {
+                None => string.len() as i64,
+                Some(value)
+                    if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55)
+                        && value.as_number().is_none() =>
+                {
+                    return Err(lua_bad_argument(
+                        "sub",
+                        if method_call { 2 } else { 3 },
+                        "number",
+                        value.type_name(),
+                    ));
+                }
+                Some(_) => profile_integer_argument(profile, arguments, 2, "string.sub")?,
+            };
             let start = relative_index(start, string.len()).clamp(1, string.len() as i64 + 1);
             let end = relative_index(end, string.len()).clamp(0, string.len() as i64);
             let result = if start > end {
@@ -17224,15 +18874,19 @@ impl Vm {
         )?;
         let string_pack = self.register_function(|vm, arguments| {
             string_pack_profile(vm, "string.pack")?;
+            let max_packsize = string_pack_max_size(vm.active_profile()?);
             let format = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.pack",
                 index: 1,
             })?;
             let format = string_bytes(format, "string.pack")?;
-            let fields = parse_string_pack_format(format, "string.pack")?;
-            let capacity = match string_pack_fixed_size(&fields) {
-                StringPackSize::Fixed(size) => size,
-                StringPackSize::Variable | StringPackSize::TooLarge => 0,
+            let fields = parse_string_pack_format(format, "string.pack", max_packsize)?;
+            let capacity = match string_pack_fixed_size(&fields, max_packsize) {
+                StringPackSize::Fixed(size) if size <= MAX_STRING_BYTES => size,
+                StringPackSize::Fixed(_) | StringPackSize::TooLarge => {
+                    return Err(string_pack_format_error("string.pack", "too long"));
+                }
+                StringPackSize::Variable => 0,
             };
             let mut result = try_vec_with_capacity(capacity, "string.pack result")?;
             let mut argument = 1usize;
@@ -17261,6 +18915,7 @@ impl Vm {
         )?;
         let string_packsize = self.register_function(|vm, arguments| {
             string_pack_profile(vm, "string.packsize")?;
+            let max_packsize = string_pack_max_size(vm.active_profile()?);
             let format = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.packsize",
                 index: 1,
@@ -17268,8 +18923,9 @@ impl Vm {
             let fields = parse_string_pack_format(
                 string_bytes(format, "string.packsize")?,
                 "string.packsize",
+                max_packsize,
             )?;
-            let size = match string_pack_fixed_size(&fields) {
+            let size = match string_pack_fixed_size(&fields, max_packsize) {
                 StringPackSize::Fixed(size) => size,
                 StringPackSize::Variable => {
                     return Err(RuntimeError::UnsupportedLibraryFeature {
@@ -17297,6 +18953,7 @@ impl Vm {
         )?;
         let string_unpack = self.register_function(|vm, arguments| {
             string_pack_profile(vm, "string.unpack")?;
+            let max_packsize = string_pack_max_size(vm.active_profile()?);
             let format = arguments.first().ok_or(RuntimeError::Argument {
                 function: "string.unpack",
                 index: 1,
@@ -17314,7 +18971,7 @@ impl Vm {
                 .unwrap_or(1);
             let format = string_bytes(format, "string.unpack")?;
             let data = string_bytes(data, "string.unpack")?;
-            let fields = parse_string_pack_format(format, "string.unpack")?;
+            let fields = parse_string_pack_format(format, "string.unpack", max_packsize)?;
             let mut cursor = string_unpack_position(position, data.len())?;
             let mut result = Vec::new();
             for field in fields {
@@ -17378,7 +19035,7 @@ impl Vm {
                 });
             }
             let (artifact, prototype, _, _upvalues) = vm.heap.blu_closure_parts(*closure)?;
-            let bytes = dump_blu_function(&artifact, prototype, strip)?;
+            let bytes = dump_blu_function(&artifact, prototype, profile, strip)?;
             Ok(vec![Value::String(Arc::from(bytes))])
         });
         self.heap.table_set(
@@ -17912,6 +19569,7 @@ impl Vm {
                     what: "io file handle registry",
                 })?;
             let userdata = vm.allocate_userdata(Arc::from(&b"file"[..]), &roots)?;
+            vm.attach_io_file_metatable(userdata)?;
             vm.io_file_handles.insert(
                 userdata,
                 IoFileState {
@@ -17950,6 +19608,7 @@ impl Vm {
                     what: "io file handle registry",
                 })?;
             let userdata = vm.allocate_userdata(Arc::from(&b"file"[..]), &roots)?;
+            vm.attach_io_file_metatable(userdata)?;
             vm.io_file_handles.insert(
                 userdata,
                 IoFileState {
@@ -17976,6 +19635,14 @@ impl Vm {
             };
             close_io_file_result(vm, userdata, "io.close")
         });
+        let gc = self.register_function(|vm, arguments| {
+            let Some(Value::UserData(userdata)) = arguments.first() else {
+                return Err(RuntimeError::LuaMessage(Arc::from(
+                    &b"bad argument #1 to '__gc' (FILE* expected, got no value)"[..],
+                )));
+            };
+            close_io_file_result(vm, *userdata, "__gc")
+        });
         let input = self.register_function(|vm, arguments| {
             let value = match arguments.first() {
                 None | Some(Value::Nil) => {
@@ -17991,6 +19658,20 @@ impl Vm {
                     vm, arguments, path, b"r", "io.input",
                 )?),
                 Some(other) => {
+                    if matches!(
+                        vm.active_profile()?,
+                        SemanticProfile::Lua51
+                            | SemanticProfile::Lua52
+                            | SemanticProfile::Lua53
+                            | SemanticProfile::Lua54
+                            | SemanticProfile::Lua55
+                    ) {
+                        let actual = vm.lua_object_type_name(other, true)?.0;
+                        return Err(RuntimeError::LuauMessage(Arc::from(
+                            format!("bad argument #1 to 'input' (FILE* expected, got {actual})")
+                                .into_bytes(),
+                        )));
+                    }
                     return Err(RuntimeError::Type {
                         operation: "io.input",
                         expected: "file handle",
@@ -18225,6 +19906,7 @@ impl Vm {
                             what: "io file handle registry",
                         })?;
                     let userdata = vm.allocate_userdata(Arc::from(&b"file"[..]), &roots)?;
+                    vm.attach_io_file_metatable(userdata)?;
                     vm.io_file_handles.insert(
                         userdata,
                         IoFileState {
@@ -18303,6 +19985,38 @@ impl Vm {
                 &b"file"[..]
             }))])
         });
+        let file_methods = self.heap.allocate_table(0, 7)?;
+        for (name, function) in [
+            (&b"close"[..], close),
+            (&b"flush"[..], flush),
+            (&b"lines"[..], file_lines),
+            (&b"read"[..], read),
+            (&b"seek"[..], seek),
+            (&b"setvbuf"[..], setvbuf),
+            (&b"write"[..], write),
+        ] {
+            self.heap.table_set(
+                file_methods,
+                Value::String(Arc::from(name)),
+                Value::NativeFunction(function),
+            )?;
+        }
+        let file_metatable = self.heap.allocate_table(0, 2)?;
+        self.heap.table_set(
+            file_metatable,
+            Value::String(Arc::from(&b"__gc"[..])),
+            Value::NativeFunction(gc),
+        )?;
+        self.heap.table_set(
+            file_metatable,
+            Value::String(Arc::from(&b"__index"[..])),
+            Value::Table(file_methods),
+        )?;
+        self.io_file_metatable = Some(file_metatable);
+        let existing_files = self.io_file_handles.keys().copied().collect::<Vec<_>>();
+        for userdata in existing_files {
+            self.attach_io_file_metatable(userdata)?;
+        }
         let io = self.heap.allocate_table(0, 12)?;
         for (name, function) in [
             (&b"open"[..], open),
@@ -18944,15 +20658,55 @@ impl Vm {
                     if level == 0.0 {
                         level_zero = true;
                         None
-                    } else if vm.debug_hook_active
-                        && level == 2.0
-                        && let Some(frame) = vm
+                    } else if level == 2.0 {
+                        let frame = vm
                             .debug_native_frames
                             .iter()
-                            .find(|frame| Some(frame.function) != vm.debug_getinfo_function)
-                    {
-                        native_frame = Some(frame.clone());
-                        None
+                            .rev()
+                            .find(|frame| Some(frame.function) != vm.debug_getinfo_function);
+                        if let Some(frame) = frame {
+                            if frame
+                                .name
+                                .as_deref()
+                                .is_some_and(|name| name == b"__blu_internal_close")
+                            {
+                                if let Some(close_caller) = vm.debug_close_caller.clone() {
+                                    Some(close_caller)
+                                } else if vm.debug_hook_active {
+                                    native_frame = Some(DebugNativeFrame {
+                                        function: frame.function,
+                                        namewhat: Some(Arc::from(&b"metamethod"[..])),
+                                        name: Some(Arc::from(&b"close"[..])),
+                                        transfer_start: frame.transfer_start,
+                                        transfer_values: frame.transfer_values.clone(),
+                                    });
+                                    None
+                                } else {
+                                    None
+                                }
+                            } else {
+                                native_frame = Some(frame.clone());
+                                None
+                            }
+                        } else if vm.protected_call_target_depth > 0
+                            && let Some(function) = vm.protected_call
+                        {
+                            native_frame = Some(DebugNativeFrame {
+                                function,
+                                namewhat: Some(Arc::from(&b"field"[..])),
+                                name: Some(Arc::from(&b"pcall"[..])),
+                                transfer_start: 1,
+                                transfer_values: Vec::new(),
+                            });
+                            None
+                        } else {
+                            let level = level as usize;
+                            let Some(frame) = vm.blu_debug_frames.iter().rev().nth(level - 1)
+                            else {
+                                return Ok(vec![Value::Nil]);
+                            };
+                            Some(frame.clone())
+                        }
                     } else {
                         let level = level as usize;
                         let Some(frame) = vm.blu_debug_frames.iter().rev().nth(level - 1) else {
@@ -20401,7 +22155,11 @@ impl Vm {
                 return Err(RuntimeError::Type {
                     operation: "debug.setuservalue",
                     expected: "userdata",
-                    actual: target.type_name(),
+                    actual: if matches!(target, Value::LightUserData(_)) {
+                        "light userdata"
+                    } else {
+                        target.type_name()
+                    },
                 });
             };
             let value = arguments.get(1).cloned().ok_or(RuntimeError::Argument {
@@ -20507,6 +22265,14 @@ impl Vm {
             } else {
                 None
             };
+            let overflow_traceback = arguments.get(message_index).is_some_and(|value| {
+                matches!(
+                    value,
+                    Value::String(message)
+                        if message.as_ref() == b"stack overflow"
+                            || message.as_ref() == b"C stack overflow"
+                )
+            });
             let mut result = try_vec_with_capacity(64, "debug traceback")?;
             if let Some(message) = arguments
                 .get(message_index)
@@ -20690,7 +22456,7 @@ impl Vm {
                     }
                     Ok(())
                 };
-            let frames = if let Some(frames) = target_frames.as_ref() {
+            let mut frames = if let Some(frames) = target_frames.as_ref() {
                 frames.clone()
             } else {
                 let coroutine_base = if vm.running_thread.is_some() {
@@ -20704,14 +22470,39 @@ impl Vm {
                 } else {
                     0
                 };
-                vm.blu_debug_frames
+                let live_frames = vm
+                    .blu_debug_frames
                     .iter()
                     .skip(coroutine_base)
                     .rev()
                     .skip(skip)
                     .cloned()
-                    .collect::<Vec<_>>()
+                    .collect::<Vec<_>>();
+                if let Some(frames) = vm
+                    .thread_debug_frames
+                    .get(&vm.running_thread.unwrap_or(vm.main_thread))
+                    .filter(|frames| frames.len() > live_frames.len())
+                {
+                    let mut saved_frames = frames
+                        .iter()
+                        .rev()
+                        .skip(skip.saturating_add(live_frames.len().max(1)))
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    saved_frames.extend(live_frames);
+                    saved_frames
+                } else {
+                    live_frames
+                }
             };
+            // Lua unwinds the protected target's active caller before asking
+            // debug.traceback to format a stack-overflow error.  The owned
+            // VM retains that caller snapshot for recovery, so discard the
+            // corresponding leading frame only for the native overflow
+            // message-handler shape.
+            if overflow_traceback && target_thread.is_none() && !frames.is_empty() {
+                frames.remove(0);
+            }
             const TRACEBACK_HEAD: usize = 10;
             const TRACEBACK_TAIL: usize = 11;
             const TRACEBACK_LIMIT: usize = TRACEBACK_HEAD + TRACEBACK_TAIL;
@@ -21158,7 +22949,7 @@ impl Vm {
                     encoded[2] = 0x80 | ((codepoint >> 6) & 0x3F) as u8;
                     encoded[3] = 0x80 | (codepoint & 0x3F) as u8;
                     4
-                } else if codepoint <= 0x3F_FFFF {
+                } else if codepoint <= 0x3FF_FFFF {
                     encoded[0] = 0xF8 | (codepoint >> 24) as u8;
                     encoded[1] = 0x80 | ((codepoint >> 18) & 0x3F) as u8;
                     encoded[2] = 0x80 | ((codepoint >> 12) & 0x3F) as u8;
@@ -21224,7 +23015,18 @@ impl Vm {
                     feature: "position out of range",
                 }
             })?;
-            if count != 0 && position <= length && bytes[byte_position] & 0xC0 == 0x80 {
+            let continuation_position = if count < 0 && position == length + 1 {
+                characters.last().map(|(start, _)| *start)
+            } else if position <= length {
+                Some(byte_position)
+            } else {
+                None
+            };
+            if count != 0
+                && continuation_position
+                    .and_then(|offset| bytes.get(offset))
+                    .is_some_and(|byte| byte & 0xC0 == 0x80)
+            {
                 return Err(RuntimeError::UnsupportedLibraryFeature {
                     function: "utf8.offset",
                     feature: "initial position is a continuation byte",
@@ -21240,7 +23042,7 @@ impl Vm {
                     .copied()
             } else if count > 0 {
                 if position == length + 1 {
-                    None
+                    (bytes.is_empty() && count == 1).then_some((0, 1))
                 } else {
                     let index = characters
                         .iter()
@@ -21251,7 +23053,7 @@ impl Vm {
                             .and_then(|delta| index.checked_add(delta))
                             .and_then(|index| {
                                 if index == characters.len() {
-                                    Some((bytes.len(), bytes.len()))
+                                    Some((bytes.len(), bytes.len().saturating_add(1)))
                                 } else {
                                     characters.get(index).copied()
                                 }
@@ -21488,7 +23290,11 @@ impl Vm {
                             ));
                         }
                     };
-                    Ok(vec![Value::Boolean(!target_is_main)])
+                    let inside_native_callback =
+                        arguments.is_empty() && vm.debug_native_frames.len() > 1;
+                    Ok(vec![Value::Boolean(
+                        !target_is_main && !inside_native_callback,
+                    )])
                 }
                 SemanticProfile::Luau => {
                     Ok(vec![Value::Boolean(vm.debug_native_frames.len() <= 1)])
@@ -21516,6 +23322,9 @@ impl Vm {
                         value.type_name(),
                     ));
                 }
+                None if profile == SemanticProfile::Lua55 => {
+                    vm.running_thread.unwrap_or(vm.main_thread)
+                }
                 None => {
                     return Err(RuntimeError::Argument {
                         function: "coroutine.close",
@@ -21536,19 +23345,37 @@ impl Vm {
             let result = match vm.threads.get(&thread) {
                 None => return Err(RuntimeError::Heap(HeapError::StaleThread(thread))),
                 Some(ThreadState::Running)
+                    if profile == SemanticProfile::Lua55
+                        && vm.running_thread == Some(thread)
+                        && vm
+                            .close_values
+                            .get(&thread)
+                            .is_some_and(|values| !values.is_empty())
+                        && !vm.closing_threads.contains(&thread) =>
+                {
+                    let depth = vm
+                        .native_contexts
+                        .last()
+                        .map_or(vm.blu_debug_frames.len(), |context| context.depth);
+                    vm.close_coroutine_thread(thread, depth)?
+                }
+                Some(ThreadState::Running)
                     if profile == SemanticProfile::Lua55 && vm.running_thread == Some(thread) =>
                 {
                     Vec::new()
                 }
                 Some(ThreadState::Running) => {
-                    let message =
-                        if profile == SemanticProfile::Luau && vm.running_thread != Some(thread) {
-                            &b"cannot close normal coroutine"[..]
-                        } else if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
-                            &b"cannot close running coroutine"[..]
-                        } else {
-                            &b"cannot close a running coroutine"[..]
-                        };
+                    let message = if vm.running_thread != Some(thread)
+                        && (profile == SemanticProfile::Luau
+                            || (matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55)
+                                && thread == vm.main_thread))
+                    {
+                        &b"cannot close normal coroutine"[..]
+                    } else if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                        &b"cannot close running coroutine"[..]
+                    } else {
+                        &b"cannot close a running coroutine"[..]
+                    };
                     return Err(RuntimeError::Raised(Value::String(Arc::from(message))));
                 }
                 Some(ThreadState::SuspendedBlu(_)) if vm.coroutine_is_normal(thread) => {
@@ -21557,6 +23384,19 @@ impl Vm {
                     ))));
                 }
                 Some(ThreadState::Dead(Some(error))) if profile == SemanticProfile::Luau => {
+                    let error = error.clone();
+                    let error_roots = GcRoots::from_values(std::slice::from_ref(&error))?;
+                    let empty = GcRoots::default();
+                    vm.thread_set_roots(thread, &empty, &error_roots)?;
+                    vm.threads.insert(thread, ThreadState::Dead(None));
+                    vec![Value::Boolean(false), error]
+                }
+                Some(ThreadState::Dead(Some(_)))
+                    if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55) =>
+                {
+                    let Some(ThreadState::Dead(Some(error))) = vm.threads.get(&thread) else {
+                        unreachable!("dead coroutine state changed during close");
+                    };
                     let error = error.clone();
                     let error_roots = GcRoots::from_values(std::slice::from_ref(&error))?;
                     let empty = GcRoots::default();
@@ -21574,29 +23414,11 @@ impl Vm {
                     | ThreadState::SuspendedBlu(_)
                     | ThreadState::SuspendedNative(_),
                 ) => {
-                    let mut remaining = vm
-                        .native_contexts
-                        .last()
-                        .map_or(vm.instruction_limit, |context| context.remaining);
                     let depth = vm
                         .native_contexts
                         .last()
                         .map_or(vm.blu_debug_frames.len(), |context| context.depth);
-                    let close_error = vm.close_values_for_thread(
-                        thread,
-                        0,
-                        None,
-                        &mut remaining,
-                        depth.saturating_add(1),
-                    );
-                    vm.sync_native_operation_remaining(&mut remaining);
-                    let empty = GcRoots::default();
-                    vm.thread_set_roots(thread, &empty, &empty)?;
-                    vm.threads.insert(thread, ThreadState::Dead(None));
-                    match close_error {
-                        Some(error) => vec![Value::Boolean(false), runtime_error_value(error)],
-                        None => vec![Value::Boolean(true)],
-                    }
+                    vm.close_coroutine_thread(thread, depth)?
                 }
             };
             Ok(result)
@@ -21665,6 +23487,43 @@ impl Vm {
         false
     }
 
+    fn close_coroutine_thread(
+        &mut self,
+        thread: ThreadId,
+        depth: usize,
+    ) -> Result<Vec<Value>, RuntimeError> {
+        if !self.heap.contains_thread(thread) {
+            return Err(RuntimeError::Heap(HeapError::StaleThread(thread)));
+        }
+        if self.threads.remove(&thread).is_some() {
+            self.threads.insert(thread, ThreadState::Running);
+        }
+        let mut remaining = self
+            .native_contexts
+            .last()
+            .map_or(self.instruction_limit, |context| context.remaining);
+        let previous_running_thread = self.running_thread.replace(thread);
+        self.closing_threads.insert(thread);
+        let close_error =
+            self.close_values_for_thread(thread, 0, None, &mut remaining, depth.saturating_add(1));
+        self.closing_threads.remove(&thread);
+        self.running_thread = previous_running_thread;
+        self.sync_native_operation_remaining(&mut remaining);
+        let empty = GcRoots::default();
+        self.thread_set_roots(thread, &empty, &empty)?;
+        self.threads.insert(thread, ThreadState::Dead(None));
+        if let Some(RuntimeError::CoroutineCloseYield(message)) = close_error {
+            if previous_running_thread == Some(thread) {
+                return Err(RuntimeError::CoroutineCloseYield(message));
+            }
+            return Ok(vec![Value::Boolean(false), Value::String(message)]);
+        }
+        Ok(match close_error {
+            Some(error) => vec![Value::Boolean(false), runtime_error_value(error)],
+            None => vec![Value::Boolean(true)],
+        })
+    }
+
     fn resume_thread(
         &mut self,
         arguments: &[Value],
@@ -21674,7 +23533,7 @@ impl Vm {
     ) -> Result<Vec<Value>, RuntimeError> {
         let limit = self.call_limit.min(MAX_NESTED_COROUTINE_RESUMES);
         if self.coroutine_resume_depth >= limit {
-            return Err(RuntimeError::CallLimit { limit });
+            return Err(RuntimeError::CStackOverflow { limit });
         }
         self.coroutine_resume_depth += 1;
         let thread = thread_argument(arguments, 0, "coroutine.resume")?;
@@ -22428,13 +24287,20 @@ impl Vm {
             let table = match table_id(table) {
                 Ok(table) => table,
                 Err(_) if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55) => {
-                    return Err(RuntimeError::Raised(Value::String(Arc::from(
-                        format!(
-                            "bad argument #1 to 'concat' (table expected, got {})",
-                            table.type_name()
-                        )
-                        .into_bytes(),
-                    ))));
+                    if vm.prefix_lua_errors {
+                        return Err(RuntimeError::Raised(Value::String(Arc::from(
+                            format!(
+                                "bad argument #1 to 'concat' (table expected, got {})",
+                                table.type_name()
+                            )
+                            .into_bytes(),
+                        ))));
+                    }
+                    return Err(RuntimeError::Type {
+                        operation: "table.concat",
+                        expected: "table",
+                        actual: table.type_name(),
+                    });
                 }
                 Err(error) => return Err(error),
             };
@@ -22662,7 +24528,46 @@ impl Vm {
                 function: "table.sort",
                 index: 1,
             })?;
-            let table = table_id(table)?;
+            let table = match table {
+                Value::Table(table) => *table,
+                other
+                    if matches!(
+                        profile,
+                        SemanticProfile::Lua51
+                            | SemanticProfile::Lua52
+                            | SemanticProfile::Lua53
+                            | SemanticProfile::Lua54
+                            | SemanticProfile::Lua55
+                    ) =>
+                {
+                    let function_name = if vm.debug_native_frames.len() > 1 {
+                        "table.sort"
+                    } else {
+                        "sort"
+                    };
+                    if vm.prefix_lua_errors {
+                        return Err(RuntimeError::LuaMessage(Arc::from(
+                            format!(
+                                "bad argument #1 to '{function_name}' (table expected, got {})",
+                                other.type_name()
+                            )
+                            .into_bytes(),
+                        )));
+                    }
+                    return Err(RuntimeError::Type {
+                        operation: "table.sort",
+                        expected: "table",
+                        actual: other.type_name(),
+                    });
+                }
+                other => {
+                    return Err(RuntimeError::Type {
+                        operation: "table.sort",
+                        expected: "table",
+                        actual: other.type_name(),
+                    });
+                }
+            };
             let comparator = arguments
                 .get(1)
                 .filter(|value| !matches!(value, Value::Nil));
@@ -22792,12 +24697,13 @@ impl Vm {
                         let result = match result {
                             Ok(result) => result,
                             Err(error @ RuntimeError::CoroutineYield(_)) => {
-                                let continuation = vm.captured_blu_continuation.take().ok_or(
-                                    RuntimeError::UnsupportedLibraryFeature {
-                                        function: "table.sort",
-                                        feature: "yielding custom comparators",
-                                    },
-                                )?;
+                                let continuation =
+                                    vm.captured_blu_continuation.take().ok_or_else(|| {
+                                        table_sort_yield_error(
+                                            vm.active_profile(),
+                                            "yielding custom comparators",
+                                        )
+                                    })?;
                                 vm.pending_blu_operation =
                                     Some(PendingBluOperation::TableSort(PendingTableSort {
                                         table,
@@ -22857,12 +24763,13 @@ impl Vm {
                         let result = match result {
                             Ok(result) => result,
                             Err(error @ RuntimeError::CoroutineYield(_)) => {
-                                let continuation = vm.captured_blu_continuation.take().ok_or(
-                                    RuntimeError::UnsupportedLibraryFeature {
-                                        function: "table.sort",
-                                        feature: "yielding metamethod ordering",
-                                    },
-                                )?;
+                                let continuation =
+                                    vm.captured_blu_continuation.take().ok_or_else(|| {
+                                        table_sort_yield_error(
+                                            vm.active_profile(),
+                                            "yielding metamethod ordering",
+                                        )
+                                    })?;
                                 vm.pending_blu_operation =
                                     Some(PendingBluOperation::TableSort(PendingTableSort {
                                         table,
@@ -23659,9 +25566,9 @@ impl Vm {
                 .any(|value| matches!(value, Value::String(_)))
             {
                 let mut values = arguments.iter();
-                let mut selected = values
-                    .next()
-                    .ok_or_else(|| math_value_expected_error(profile, "math.min"))?;
+                let mut selected = values.next().ok_or_else(|| {
+                    math_value_expected_error(profile, "math.min", vm.prefix_lua_errors)
+                })?;
                 let mut selected_number =
                     coercible_number_argument(profile, arguments, 0, "math.min")?;
                 for (index, value) in values.enumerate() {
@@ -23685,9 +25592,9 @@ impl Vm {
                 };
             }
             let mut values = arguments.iter();
-            let mut selected = values
-                .next()
-                .ok_or_else(|| math_value_expected_error(profile, "math.min"))?;
+            let mut selected = values.next().ok_or_else(|| {
+                math_value_expected_error(profile, "math.min", vm.prefix_lua_errors)
+            })?;
             selected.as_number().ok_or(RuntimeError::Type {
                 operation: "math.min",
                 expected: "number",
@@ -23726,9 +25633,9 @@ impl Vm {
                 .any(|value| matches!(value, Value::String(_)))
             {
                 let mut values = arguments.iter();
-                let mut selected = values
-                    .next()
-                    .ok_or_else(|| math_value_expected_error(profile, "math.max"))?;
+                let mut selected = values.next().ok_or_else(|| {
+                    math_value_expected_error(profile, "math.max", vm.prefix_lua_errors)
+                })?;
                 let mut selected_number =
                     coercible_number_argument(profile, arguments, 0, "math.max")?;
                 for (index, value) in values.enumerate() {
@@ -23752,9 +25659,9 @@ impl Vm {
                 };
             }
             let mut values = arguments.iter();
-            let mut selected = values
-                .next()
-                .ok_or_else(|| math_value_expected_error(profile, "math.max"))?;
+            let mut selected = values.next().ok_or_else(|| {
+                math_value_expected_error(profile, "math.max", vm.prefix_lua_errors)
+            })?;
             selected.as_number().ok_or(RuntimeError::Type {
                 operation: "math.max",
                 expected: "number",
@@ -24964,6 +26871,45 @@ fn string_bytes<'a>(value: &'a Value, operation: &'static str) -> Result<&'a [u8
     }
 }
 
+fn lua_bad_argument(
+    function: &'static str,
+    index: usize,
+    expected: &'static str,
+    actual: &'static str,
+) -> RuntimeError {
+    RuntimeError::LuaMessage(Arc::from(
+        format!("bad argument #{index} to '{function}' ({expected} expected, got {actual})")
+            .into_bytes(),
+    ))
+}
+
+fn table_sort_yield_error(
+    profile: Result<SemanticProfile, RuntimeError>,
+    feature: &'static str,
+) -> RuntimeError {
+    match profile {
+        Err(error) => error,
+        Ok(profile)
+            if matches!(
+                profile,
+                SemanticProfile::Lua51
+                    | SemanticProfile::Lua52
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) =>
+        {
+            RuntimeError::Raised(Value::String(Arc::from(
+                &b"attempt to yield across a C-call boundary"[..],
+            )))
+        }
+        Ok(_) => RuntimeError::UnsupportedLibraryFeature {
+            function: "table.sort",
+            feature,
+        },
+    }
+}
+
 fn io_file_argument(
     arguments: &[Value],
     function: &'static str,
@@ -25002,6 +26948,7 @@ fn open_io_file(
         })?;
     let roots = GcRoots::from_values(arguments)?;
     let userdata = vm.allocate_userdata(Arc::from(&b"file"[..]), &roots)?;
+    vm.attach_io_file_metatable(userdata)?;
     vm.io_file_handles.insert(
         userdata,
         IoFileState {
@@ -25035,6 +26982,7 @@ fn open_io_file_required(
         })?;
     let roots = GcRoots::from_values(arguments)?;
     let userdata = vm.allocate_userdata(Arc::from(&b"file"[..]), &roots)?;
+    vm.attach_io_file_metatable(userdata)?;
     vm.io_file_handles.insert(
         userdata,
         IoFileState {
@@ -25376,12 +27324,17 @@ fn unpack_table_values(
         required: usize::MAX,
         limit: MAX_DYNAMIC_REGISTERS,
     })?;
-    let result_limit = if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
-        MAX_LUAU_UNPACK_RESULTS
-    } else {
-        MAX_DYNAMIC_REGISTERS
+    let result_limit = match profile {
+        SemanticProfile::Blu | SemanticProfile::Luau => MAX_LUAU_UNPACK_RESULTS,
+        SemanticProfile::Lua54 | SemanticProfile::Lua55 => MAX_DYNAMIC_REGISTERS - 1,
+        _ => MAX_DYNAMIC_REGISTERS,
     };
     if count > result_limit {
+        if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55) {
+            return Err(RuntimeError::LuaMessage(Arc::from(
+                &b"too many results to unpack"[..],
+            )));
+        }
         return Err(RuntimeError::StackLimit {
             required: count,
             limit: result_limit,
@@ -25477,6 +27430,16 @@ fn string_pack_format_error(function: &'static str, feature: &'static str) -> Ru
     RuntimeError::UnsupportedLibraryFeature { function, feature }
 }
 
+fn string_pack_max_size(profile: SemanticProfile) -> usize {
+    if profile == SemanticProfile::Lua55 {
+        i64::MAX as usize
+    } else if profile == SemanticProfile::Luau {
+        1 << 30
+    } else {
+        MAX_PACKSIZE_BYTES
+    }
+}
+
 fn string_pack_read_size(
     format: &[u8],
     cursor: &mut usize,
@@ -25491,7 +27454,7 @@ fn string_pack_read_size(
         value = value
             .checked_mul(10)
             .and_then(|value| value.checked_add(usize::from(byte - b'0')))
-            .ok_or(string_pack_format_error(function, "too large"))?;
+            .ok_or(string_pack_format_error(function, "invalid format"))?;
     }
     if *cursor == start {
         return default.ok_or(string_pack_format_error(function, "missing size"));
@@ -25532,6 +27495,7 @@ fn string_pack_option(
     cursor: &mut usize,
     little_endian: bool,
     function: &'static str,
+    max_packsize: usize,
 ) -> Result<Option<(StringPackKind, usize, bool)>, RuntimeError> {
     let option = *format.get(*cursor).ok_or(string_pack_format_error(
         function,
@@ -25571,14 +27535,14 @@ fn string_pack_option(
         )),
         b'c' => Some((
             StringPackKind::FixedString,
-            string_pack_read_size(format, cursor, None, MAX_PACKSIZE_BYTES, function)?,
+            string_pack_read_size(format, cursor, None, max_packsize, function)?,
             little_endian,
         )),
         b'z' => Some((StringPackKind::ZeroString, 0, little_endian)),
         b'x' => Some((StringPackKind::Padding, 1, little_endian)),
         b'X' => {
             let Some((kind, size, _)) =
-                string_pack_option(format, cursor, little_endian, function)?
+                string_pack_option(format, cursor, little_endian, function, max_packsize)?
             else {
                 return Err(string_pack_format_error(function, "invalid next option"));
             };
@@ -25604,6 +27568,7 @@ fn string_pack_option(
 fn parse_string_pack_format(
     format: &[u8],
     function: &'static str,
+    max_packsize: usize,
 ) -> Result<Vec<StringPackField>, RuntimeError> {
     let mut fields = Vec::new();
     let mut cursor = 0usize;
@@ -25650,7 +27615,7 @@ fn parse_string_pack_format(
                 return Err(string_pack_format_error(function, "invalid next option"));
             }
             let Some((kind, size, little)) =
-                string_pack_option(format, &mut cursor, little_endian, function)?
+                string_pack_option(format, &mut cursor, little_endian, function, max_packsize)?
             else {
                 return Err(string_pack_format_error(function, "invalid next option"));
             };
@@ -25677,7 +27642,7 @@ fn parse_string_pack_format(
             continue;
         }
         let Some((kind, size, little)) =
-            string_pack_option(format, &mut cursor, little_endian, function)?
+            string_pack_option(format, &mut cursor, little_endian, function, max_packsize)?
         else {
             continue;
         };
@@ -25714,7 +27679,7 @@ enum StringPackSize {
     TooLarge,
 }
 
-fn string_pack_fixed_size(fields: &[StringPackField]) -> StringPackSize {
+fn string_pack_fixed_size(fields: &[StringPackField], max_packsize: usize) -> StringPackSize {
     let mut total = 0usize;
     for field in fields {
         if matches!(
@@ -25726,7 +27691,7 @@ fn string_pack_fixed_size(fields: &[StringPackField]) -> StringPackSize {
         let Some(next) = total.checked_add(field.size) else {
             return StringPackSize::TooLarge;
         };
-        if next > MAX_PACKSIZE_BYTES {
+        if next > max_packsize {
             return StringPackSize::TooLarge;
         }
         total = next;
@@ -26200,13 +28165,22 @@ fn profile_integer_argument(
                 actual: value.type_name(),
             });
         }
-        return exact_integer_conversion(value, profile).ok_or(RuntimeError::Type {
-            operation: function,
-            expected: "integer",
-            actual: value.type_name(),
-        });
+        return exact_integer_conversion(value, profile)
+            .ok_or_else(|| profile_integer_argument_error(profile, value, function));
     }
     integer_argument(arguments, zero_based_index, function)
+}
+
+fn profile_integer_argument_error(
+    _profile: SemanticProfile,
+    value: &Value,
+    function: &'static str,
+) -> RuntimeError {
+    RuntimeError::Type {
+        operation: function,
+        expected: "integer",
+        actual: value.type_name(),
+    }
 }
 
 fn debug_integer_conversion(value: &Value, profile: SemanticProfile) -> Option<i64> {
@@ -26861,7 +28835,7 @@ fn blu_bitwise_integer(
         } else {
             &b"number has no integer representation"[..]
         };
-        return Err(RuntimeError::LuauMessage(Arc::from(message)));
+        return Err(RuntimeError::LuaIntegerConversion(Arc::from(message)));
     }
     Err(RuntimeError::Type {
         operation,
@@ -27068,20 +29042,39 @@ fn profiled_number_argument(
                     | SemanticProfile::Lua55
             ) =>
         {
-            Err(RuntimeError::LuauMessage(Arc::from(
-                format!(
-                    "bad argument #{} to '{}' (number expected, got {actual})",
-                    zero_based_index + 1,
-                    function.rsplit('.').next().unwrap_or(function),
-                )
-                .into_bytes(),
-            )))
+            if vm.prefix_lua_errors {
+                let function_name = function.rsplit('.').next().unwrap_or(function);
+                let actual = arguments
+                    .get(zero_based_index)
+                    .map(|value| vm.lua_object_type_name(value, true).map(|(name, _)| name))
+                    .transpose()?
+                    .unwrap_or_else(|| actual.to_owned());
+                Err(RuntimeError::LuaMessage(Arc::from(
+                    format!(
+                        "bad argument #{} to '{}' (number expected, got {})",
+                        zero_based_index + 1,
+                        function_name,
+                        actual,
+                    )
+                    .into_bytes(),
+                )))
+            } else {
+                Err(RuntimeError::Type {
+                    operation: function,
+                    expected: "number",
+                    actual,
+                })
+            }
         }
         result => result,
     }
 }
 
-fn math_value_expected_error(profile: SemanticProfile, function: &'static str) -> RuntimeError {
+fn math_value_expected_error(
+    profile: SemanticProfile,
+    function: &'static str,
+    source_errors: bool,
+) -> RuntimeError {
     if matches!(
         profile,
         SemanticProfile::Lua51
@@ -27090,13 +29083,18 @@ fn math_value_expected_error(profile: SemanticProfile, function: &'static str) -
             | SemanticProfile::Lua54
             | SemanticProfile::Lua55
     ) {
-        RuntimeError::LuauMessage(Arc::from(
-            format!(
-                "bad argument #1 to '{}' (value expected)",
-                function.rsplit('.').next().unwrap_or(function),
-            )
-            .into_bytes(),
-        ))
+        if source_errors {
+            let function_name = function.rsplit('.').next().unwrap_or(function);
+            RuntimeError::LuaMessage(Arc::from(
+                format!("bad argument #1 to '{function_name}' (value expected)").into_bytes(),
+            ))
+        } else {
+            RuntimeError::Type {
+                operation: function,
+                expected: "value",
+                actual: "missing",
+            }
+        }
     } else {
         RuntimeError::Argument { function, index: 1 }
     }
@@ -28768,6 +30766,32 @@ fn runtime_error_value(error: RuntimeError) -> Value {
     }
 }
 
+fn close_metamethod_error(error: RuntimeError) -> RuntimeError {
+    match error {
+        RuntimeError::Raised(Value::String(message)) => {
+            let mut message = message.to_vec();
+            message.extend_from_slice(b"\n\t[C]: in metamethod 'close'");
+            RuntimeError::Raised(Value::String(Arc::from(message)))
+        }
+        RuntimeError::Type {
+            operation: "call",
+            actual,
+            ..
+        } => RuntimeError::Raised(Value::String(Arc::from(
+            format!(
+                "attempt to call a {} value\n\t[C]: in metamethod 'close'",
+                if matches!(actual, "integer" | "number") {
+                    "number"
+                } else {
+                    actual
+                }
+            )
+            .into_bytes(),
+        ))),
+        error => error,
+    }
+}
+
 fn validate_generic_iterator_result(
     vm: &Vm,
     values: Vec<Value>,
@@ -28844,7 +30868,24 @@ fn is_guest_memory_error(error: &RuntimeError) -> bool {
 }
 
 fn xpcall_runtime_error_value(error: RuntimeError, profile: SemanticProfile) -> Value {
-    if guest_memory_diagnostic(profile) && is_memory_error(&error) {
+    if matches!(
+        profile,
+        SemanticProfile::Lua51
+            | SemanticProfile::Lua52
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    ) && matches!(
+        &error,
+        RuntimeError::CallLimit { .. } | RuntimeError::CStackOverflow { .. }
+    ) {
+        let message = if matches!(error, RuntimeError::CStackOverflow { .. }) {
+            &b"C stack overflow"[..]
+        } else {
+            &b"stack overflow"[..]
+        };
+        Value::String(Arc::from(message))
+    } else if guest_memory_diagnostic(profile) && is_memory_error(&error) {
         Value::String(Arc::from(&b"not enough memory"[..]))
     } else {
         xpcall_error_value(runtime_error_value(error), profile)
@@ -28852,7 +30893,24 @@ fn xpcall_runtime_error_value(error: RuntimeError, profile: SemanticProfile) -> 
 }
 
 fn pcall_runtime_error_value(error: RuntimeError, profile: SemanticProfile) -> Value {
-    if guest_memory_diagnostic(profile) && is_memory_error(&error) {
+    if matches!(
+        profile,
+        SemanticProfile::Lua51
+            | SemanticProfile::Lua52
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    ) && matches!(
+        &error,
+        RuntimeError::CallLimit { .. } | RuntimeError::CStackOverflow { .. }
+    ) {
+        let message = if matches!(error, RuntimeError::CStackOverflow { .. }) {
+            &b"C stack overflow"[..]
+        } else {
+            &b"stack overflow"[..]
+        };
+        Value::String(Arc::from(message))
+    } else if guest_memory_diagnostic(profile) && is_memory_error(&error) {
         Value::String(Arc::from(&b"not enough memory"[..]))
     } else if profile == SemanticProfile::Luau && matches!(error, RuntimeError::CallLimit { .. }) {
         Value::String(Arc::from(&b"[string \"=(load)\"]:1: stack overflow"[..]))
@@ -29416,7 +31474,10 @@ fn blu_parameter_offset(prototype: &BluPrototype) -> usize {
     usize::from(
         prototype
             .required_features
-            .contains(FeatureBits::IMPLICIT_ENVIRONMENT),
+            .contains(FeatureBits::IMPLICIT_ENVIRONMENT)
+            && !prototype
+                .required_features
+                .contains(FeatureBits::DUMPED_FUNCTION),
     )
 }
 
@@ -29823,6 +31884,16 @@ fn inject_pending_resume_error(
 fn pending_blu_operation_roots(operation: &PendingBluOperation) -> Result<GcRoots, RuntimeError> {
     match operation {
         PendingBluOperation::ResumeValues => Ok(GcRoots::default()),
+        PendingBluOperation::Close(operation) => {
+            let mut roots = GcRoots::from_values(&operation.values)?;
+            if let Some(RuntimeError::Raised(value)) = &operation.error {
+                roots.push_value(value.clone())?;
+            }
+            if let Some(continuation) = &operation.continuation {
+                roots.extend(blu_continuation_roots(continuation)?)?;
+            }
+            Ok(roots)
+        }
         PendingBluOperation::ProtectedCall(operation) => {
             let mut roots = operation.request.roots.try_clone()?;
             roots.push_value(operation.request.target.clone())?;
@@ -30153,6 +32224,7 @@ fn blu_v1_execution_bytes(prototype: &blu_bytecode::blu::Prototype) -> Result<us
 fn dump_blu_function(
     artifact: &BluArtifact,
     main: usize,
+    profile: SemanticProfile,
     strip: bool,
 ) -> Result<Vec<u8>, RuntimeError> {
     artifact
@@ -30328,7 +32400,46 @@ fn dump_blu_function(
     };
     let validated =
         ValidatedBluArtifact::new(projected, limits).map_err(RuntimeError::BluValidation)?;
-    encode(&validated, limits).map_err(RuntimeError::BluEncode)
+    let payload = encode(&validated, limits).map_err(RuntimeError::BluEncode)?;
+    let Some(mut header) = lua_dump_header(profile) else {
+        return Ok(payload);
+    };
+    header.extend_from_slice(&payload);
+    Ok(header)
+}
+
+fn lua_dump_header(profile: SemanticProfile) -> Option<Vec<u8>> {
+    let mut header = Vec::new();
+    match profile {
+        SemanticProfile::Lua54 => {
+            header.extend_from_slice(b"\x1bLua");
+            header.push(0x54);
+            header.push(0);
+            header.extend_from_slice(b"\x19\x93\r\n\x1a\n");
+            header.push(4);
+            header.push(core::mem::size_of::<i64>() as u8);
+            header.push(core::mem::size_of::<f64>() as u8);
+            header.extend_from_slice(&0x5678_i64.to_ne_bytes());
+            header.extend_from_slice(&370.5_f64.to_ne_bytes());
+            Some(header)
+        }
+        SemanticProfile::Lua55 => {
+            header.extend_from_slice(b"\x1bLua");
+            header.push(0x55);
+            header.push(0);
+            header.extend_from_slice(b"\x19\x93\r\n\x1a\n");
+            header.push(core::mem::size_of::<i32>() as u8);
+            header.extend_from_slice(&(-0x5678_i32).to_ne_bytes());
+            header.push(4);
+            header.extend_from_slice(&0x1234_5678_u32.to_ne_bytes());
+            header.push(core::mem::size_of::<i64>() as u8);
+            header.extend_from_slice(&(-0x5678_i64).to_ne_bytes());
+            header.push(core::mem::size_of::<f64>() as u8);
+            header.extend_from_slice(&(-370.5_f64).to_ne_bytes());
+            Some(header)
+        }
+        _ => None,
+    }
 }
 
 fn try_clone_string(value: &str, what: &'static str) -> Result<String, RuntimeError> {
@@ -30721,6 +32832,8 @@ fn blu_instruction_successors(
         ],
         BluInstruction::Return { .. }
         | BluInstruction::ReturnVarargs { .. }
+        | BluInstruction::ReturnDynamic
+        | BluInstruction::ReturnDynamicPrefix { .. }
         | BluInstruction::ReturnCall { .. }
         | BluInstruction::ReturnCallPrefix { .. }
         | BluInstruction::ReturnCallVarargs { .. }
@@ -30876,6 +32989,7 @@ fn mark_blu_instruction_reads(
             }
         }
         BluInstruction::ReturnVarargs { first, count }
+        | BluInstruction::ReturnDynamicPrefix { first, count }
         | BluInstruction::Return { first, count } => {
             mark_blu_register_range(live, first, count);
         }
@@ -30906,6 +33020,7 @@ fn mark_blu_instruction_reads(
         | BluInstruction::GetUpvalue { .. }
         | BluInstruction::CloseUpvalues { .. }
         | BluInstruction::Varargs { .. }
+        | BluInstruction::ReturnDynamic
         | BluInstruction::Jump { .. } => {}
     }
 }
@@ -30979,6 +33094,8 @@ fn clear_blu_instruction_writes(instruction: BluInstruction, live: &mut [bool]) 
         | BluInstruction::ReturnCallDynamic { .. }
         | BluInstruction::ReturnCallDynamicPrefix { .. }
         | BluInstruction::ReturnVarargs { .. }
+        | BluInstruction::ReturnDynamic
+        | BluInstruction::ReturnDynamicPrefix { .. }
         | BluInstruction::Return { .. }
         | BluInstruction::JumpIfTruthy { .. }
         | BluInstruction::JumpIfFalsy { .. }
@@ -31302,7 +33419,15 @@ pub enum RuntimeError {
     /// A profile-specific guest diagnostic whose wording is observable by
     /// `pcall`/`xpcall` and cannot be represented by the generic host error
     /// categories above.
+    LuaIntegerConversion(Arc<[u8]>),
+    /// A profile-specific guest diagnostic whose wording is observable by
+    /// `pcall`/`xpcall` and cannot be represented by the generic host error
+    /// categories above.
     LuauMessage(Arc<[u8]>),
+    /// A profile-specific Lua diagnostic whose wording is observable through
+    /// protected calls and cannot be represented by the generic host error
+    /// categories above.
+    LuaMessage(Arc<[u8]>),
     InvalidRange {
         operation: &'static str,
     },
@@ -31327,6 +33452,9 @@ pub enum RuntimeError {
     Interrupted,
     DeadlineExceeded,
     CallLimit {
+        limit: usize,
+    },
+    CStackOverflow {
         limit: usize,
     },
     StackLimit {
@@ -31394,6 +33522,7 @@ pub enum RuntimeError {
     },
     ProtectedCallActivation,
     CoroutineYield(Vec<Value>),
+    CoroutineCloseYield(Arc<[u8]>),
     CoroutineYieldOutside,
     ModuleLoaderMissing,
     CircularModule(Arc<[u8]>),
@@ -31509,7 +33638,9 @@ impl fmt::Display for RuntimeError {
                 expected,
                 actual,
             } => write!(f, "{operation} expected {expected}, received {actual}"),
+            Self::LuaIntegerConversion(message) => f.write_str(&String::from_utf8_lossy(message)),
             Self::LuauMessage(message) => f.write_str(&String::from_utf8_lossy(message)),
+            Self::LuaMessage(message) => f.write_str(&String::from_utf8_lossy(message)),
             Self::InvalidRange { operation } => {
                 write!(f, "{operation} received an invalid range")
             }
@@ -31537,6 +33668,7 @@ impl fmt::Display for RuntimeError {
             Self::Interrupted => f.write_str("execution interrupted"),
             Self::DeadlineExceeded => f.write_str("execution deadline exceeded"),
             Self::CallLimit { limit } => write!(f, "call depth limit {limit} exceeded"),
+            Self::CStackOverflow { .. } => f.write_str("C stack overflow"),
             Self::StackLimit { required, limit } => {
                 write!(
                     f,
@@ -31637,6 +33769,7 @@ impl fmt::Display for RuntimeError {
             Self::CoroutineYield(values) => {
                 write!(f, "coroutine yielded {} values", values.len())
             }
+            Self::CoroutineCloseYield(message) => f.write_str(&String::from_utf8_lossy(message)),
             Self::CoroutineYieldOutside => f.write_str("cannot yield outside a running coroutine"),
             Self::ModuleLoaderMissing => f.write_str("require has no configured module loader"),
             Self::CircularModule(name) => write!(

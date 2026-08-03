@@ -75,3 +75,47 @@ local close_state, close_message = load("local <close> a, b")
 print("close", close_state, close_message)
 local close_state2, close_message2 = load("local a<close>, b<close>")
 print("close2", close_state2, close_message2)
+local X, Y
+local function tail_foo()
+    local _ <close> = setmetatable({}, {__close = function() Y = 10 end})
+    print("tail-before", X, Y)
+    return 1, 2, 3
+end
+local function tail_bar()
+    local _ <close> = setmetatable({}, {__close = function() X = false end})
+    X = true
+    do
+        return tail_foo()
+    end
+end
+local ta, tb, tc, td = tail_bar()
+print("tail", ta, tb, tc, td, X, Y)
+local close_events = ""
+local function close_chain()
+    local x <close> = setmetatable({}, {__close=function(_, message) close_events = close_events .. "x:" .. tostring(message) end})
+    local x1 <close> = setmetatable({}, {__close=function(_, message) close_events = close_events .. "x1:" .. tostring(message); error("@x1") end})
+    local gc <close> = setmetatable({}, {__close=function() close_events = close_events .. "gc" end})
+    local y <close> = setmetatable({}, {__close=function(_, message) close_events = close_events .. "y:" .. tostring(message); error("@y") end})
+    local z <close> = setmetatable({}, {__close=function(_, message) close_events = close_events .. "z:" .. tostring(message); error("@z") end})
+    error(4)
+end
+local chain_ok, chain_message = pcall(close_chain)
+print("chain", chain_ok, chain_message, close_events)
+local function debug_chain()
+    local x <close> = setmetatable({}, {__close=function(_, message)
+        print("debug-x", debug.getinfo(2).name, message)
+    end})
+    local x1 <close> = setmetatable({}, {__close=function(_, message)
+        print("debug-x1", debug.getinfo(2).name, message); error("@x1")
+    end})
+    local gc <close> = setmetatable({}, {__close=function() collectgarbage() end})
+    local y <close> = setmetatable({}, {__close=function(_, message)
+        print("debug-y", debug.getinfo(2).name, message); error("@y")
+    end})
+    local z <close> = setmetatable({}, {__close=function(_, message)
+        print("debug-z", debug.getinfo(2).name, message); error("@z")
+    end})
+    error(4)
+end
+local debug_ok, debug_message = pcall(debug_chain, true)
+print("debug-chain", debug_ok, debug_message)

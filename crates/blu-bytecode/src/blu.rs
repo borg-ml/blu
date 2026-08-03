@@ -432,6 +432,16 @@ pub enum Instruction {
         first: u16,
         count: u16,
     },
+    /// Returns the exact dynamic result vector produced by the immediately
+    /// preceding all-results call after the compiler has closed active
+    /// to-be-closed locals.
+    ReturnDynamic,
+    /// Returns a fixed register prefix followed by the exact dynamic result
+    /// vector produced by the immediately preceding all-results call.
+    ReturnDynamicPrefix {
+        first: u16,
+        count: u16,
+    },
     Move {
         destination: u16,
         source: u16,
@@ -614,6 +624,8 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::CloseUpvalues { .. }
             | Instruction::Varargs { .. }
             | Instruction::ReturnVarargs { .. }
+            | Instruction::ReturnDynamic
+            | Instruction::ReturnDynamicPrefix { .. }
             | Instruction::Move { .. }
             | Instruction::Not { .. }
             | Instruction::Negate { .. }
@@ -671,6 +683,8 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::CloseUpvalues { .. }
                 | Instruction::Varargs { .. }
                 | Instruction::ReturnVarargs { .. }
+                | Instruction::ReturnDynamic
+                | Instruction::ReturnDynamicPrefix { .. }
                 | Instruction::Move { .. }
                 | Instruction::Not { .. }
                 | Instruction::Negate { .. }
@@ -1408,6 +1422,7 @@ fn backward_branch_requirements(
     code: &[Instruction],
     target: usize,
     registers: usize,
+    closure_capture_registers: &[Vec<u16>],
 ) -> Vec<bool> {
     let mut required = vec![false; registers];
     let mut incoming = HashMap::<usize, Vec<bool>>::new();
@@ -1433,8 +1448,15 @@ fn backward_branch_requirements(
             Instruction::LoadConstant { destination, .. }
             | Instruction::LoadGlobal { destination, .. }
             | Instruction::NewTable { destination }
-            | Instruction::NewClosure { destination, .. }
             | Instruction::GetUpvalue { destination, .. } => {
+                mark_written_register(destination, &mut initialized);
+            }
+            Instruction::NewClosure { destination, .. } => {
+                if let Some(captures) = closure_capture_registers.get(pc) {
+                    for &register in captures {
+                        mark_required_register(register, &mut initialized, &mut required);
+                    }
+                }
                 mark_written_register(destination, &mut initialized);
             }
             Instruction::StoreGlobal { source, .. } | Instruction::SetUpvalue { source, .. } => {
@@ -1584,6 +1606,13 @@ fn backward_branch_requirements(
                 mark_written_range(destination, count, &mut initialized);
             }
             Instruction::ReturnVarargs { first, count } => {
+                mark_required_range(first, count, &mut initialized, &mut required);
+                terminates = true;
+            }
+            Instruction::ReturnDynamic => {
+                terminates = true;
+            }
+            Instruction::ReturnDynamicPrefix { first, count } => {
                 mark_required_range(first, count, &mut initialized, &mut required);
                 terminates = true;
             }
@@ -1899,6 +1928,8 @@ fn validate_prototype(
                 | Instruction::CallVarargsAllResults { .. }
                 | Instruction::CallDynamicResults { .. }
                 | Instruction::CallDynamicAllResults { .. }
+                | Instruction::ReturnDynamic
+                | Instruction::ReturnDynamicPrefix { .. }
                 | Instruction::ReturnCallDynamic { .. }
                 | Instruction::ReturnCallDynamicPrefix { .. }
         )
@@ -2150,6 +2181,24 @@ fn validate_prototype(
             }
         }
     }
+    let mut closure_capture_registers = vec![Vec::new(); prototype.code.len()];
+    for (pc, instruction) in prototype.code.iter().copied().enumerate() {
+        let Instruction::NewClosure { child, .. } = instruction else {
+            continue;
+        };
+        let Some(&child_index) = prototype.children.get(child as usize) else {
+            continue;
+        };
+        let Some(child_prototype) = prototypes.get(child_index as usize) else {
+            continue;
+        };
+        closure_capture_registers[pc].extend(child_prototype.upvalues.iter().filter_map(
+            |capture| match capture {
+                Upvalue::ParentRegister(register) => Some(*register),
+                Upvalue::ParentUpvalue(_) => None,
+            },
+        ));
+    }
     let mut backward_states = HashMap::<usize, Vec<bool>>::new();
     let mut reachable = true;
     for (pc, instruction) in prototype.code.iter().copied().enumerate() {
@@ -2157,6 +2206,8 @@ fn validate_prototype(
             instruction,
             Instruction::CallDynamicResults { .. }
                 | Instruction::CallDynamicAllResults { .. }
+                | Instruction::ReturnDynamic
+                | Instruction::ReturnDynamicPrefix { .. }
                 | Instruction::ReturnCallDynamic { .. }
                 | Instruction::ReturnCallDynamicPrefix { .. }
                 | Instruction::SetListCallDynamic { .. }
@@ -2196,7 +2247,12 @@ fn validate_prototype(
             // later backward goto.  Treat that backward target as a second
             // entry point so the linear validator can check its instructions
             // and record the initialization state used by the back-edge.
-            initialized = backward_branch_requirements(&prototype.code, pc, registers);
+            initialized = backward_branch_requirements(
+                &prototype.code,
+                pc,
+                registers,
+                &closure_capture_registers,
+            );
             reachable = true;
         }
         if !reachable {
@@ -2497,6 +2553,8 @@ fn validate_prototype(
                     Some(
                         Instruction::CallDynamicResults { .. }
                             | Instruction::CallDynamicAllResults { .. }
+                            | Instruction::ReturnDynamic
+                            | Instruction::ReturnDynamicPrefix { .. }
                             | Instruction::ReturnCallDynamic { .. }
                             | Instruction::ReturnCallDynamicPrefix { .. }
                             | Instruction::SetListCallDynamic { .. }
@@ -2719,6 +2777,29 @@ fn validate_prototype(
                 }
                 reachable = false;
             }
+            Instruction::ReturnDynamic => {
+                reachable = false;
+            }
+            Instruction::ReturnDynamicPrefix { first, count } => {
+                let end = usize::from(first).checked_add(usize::from(count)).ok_or(
+                    ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "dynamic return prefix register range overflows",
+                    },
+                )?;
+                if end > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "dynamic return prefix register range is invalid",
+                    });
+                }
+                for register in first..first + count {
+                    check_read(index, pc, register, &initialized)?;
+                }
+                reachable = false;
+            }
             Instruction::Move {
                 destination,
                 source,
@@ -2913,7 +2994,12 @@ fn validate_prototype(
                             what: "backward branch target state is unavailable",
                         });
                     };
-                    let required = backward_branch_requirements(&prototype.code, target, registers);
+                    let required = backward_branch_requirements(
+                        &prototype.code,
+                        target,
+                        registers,
+                        &closure_capture_registers,
+                    );
                     if target_state.iter().zip(&initialized).zip(&required).any(
                         |((target_initialized, current), required)| {
                             *required && *target_initialized && !*current
@@ -2997,6 +3083,8 @@ fn validate_prototype(
                 | Instruction::ReturnCallDynamic { .. }
                 | Instruction::ReturnCallDynamicPrefix { .. }
                 | Instruction::ReturnVarargs { .. }
+                | Instruction::ReturnDynamic
+                | Instruction::ReturnDynamicPrefix { .. }
         )
     ) {
         return Err(ValidationError::InvalidInstruction {
@@ -3278,6 +3366,8 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     Instruction::ReturnCallPrefix { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. } => 11,
                     Instruction::ReturnCallDynamicPrefix { .. } => 11,
+                    Instruction::ReturnDynamic => 1,
+                    Instruction::ReturnDynamicPrefix { .. } => 5,
                     Instruction::SetListCall { .. }
                     | Instruction::SetListCallVarargs { .. }
                     | Instruction::SetListCallDynamic { .. } => 13,
@@ -3667,6 +3757,14 @@ fn put_prototype(
             }
             Instruction::ReturnVarargs { first, count } => {
                 out.push(33);
+                put_u16(out, *first);
+                put_u16(out, *count);
+            }
+            Instruction::ReturnDynamic => {
+                out.push(54);
+            }
+            Instruction::ReturnDynamicPrefix { first, count } => {
+                out.push(55);
                 put_u16(out, *first);
                 put_u16(out, *count);
             }
@@ -4729,6 +4827,11 @@ fn read_prototype(
                 function: reader.u16()?,
                 arguments: reader.u16()?,
                 argument_count: reader.u16()?,
+            },
+            54 => Instruction::ReturnDynamic,
+            55 => Instruction::ReturnDynamicPrefix {
+                first: reader.u16()?,
+                count: reader.u16()?,
             },
             tag => {
                 return Err(DecodeError::InvalidTag {

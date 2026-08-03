@@ -1,0 +1,6 @@
+local a = assert(load(string.dump(load("x = 1; return x")), nil, "b"))
+print("BEFORE", debug.getupvalue(a, 1), _G.x)
+local result = a()
+print("MIDDLE", result, _G.x)
+assert(result == 1 and _G.x == 1)
+print("AFTER", _G.x)

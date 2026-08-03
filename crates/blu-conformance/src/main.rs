@@ -164,6 +164,7 @@ const OFFICIAL_LUAU_PROFILE_ISOLATIONS: &[(&str, &str)] = &[
 const DEFAULT_OFFICIAL_TEST_DEADLINE: Duration = Duration::from_secs(30);
 const TABLES_OFFICIAL_TEST_DEADLINE: Duration = Duration::from_secs(60);
 const SORT_OFFICIAL_TEST_DEADLINE: Duration = Duration::from_secs(120);
+const MODERN_LUA_OFFICIAL_TEST_DEADLINE: Duration = Duration::from_secs(30);
 const DEFAULT_OFFICIAL_TEST_INSTRUCTION_LIMIT: u64 = 10_000_000;
 const TABLES_OFFICIAL_TEST_INSTRUCTION_LIMIT: u64 = 40_000_000;
 const PCALL_OFFICIAL_TEST_CALL_LIMIT: usize = 20_000;
@@ -263,83 +264,43 @@ const OFFICIAL_LUA55_PORTABLE_TESTS: &[&str] = &[
 const OFFICIAL_LUA_MODERN_ISOLATIONS: &[(&str, &str, &str)] = &[
     (
         "5.4.8",
-        "calls.lua",
-        "the owned VM does not yet retain a resumable protected activation when xpcall is invoked from an error handling path; ordinary calls and tail calls in the fixture run",
-    ),
-    (
-        "5.5.0",
-        "calls.lua",
-        "the owned VM does not yet retain a resumable protected activation when xpcall is invoked from an error handling path; ordinary calls and tail calls in the fixture run",
-    ),
-    (
-        "5.4.8",
-        "closure.lua",
-        "owned control-flow validation still rejects a valid closure/goto path when a captured register is conservatively considered uninitialized",
-    ),
-    (
-        "5.5.0",
-        "closure.lua",
-        "owned control-flow validation still rejects a valid closure/goto path when a captured register is conservatively considered uninitialized",
-    ),
-    (
-        "5.4.8",
         "constructs.lua",
-        "the broad constructor/control-flow fixture reaches an owned load or generated-expression boundary before its final syntax probes",
+        "the executable assertions pass, but the owned child does not reproduce PUC's syntax/progress output bytes",
     ),
     (
         "5.5.0",
-        "constructs.lua",
-        "the broad constructor/control-flow fixture reaches an owned load or generated-expression boundary before its final syntax probes",
-    ),
-    (
-        "5.4.8",
-        "coroutine.lua",
-        "the owned main activation does not yet reproduce PUC's protected main-coroutine resume/yield boundary",
-    ),
-    (
-        "5.5.0",
-        "coroutine.lua",
-        "the owned main activation does not yet reproduce PUC's protected main-coroutine resume/yield boundary",
+        "calls.lua",
+        "the executable assertions pass, but the owned child does not reproduce PUC's call/progress output bytes",
     ),
     (
         "5.4.8",
         "errors.lua",
-        "owned source diagnostics for malformed loaded chunks still differ from PUC's exact near-token wording",
+        "the executable assertions pass, but PUC's printed C-stack capacity is host-dependent and differs from the owned stack count",
+    ),
+    (
+        "5.5.0",
+        "constructs.lua",
+        "the executable assertions pass, but the owned child does not reproduce PUC's syntax/progress output bytes",
+    ),
+    (
+        "5.4.8",
+        "locals.lua",
+        "the executable assertions pass, but the owned child does not reproduce PUC's progress-dot output bytes",
     ),
     (
         "5.5.0",
         "errors.lua",
-        "owned source diagnostics for malformed loaded chunks still differ from PUC's exact near-token wording",
+        "the executable assertions pass, but PUC's printed C-stack capacity is host-dependent and differs from the owned stack count",
     ),
     (
         "5.4.8",
         "locals.lua",
-        "owned const-assignment diagnostics still differ from PUC's exact wording",
+        "the executable assertions pass, but the owned child does not reproduce PUC's progress-dot output bytes",
     ),
     (
         "5.5.0",
         "locals.lua",
-        "the owned frontend does not yet parse the comma-separated Lua 5.5 global declaration used by this fixture",
-    ),
-    (
-        "5.4.8",
-        "tpack.lua",
-        "the owned binary-format boundary reaches a platform/error-convention mismatch in the invalid-format checks",
-    ),
-    (
-        "5.5.0",
-        "tpack.lua",
-        "the owned binary-format boundary reaches a platform/error-convention mismatch in the invalid-format checks",
-    ),
-    (
-        "5.4.8",
-        "utf8.lua",
-        "the owned UTF-8 offset/character-boundary behavior still differs in a later exhaustive check after the invalid-code wording is matched",
-    ),
-    (
-        "5.5.0",
-        "utf8.lua",
-        "the owned UTF-8 offset/character-boundary behavior still differs in a later exhaustive check after the invalid-code wording is matched",
+        "the executable assertions pass, but the owned child does not reproduce PUC's progress-dot output bytes",
     ),
 ];
 const PORTABLE_EXPECTED: &str = "14\nlu";
@@ -7585,18 +7546,18 @@ fn wait_for_child(mut child: Child, timeout: Duration) -> Result<Option<Output>,
     loop {
         match child
             .try_wait()
-            .map_err(|error| format!("failed to poll official Luau child: {error}"))?
+            .map_err(|error| format!("failed to poll official child: {error}"))?
         {
             Some(_) => {
                 return child
                     .wait_with_output()
                     .map(Some)
-                    .map_err(|error| format!("failed to collect official Luau child: {error}"));
+                    .map_err(|error| format!("failed to collect official child: {error}"));
             }
             None if Instant::now() >= deadline => {
                 child
                     .kill()
-                    .map_err(|error| format!("failed to stop official Luau child: {error}"))?;
+                    .map_err(|error| format!("failed to stop official child: {error}"))?;
                 let _ = child.wait();
                 return Ok(None);
             }
@@ -11303,10 +11264,26 @@ fn verify_official_lua_modern_tests(checkout: &Path) -> Result<(), String> {
                 .arg(semantic_profile_name(profile))
                 .arg("portable")
                 .current_dir(&test_dir)
-                .output()
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
                 .map_err(|error| {
                     format!("failed to execute Blu official Lua {version} child {name:?}: {error}")
                 })?;
+            let Some(child) = wait_for_child(child, MODERN_LUA_OFFICIAL_TEST_DEADLINE)? else {
+                let reason = OFFICIAL_LUA_MODERN_ISOLATIONS
+                    .iter()
+                    .find(|(isolated_version, isolated_name, _)| {
+                        *isolated_version == version && *isolated_name == *name
+                    })
+                    .map(|(_, _, reason)| *reason);
+                isolated.push(format!(
+                    "{name}:timeout (owned child exceeded {}s; assertions not completed{})",
+                    MODERN_LUA_OFFICIAL_TEST_DEADLINE.as_secs(),
+                    reason.map_or_else(String::new, |reason| format!("; {reason}"))
+                ));
+                continue;
+            };
             if !child.status.success() {
                 let reason = OFFICIAL_LUA_MODERN_ISOLATIONS
                     .iter()

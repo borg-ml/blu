@@ -1512,7 +1512,7 @@ Lua 5.1 portable matrix currently passes 9/9 cases in Blu, including its deep
 instruments `assert` and reports the failing assertion ordinal. The current
 Blu-owned ledger is therefore concrete rather than a blanket suite waiver:
 the selected portable Lua 5.4.8 and 5.5.0 matrices each execute 16 cases,
-with 8 reference passes and 8 explicitly isolated cases. The original
+with 9 reference passes and 7 explicitly isolated cases. The original
 portable smoke subset remains 8/8 for each version, including the 5.5
 named-vararg fixture; the added cases are retained to make the remaining
 frontend, continuation, diagnostic, and library boundaries executable.

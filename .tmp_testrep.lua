@@ -1,0 +1,22 @@
+local function testrep(name, init, rep, close, repc, finalresult)
+  local function gencode(n)
+    return init .. string.rep(rep, n) .. close .. string.rep(repc, n)
+  end
+  local res, msg = load(gencode(100))
+  print(name, "100", res ~= nil, msg)
+  if finalresult then print(name, "value", res()) end
+  local res2, msg2 = load(gencode(500))
+  print(name, "500", res2 ~= nil, msg2)
+end
+testrep("locals", "local a", ",a", ";", "")
+testrep("locals-init", "local a", ",a", "= 1", ",1")
+testrep("assignment", "local a; a", ",a", "= 1", ",1")
+testrep("constructors", "local a; a=", "{", "0", "}")
+testrep("parens", "return ", "(", "2", ")", 2)
+testrep("calls", "local function a (x) return x end; return ", "a(", "2.2", ")", 2.2)
+testrep("do", "", "do ", "", " end")
+testrep("while", "", "while a do ", "", " end")
+testrep("if", "local a; ", "if a then else ", "", " end")
+testrep("function", "", "function foo () ", "", " end")
+testrep("concat", "local a = ''; return ", "a..", "'a'", "", "a")
+testrep("power", "local a = 1; return ", "a^", "a", "", 1)

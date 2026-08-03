@@ -356,10 +356,15 @@ fn owned_goto_rejects_missing_duplicate_and_cross_scope_targets() {
             SemanticProfile::Lua54,
             compiler_identity(),
         );
-        assert!(matches!(
-            result,
-            Err(OwnedCompileError::ControlFlow { message: actual }) if actual.contains(message)
-        ));
+        match result {
+            Err(OwnedCompileError::ControlFlow { message: actual }) => {
+                assert!(actual.contains(message), "{actual}");
+            }
+            Err(OwnedCompileError::Diagnostic(diagnostic)) => {
+                assert!(diagnostic.primary().message().contains(message));
+            }
+            other => panic!("unexpected duplicate-label result: {other:?}"),
+        }
     }
 
     let cross_scope =
@@ -2524,10 +2529,19 @@ fn lua54_to_be_closed_locals_close_on_break_and_return() {
 #[test]
 fn lua54_const_locals_reject_assignment_and_close_values_require_handlers() {
     let const_source = make_source(b"local <const> value=1 value=2".to_vec());
+    let close_const_source = make_source(b"local <close> value=nil value=2".to_vec());
     for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
         let error = OwnedCompiler::default()
             .compile(&const_source, profile, compiler_identity())
             .expect_err("const assignment must be rejected");
+        assert!(
+            error.to_string().contains("const variable 'value'"),
+            "{profile}: {error}"
+        );
+
+        let error = OwnedCompiler::default()
+            .compile(&close_const_source, profile, compiler_identity())
+            .expect_err("to-be-closed assignment must be rejected");
         assert!(
             error.to_string().contains("const variable 'value'"),
             "{profile}: {error}"
@@ -2564,16 +2578,17 @@ fn lua55_global_const_visibility_survives_nested_function_boundaries() {
         .compile(&source, SemanticProfile::Lua55, compiler_identity())
         .expect_err("nested assignment to a global const must be rejected");
     assert!(
-        error
-            .to_string()
-            .contains("const variable 'var1'"),
+        error.to_string().contains("const variable 'var1'"),
         "{error}"
     );
 }
 
 #[test]
 fn lua54_and_lua55_reject_multiple_to_be_closed_locals_in_one_list() {
-    for source in [b"local <close> a, b".as_slice(), b"local a<close>, b<close>".as_slice()] {
+    for source in [
+        b"local <close> a, b".as_slice(),
+        b"local a<close>, b<close>".as_slice(),
+    ] {
         for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
             let error = OwnedCompiler::default()
                 .compile(&make_source(source.to_vec()), profile, compiler_identity())

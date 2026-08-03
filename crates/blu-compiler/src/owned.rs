@@ -50,6 +50,8 @@ pub struct OwnedCompileLimits {
     pub max_constants: usize,
     pub max_instructions: usize,
     pub max_return_values: usize,
+    /// Maximum fixed arguments accepted by one call expression.
+    pub max_call_arguments: usize,
     /// Maximum decimal-token length; defaults to 256 bytes.
     pub max_integer_literal_bytes: usize,
     /// Maximum fractional or exponent-form decimal-token length.
@@ -66,6 +68,7 @@ impl Default for OwnedCompileLimits {
             max_constants: 1_000_000,
             max_instructions: 8_000_000,
             max_return_values: 65_535,
+            max_call_arguments: 65_535,
             // Bounded independently from source size while permitting the
             // decimal-to-float fallback used by the supported profiles.
             max_integer_literal_bytes: 256,
@@ -407,6 +410,7 @@ enum BindingName {
     GlobalDefault,
     ImplicitSelf,
     ImplicitEnvironment,
+    ImplicitToClose,
 }
 
 impl BindingName {
@@ -414,7 +418,7 @@ impl BindingName {
         let expected = match self {
             Self::Source(span) => source.slice(span)?,
             Self::Global(span) => source.slice(span)?,
-            Self::GlobalWildcard | Self::GlobalDefault => return Ok(false),
+            Self::GlobalWildcard | Self::GlobalDefault | Self::ImplicitToClose => return Ok(false),
             Self::ImplicitSelf => b"self",
             Self::ImplicitEnvironment => b"_ENV",
         };
@@ -425,7 +429,7 @@ impl BindingName {
         match self {
             Self::Source(span) => Ok(source.slice(span)?),
             Self::Global(span) => Ok(source.slice(span)?),
-            Self::GlobalWildcard | Self::GlobalDefault => Ok(b""),
+            Self::GlobalWildcard | Self::GlobalDefault | Self::ImplicitToClose => Ok(b""),
             Self::ImplicitSelf => Ok(b"self"),
             Self::ImplicitEnvironment => Ok(b"_ENV"),
         }
@@ -438,6 +442,7 @@ impl BindingName {
                 | Self::GlobalWildcard
                 | Self::GlobalDefault
                 | Self::ImplicitEnvironment
+                | Self::ImplicitToClose
         )
     }
 
@@ -710,6 +715,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             self.emit(Instruction::Return { first: 0, count: 0 }, return_span)?;
         }
         self.resolve_gotos()?;
+        self.reorder_upvalues()?;
 
         let mut line_info = allocate_vec(self.source_map.len(), "line info")?;
         for span in &self.source_map {
@@ -1898,18 +1904,35 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             };
         let to_close = controls.get(3).copied();
 
-        if let Some(to_close) = to_close {
-            self.emit_mark_close_value(to_close, statement.span())?;
-        }
-
         let loop_scope = self.bindings.len();
+        if let Some(to_close) = to_close {
+            let loop_binding_start = u32::try_from(self.code.len()).map_err(|_| {
+                OwnedCompileError::InternalInvariant {
+                    message: "instruction count passed limits but cannot fit a debug PC",
+                }
+            })?;
+            self.push_binding_with_flags(
+                BindingName::ImplicitToClose,
+                to_close,
+                loop_binding_start,
+                false,
+                true,
+            )?;
+            self.emit_mark_close_value(to_close, None, statement.span())?;
+        }
         let start = self.code.len();
+        let iterator_span = statement
+            .values()
+            .first()
+            .map(|value| self.expression(*value).map(|expression| expression.span()))
+            .transpose()?
+            .unwrap_or(statement.span());
         let results = self.emit_fixed_call_results(
             iterator,
             &[state, control],
             statement.names().len(),
             false,
-            statement.span(),
+            iterator_span,
         )?;
         self.emit(
             Instruction::Move {
@@ -2011,27 +2034,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         let close_start = self.code.len();
         self.patch_forward_branch(exit, close_start)?;
         self.emit_close_upvalues(loop_scope, statement.span())?;
-        if let Some(to_close) = to_close {
-            let close = self.lower_global_name(b"__blu_internal_close", statement.span())?;
-            let arguments = self.allocate_register()?;
-            self.emit(
-                Instruction::Move {
-                    destination: arguments,
-                    source: to_close,
-                },
-                statement.span(),
-            )?;
-            let result = self.allocate_register()?;
-            self.emit(
-                Instruction::Call {
-                    destination: result,
-                    function: close,
-                    arguments,
-                    argument_count: 1,
-                },
-                statement.span(),
-            )?;
-        }
+        self.emit_close_bindings(loop_scope, statement.span())?;
         self.close_scope(loop_scope)
     }
 
@@ -2156,9 +2159,32 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 && self.block_is_visible(label.block, block)
         }) {
             let name = self.control_flow_name(name)?;
-            return Err(OwnedCompileError::ControlFlow {
-                message: format!("label '{name}' is already defined"),
-            });
+            let defined_line = self
+                .labels
+                .iter()
+                .find(|label| {
+                    self.source.slice(label.name).ok()
+                        == self.source.slice(statement.name().span()).ok()
+                        && self.block_is_visible(label.block, block)
+                })
+                .and_then(|label| {
+                    owned_source_line(self.source, self.profile, label.name.start().as_usize()).ok()
+                })
+                .map_or(1, |line| line.saturating_add(1));
+            let message = if matches!(
+                self.profile,
+                SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                format!("label '{name}' already defined on line {defined_line}")
+            } else {
+                format!("label '{name}' is already defined")
+            };
+            return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
+                "BLU-COMPILE-0014",
+                Phase::Lower,
+                statement.name().span(),
+                &message,
+            )?));
         }
         // A label does not create a lexical scope. Keep the bindings live at
         // the point where it is emitted; enclosing constructs and cross-block
@@ -2237,9 +2263,21 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             self.source.slice(label.name).ok() == self.source.slice(statement.name().span()).ok()
         }) {
             let name = self.control_flow_name(statement.name().span())?;
-            return Err(OwnedCompileError::ControlFlow {
-                message: format!("label '{name}' is not visible from this goto"),
-            });
+            let goto_line = owned_source_line(
+                self.source,
+                self.profile,
+                statement.name().span().start().as_usize(),
+            )?
+            .saturating_add(1);
+            let message = if matches!(
+                self.profile,
+                SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                format!("no visible label '{name}' for <goto> at line {goto_line}")
+            } else {
+                format!("label '{name}' is not visible from this goto")
+            };
+            return Err(OwnedCompileError::ControlFlow { message });
         }
         let instruction = self.code.len();
         self.emit(Instruction::Jump { target: 0 }, statement.span())?;
@@ -2263,9 +2301,18 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     && self.block_is_visible(label.block, goto.block)
             }) else {
                 let name = self.control_flow_name(goto.name)?;
-                return Err(OwnedCompileError::ControlFlow {
-                    message: format!("label '{name}' is not defined"),
-                });
+                let goto_line =
+                    owned_source_line(self.source, self.profile, goto.name.start().as_usize())?
+                        .saturating_add(1);
+                let message = if matches!(
+                    self.profile,
+                    SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) {
+                    format!("no visible label '{name}' for <goto> at line {goto_line}")
+                } else {
+                    format!("label '{name}' is not defined")
+                };
+                return Err(OwnedCompileError::ControlFlow { message });
             };
             let planned = self.planned_labels.iter().find(|planned| {
                 planned.block == label.block
@@ -2665,6 +2712,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     fn emit_mark_close_value(
         &mut self,
         value: u16,
+        name: Option<ByteSpan>,
         span: ByteSpan,
     ) -> Result<(), OwnedCompileError> {
         let mark = self.lower_global_name(b"__blu_internal_mark_close", span)?;
@@ -2676,24 +2724,27 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             },
             span,
         )?;
+        let argument_count = if let Some(name) = name {
+            let name = self.lower_environment_key(name)?;
+            debug_assert_eq!(name, arguments.saturating_add(1));
+            2
+        } else {
+            1
+        };
         let result = self.allocate_register()?;
         self.emit(
             Instruction::Call {
                 destination: result,
                 function: mark,
                 arguments,
-                argument_count: 1,
+                argument_count,
             },
             span,
         )
     }
 
     fn lower_global(&mut self, statement: &GlobalStatement) -> Result<(), OwnedCompileError> {
-        if statement
-            .attributes()
-            .iter()
-            .any(|attribute| *attribute == LocalAttribute::Close)
-        {
+        if statement.attributes().contains(&LocalAttribute::Close) {
             return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
                 "BLU-COMPILE-0011",
                 Phase::Lower,
@@ -2826,11 +2877,11 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             BindingName::Source(statement.name().span()),
             register,
             start_pc,
-            statement.attribute() == LocalAttribute::Const,
+            statement.attribute() == LocalAttribute::Const || to_close,
             to_close,
         )?;
         if to_close {
-            self.emit_mark_close_value(register, statement.span())?;
+            self.emit_mark_close_value(register, Some(statement.name().span()), statement.span())?;
         }
         Ok(())
     }
@@ -2891,9 +2942,16 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             })?;
         let mut demanded_upvalues = allocate_vec(self.outer_bindings.len(), "demanded upvalues")?;
         for binding in self.outer_bindings.iter().copied() {
-            if !binding.name.is_global()
-                && self.function_mentions_binding(body.span(), binding.name)?
-            {
+            if binding.name.is_global() {
+                continue;
+            }
+            let name = binding.name.bytes(self.source)?;
+            let parameter_shadows = body.parameters().iter().any(|parameter| {
+                self.source
+                    .slice(parameter.span())
+                    .is_ok_and(|candidate| candidate == name)
+            });
+            if !parameter_shadows && self.function_mentions_binding(body.span(), binding.name)? {
                 push_fallible(&mut demanded_upvalues, binding, "demanded upvalues")?;
             }
         }
@@ -3157,17 +3215,21 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         match statement.target() {
             AssignmentTarget::Identifier(identifier) => {
                 self.ensure_writable(identifier.span())?;
-                let source = self.lower_expression(statement.value())?;
                 let local = self.resolve_local(identifier.span())?;
                 let upvalue = if local.is_none() {
                     self.resolve_upvalue(identifier.span())?
                 } else {
                     None
                 };
-                if local.is_none()
+                let global = local.is_none()
                     && upvalue.is_none()
-                    && self.global_status(identifier.span())? == Some(false)
-                {
+                    && self.global_status(identifier.span())? == Some(false);
+                let environment = if local.is_none() && upvalue.is_none() && !global {
+                    self.resolve_environment(statement.span())?
+                } else {
+                    None
+                };
+                if global {
                     let message = self.undeclared_global_message(identifier.span())?;
                     return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
                         "BLU-COMPILE-0012",
@@ -3176,6 +3238,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                         &message,
                     )?));
                 }
+                let source = self.lower_expression(statement.value())?;
                 if let Some(destination) = local {
                     self.emit(
                         Instruction::Move {
@@ -3186,7 +3249,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                     )
                 } else if let Some(upvalue) = upvalue {
                     self.emit(Instruction::SetUpvalue { upvalue, source }, assignment_span)
-                } else if let Some(environment) = self.resolve_environment(statement.span())? {
+                } else if let Some(environment) = environment {
                     let key_start = self.code.len();
                     let key = self.lower_environment_key(identifier.span())?;
                     if assignment_span != statement.span() {
@@ -3390,13 +3453,15 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             .min(self.limits.artifact.max_total_debug_entries);
         check_limit(OwnedCompileLimit::Bindings, required, limit)?;
 
-        if matches!(self.profile, SemanticProfile::Lua54 | SemanticProfile::Lua55)
-            && statement
-                .attributes()
-                .iter()
-                .filter(|attribute| **attribute == LocalAttribute::Close)
-                .count()
-                > 1
+        if matches!(
+            self.profile,
+            SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) && statement
+            .attributes()
+            .iter()
+            .filter(|attribute| **attribute == LocalAttribute::Close)
+            .count()
+            > 1
         {
             return Err(OwnedCompileError::Diagnostic(self.source_diagnostic(
                 "BLU-COMPILE-0011",
@@ -3449,7 +3514,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 Binding {
                     name: BindingName::Source(name.span()),
                     register,
-                    constant: attribute == LocalAttribute::Const,
+                    constant: attribute == LocalAttribute::Const || to_close,
                     to_close,
                     start_pc,
                     end_pc: None,
@@ -3457,7 +3522,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 "local bindings",
             )?;
             if to_close {
-                self.emit_mark_close_value(register, statement.span())?;
+                self.emit_mark_close_value(register, Some(name.span()), statement.span())?;
             }
         }
         Ok(())
@@ -3675,6 +3740,48 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 }
             }
         }
+        if has_to_close
+            && matches!(
+                self.expression(last)?.kind(),
+                ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
+            )
+        {
+            let prefix_expressions = &values[..values.len() - 1];
+            let mut prefix_registers =
+                allocate_vec(prefix_expressions.len(), "dynamic return prefix registers")?;
+            for expression in prefix_expressions.iter().copied() {
+                prefix_registers.push(self.lower_expression(expression)?);
+            }
+            let prefix = if prefix_registers.is_empty() {
+                None
+            } else {
+                let contiguous = prefix_registers
+                    .windows(2)
+                    .all(|pair| pair[0].checked_add(1) == Some(pair[1]));
+                let first = if contiguous {
+                    prefix_registers[0]
+                } else {
+                    self.copy_return_values(prefix_expressions, &prefix_registers)?
+                };
+                Some((
+                    first,
+                    u16::try_from(prefix_registers.len()).map_err(|_| {
+                        OwnedCompileError::InternalInvariant {
+                            message: "dynamic return prefix count passed limits but cannot fit BluV1",
+                        }
+                    })?,
+                ))
+            };
+            self.lower_all_call_results(last)?;
+            return if let Some((first, count)) = prefix {
+                self.emit(
+                    Instruction::ReturnDynamicPrefix { first, count },
+                    statement.span(),
+                )
+            } else {
+                self.emit(Instruction::ReturnDynamic, statement.span())
+            };
+        }
         let mut registers = allocate_vec(values.len(), "return registers")?;
         for expression_id in values.iter().copied() {
             registers.push(self.lower_expression(expression_id)?);
@@ -3734,6 +3841,69 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             return Err(OwnedCompileError::InternalInvariant {
                 message: "table constructor field range is out of bounds",
             });
+        }
+        // Large array constructors are common in the Lua compatibility suite.
+        // Their keys and values are constants, so keeping a fresh register for
+        // every field needlessly exhausts Lua's 255-register window. Reuse one
+        // key and one value register while retaining the normal lowering path
+        // for constructors that contain expressions or keyed fields.
+        if constructor.field_count() > 1
+            && (constructor.first_field()..end).all(|index| {
+                matches!(self.table_fields[index], TableField::Array(value)
+                    if self.table_literal_constant(value).ok().flatten().is_some())
+            })
+        {
+            let key_register = self.allocate_register()?;
+            let value_register = self.allocate_register()?;
+            let mut array_index = 1_i64;
+            for index in constructor.first_field()..end {
+                let TableField::Array(value) = self.table_fields[index] else {
+                    unreachable!("constant table fast path only accepts array fields")
+                };
+                let span = self.expression(value)?.span();
+                let key = if matches!(
+                    self.profile,
+                    SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) {
+                    Constant::Integer(array_index)
+                } else {
+                    Constant::Number(array_index as f64)
+                };
+                let key_constant = self.push_constant(key)?;
+                let value_constant = self
+                    .table_literal_constant(value)?
+                    .expect("constant table fast path was checked above");
+                let value_constant = self.push_constant(value_constant)?;
+                self.emit(
+                    Instruction::LoadConstant {
+                        destination: key_register,
+                        constant: key_constant,
+                    },
+                    span,
+                )?;
+                self.emit(
+                    Instruction::LoadConstant {
+                        destination: value_register,
+                        constant: value_constant,
+                    },
+                    span,
+                )?;
+                self.emit(
+                    Instruction::SetTable {
+                        table,
+                        key: key_register,
+                        value: value_register,
+                    },
+                    span,
+                )?;
+                array_index =
+                    array_index
+                        .checked_add(1)
+                        .ok_or(OwnedCompileError::InternalInvariant {
+                            message: "table array field index overflows i64",
+                        })?;
+            }
+            return Ok(());
         }
         let mut reverse_constant_hash_fields =
             self.profile != SemanticProfile::Luau && constructor.field_count() > 1;
@@ -4007,6 +4177,23 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         Ok(())
     }
 
+    fn table_literal_constant(
+        &self,
+        expression: ExpressionId,
+    ) -> Result<Option<Constant>, OwnedCompileError> {
+        let expression = *self.expression(expression)?;
+        Ok(Some(match expression.kind() {
+            ExpressionKind::Nil => Constant::Nil,
+            ExpressionKind::Boolean(value) => Constant::Boolean(value),
+            ExpressionKind::DecimalInteger => self.decimal_constant(expression.span())?,
+            ExpressionKind::DecimalNumber => self.decimal_number_constant(expression.span())?,
+            ExpressionKind::HexInteger => self.hex_integer_constant(expression.span())?,
+            ExpressionKind::HexNumber => self.hex_number_constant(expression.span())?,
+            ExpressionKind::BinaryInteger => self.binary_integer_constant(expression.span())?,
+            _ => return Ok(None),
+        }))
+    }
+
     fn lower_call(&mut self, call: CallExpression) -> Result<u16, OwnedCompileError> {
         let mut results = self.lower_call_results(call, 1)?;
         results.pop().ok_or(OwnedCompileError::InternalInvariant {
@@ -4057,16 +4244,11 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 arguments,
                 argument_count,
                 result_count,
-                call.span(),
+                self.call_debug_span(call.span())?,
             );
         }
-        self.emit_fixed_call_results(
-            function,
-            &sources,
-            result_count,
-            expands_varargs,
-            call.span(),
-        )
+        let call_span = self.call_debug_span(call.span())?;
+        self.emit_fixed_call_results(function, &sources, result_count, expands_varargs, call_span)
     }
 
     fn lower_method_call(&mut self, call: MethodCallExpression) -> Result<u16, OwnedCompileError> {
@@ -4152,16 +4334,11 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 arguments,
                 argument_count,
                 result_count,
-                call.span(),
+                self.call_debug_span(call.span())?,
             );
         }
-        self.emit_fixed_call_results(
-            function,
-            &sources,
-            result_count,
-            expands_varargs,
-            call.span(),
-        )
+        let call_span = self.call_debug_span(call.span())?;
+        self.emit_fixed_call_results(function, &sources, result_count, expands_varargs, call_span)
     }
 
     fn lower_call_expression_results(
@@ -4540,6 +4717,25 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         Ok(end)
     }
 
+    fn call_debug_span(&self, span: ByteSpan) -> Result<ByteSpan, OwnedCompileError> {
+        let start = span.start().as_usize();
+        let end = span.end().as_usize();
+        let opening = self.source.bytes()[start..end]
+            .iter()
+            .position(|byte| *byte == b'(')
+            .map(|offset| start.saturating_add(offset));
+        match opening {
+            Some(opening) => {
+                ByteSpan::from_usize(span.source(), opening, opening + 1).map_err(|_| {
+                    OwnedCompileError::InternalInvariant {
+                        message: "call opening parenthesis span overflowed",
+                    }
+                })
+            }
+            None => Ok(span),
+        }
+    }
+
     fn emit_fixed_call_results(
         &mut self,
         function: u16,
@@ -4550,8 +4746,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     ) -> Result<Vec<u16>, OwnedCompileError> {
         let limit = self
             .limits
-            .artifact
-            .max_registers_per_prototype
+            .max_call_arguments
+            .min(self.limits.artifact.max_registers_per_prototype)
             .min(u16::MAX as usize);
         check_limit(OwnedCompileLimit::CallArguments, sources.len(), limit)?;
         check_limit(OwnedCompileLimit::ReturnValues, result_count, limit)?;
@@ -4609,8 +4805,8 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
     ) -> Result<(u16, u16), OwnedCompileError> {
         let limit = self
             .limits
-            .artifact
-            .max_registers_per_prototype
+            .max_call_arguments
+            .min(self.limits.artifact.max_registers_per_prototype)
             .min(u16::MAX as usize);
         check_limit(OwnedCompileLimit::CallArguments, sources.len(), limit)?;
         let arguments = if sources.is_empty() {
@@ -5928,6 +6124,78 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             });
         }
         self.push_upvalue(binding)
+    }
+
+    fn reorder_upvalues(&mut self) -> Result<(), OwnedCompileError> {
+        if self.upvalues.len() < 2 || self.outer_bindings.is_empty() {
+            return Ok(());
+        }
+        let mut order = allocate_vec(self.upvalues.len(), "upvalue reorder indices")?;
+        order.extend(0..self.upvalues.len());
+        order.sort_by_key(|index| {
+            let binding = self.upvalues[*index];
+            let environment = binding
+                .name
+                .bytes(self.source)
+                .is_ok_and(|name| name == b"_ENV");
+            usize::from(environment)
+        });
+        if order.iter().enumerate().all(|(new, old)| new == *old) {
+            return Ok(());
+        }
+
+        let mut remap = allocate_vec(self.upvalues.len(), "upvalue reorder map")?;
+        remap.resize(self.upvalues.len(), 0);
+        for (new, old) in order.iter().copied().enumerate() {
+            remap[old] = new;
+        }
+        for instruction in &mut self.code {
+            let index = match instruction {
+                Instruction::GetUpvalue { upvalue, .. }
+                | Instruction::SetUpvalue { upvalue, .. } => Some(upvalue),
+                _ => None,
+            };
+            if let Some(index) = index {
+                let old = usize::from(*index);
+                let new = *remap.get(old).ok_or(OwnedCompileError::InternalInvariant {
+                    message: "upvalue instruction index is out of bounds during reorder",
+                })?;
+                *index = u16::try_from(new).map_err(|_| OwnedCompileError::InternalInvariant {
+                    message: "upvalue reorder index cannot fit BluV1",
+                })?;
+            }
+        }
+        for child in self.children.iter().copied() {
+            let child =
+                usize::try_from(child).map_err(|_| OwnedCompileError::InternalInvariant {
+                    message: "child prototype index cannot fit the host index",
+                })?;
+            let prototype =
+                self.prototypes
+                    .get_mut(child)
+                    .ok_or(OwnedCompileError::InternalInvariant {
+                        message: "child prototype is missing during upvalue reorder",
+                    })?;
+            for capture in &mut prototype.upvalues {
+                if let Upvalue::ParentUpvalue(index) = capture {
+                    let old = usize::from(*index);
+                    let new = *remap.get(old).ok_or(OwnedCompileError::InternalInvariant {
+                        message: "child upvalue capture is out of bounds during reorder",
+                    })?;
+                    *index =
+                        u16::try_from(new).map_err(|_| OwnedCompileError::InternalInvariant {
+                            message: "child upvalue reorder index cannot fit BluV1",
+                        })?;
+                }
+            }
+        }
+        let previous = core::mem::take(&mut self.upvalues);
+        let mut reordered = allocate_vec(previous.len(), "reordered prototype upvalues")?;
+        for index in order {
+            reordered.push(previous[index]);
+        }
+        self.upvalues = reordered;
+        Ok(())
     }
 
     fn global_name_constant(&mut self, name: ByteSpan) -> Result<u32, OwnedCompileError> {

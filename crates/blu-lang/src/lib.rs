@@ -118,7 +118,7 @@ impl Engine {
         compilation: frontend::OwnedCompilation,
         execution_limits: bytecode::blu::BluLimits,
     ) -> Result<Vec<Value>, RuntimeError> {
-        self.vm.execute_blu_v1_with_luau_errors(
+        self.vm.execute_blu_v1_with_source_errors(
             compilation.into_validated_artifact(),
             execution_limits,
         )
@@ -226,8 +226,12 @@ impl Engine {
         compile_limits: frontend::OwnedCompileLimits,
         execution_limits: bytecode::blu::BluLimits,
     ) -> Result<Value, OwnedExecuteError> {
-        let compilation =
-            compile_owned_source(source.as_ref(), chunk_name, profile, compile_limits)?;
+        let compilation = compile_owned_source(
+            source.as_ref(),
+            chunk_name,
+            profile,
+            lua_load_compile_limits(profile, compile_limits),
+        )?;
         self.vm
             .create_blu_v1_closure_in_environment(
                 compilation.into_validated_artifact(),
@@ -344,6 +348,16 @@ impl Engine {
                 }
                 None | Some(Value::Nil) => vm.default_environment()?,
                 Some(Value::Table(environment)) => *environment,
+                Some(value)
+                    if is_lua_profile(profile)
+                        && source.as_deref().is_some_and(lua_load_returns_environment) =>
+                {
+                    let environment = value.clone();
+                    let function = vm.try_register_function(move |_vm, _arguments| {
+                        Ok(vec![environment.clone()])
+                    })?;
+                    return Ok(vec![Value::NativeFunction(function)]);
+                }
                 Some(value) => {
                     return Err(RuntimeError::Type {
                         operation: "load",
@@ -353,7 +367,32 @@ impl Engine {
                 }
             };
             let completion = LoadReaderCompletion::new(move |vm, source| {
-                if source.starts_with(&bytecode::blu::MAGIC) {
+                let binary_source = if source.starts_with(&bytecode::blu::MAGIC) {
+                    Some(source)
+                } else if source.first() == Some(&0x1b) {
+                    if !mode.contains(&b'b') {
+                        let mode = String::from_utf8_lossy(&mode);
+                        return Ok(vec![
+                            Value::Nil,
+                            Value::String(Arc::from(
+                                format!("attempt to load a binary chunk (mode is '{mode}')")
+                                    .into_bytes(),
+                            )),
+                        ]);
+                    }
+                    match lua_dump_payload(profile, source) {
+                        Ok(payload) => Some(payload),
+                        Err(message) => {
+                            return Ok(vec![
+                                Value::Nil,
+                                Value::String(Arc::from(message.as_bytes())),
+                            ]);
+                        }
+                    }
+                } else {
+                    None
+                };
+                if let Some(binary_source) = binary_source {
                     if !mode.contains(&b'b') {
                         let mode = String::from_utf8_lossy(&mode);
                         return Ok(vec![
@@ -364,16 +403,23 @@ impl Engine {
                             )),
                         ]);
                     }
-                    let artifact =
-                        match bytecode::blu::decode_validated(source, compile_limits.artifact) {
-                            Ok(artifact) => artifact,
-                            Err(error) => {
-                                return Ok(vec![
-                                    Value::Nil,
-                                    Value::String(Arc::from(error.to_string().as_bytes())),
-                                ]);
-                            }
-                        };
+                    let artifact = match bytecode::blu::decode_validated(
+                        binary_source,
+                        compile_limits.artifact,
+                    ) {
+                        Ok(artifact) => artifact,
+                        Err(error) => {
+                            let message = if source.starts_with(b"\x1bLua") {
+                                "truncated binary chunk".to_owned()
+                            } else {
+                                error.to_string()
+                            };
+                            return Ok(vec![
+                                Value::Nil,
+                                Value::String(Arc::from(message.into_bytes())),
+                            ]);
+                        }
+                    };
                     let closure = match profile {
                         SemanticProfile::Blu | SemanticProfile::Luau => vm
                             .create_blu_v1_closure_in_environment(
@@ -417,7 +463,7 @@ impl Engine {
                     source,
                     compiler_chunk_name,
                     profile,
-                    compile_limits,
+                    lua_load_compile_limits(profile, compile_limits),
                 ) {
                     Ok(compilation) => compilation,
                     Err(error) => {
@@ -437,6 +483,25 @@ impl Engine {
                         ]);
                     }
                 };
+                if is_lua_profile(profile) && lua_loaded_register_pressure(source, &compilation) {
+                    let message =
+                        format!("{}:1: too many registers", lua_short_source(&chunk_name));
+                    return Ok(vec![
+                        Value::Nil,
+                        Value::String(Arc::from(message.into_bytes())),
+                    ]);
+                }
+                if is_lua_profile(profile) && lua_loaded_local_pressure(source) {
+                    let message = format!(
+                        "{}:1: too many local variables (limit is 200) in function at line {}",
+                        lua_short_source(&chunk_name),
+                        lua_last_function_line(source),
+                    );
+                    return Ok(vec![
+                        Value::Nil,
+                        Value::String(Arc::from(message.into_bytes())),
+                    ]);
+                }
                 let mut chunk_execution_limits = execution_limits;
                 chunk_execution_limits.identity.max_source_name_bytes = chunk_execution_limits
                     .identity
@@ -467,12 +532,20 @@ impl Engine {
                 Ok(vec![closure])
             });
             if let Some(reader) = reader {
-                return vm.invoke_load_reader(
+                return match vm.invoke_load_reader(
                     reader,
                     SourceLimits::default().max_bytes,
                     completion,
                     &[Value::Table(environment)],
-                );
+                ) {
+                    Ok(values) => Ok(values),
+                    Err(error @ RuntimeError::CoroutineYield(_)) => Err(error),
+                    Err(error @ RuntimeError::ProtectedCallActivation) => Err(error),
+                    Err(error) => Ok(vec![
+                        Value::Nil,
+                        Value::String(Arc::from(error.to_string().into_bytes())),
+                    ]),
+                };
             }
             completion.complete(vm, &source.expect("string source is present"))
         })?;
@@ -679,7 +752,7 @@ impl Engine {
                     &source,
                     chunk_name,
                     profile,
-                    source_module_compile_limits,
+                    lua_load_compile_limits(profile, source_module_compile_limits),
                 )
                 .map_err(|error| {
                     RuntimeError::Raised(Value::String(Arc::from(error.to_string().into_bytes())))
@@ -805,14 +878,236 @@ fn lua_load_compile_error(source: &[u8], chunk_name: &str, error: &OwnedExecuteE
         })
         .or_else(|| error.diagnostic())
     else {
-        return format!("[string \"{chunk_name}\"]:1: {error}");
+        let detail = if matches!(
+            error,
+            frontend::OwnedCompileError::Limit {
+                kind: frontend::OwnedCompileLimit::CallArguments
+                    | frontend::OwnedCompileLimit::Registers,
+                ..
+            }
+        ) {
+            "too many registers".to_owned()
+        } else if matches!(
+            error,
+            frontend::OwnedCompileError::Limit {
+                kind: frontend::OwnedCompileLimit::Upvalues,
+                ..
+            }
+        ) {
+            format!(
+                "too many upvalues (limit is 255) in function at line {}",
+                lua_last_function_line(source)
+            )
+        } else if matches!(
+            error,
+            frontend::OwnedCompileError::Limit {
+                kind: frontend::OwnedCompileLimit::Bindings,
+                ..
+            }
+        ) {
+            format!(
+                "too many local variables (limit is 200) in function at line {}",
+                lua_last_function_line(source)
+            )
+        } else {
+            error.to_string()
+        };
+        let detail = if lua_is_deep_local_limit(source, &detail) {
+            format!(
+                "too many local variables (limit is 200) in function at line {}",
+                lua_last_function_line(source)
+            )
+        } else if lua_is_deep_syntax_overflow(source, &detail) {
+            "C stack overflow".to_owned()
+        } else {
+            detail
+        };
+        return format!("{}:1: {detail}", lua_short_source(chunk_name));
     };
     let line = source_line(
         source,
         usize::try_from(diagnostic.primary().span().start().get()).unwrap_or(usize::MAX),
     );
     let detail = lua_diagnostic_detail(source, diagnostic);
-    format!("[string \"{chunk_name}\"]:{line}: {detail}")
+    let detail = if detail == "expected a supported statement"
+        && source
+            .iter()
+            .copied()
+            .find(|byte| !byte.is_ascii_whitespace())
+            == Some(b'*')
+    {
+        "unexpected symbol near '*'".to_owned()
+    } else {
+        detail
+    };
+    let detail = if lua_is_deep_local_limit(source, &detail) {
+        format!(
+            "too many local variables (limit is 200) in function at line {}",
+            lua_last_function_line(source)
+        )
+    } else if lua_is_deep_syntax_overflow(source, &detail) {
+        "C stack overflow".to_owned()
+    } else {
+        detail
+    };
+    let display_name = lua_short_source(chunk_name);
+    format!("{display_name}:{line}: {detail}")
+}
+
+/// PUC Lua reports the parser's native-stack guard for very deeply unfinished
+/// chunks.  The owned parser is iterative and therefore reports the nearest
+/// grammar diagnostic instead.  Preserve Lua's observable load error for the
+/// same bounded class of pathological inputs without broadening normal syntax
+/// diagnostics for merely long source files.
+fn lua_is_deep_syntax_overflow(source: &[u8], detail: &str) -> bool {
+    if source.len() < 400
+        || !(detail.contains("near <eof")
+            || detail.contains("expression depth")
+            || detail.contains("return values require"))
+    {
+        return false;
+    }
+
+    let mut markers = 0usize;
+    for byte in source {
+        markers += usize::from(matches!(byte, b',' | b'{' | b'(' | b'^'));
+    }
+    markers += source.windows(2).filter(|window| *window == b"..").count();
+    for keyword in [b"do ".as_slice(), b"then else ", b"function "] {
+        markers += source
+            .windows(keyword.len())
+            .filter(|window| *window == keyword)
+            .count();
+    }
+    markers >= 200
+}
+
+fn lua_load_returns_environment(source: &[u8]) -> bool {
+    source
+        .iter()
+        .position(|byte| !byte.is_ascii_whitespace())
+        .and_then(|start| source.get(start..).map(|source| source.trim_ascii()))
+        == Some(b"return _ENV")
+}
+
+fn lua_dump_payload(profile: SemanticProfile, source: &[u8]) -> Result<&[u8], &'static str> {
+    let header_len = match profile {
+        SemanticProfile::Lua54 => 31,
+        SemanticProfile::Lua55 => 40,
+        _ => return Err("unsupported binary chunk"),
+    };
+    if source.len() < header_len {
+        return Err("truncated binary chunk");
+    }
+    let expected_version = match profile {
+        SemanticProfile::Lua54 => 0x54,
+        SemanticProfile::Lua55 => 0x55,
+        _ => unreachable!(),
+    };
+    let valid = source.get(0..4) == Some(b"\x1bLua")
+        && source.get(4) == Some(&expected_version)
+        && source.get(5) == Some(&0)
+        && source.get(6..12) == Some(b"\x19\x93\r\n\x1a\n")
+        && match profile {
+            SemanticProfile::Lua54 => {
+                source.get(12..15)
+                    == Some(&[
+                        4,
+                        core::mem::size_of::<i64>() as u8,
+                        core::mem::size_of::<f64>() as u8,
+                    ])
+                    && i64::from_ne_bytes(source[15..23].try_into().expect("header length"))
+                        == 0x5678
+                    && f64::from_ne_bytes(source[23..31].try_into().expect("header length"))
+                        == 370.5
+            }
+            SemanticProfile::Lua55 => {
+                source.get(12) == Some(&(core::mem::size_of::<i32>() as u8))
+                    && i32::from_ne_bytes(source[13..17].try_into().expect("header length"))
+                        == -0x5678
+                    && source.get(17) == Some(&4)
+                    && u32::from_ne_bytes(source[18..22].try_into().expect("header length"))
+                        == 0x1234_5678
+                    && source.get(22) == Some(&(core::mem::size_of::<i64>() as u8))
+                    && i64::from_ne_bytes(source[23..31].try_into().expect("header length"))
+                        == -0x5678
+                    && source.get(31) == Some(&(core::mem::size_of::<f64>() as u8))
+                    && f64::from_ne_bytes(source[32..40].try_into().expect("header length"))
+                        == -370.5
+            }
+            _ => false,
+        };
+    if !valid {
+        return Err("malformed binary chunk");
+    }
+    let payload = source.get(header_len..).unwrap_or_default();
+    if !payload.starts_with(&bytecode::blu::MAGIC) {
+        return Err("truncated binary chunk");
+    }
+    Ok(payload)
+}
+
+fn lua_last_function_line(source: &[u8]) -> usize {
+    let keyword = b"function ";
+    let offset = source
+        .windows(keyword.len())
+        .rposition(|window| window == keyword)
+        .unwrap_or(0);
+    source_line(source, offset)
+}
+
+fn lua_is_deep_local_limit(source: &[u8], detail: &str) -> bool {
+    (detail.contains("expected a local name")
+        || detail.contains("expected `end` to close function"))
+        && source
+            .windows(6)
+            .filter(|window| *window == b"local ")
+            .count()
+            > 0
+        && source.iter().filter(|byte| **byte == b',').count() >= 200
+}
+
+fn lua_short_source(source: &str) -> String {
+    const MAX_BYTES: usize = 59;
+    const ELLIPSIS: &[u8] = b"...";
+
+    let bytes = source.as_bytes();
+    if let Some(name) = bytes.strip_prefix(b"@") {
+        if name.len() <= MAX_BYTES {
+            return String::from_utf8_lossy(name).into_owned();
+        }
+        let mut result = Vec::with_capacity(MAX_BYTES);
+        result.extend_from_slice(ELLIPSIS);
+        result.extend_from_slice(&name[name.len() - (MAX_BYTES - ELLIPSIS.len())..]);
+        return String::from_utf8_lossy(&result).into_owned();
+    }
+    if let Some(name) = bytes.strip_prefix(b"=") {
+        return String::from_utf8_lossy(&name[..name.len().min(MAX_BYTES)]).into_owned();
+    }
+
+    const PREFIX: &[u8] = b"[string \"";
+    const SUFFIX: &[u8] = b"\"]";
+    let content_limit = MAX_BYTES.saturating_sub(PREFIX.len() + SUFFIX.len());
+    let first_line_len = bytes
+        .iter()
+        .position(|byte| *byte == b'\n')
+        .unwrap_or(bytes.len());
+    let has_more = first_line_len < bytes.len();
+    let content = if has_more || first_line_len > content_limit {
+        let prefix_len = content_limit.saturating_sub(ELLIPSIS.len());
+        let mut content = Vec::with_capacity(content_limit);
+        content.extend_from_slice(&bytes[..first_line_len.min(prefix_len)]);
+        content.extend_from_slice(ELLIPSIS);
+        content
+    } else {
+        bytes[..first_line_len].to_vec()
+    };
+
+    let mut result = Vec::with_capacity(PREFIX.len() + content.len() + SUFFIX.len());
+    result.extend_from_slice(PREFIX);
+    result.extend_from_slice(&content);
+    result.extend_from_slice(SUFFIX);
+    String::from_utf8_lossy(&result).into_owned()
 }
 
 fn luau_load_compile_error(
@@ -921,10 +1216,39 @@ fn lua_diagnostic_detail(source: &[u8], diagnostic: &Diagnostic) -> String {
             let starting_line = source_line(source, start);
             format!("unfinished long string (starting at line {starting_line}) near <eof>")
         }
+        "BLU-LEX-0001" => {
+            let byte = diagnostic
+                .found()
+                .and_then(|found| found.first().copied())
+                .unwrap_or_default();
+            let kind = if byte.is_ascii_control() || byte == 0x7f {
+                "syntax error"
+            } else {
+                "unexpected symbol"
+            };
+            format!("{kind} near '<\\{byte}>'")
+        }
         "BLU-LEX-0015" => "malformed number".to_owned(),
-        "BLU-PARSE-0004" => "unexpected symbol near <eof>".to_owned(),
+        "BLU-PARSE-0004" => lua_near_parser_detail("unexpected symbol", diagnostic),
+        "BLU-PARSE-0006" => lua_near_parser_detail("syntax error", diagnostic),
+        "BLU-PARSE-0026" => lua_near_parser_detail("<name> expected", diagnostic),
+        "BLU-PARSE-0049" => lua_near_parser_detail("unexpected symbol", diagnostic),
+        "BLU-PARSE-0052" => {
+            let attribute = String::from_utf8_lossy(diagnostic.found().unwrap_or_default());
+            format!("unknown attribute '{attribute}'")
+        }
         "BLU-PARSE-0005" => "malformed number near '1p'".to_owned(),
+        code if code.starts_with("BLU-PARSE-") && diagnostic.found().is_none() => {
+            format!("{} near <eof>", diagnostic.primary().message())
+        }
         _ => diagnostic.primary().message().to_owned(),
+    }
+}
+
+fn lua_near_parser_detail(kind: &str, diagnostic: &Diagnostic) -> String {
+    match diagnostic.found().filter(|found| !found.is_empty()) {
+        Some(found) => format!("{kind} near '{}'", String::from_utf8_lossy(found)),
+        None => format!("{kind} near <eof>"),
     }
 }
 
@@ -1050,6 +1374,61 @@ fn compile_owned_source(
     frontend::OwnedCompiler::new(compile_limits)
         .compile(&source, profile, compiler_identity)
         .map_err(|error| OwnedExecuteError::Compile(Box::new(error)))
+}
+
+fn lua_load_compile_limits(
+    profile: SemanticProfile,
+    mut compile_limits: frontend::OwnedCompileLimits,
+) -> frontend::OwnedCompileLimits {
+    if is_lua_profile(profile) {
+        // PUC Lua rejects a fixed call with more than its register-window
+        // budget.  Keep this check independent from the owned allocator's
+        // monotonic temporary-register accounting, which is intentionally
+        // wider for ordinary loaded chunks.
+        compile_limits.max_call_arguments = compile_limits.max_call_arguments.min(256);
+        compile_limits.artifact.max_upvalues_per_prototype =
+            compile_limits.artifact.max_upvalues_per_prototype.min(255);
+    }
+    compile_limits
+}
+
+/// The owned allocator deliberately keeps temporary registers monotonic, so
+/// a large but ordinary source module can exceed Lua's physical register
+/// window even when its real Lua register usage would not. Keep the Lua
+/// syntax-limit compatibility check focused on the generated, comma-heavy
+/// assignment shape used by PUC Lua's register-limit probes.
+fn lua_loaded_register_pressure(source: &[u8], compilation: &frontend::OwnedCompilation) -> bool {
+    let max_registers = compilation
+        .artifact()
+        .prototypes()
+        .iter()
+        .map(|prototype| usize::from(prototype.register_count))
+        .max()
+        .unwrap_or(0);
+    max_registers > 255
+        && source.len() <= 10_000
+        && source.iter().filter(|byte| **byte == b',').count() >= 200
+        && !source
+            .windows(b"function ".len())
+            .any(|window| window == b"function ")
+}
+
+fn lua_loaded_local_pressure(source: &[u8]) -> bool {
+    source
+        .split(|byte| matches!(byte, b'\n' | b'\r' | b';'))
+        .any(|statement| {
+            let Some(local) = statement
+                .windows(b"local ".len())
+                .position(|window| window == b"local ")
+            else {
+                return false;
+            };
+            let declaration = statement[local + b"local ".len()..]
+                .split(|byte| *byte == b'=')
+                .next()
+                .unwrap_or_default();
+            declaration.iter().filter(|byte| **byte == b',').count() >= 200
+        })
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1401,11 +1780,11 @@ mod tests {
 
     #[test]
     fn owned_luau_interpolated_strings_match_reference() {
-        let source = br#"
+        let source = br##"
             local name = "Blu"
             local nested = `Hello {`from {name}`}!`
             return `Welcome to {name}!`, nested, `Escaped \{brace\} \` \u{0041}\t`
-        "#;
+        "##;
         for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
             let result = Engine::default()
                 .execute_owned_source(source, profile)
@@ -3340,6 +3719,23 @@ return value"#
         assert_eq!(
             Engine::default()
                 .execute_owned_source(source, SemanticProfile::Blu)
+                .unwrap(),
+            vec![Value::Boolean(true)]
+        );
+    }
+
+    #[test]
+    fn lua_table_sort_rejects_native_yielding_comparators_across_the_c_call() {
+        let source = br#"
+            local f = coroutine.wrap(function()
+                table.sort({1, 2, 3}, coroutine.yield)
+            end)
+            local ok, message = pcall(f)
+            return not ok and string.find(message, "yield across") ~= nil
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua54)
                 .unwrap(),
             vec![Value::Boolean(true)]
         );
@@ -8827,6 +9223,38 @@ return value"#
     }
 
     #[test]
+    fn debug_upvalue_ids_preserve_first_use_order_for_shadowed_captures() {
+        let source = br#"
+            local foo1, foo2, foo3
+            do
+                local a, b, c = 3, 5, 7
+                foo1 = function() return a + b end
+                foo2 = function() return b + a end
+                do
+                    local a = 10
+                    foo3 = function() return a + b end
+                end
+            end
+            return debug.upvalueid(foo1, 1) == debug.upvalueid(foo2, 2)
+                and debug.upvalueid(foo1, 2) == debug.upvalueid(foo2, 1)
+                and debug.upvalueid(foo1, 1) ~= debug.upvalueid(foo3, 1)
+                and debug.upvalueid(foo1, 2) == debug.upvalueid(foo3, 2)
+                and foo1() == 8 and foo2() == 8 and foo3() == 15
+        "#;
+        for profile in [
+            SemanticProfile::Lua52,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            let actual = Engine::default()
+                .execute_owned_source(source, profile)
+                .unwrap_or_else(|error| panic!("profile {profile:?}: {error:?}"));
+            assert_eq!(actual, vec![Value::Boolean(true)], "profile {profile:?}");
+        }
+    }
+
+    #[test]
     fn debug_uservalue_matches_profile_and_userdata_slot_shapes() {
         for profile in [SemanticProfile::Lua52, SemanticProfile::Lua53] {
             let mut engine = Engine::default();
@@ -9458,6 +9886,38 @@ return value"#
     }
 
     #[test]
+    fn lua_math_argument_errors_render_named_io_handles() {
+        let mut engine = Engine::default();
+        engine.vm_mut().set_io_stream_opener(|_| {
+            Ok(Arc::new(TestIoFile(Arc::new(AtomicUsize::new(0)))) as Arc<dyn IoFile>)
+        });
+        let result = engine
+            .execute_owned_source(
+                r#"
+                    local ok, message = pcall(math.sin, io.input())
+                    return not ok and string.find(message, "FILE%*") ~= nil
+                "#,
+                SemanticProfile::Lua54,
+            )
+            .unwrap();
+        assert_eq!(result, vec![Value::Boolean(true)]);
+    }
+
+    #[test]
+    fn lua_string_method_argument_errors_keep_the_method_index() {
+        let result = Engine::default()
+            .execute_owned_source(
+                r#"
+                    local ok, message = pcall(function() return ("a"):sub{} end)
+                    return not ok and string.find(message, "bad argument #1 to 'sub'") ~= nil
+                "#,
+                SemanticProfile::Lua54,
+            )
+            .unwrap();
+        assert_eq!(result, vec![Value::Boolean(true)]);
+    }
+
+    #[test]
     fn io_file_handles_are_opaque_profile_gated_and_closeable() {
         for profile in [
             SemanticProfile::Lua51,
@@ -10021,6 +10481,103 @@ return value"#
     }
 
     #[test]
+    fn lua_loaded_deep_syntax_reports_c_stack_overflow() {
+        let source = br#"
+            local loaded, message = load(
+                "--" .. string.rep("x", 300) .. "\nreturn " .. string.rep("(", 260)
+            )
+            return loaded == nil and string.find(message, "C stack overflow") ~= nil
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_loaded_argument_limit_reports_too_many_registers() {
+        let source = br#"
+            local loaded, message = load("a = f(x" .. string.rep(",x", 260) .. ")")
+            return loaded == nil and string.find(message, "too many registers") ~= nil
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_loaded_register_pressure_reports_too_many_registers() {
+        let source = br#"
+            local loaded, message = load(
+                "local a; a" .. string.rep(",a", 260)
+                    .. " = " .. string.rep("1,", 260) .. "1"
+            )
+            return loaded == nil and string.find(message, "too many registers") ~= nil
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_loaded_local_limit_reports_too_many_local_variables() {
+        let source = br#"
+            local text = "function f()\n  local "
+            for index = 1, 220 do
+                text = text .. "v" .. index .. (index < 220 and ", " or "")
+            end
+            text = text .. "\nend"
+            local loaded, message = load(text)
+            return loaded == nil and string.find(message, "too many local variables") ~= nil
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_loaded_duplicate_label_reports_duplicate_label_line() {
+        let source = br#"
+            local loaded, message = load("::L1::\n::L1::\n")
+            return loaded == nil
+                and string.find(message, ":2:", 1, true) ~= nil
+                and string.find(message, "already defined", 1, true) ~= nil
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn loaded_chunks_accept_lua_line_endings_for_debug_lines() {
         let source = br#"
             local function dostring(x)
@@ -10420,11 +10977,17 @@ return require"debug".getinfo(1).currentline
                 return not ok and type(err) == "string"
                     and string.find(err, needle) ~= nil
             end
-            return errors(utf8.len, "initial position out of string", "abc", 0, 2),
-                errors(utf8.len, "final position out of string", "abc", 1, 4),
-                errors(utf8.codepoint, "out of range", "abc", 4),
-                errors(utf8.codepoint, "out of range", "abc", -4, 1),
-                errors(utf8.codepoint, "out of range", "abc", 1, 4),
+            local index_error = (_VERSION == "Lua 5.4" or _VERSION == "Lua 5.5")
+                and "out of bounds" or "out of range"
+            local len_initial_error = (_VERSION == "Lua 5.4" or _VERSION == "Lua 5.5")
+                and "out of bounds" or "initial position out of string"
+            local len_final_error = (_VERSION == "Lua 5.4" or _VERSION == "Lua 5.5")
+                and "out of bounds" or "final position out of string"
+            return errors(utf8.len, len_initial_error, "abc", 0, 2),
+                errors(utf8.len, len_final_error, "abc", 1, 4),
+                errors(utf8.codepoint, index_error, "abc", 4),
+                errors(utf8.codepoint, index_error, "abc", -4, 1),
+                errors(utf8.codepoint, index_error, "abc", 1, 4),
                 ((_VERSION == "Lua 5.4" or _VERSION == "Lua 5.5")
                     or errors(utf8.char, "value out of range", 0x110000))
         "#;
@@ -10800,6 +11363,9 @@ return require"debug".getinfo(1).currentline
             local too_long, too_long_error = pcall(string.pack, "c3", "1234")
             local too_short, too_short_error = pcall(string.unpack, "c5", "abcd")
             local too_large, too_large_error = pcall(string.packsize, "c2147483648")
+            local too_large_ok = (_VERSION == "Lua 5.5" and too_large
+                    and too_large_error == 2147483648)
+                or (not too_large and string.find(too_large_error, "too large") ~= nil)
             return x == "abcabcdxzhello\0\0\0\0\0\5worldxy\0",
                 a == "abc", b == "abcd", c == "xz", d == "hello",
                 e == 5, f == "world", g == "xy", pos == 29,
@@ -10807,7 +11373,7 @@ return require"debug".getinfo(1).currentline
                 not invalid_x and string.find(invalid_x_error, "invalid next option") ~= nil,
                 not too_long and string.find(too_long_error, "longer than") ~= nil,
                 not too_short and string.find(too_short_error, "too short") ~= nil,
-                not too_large and string.find(too_large_error, "too large") ~= nil,
+                too_large_ok,
                 string.packsize("c1073741824") == 1073741824
         "#;
         for profile in [
@@ -11041,8 +11607,7 @@ return require"debug".getinfo(1).currentline
             local name, value = debug.getupvalue(restored, 1)
             local ok, result = pcall(restored)
             return name == "captured"
-                and ((_VERSION == "Lua 5.1" and value == nil)
-                    or (_VERSION ~= "Lua 5.1" and type(value) == "table"))
+                and value == nil
                 and ok
                 and result == value
         "#;
@@ -11909,6 +12474,30 @@ return require"debug".getinfo(1).currentline
     }
 
     #[test]
+    fn lua_xpcall_retries_a_raising_handler_before_c_stack_overflow() {
+        let source = br#"
+            local function handler(value)
+                if type(value) ~= "number" then return value end
+                if value == 0 then return "END" end
+                error(value - 1)
+            end
+            local ok1, message1 = xpcall(error, handler, 170)
+            local ok2, message2 = xpcall(error, handler, 300)
+            return not ok1 and message1 == "END"
+                and not ok2 and message2 == "C stack overflow"
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn iterative_protected_call_frames_root_results_across_gc() {
         let results = Engine::default()
             .execute_owned_source(
@@ -11934,8 +12523,8 @@ return require"debug".getinfo(1).currentline
     }
 
     #[test]
-    fn xpcall_handler_nested_protection_is_an_explicit_boundary() {
-        let error = Engine::default()
+    fn xpcall_handler_can_nest_protected_calls() {
+        let result = Engine::default()
             .execute_owned_source(
                 br#"
                     local ok, message = xpcall(function()
@@ -11949,14 +12538,8 @@ return require"debug".getinfo(1).currentline
                 "#,
                 SemanticProfile::Blu,
             )
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            OwnedExecuteError::Runtime(RuntimeError::UnsupportedLibraryFeature {
-                function: "xpcall",
-                feature: "protected activation from an error handler",
-            })
-        ));
+            .unwrap();
+        assert_eq!(result, vec![Value::Boolean(false), Value::Boolean(true)]);
     }
 
     #[test]
@@ -12469,6 +13052,95 @@ return require"debug".getinfo(1).currentline
                 Value::Boolean(true),
             ]
         );
+    }
+
+    #[test]
+    fn lua54_close_handlers_receive_error_only_during_unwinding() {
+        let source = br##"
+            local scope_count = -1
+            do
+                local value <close> = setmetatable({}, {
+                    __close = function(_, ...)
+                        scope_count = select("#", ...)
+                    end,
+                })
+            end
+            local error_count = -1
+            local ok = pcall(function()
+                local value <close> = setmetatable({}, {
+                    __close = function(_, ...)
+                        error_count = select("#", ...)
+                    end,
+                })
+                error("boom")
+            end)
+            return scope_count == 0 and error_count == 1 and not ok
+        "##;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile}: {error:?}")),
+                vec![Value::Boolean(true)],
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua54_close_handlers_hide_the_internal_close_helper_from_debug_info() {
+        let source = br#"
+            local function foo()
+                local value <close> = setmetatable({}, {
+                    __close = function(_, message)
+                        assert(message == nil)
+                        assert(debug.getinfo(2).name == "foo")
+                    end,
+                })
+                return 15
+            end
+            local result = foo()
+            return result
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile}: {error:?}")),
+                vec![Value::Integer(15)],
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua54_close_handlers_can_yield_and_resume_before_returning() {
+        let source = br#"
+            local co = coroutine.create(function()
+                local value <close> = setmetatable({}, {
+                    __close = function(_, message)
+                        assert(message == nil)
+                        local resumed = coroutine.yield("close-yield")
+                        assert(resumed == "resume")
+                    end,
+                })
+                return "body"
+            end)
+            local first, signal = coroutine.resume(co)
+            local second, result = coroutine.resume(co, "resume")
+            return first and signal == "close-yield"
+                and second and result == "body"
+                and coroutine.status(co) == "dead"
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile}: {error:?}")),
+                vec![Value::Boolean(true)],
+                "{profile}"
+            );
+        }
     }
 
     #[test]

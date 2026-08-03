@@ -549,6 +549,7 @@ impl GlobalStatement {
     }
 
     #[must_use]
+    #[allow(clippy::incompatible_msrv)]
     pub const fn attribute(&self) -> LocalAttribute {
         match self.attributes.as_slice() {
             [attribute, ..] => *attribute,

@@ -422,7 +422,9 @@ fn translate_instruction(
         | BluInstruction::SetListCallDynamic { .. }
         | BluInstruction::CallAllResults { .. }
         | BluInstruction::CallDynamicAllResults { .. }
-        | BluInstruction::CallDynamicResults { .. } => {
+        | BluInstruction::CallDynamicResults { .. }
+        | BluInstruction::ReturnDynamic
+        | BluInstruction::ReturnDynamicPrefix { .. } => {
             Err(TranslationError::UnsupportedInstruction {
                 prototype,
                 instruction: "dynamic call results",
