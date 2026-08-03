@@ -106,6 +106,33 @@ fn line_positions_are_zero_based_byte_offsets_for_lf_and_crlf() {
 }
 
 #[test]
+fn line_positions_treat_lone_cr_as_a_line_ending() {
+    let source = SourceFile::new(
+        SourceId::new(18),
+        "cr-lines.lua",
+        b"alpha\rbeta\nomega".to_vec(),
+        SourceLimits::default(),
+    )
+    .unwrap();
+
+    assert_eq!(source.line_index().line_count(), 3);
+    assert_eq!(source.position(6).unwrap().line, 1);
+    assert_eq!(source.position(11).unwrap().line, 2);
+    assert_eq!(
+        source.slice(source.line_content_span(0).unwrap()).unwrap(),
+        b"alpha"
+    );
+    assert_eq!(
+        source.slice(source.line_content_span(1).unwrap()).unwrap(),
+        b"beta"
+    );
+    assert_eq!(
+        source.slice(source.line_content_span(2).unwrap()).unwrap(),
+        b"omega"
+    );
+}
+
+#[test]
 fn source_contents_and_diagnostic_found_tokens_accept_non_utf8() {
     let source = SourceFile::new(
         SourceId::new(8),

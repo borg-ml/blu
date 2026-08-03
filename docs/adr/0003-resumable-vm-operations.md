@@ -355,13 +355,48 @@ Tail-call replacement, weak/finalizer semantics, and individual library
 algorithms may proceed separately, but cannot bypass these gates when they
 invoke yieldable code.
 
+## Cross-thread coroutine activation
+
+`coroutine.wrap` exposes a distinct continuation problem from a yield inside
+one coroutine: a wrapped coroutine can synchronously call another wrapped
+coroutine, causing `call_value` to re-enter `resume_thread` before the outer
+activation has completed. The owned BluV1 path now represents this pending
+cross-thread resume with `drive_blu_coroutine`, an explicit iterative
+activation stack. Each entry retains:
+
+- the target thread and its resumable state;
+- the caller activation and result destination waiting for that thread;
+- the active profile, fuel, call-depth accounting, and protected/error
+  boundary;
+- all arguments and yielded/resumed values; and
+- GC roots for every activation, pending continuation, closure, thread, and
+  error value.
+
+The scheduler iteratively drives one activation to return, yield, or error,
+then delivers that outcome to the waiting activation without recursive
+`resume_thread` re-entry. A nested resume consumes one live language
+activation, while resuming an existing frame does not consume another frame;
+call-limit accounting preserves that distinction. Error unwinding and
+`pcall`/`xpcall` handling pop or retain activation entries using the same rules
+as ordinary frames, and collection traces the complete activation stack. The
+pinned Lua 5.1 portable child matrix now passes all eight cases, including
+`test/sieve.lua`.
+
+`MAX_NESTED_COROUTINE_RESUMES` remains a deliberate 64-level guard only for
+the legacy/foreign synchronous bridge, while `BluResume::Coroutine` reached
+from an arbitrary suspended cross-thread continuation remains an explicit
+structured unsupported-feature boundary. Increasing that bridge guard would
+not implement the missing foreign continuation ownership.
+
 ## Conformance and regression tests
 
 The primary oracle is the pinned Luau revision recorded in `UPSTREAM.toml`.
 Implementation proceeds by admitting complete applicable sections from:
 
 - `tests/conformance/iter.luau`, including table `__iter`, yielding iterator
-  preparation, yielding iterator functions, errors, and repeated resumes;
+  preparation, yielding iterator functions, errors, and repeated resumes; its
+  C++-only `cYieldingIterator` callback is tracked as a host-capability
+  isolation;
 - `tests/conformance/events.luau`, including index, assignment, arithmetic,
   comparison, concatenation, length, handler selection, and error cases;
 - `tests/conformance/cyield.luau`, including yields across protected and native

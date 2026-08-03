@@ -99,6 +99,224 @@ fn labels_and_goto_parse_as_control_flow_statements() {
 }
 
 #[test]
+fn lua55_global_declarations_preserve_names_values_and_wildcards() {
+    let source = source(b"global first, second = 1, 2\ndo global * end".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Lua55, ParseLimits::default());
+    let Statement::Global(global) = &parsed.ast().statements()[0] else {
+        panic!("expected global declaration");
+    };
+    assert_eq!(global.names().len(), 2);
+    assert_eq!(global.values().len(), 2);
+    assert!(!global.wildcard());
+    assert_eq!(
+        source.slice(global.span()).unwrap(),
+        b"global first, second = 1, 2"
+    );
+    let Statement::Do(block) = &parsed.ast().statements()[1] else {
+        panic!("expected do block");
+    };
+    assert!(matches!(block.body().statements()[0], Statement::Global(_)));
+}
+
+#[test]
+fn lua55_global_const_wildcard_preserves_attribute() {
+    let source = source(b"global <const> *".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Lua55, ParseLimits::default());
+    let Statement::Global(global) = &parsed.ast().statements()[0] else {
+        panic!("expected global declaration");
+    };
+    assert!(global.wildcard());
+    assert_eq!(global.attribute(), LocalAttribute::Const);
+}
+
+#[test]
+fn lua55_global_name_trailing_attribute_preserves_const() {
+    let source = source(b"global value<const>".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Lua55, ParseLimits::default());
+    let Statement::Global(global) = &parsed.ast().statements()[0] else {
+        panic!("expected global declaration");
+    };
+    assert_eq!(global.attribute(), LocalAttribute::Const);
+    assert_eq!(global.names().len(), 1);
+}
+
+#[test]
+fn lua55_global_name_attributes_are_tracked_per_name() {
+    let source = source(b"global assert<const>, load, string, X".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Lua55, ParseLimits::default());
+    let Statement::Global(global) = &parsed.ast().statements()[0] else {
+        panic!("expected global declaration");
+    };
+    assert_eq!(global.names().len(), 4);
+    assert_eq!(global.attributes().len(), 4);
+    assert_eq!(global.attributes()[0], LocalAttribute::Const);
+    assert!(
+        global.attributes()[1..]
+            .iter()
+            .all(|attribute| { *attribute == LocalAttribute::Regular })
+    );
+}
+
+#[test]
+fn lua55_global_function_is_marked_as_a_global_definition() {
+    let source = source(b"global function answer() return 42 end".to_vec());
+    let parsed = accepted(&source, SemanticProfile::Lua55, ParseLimits::default());
+    let Statement::Function(function) = &parsed.ast().statements()[0] else {
+        panic!("expected global function statement");
+    };
+    assert!(function.is_global());
+    assert_eq!(function.names().len(), 1);
+}
+
+#[test]
+fn named_vararg_tables_are_lua55_and_blu_only() {
+    for profile in [SemanticProfile::Blu, SemanticProfile::Lua55] {
+        let source = source(b"local function collect(... args) return args end".to_vec());
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::LocalFunction(function) = &parsed.ast().statements()[0] else {
+            panic!("expected local function");
+        };
+        let body = parsed.ast().function(function.function()).unwrap();
+        assert!(body.is_vararg(), "{profile}");
+        assert!(body.vararg_name().is_some(), "{profile}");
+    }
+    let source = source(b"local function collect(... args) end".to_vec());
+    let rejected = parse(&source, SemanticProfile::Lua54, ParseLimits::default()).unwrap();
+    assert!(matches!(rejected, ParseOutcome::Rejected(_)));
+}
+
+#[test]
+fn blu_and_luau_function_type_annotations_are_erased_from_the_owned_ast() {
+    let source = source(
+        b"local function add(left: number, right: number): number return left + right end\nreturn add(40, 2)"
+            .to_vec(),
+    );
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::LocalFunction(function) = &parsed.ast().statements()[0] else {
+            panic!("expected local function");
+        };
+        let body = parsed.ast().function(function.function()).unwrap();
+        assert_eq!(body.parameters().len(), 2);
+        assert_eq!(source.slice(body.parameters()[0].span()).unwrap(), b"left");
+        assert_eq!(source.slice(body.parameters()[1].span()).unwrap(), b"right");
+    }
+
+    let rejected = parse(&source, SemanticProfile::Lua51, ParseLimits::default()).unwrap();
+    assert!(matches!(rejected, ParseOutcome::Rejected(_)));
+}
+
+#[test]
+fn typed_annotations_accept_qualified_union_and_intersection_names() {
+    for (profile, bytes) in [
+        (
+            SemanticProfile::Blu,
+            b"local function keep(value: module.Type | Other & Third): module.Result return value end"
+                .as_slice(),
+        ),
+        (
+            SemanticProfile::Luau,
+            b"local function keep(value: module.Type): module.Result return value end".as_slice(),
+        ),
+    ] {
+        let source = source(bytes.to_vec());
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::LocalFunction(function) = &parsed.ast().statements()[0] else {
+            panic!("expected local function");
+        };
+        let body = parsed.ast().function(function.function()).unwrap();
+        assert_eq!(body.parameters().len(), 1);
+    }
+}
+
+#[test]
+fn blu_and_luau_local_annotations_and_optional_varargs_are_erased() {
+    let source = source(
+        b"local answer: number, label: string = 40, 'ok'\nlocal function choose(...: string?) return ... end\nreturn answer"
+            .to_vec(),
+    );
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::LocalList(local) = &parsed.ast().statements()[0] else {
+            panic!("expected local list");
+        };
+        assert_eq!(local.names().len(), 2);
+        assert_eq!(local.values().len(), 2);
+        let Statement::LocalFunction(function) = &parsed.ast().statements()[1] else {
+            panic!("expected local function");
+        };
+        let body = parsed.ast().function(function.function()).unwrap();
+        assert!(body.is_vararg());
+        assert!(body.vararg_name().is_none());
+    }
+
+    let rejected = parse(&source, SemanticProfile::Lua51, ParseLimits::default()).unwrap();
+    assert!(matches!(rejected, ParseOutcome::Rejected(_)));
+}
+
+#[test]
+fn blu_and_luau_type_annotations_accept_nil_atoms() {
+    let source = source(b"local function only_nil(value: nil): nil return value end".to_vec());
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        let Statement::LocalFunction(function) = &parsed.ast().statements()[0] else {
+            panic!("expected local function");
+        };
+        assert_eq!(
+            parsed
+                .ast()
+                .function(function.function())
+                .unwrap()
+                .parameters()
+                .len(),
+            1
+        );
+    }
+    let rejected = parse(&source, SemanticProfile::Lua51, ParseLimits::default()).unwrap();
+    assert!(matches!(rejected, ParseOutcome::Rejected(_)));
+}
+
+#[test]
+fn blu_and_luau_type_annotations_erase_balanced_type_forms() {
+    let source = source(
+        b"local record: { field: number, nested: { string } } = {}\nlocal function read(value: Array<number>): (number) return 42 end\nlocal callback: (number) -> string = nil\nreturn record"
+            .to_vec(),
+    );
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        assert!(matches!(parsed.ast().statements()[0], Statement::Local(_)));
+        assert!(matches!(
+            parsed.ast().statements()[1],
+            Statement::LocalFunction(_)
+        ));
+        assert!(matches!(parsed.ast().statements()[2], Statement::Local(_)));
+    }
+    let rejected = parse(&source, SemanticProfile::Lua51, ParseLimits::default()).unwrap();
+    assert!(matches!(rejected, ParseOutcome::Rejected(_)));
+}
+
+#[test]
+fn luau_type_assertions_use_colon_colon_without_enabling_labels() {
+    let source_file = source(b"return value :: any".to_vec());
+    let parsed = accepted(&source_file, SemanticProfile::Luau, ParseLimits::default());
+    assert!(matches!(parsed.ast().statements()[0], Statement::Return(_)));
+
+    let source_file = source(b"::label:: return 1".to_vec());
+    let rejected = parse(&source_file, SemanticProfile::Luau, ParseLimits::default()).unwrap();
+    assert!(matches!(rejected, ParseOutcome::Rejected(_)));
+}
+
+#[test]
+fn luau_parenthesized_prefix_expressions_can_be_assignment_targets() {
+    let source_file = source(b"local t = {}\n(if true then t else t)['x'] = 7".to_vec());
+    let parsed = accepted(&source_file, SemanticProfile::Luau, ParseLimits::default());
+    assert!(matches!(
+        parsed.ast().statements()[1],
+        Statement::Assignment(_)
+    ));
+}
+
+#[test]
 fn local_without_initializer_has_no_value_and_ends_at_its_name() {
     for profile in SemanticProfile::ALL {
         let source = source(b"local missing\nreturn missing".to_vec());
@@ -110,6 +328,19 @@ fn local_without_initializer_has_no_value_and_ends_at_its_name() {
         assert_eq!(source.slice(local.name().span()).unwrap(), b"missing");
         assert_eq!(local.value(), None);
     }
+}
+
+#[test]
+fn newline_after_literal_initializer_starts_a_parenthesized_call_statement() {
+    let parsed = accepted(
+        &source(b"local a = nil\n(function(x) a = x end)(23)\nreturn a".to_vec()),
+        SemanticProfile::Blu,
+        ParseLimits::default(),
+    );
+    assert_eq!(parsed.ast().statements().len(), 3);
+    assert!(matches!(parsed.ast().statements()[0], Statement::Local(_)));
+    assert!(matches!(parsed.ast().statements()[1], Statement::Call(_)));
+    assert!(matches!(parsed.ast().statements()[2], Statement::Return(_)));
 }
 
 #[test]
@@ -246,6 +477,64 @@ fn parenthesized_call_is_valid_as_a_statement() {
 }
 
 #[test]
+fn table_constructor_call_sugar_is_retained_as_one_argument() {
+    let parsed = accepted(
+        &source(b"local f=function(value) return value end; return f{answer=42}".to_vec()),
+        SemanticProfile::Blu,
+        ParseLimits::default(),
+    );
+    let Statement::Return(returned) = &parsed.ast().statements()[1] else {
+        panic!("expected return");
+    };
+    let ExpressionKind::Call(call) = parsed
+        .ast()
+        .expression(returned.values()[0])
+        .unwrap()
+        .kind()
+    else {
+        panic!("expected call");
+    };
+    assert_eq!(call.argument_count(), 1);
+    assert!(matches!(
+        parsed
+            .ast()
+            .expression(parsed.ast().call_arguments(call).unwrap()[0])
+            .unwrap()
+            .kind(),
+        ExpressionKind::Table(_)
+    ));
+}
+
+#[test]
+fn string_literal_call_sugar_is_retained_as_one_argument() {
+    let parsed = accepted(
+        &source(br#"local function echo(value) return value end; return echo"answer""#.to_vec()),
+        SemanticProfile::Lua54,
+        ParseLimits::default(),
+    );
+    let Statement::Return(returned) = &parsed.ast().statements()[1] else {
+        panic!("expected return");
+    };
+    let ExpressionKind::Call(call) = parsed
+        .ast()
+        .expression(returned.values()[0])
+        .unwrap()
+        .kind()
+    else {
+        panic!("expected call");
+    };
+    assert_eq!(call.argument_count(), 1);
+    assert!(matches!(
+        parsed
+            .ast()
+            .expression(parsed.ast().call_arguments(call).unwrap()[0])
+            .unwrap()
+            .kind(),
+        ExpressionKind::StringLiteral
+    ));
+}
+
+#[test]
 fn method_calls_retain_receiver_method_and_explicit_arguments() {
     let source =
         source(br#"object:notify("first"); return factory().method:invoke("second")"#.to_vec());
@@ -268,6 +557,54 @@ fn method_calls_retain_receiver_method_and_explicit_arguments() {
     assert!(matches!(
         parsed.ast().expression(call.receiver()).unwrap().kind(),
         ExpressionKind::Field(_)
+    ));
+}
+
+#[test]
+fn method_calls_accept_string_and_table_argument_sugar() {
+    let parsed = accepted(
+        &source(br#"return object:notify"first", object:notify{answer=42}"#.to_vec()),
+        SemanticProfile::Lua54,
+        ParseLimits::default(),
+    );
+    let Statement::Return(returned) = &parsed.ast().statements()[0] else {
+        panic!("expected return");
+    };
+    assert_eq!(returned.values().len(), 2);
+    let ExpressionKind::MethodCall(string_call) = parsed
+        .ast()
+        .expression(returned.values()[0])
+        .unwrap()
+        .kind()
+    else {
+        panic!("expected string method call");
+    };
+    assert_eq!(string_call.argument_count(), 1);
+    assert!(matches!(
+        parsed
+            .ast()
+            .expression(parsed.ast().method_call_arguments(string_call).unwrap()[0])
+            .unwrap()
+            .kind(),
+        ExpressionKind::StringLiteral
+    ));
+
+    let ExpressionKind::MethodCall(table_call) = parsed
+        .ast()
+        .expression(returned.values()[1])
+        .unwrap()
+        .kind()
+    else {
+        panic!("expected table method call");
+    };
+    assert_eq!(table_call.argument_count(), 1);
+    assert!(matches!(
+        parsed
+            .ast()
+            .expression(parsed.ast().method_call_arguments(table_call).unwrap()[0])
+            .unwrap()
+            .kind(),
+        ExpressionKind::Table(_)
     ));
 }
 
@@ -509,8 +846,23 @@ fn identifier_statement_without_equal_is_rejected_structurally() {
 
 #[test]
 fn semicolons_separate_statements_represent_empty_statements_and_trail_return() {
-    for profile in SemanticProfile::ALL {
-        let source = source(b";;local answer = 40;answer = answer + 2;;return answer;;;".to_vec());
+    for profile in SemanticProfile::ALL
+        .into_iter()
+        .filter(|profile| *profile != SemanticProfile::Luau)
+    {
+        let bytes = if matches!(
+            profile,
+            SemanticProfile::Lua51
+                | SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            b";;local answer = 40;answer = answer + 2;;return answer;".as_slice()
+        } else {
+            b";;local answer = 40;answer = answer + 2;;return answer;;;".as_slice()
+        };
+        let source = source(bytes.to_vec());
         let parsed = accepted(&source, profile, ParseLimits::default());
         assert_eq!(parsed.ast().statements().len(), 3, "{profile}");
         assert!(matches!(parsed.ast().statements()[0], Statement::Local(_)));
@@ -519,13 +871,18 @@ fn semicolons_separate_statements_represent_empty_statements_and_trail_return() 
             Statement::Assignment(_)
         ));
         assert!(matches!(parsed.ast().statements()[2], Statement::Return(_)));
+        let expected_semicolons = if profile == SemanticProfile::Blu {
+            8
+        } else {
+            6
+        };
         assert_eq!(
             parsed
                 .tokens()
                 .iter()
                 .filter(|token| token.kind() == TokenKind::Semicolon)
                 .count(),
-            8,
+            expected_semicolons,
             "{profile}"
         );
     }
@@ -537,6 +894,68 @@ fn semicolons_separate_statements_represent_empty_statements_and_trail_return() 
     };
     assert!(statement.values().is_empty());
     assert_eq!(source.slice(statement.span()).unwrap(), b"return");
+}
+
+#[test]
+fn luau_rejects_empty_statements_but_accepts_statement_separators() {
+    let accepted_source = source(b"local answer = 40; return answer;".to_vec());
+    assert!(
+        parse(
+            &accepted_source,
+            SemanticProfile::Luau,
+            ParseLimits::default()
+        )
+        .unwrap()
+        .accepted()
+        .is_some()
+    );
+
+    for bytes in [b";".as_slice(), b"answer = 1;;", b"return;;"] {
+        let source = source(bytes.to_vec());
+        let outcome = parse(&source, SemanticProfile::Luau, ParseLimits::default()).unwrap();
+        let rejected = outcome
+            .rejected()
+            .expect("Luau should reject empty statements");
+        assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0056");
+    }
+}
+
+#[test]
+fn lua_profiles_reject_an_empty_statement_after_return() {
+    for profile in [
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let source = source(b"return;;".to_vec());
+        let outcome = parse(&source, profile, ParseLimits::default()).unwrap();
+        let rejected = outcome
+            .rejected()
+            .unwrap_or_else(|| panic!("{profile} should reject return;;"));
+        assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0005");
+    }
+    assert!(
+        parse(
+            &source(b"return;;".to_vec()),
+            SemanticProfile::Blu,
+            ParseLimits::default()
+        )
+        .unwrap()
+        .accepted()
+        .is_some()
+    );
+}
+
+#[test]
+fn luau_rejects_line_break_before_parenthesized_calls() {
+    let source = source(b"a = math.sin\n(3)".to_vec());
+    let outcome = parse(&source, SemanticProfile::Luau, ParseLimits::default()).unwrap();
+    let rejected = outcome
+        .rejected()
+        .expect("Luau should reject a line break before call arguments");
+    assert_eq!(rejected.diagnostics()[0].code().as_str(), "BLU-PARSE-0057");
 }
 
 #[test]
@@ -1191,6 +1610,23 @@ fn bare_return_has_an_empty_value_list_and_keyword_span() {
         };
         assert!(statement.values().is_empty());
         assert_eq!(source.slice(statement.span()).unwrap(), b"return");
+    }
+}
+
+#[test]
+fn bare_return_accepts_block_terminators() {
+    for (profile, bytes) in [
+        (SemanticProfile::Blu, b"function f() return end".as_slice()),
+        (
+            SemanticProfile::Blu,
+            b"if true then return else return end".as_slice(),
+        ),
+        (SemanticProfile::Blu, b"while true do return end".as_slice()),
+        (SemanticProfile::Blu, b"repeat return until true".as_slice()),
+    ] {
+        let source = source(bytes.to_vec());
+        let parsed = accepted(&source, profile, ParseLimits::default());
+        assert!(!parsed.ast().statements().is_empty());
     }
 }
 

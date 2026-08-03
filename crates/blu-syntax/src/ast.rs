@@ -378,6 +378,44 @@ pub struct IfExpression {
     else_value: ExpressionId,
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct InterpolatedString {
+    first_part: usize,
+    part_count: usize,
+    span: ByteSpan,
+}
+
+impl InterpolatedString {
+    pub(crate) const fn new(first_part: usize, part_count: usize, span: ByteSpan) -> Self {
+        Self {
+            first_part,
+            part_count,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub const fn first_part(self) -> usize {
+        self.first_part
+    }
+
+    #[must_use]
+    pub const fn part_count(self) -> usize {
+        self.part_count
+    }
+
+    #[must_use]
+    pub const fn span(self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum InterpolatedStringPart {
+    Text(ByteSpan),
+    Expression(ExpressionId),
+}
+
 impl IfExpression {
     pub(crate) const fn new(
         condition: ExpressionId,
@@ -418,6 +456,7 @@ pub enum ExpressionKind {
     HexNumber,
     BinaryInteger,
     StringLiteral,
+    InterpolatedString(InterpolatedString),
     Table(TableConstructor),
     Identifier(Identifier),
     Group(ExpressionId),
@@ -469,9 +508,70 @@ pub struct LocalStatement {
 }
 
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub struct GlobalStatement {
+    names: Vec<Identifier>,
+    values: Vec<ExpressionId>,
+    wildcard: bool,
+    attributes: Vec<LocalAttribute>,
+    span: ByteSpan,
+}
+
+impl GlobalStatement {
+    pub(crate) const fn new(
+        names: Vec<Identifier>,
+        values: Vec<ExpressionId>,
+        wildcard: bool,
+        attributes: Vec<LocalAttribute>,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            names,
+            values,
+            wildcard,
+            attributes,
+            span,
+        }
+    }
+
+    #[must_use]
+    pub fn names(&self) -> &[Identifier] {
+        &self.names
+    }
+
+    #[must_use]
+    pub fn values(&self) -> &[ExpressionId] {
+        &self.values
+    }
+
+    #[must_use]
+    pub const fn wildcard(&self) -> bool {
+        self.wildcard
+    }
+
+    #[must_use]
+    pub const fn attribute(&self) -> LocalAttribute {
+        match self.attributes.as_slice() {
+            [attribute, ..] => *attribute,
+            [] => LocalAttribute::Regular,
+        }
+    }
+
+    #[must_use]
+    pub fn attributes(&self) -> &[LocalAttribute] {
+        &self.attributes
+    }
+
+    #[must_use]
+    pub const fn span(&self) -> ByteSpan {
+        self.span
+    }
+}
+
+#[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct FunctionBody {
     parameters: Vec<Identifier>,
     is_vararg: bool,
+    vararg_name: Option<Identifier>,
     body: Block,
     span: ByteSpan,
 }
@@ -480,12 +580,14 @@ impl FunctionBody {
     pub(crate) const fn new(
         parameters: Vec<Identifier>,
         is_vararg: bool,
+        vararg_name: Option<Identifier>,
         body: Block,
         span: ByteSpan,
     ) -> Self {
         Self {
             parameters,
             is_vararg,
+            vararg_name,
             body,
             span,
         }
@@ -499,6 +601,11 @@ impl FunctionBody {
     #[must_use]
     pub const fn is_vararg(&self) -> bool {
         self.is_vararg
+    }
+
+    #[must_use]
+    pub const fn vararg_name(&self) -> Option<Identifier> {
+        self.vararg_name
     }
 
     #[must_use]
@@ -524,6 +631,7 @@ pub struct FunctionStatement {
     names: Vec<Identifier>,
     function: FunctionId,
     is_method: bool,
+    is_global: bool,
     span: ByteSpan,
 }
 
@@ -538,6 +646,21 @@ impl FunctionStatement {
             names,
             function,
             is_method,
+            is_global: false,
+            span,
+        }
+    }
+
+    pub(crate) const fn new_global(
+        names: Vec<Identifier>,
+        function: FunctionId,
+        span: ByteSpan,
+    ) -> Self {
+        Self {
+            names,
+            function,
+            is_method: false,
+            is_global: true,
             span,
         }
     }
@@ -555,6 +678,11 @@ impl FunctionStatement {
     #[must_use]
     pub const fn is_method(&self) -> bool {
         self.is_method
+    }
+
+    #[must_use]
+    pub const fn is_global(&self) -> bool {
+        self.is_global
     }
 
     #[must_use]
@@ -1190,6 +1318,7 @@ impl BreakStatement {
 
 #[derive(Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub enum Statement {
+    Global(GlobalStatement),
     Local(LocalStatement),
     LocalFunction(LocalFunctionStatement),
     Function(FunctionStatement),
@@ -1215,6 +1344,7 @@ impl Statement {
     #[must_use]
     pub const fn span(&self) -> ByteSpan {
         match self {
+            Self::Global(statement) => statement.span(),
             Self::Local(statement) => statement.span(),
             Self::LocalFunction(statement) => statement.span(),
             Self::Function(statement) => statement.span(),
@@ -1293,17 +1423,20 @@ pub struct Ast {
     block: Block,
     expressions: Vec<Expression>,
     table_fields: Vec<TableField>,
+    interpolated_parts: Vec<InterpolatedStringPart>,
     call_arguments: Vec<ExpressionId>,
     functions: Vec<FunctionBody>,
 }
 
 impl Ast {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) const fn new(
         profile: SemanticProfile,
         span: ByteSpan,
         statements: Vec<Statement>,
         expressions: Vec<Expression>,
         table_fields: Vec<TableField>,
+        interpolated_parts: Vec<InterpolatedStringPart>,
         call_arguments: Vec<ExpressionId>,
         functions: Vec<FunctionBody>,
     ) -> Self {
@@ -1313,6 +1446,7 @@ impl Ast {
             block: Block::new(statements),
             expressions,
             table_fields,
+            interpolated_parts,
             call_arguments,
             functions,
         }
@@ -1362,6 +1496,20 @@ impl Ast {
     }
 
     #[must_use]
+    pub fn interpolated_string_parts(
+        &self,
+        string: InterpolatedString,
+    ) -> Option<&[InterpolatedStringPart]> {
+        let end = string.first_part().checked_add(string.part_count())?;
+        self.interpolated_parts.get(string.first_part()..end)
+    }
+
+    #[must_use]
+    pub fn interpolated_string_part_arena(&self) -> &[InterpolatedStringPart] {
+        &self.interpolated_parts
+    }
+
+    #[must_use]
     pub fn call_arguments(&self, call: CallExpression) -> Option<&[ExpressionId]> {
         let end = call.first_argument().checked_add(call.argument_count())?;
         self.call_arguments.get(call.first_argument()..end)
@@ -1394,6 +1542,7 @@ impl Ast {
             .node_count()
             .saturating_add(self.expressions.len())
             .saturating_add(self.table_fields.len())
+            .saturating_add(self.interpolated_parts.len())
             .saturating_add(self.call_arguments.len())
             .saturating_add(self.functions.iter().fold(0, |count, function| {
                 count

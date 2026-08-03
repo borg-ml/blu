@@ -1,4 +1,4 @@
-use crate::{ClosureId, TableId, ThreadId};
+use crate::{ClosureId, TableId, ThreadId, UpvalueId, UserDataId};
 use core::cmp::Ordering;
 use core::fmt;
 use std::sync::Arc;
@@ -18,6 +18,8 @@ pub enum Value {
     Closure(ClosureId),
     Thread(ThreadId),
     CoroutineFunction(ThreadId),
+    LightUserData(UpvalueId),
+    UserData(UserDataId),
     NativeFunction(NativeFunctionId),
 }
 
@@ -38,8 +40,27 @@ impl Value {
             Self::Closure(_) => "function",
             Self::Thread(_) => "thread",
             Self::CoroutineFunction(_) => "function",
+            Self::LightUserData(_) => "userdata",
+            Self::UserData(_) => "userdata",
             Self::NativeFunction(_) => "function",
         }
+    }
+
+    #[must_use]
+    pub(crate) const fn contains_heap_reference(&self) -> bool {
+        matches!(
+            self,
+            Self::Table(_)
+                | Self::Closure(_)
+                | Self::Thread(_)
+                | Self::CoroutineFunction(_)
+                | Self::UserData(_)
+        )
+    }
+
+    #[must_use]
+    pub(crate) const fn contains_gc_storage(&self) -> bool {
+        self.contains_heap_reference() || matches!(self, Self::String(_))
     }
 
     pub(crate) fn as_number(&self) -> Option<f64> {
@@ -128,6 +149,8 @@ impl fmt::Debug for Value {
             Self::CoroutineFunction(value) => {
                 f.debug_tuple("CoroutineFunction").field(value).finish()
             }
+            Self::LightUserData(value) => f.debug_tuple("LightUserData").field(value).finish(),
+            Self::UserData(value) => value.fmt(f),
             Self::NativeFunction(value) => value.fmt(f),
         }
     }
@@ -147,6 +170,8 @@ impl PartialEq for Value {
             (Self::Closure(left), Self::Closure(right)) => left == right,
             (Self::Thread(left), Self::Thread(right)) => left == right,
             (Self::CoroutineFunction(left), Self::CoroutineFunction(right)) => left == right,
+            (Self::LightUserData(left), Self::LightUserData(right)) => left == right,
+            (Self::UserData(left), Self::UserData(right)) => left == right,
             (Self::NativeFunction(left), Self::NativeFunction(right)) => left == right,
             _ => false,
         }

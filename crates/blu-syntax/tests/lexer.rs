@@ -57,6 +57,26 @@ fn vertical_slice_tokens_keep_half_open_byte_spans() {
 }
 
 #[test]
+fn global_is_reserved_only_in_blu_and_lua55_profiles() {
+    for profile in SemanticProfile::ALL {
+        let lexed = lex(
+            &source(b"global value".to_vec()),
+            profile,
+            LexerLimits::default(),
+        )
+        .unwrap();
+        let kinds = significant_kinds(&lexed);
+        let expected = if matches!(profile, SemanticProfile::Blu | SemanticProfile::Lua55) {
+            TokenKind::Global
+        } else {
+            TokenKind::Identifier
+        };
+        assert_eq!(kinds, [expected, TokenKind::Identifier], "{profile}");
+        assert!(!lexed.has_errors(), "{profile}");
+    }
+}
+
+#[test]
 fn floor_division_gate_covers_all_seven_profiles() {
     for profile in SemanticProfile::ALL {
         let source = source(b"return 7 // 2".to_vec());
@@ -374,6 +394,13 @@ fn whitespace_escape_is_profile_gated_and_spans_lines() {
 }
 
 #[test]
+fn whitespace_escape_can_consume_a_final_line_break() {
+    let source = source(b"return '\\z  \n\t\x0c\x0b\n'".to_vec());
+    let lexed = lex(&source, SemanticProfile::Lua54, LexerLimits::default()).unwrap();
+    assert!(!lexed.has_errors());
+}
+
+#[test]
 fn escaped_physical_line_endings_are_shared() {
     for profile in SemanticProfile::ALL {
         let source = source(b"return \"a\\\nb\", \"c\\\r\nd\", \"e\\\rf\"".to_vec());
@@ -520,6 +547,37 @@ fn line_and_multiline_comments_are_retained_without_inner_tokens() {
         [b"-- line".as_slice(), b"--[=[ long\ncomment ]=]"]
     );
     assert!(!lexed.has_errors());
+}
+
+#[test]
+fn unix_shebang_is_a_leading_comment() {
+    let source = source(b"#!/usr/bin/env lua\nreturn 1".to_vec());
+    let lexed = lex(&source, SemanticProfile::Lua54, LexerLimits::default()).unwrap();
+
+    assert!(!lexed.has_errors());
+    let comments: Vec<_> = lexed
+        .tokens()
+        .iter()
+        .filter(|token| token.kind() == TokenKind::Comment)
+        .map(|token| source.slice(token.span()).unwrap())
+        .collect();
+    assert_eq!(comments, [b"#!/usr/bin/env lua".as_slice()]);
+    assert_eq!(
+        significant_kinds(&lexed),
+        [TokenKind::Return, TokenKind::DecimalInteger]
+    );
+}
+
+#[test]
+fn hash_without_bang_remains_the_length_operator() {
+    let leading = source(b"#value\nreturn 1".to_vec());
+    let lexed = lex(&leading, SemanticProfile::Lua54, LexerLimits::default()).unwrap();
+
+    assert!(!lexed.has_errors());
+    assert_eq!(lexed.tokens()[0].kind(), TokenKind::Hash);
+    assert!(!lexed.tokens().iter().any(|token| {
+        token.kind() == TokenKind::Comment && leading.slice(token.span()).unwrap().starts_with(b"#")
+    }));
 }
 
 #[test]
@@ -1116,6 +1174,39 @@ fn compound_assignment_tokens_are_blu_and_luau_only() {
         );
         if !supported {
             assert_eq!(lexed.diagnostics().len(), 8, "{profile}");
+        }
+    }
+}
+
+#[test]
+fn interpolated_strings_are_profile_gated_and_keep_expression_spans() {
+    let source = source(br#"return `hello {name}!`"#.to_vec());
+    for profile in SemanticProfile::ALL {
+        let lexed = lex(&source, profile, LexerLimits::default()).unwrap();
+        let supported = matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau);
+        assert_eq!(lexed.has_errors(), !supported, "{profile}");
+        if supported {
+            let significant = significant_kinds(&lexed);
+            assert_eq!(
+                significant,
+                [
+                    TokenKind::Return,
+                    TokenKind::InterpolatedStringStart,
+                    TokenKind::InterpolatedStringText,
+                    TokenKind::InterpolationOpen,
+                    TokenKind::Identifier,
+                    TokenKind::InterpolationClose,
+                    TokenKind::InterpolatedStringText,
+                    TokenKind::InterpolatedStringEnd,
+                ],
+                "{profile}"
+            );
+            let identifier = lexed
+                .tokens()
+                .iter()
+                .find(|token| token.kind() == TokenKind::Identifier)
+                .unwrap();
+            assert_eq!(source.slice(identifier.span()).unwrap(), b"name");
         }
     }
 }

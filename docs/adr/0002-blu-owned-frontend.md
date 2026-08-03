@@ -91,14 +91,16 @@ metamethods, or evaluation order.
 
 ### Blu bytecode
 
-`BytecodeFormat::BluV1` will be distinct from serialized Luau bytecode, even
+`BytecodeFormat::BluV1` and its backward-readable `BytecodeFormat::BluV2`
+will be distinct from serialized Luau bytecode, even
 where register layouts or individual operations are similar. Every prototype
 will include:
 
 - its semantic profile;
 - register, parameter, vararg, constant, child, and upvalue metadata;
 - code and required bytecode feature bits;
-- source identity and a validated PC-to-byte-span map; and
+- source identity and a validated PC-to-byte-span map;
+- function definition line ranges in BluV2; and
 - local and upvalue debug ranges.
 
 The normalized instruction set will add operations required by the supported
@@ -141,7 +143,8 @@ cannot contain mixed-profile prototypes.
 New compilation APIs accept an explicit source identity and profile and return
 a validated Blu artifact with frontend identity, profile, and source digest.
 Existing convenience methods may remain as deprecated, documented wrappers.
-Newly published source builds use `BluV1`. Existing Luau payloads remain
+Newly published source builds use `BluV2`; BluV1 remains readable for existing
+artifacts. Existing Luau payloads remain
 loadable.
 
 The owned frontend will eventually compile the `luau` profile itself. The

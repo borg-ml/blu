@@ -15,10 +15,16 @@ mod value;
 mod vm;
 
 pub use dialect::Dialect;
-pub use heap::{ClosureId, CollectionStats, Heap, HeapError, TableId, ThreadId};
+pub use heap::{
+    ClosureId, CollectionStats, Heap, HeapError, TableId, ThreadId, UpvalueId, UserDataId,
+};
 pub use memory::{
     MemoryAccount, MemoryConfig, MemoryError, MemoryReservation, MemoryUsage, checked_hash_bytes,
     checked_reallocation_peak, checked_vector_bytes,
 };
 pub use value::{NativeFunctionId, Value};
-pub use vm::{InterruptHandle, RuntimeError, Vm};
+pub use vm::{
+    CalendarDate, CalendarDateInput, InterruptHandle, IoBufferMode, IoFile, IoReadRequest,
+    IoSeekWhence, IoStreamKind, LoadReaderCompletion, NativeLibraryFailure,
+    NativeLibraryLoadResult, OsExecuteResult, OsExitRequest, RuntimeError, Vm,
+};

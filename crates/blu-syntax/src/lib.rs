@@ -16,17 +16,18 @@ pub use ast::{
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement,
     CompoundAssignmentOperator, CompoundAssignmentStatement, ContinueStatement, DoStatement,
     Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody, FunctionExpression,
-    FunctionId, FunctionStatement, GenericForStatement, GotoStatement, Identifier, IfClause,
-    IfExpression, IfStatement, IndexExpression, LabelStatement, LocalAttribute,
-    LocalFunctionStatement, LocalListStatement, LocalStatement, MethodCallExpression,
-    NumericForStatement, RepeatStatement, ReturnStatement, Statement, TableConstructor, TableField,
-    UnaryExpression, UnaryOperator, WhileStatement,
+    FunctionId, FunctionStatement, GenericForStatement, GlobalStatement, GotoStatement, Identifier,
+    IfClause, IfExpression, IfStatement, IndexExpression, InterpolatedString,
+    InterpolatedStringPart, LabelStatement, LocalAttribute, LocalFunctionStatement,
+    LocalListStatement, LocalStatement, MethodCallExpression, NumericForStatement, RepeatStatement,
+    ReturnStatement, Statement, TableConstructor, TableField, UnaryExpression, UnaryOperator,
+    WhileStatement,
 };
 pub use parser::{ParseError, ParseLimit, ParseLimits, ParseOutcome, Parsed, Rejected, parse};
 
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
-    SourceFile, SpanError,
+    SourceFile, SourceLimits, SpanError,
 };
 use core::fmt;
 
@@ -133,6 +134,7 @@ pub enum TokenKind {
     Whitespace,
     Comment,
     DialectDirective,
+    Global,
     Local,
     Function,
     Return,
@@ -164,6 +166,11 @@ pub enum TokenKind {
     HexNumber,
     BinaryInteger,
     StringLiteral,
+    InterpolatedStringStart,
+    InterpolatedStringEnd,
+    InterpolatedStringText,
+    InterpolationOpen,
+    InterpolationClose,
     Equal,
     EqualEqual,
     NotEqual,
@@ -204,6 +211,7 @@ pub enum TokenKind {
     RightBrace,
     LeftBracket,
     RightBracket,
+    Question,
     Unknown,
 }
 
@@ -311,7 +319,17 @@ pub fn lex(
     let mut directive = None;
     let mut offset = 0;
 
-    if is_initial_directive(bytes) {
+    if bytes.first() == Some(&b'#') && bytes.get(1) == Some(&b'!') {
+        let shebang_end = line_content_end(bytes, 0);
+        push_token(
+            &mut tokens,
+            Token::new(TokenKind::Comment, source.span(0, shebang_end)?),
+            limits.max_tokens,
+        )?;
+        offset = shebang_end;
+    }
+
+    if offset == 0 && is_initial_directive(bytes) {
         let line_end = line_end(bytes, 0);
         let directive_end = if line_end > 0 && bytes[line_end - 1] == b'\r' {
             line_end - 1
@@ -337,6 +355,36 @@ pub fn lex(
     }
 
     while offset < bytes.len() {
+        if bytes[offset] == b'`' {
+            let start = offset;
+            if supports_interpolated_strings(explicit_profile) {
+                offset = lex_interpolated_string(
+                    source,
+                    explicit_profile,
+                    limits,
+                    start,
+                    &mut tokens,
+                    &mut diagnostics,
+                )?;
+            } else {
+                offset += 1;
+                push_unavailable_syntax_diagnostic(
+                    source,
+                    &mut diagnostics,
+                    limits,
+                    explicit_profile,
+                    start,
+                    offset,
+                    "interpolated strings are unavailable in this profile",
+                )?;
+                push_token(
+                    &mut tokens,
+                    Token::new(TokenKind::Unknown, source.span(start, offset)?),
+                    limits.max_tokens,
+                )?;
+            }
+            continue;
+        }
         let start = offset;
         let kind = match bytes[offset] {
             byte if is_whitespace(byte) => {
@@ -507,7 +555,10 @@ pub fn lex(
             b':' => {
                 let label = bytes.get(offset + 1) == Some(&b':');
                 offset += 1 + usize::from(label);
-                if label && !supports_goto(explicit_profile) {
+                if label
+                    && !supports_goto(explicit_profile)
+                    && explicit_profile != SemanticProfile::Luau
+                {
                     push_unavailable_syntax_diagnostic(
                         source,
                         &mut diagnostics,
@@ -664,6 +715,21 @@ pub fn lex(
                 offset += 1;
                 TokenKind::LeftBracket
             }
+            b'?' => {
+                offset += 1;
+                if !supports_type_annotations(explicit_profile) {
+                    push_unavailable_syntax_diagnostic(
+                        source,
+                        &mut diagnostics,
+                        limits,
+                        explicit_profile,
+                        start,
+                        offset,
+                        "optional type syntax is unavailable in this profile",
+                    )?;
+                }
+                TokenKind::Question
+            }
             quote @ (b'\'' | b'"') => {
                 offset += 1;
                 let mut unsupported_escape = None;
@@ -680,7 +746,11 @@ pub fn lex(
                             continue;
                         };
                         if escaped == b'\n' {
-                            offset += 2;
+                            offset += if bytes.get(offset + 2) == Some(&b'\r') {
+                                3
+                            } else {
+                                2
+                            };
                             continue;
                         }
                         if escaped == b'\r' {
@@ -732,7 +802,7 @@ pub fn lex(
                         }
                         if escaped == b'z' && supports_whitespace_escape(explicit_profile) {
                             offset += 2;
-                            while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+                            while offset < bytes.len() && is_lua_whitespace(bytes[offset]) {
                                 offset += 1;
                             }
                             continue;
@@ -1049,6 +1119,9 @@ pub fn lex(
                     offset += 1;
                 }
                 match &bytes[start..offset] {
+                    b"global" if supports_global_declarations(explicit_profile) => {
+                        TokenKind::Global
+                    }
                     b"local" => TokenKind::Local,
                     b"function" => TokenKind::Function,
                     b"return" => TokenKind::Return,
@@ -1371,7 +1444,15 @@ const fn supports_compound_assignment(profile: SemanticProfile) -> bool {
     matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
 }
 
+const fn supports_interpolated_strings(profile: SemanticProfile) -> bool {
+    matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
+}
+
 const fn supports_continue(profile: SemanticProfile) -> bool {
+    matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
+}
+
+pub(crate) const fn supports_type_annotations(profile: SemanticProfile) -> bool {
     matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
 }
 
@@ -1391,6 +1472,14 @@ const fn supports_local_attributes(profile: SemanticProfile) -> bool {
         profile,
         SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
     )
+}
+
+pub(crate) const fn supports_global_declarations(profile: SemanticProfile) -> bool {
+    matches!(profile, SemanticProfile::Blu | SemanticProfile::Lua55)
+}
+
+pub(crate) const fn supports_named_vararg(profile: SemanticProfile) -> bool {
+    supports_global_declarations(profile)
 }
 
 const fn supports_numeric_separators(profile: SemanticProfile) -> bool {
@@ -1429,6 +1518,10 @@ const fn supports_hex_byte_escape(profile: SemanticProfile) -> bool {
 
 const fn supports_whitespace_escape(profile: SemanticProfile) -> bool {
     supports_hex_byte_escape(profile)
+}
+
+const fn is_lua_whitespace(byte: u8) -> bool {
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c)
 }
 
 const fn unicode_escape_maximum(profile: SemanticProfile) -> Option<u32> {
@@ -1478,6 +1571,292 @@ fn long_comment_end(bytes: &[u8], mut cursor: usize, equals: usize) -> Option<us
     None
 }
 
+fn lex_interpolated_string(
+    source: &SourceFile,
+    profile: SemanticProfile,
+    limits: LexerLimits,
+    start: usize,
+    tokens: &mut Vec<Token>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<usize, LexError> {
+    push_token(
+        tokens,
+        Token::new(
+            TokenKind::InterpolatedStringStart,
+            source.span(start, start + 1)?,
+        ),
+        limits.max_tokens,
+    )?;
+    let bytes = source.bytes();
+    let mut cursor = start + 1;
+    let mut text_start = cursor;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = escaped_cursor(bytes, cursor),
+            b'`' => {
+                push_token(
+                    tokens,
+                    Token::new(
+                        TokenKind::InterpolatedStringText,
+                        source.span(text_start, cursor)?,
+                    ),
+                    limits.max_tokens,
+                )?;
+                push_token(
+                    tokens,
+                    Token::new(
+                        TokenKind::InterpolatedStringEnd,
+                        source.span(cursor, cursor + 1)?,
+                    ),
+                    limits.max_tokens,
+                )?;
+                return Ok(cursor + 1);
+            }
+            b'{' => {
+                push_token(
+                    tokens,
+                    Token::new(
+                        TokenKind::InterpolatedStringText,
+                        source.span(text_start, cursor)?,
+                    ),
+                    limits.max_tokens,
+                )?;
+                push_token(
+                    tokens,
+                    Token::new(
+                        TokenKind::InterpolationOpen,
+                        source.span(cursor, cursor + 1)?,
+                    ),
+                    limits.max_tokens,
+                )?;
+                let expression_start = cursor + 1;
+                let close = find_interpolation_close(bytes, expression_start);
+                let expression_end = close.unwrap_or(bytes.len());
+                lex_interpolation_fragment(
+                    source,
+                    profile,
+                    limits,
+                    expression_start,
+                    expression_end,
+                    tokens,
+                    diagnostics,
+                )?;
+                if let Some(close) = close {
+                    push_token(
+                        tokens,
+                        Token::new(
+                            TokenKind::InterpolationClose,
+                            source.span(close, close + 1)?,
+                        ),
+                        limits.max_tokens,
+                    )?;
+                    cursor = close + 1;
+                    text_start = cursor;
+                    continue;
+                }
+                let span = source.span(cursor, bytes.len())?;
+                let diagnostic = diagnostic(
+                    "BLU-LEX-0020",
+                    profile,
+                    span,
+                    "unterminated interpolated expression",
+                    limits.diagnostic_limits,
+                )?
+                .try_with_expected("}")?;
+                push_diagnostic(diagnostics, diagnostic, limits.max_diagnostics)?;
+                return Ok(bytes.len());
+            }
+            _ => cursor += 1,
+        }
+    }
+    push_token(
+        tokens,
+        Token::new(
+            TokenKind::InterpolatedStringText,
+            source.span(text_start, bytes.len())?,
+        ),
+        limits.max_tokens,
+    )?;
+    let span = source.span(start, bytes.len())?;
+    let diagnostic = diagnostic(
+        "BLU-LEX-0021",
+        profile,
+        span,
+        "unterminated interpolated string",
+        limits.diagnostic_limits,
+    )?
+    .try_with_expected("`")?;
+    push_diagnostic(diagnostics, diagnostic, limits.max_diagnostics)?;
+    Ok(bytes.len())
+}
+
+fn lex_interpolation_fragment(
+    source: &SourceFile,
+    profile: SemanticProfile,
+    limits: LexerLimits,
+    start: usize,
+    end: usize,
+    tokens: &mut Vec<Token>,
+    diagnostics: &mut Vec<Diagnostic>,
+) -> Result<(), LexError> {
+    if start == end {
+        return Ok(());
+    }
+    let fragment = SourceFile::new(
+        source.identity().id(),
+        source.identity().name(),
+        source.bytes()[start..end].to_vec(),
+        SourceLimits::default(),
+    )
+    .map_err(|_| LexError::AllocationFailed {
+        what: "interpolated expression source",
+        requested: end.saturating_sub(start),
+    })?;
+    let nested = lex(
+        &fragment,
+        profile,
+        LexerLimits {
+            max_tokens: limits.max_tokens.saturating_sub(tokens.len()),
+            max_diagnostics: limits.max_diagnostics.saturating_sub(diagnostics.len()),
+            diagnostic_limits: limits.diagnostic_limits,
+        },
+    )?;
+    for token in nested.tokens() {
+        let span = source.span(
+            start.saturating_add(token.span().start().as_usize()),
+            start.saturating_add(token.span().end().as_usize()),
+        )?;
+        push_token(tokens, Token::new(token.kind(), span), limits.max_tokens)?;
+    }
+    for diagnostic in nested.diagnostics() {
+        push_diagnostic(
+            diagnostics,
+            remap_fragment_diagnostic(source, start, diagnostic)?,
+            limits.max_diagnostics,
+        )?;
+    }
+    Ok(())
+}
+
+fn remap_fragment_diagnostic(
+    source: &SourceFile,
+    offset: usize,
+    diagnostic: &Diagnostic,
+) -> Result<Diagnostic, LexError> {
+    let remap = |span: ByteSpan| {
+        source.span(
+            offset.saturating_add(span.start().as_usize()),
+            offset.saturating_add(span.end().as_usize()),
+        )
+    };
+    let mut mapped = Diagnostic::try_new(
+        diagnostic.code().as_str(),
+        diagnostic.phase(),
+        diagnostic.profile(),
+        diagnostic.severity(),
+        remap(diagnostic.primary().span())?,
+        diagnostic.primary().message(),
+        diagnostic.limits(),
+    )?;
+    for label in diagnostic.secondary() {
+        mapped = mapped.try_with_secondary(remap(label.span())?, label.message())?;
+    }
+    for expected in diagnostic.expected() {
+        mapped = mapped.try_with_expected(expected)?;
+    }
+    if let Some(found) = diagnostic.found() {
+        mapped = mapped.try_with_found(found)?;
+    }
+    for note in diagnostic.notes() {
+        mapped = mapped.try_with_note(note)?;
+    }
+    for help in diagnostic.help() {
+        mapped = mapped.try_with_help(help)?;
+    }
+    Ok(mapped)
+}
+
+fn find_interpolation_close(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start;
+    let mut nested_braces = 0_usize;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = escaped_cursor(bytes, cursor),
+            quote @ (b'\'' | b'"') => cursor = skip_quoted(bytes, cursor, quote),
+            b'`' => cursor = find_interpolated_string_end(bytes, cursor)?,
+            b'-' if bytes.get(cursor + 1) == Some(&b'-') => {
+                if let Some((delimiter_len, equals)) = long_comment_opener(bytes, cursor + 2) {
+                    cursor = long_comment_end(bytes, cursor + 2 + delimiter_len, equals)?;
+                } else {
+                    cursor = line_end(bytes, cursor);
+                }
+            }
+            b'[' => {
+                if let Some((delimiter_len, equals)) = long_comment_opener(bytes, cursor) {
+                    cursor = long_comment_end(bytes, cursor + delimiter_len, equals)?;
+                } else {
+                    cursor += 1;
+                }
+            }
+            b'{' => {
+                nested_braces = nested_braces.saturating_add(1);
+                cursor += 1;
+            }
+            b'}' if nested_braces == 0 => return Some(cursor),
+            b'}' => {
+                nested_braces -= 1;
+                cursor += 1;
+            }
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn find_interpolated_string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        match bytes[cursor] {
+            b'\\' => cursor = escaped_cursor(bytes, cursor),
+            b'`' => return Some(cursor + 1),
+            b'{' => cursor = find_interpolation_close(bytes, cursor + 1)?.saturating_add(1),
+            _ => cursor += 1,
+        }
+    }
+    None
+}
+
+fn skip_quoted(bytes: &[u8], start: usize, quote: u8) -> usize {
+    let mut cursor = start + 1;
+    while cursor < bytes.len() {
+        if bytes[cursor] == b'\\' {
+            cursor = escaped_cursor(bytes, cursor);
+        } else if bytes[cursor] == quote {
+            return cursor + 1;
+        } else {
+            cursor += 1;
+        }
+    }
+    bytes.len()
+}
+
+fn escaped_cursor(bytes: &[u8], start: usize) -> usize {
+    let mut cursor = start.saturating_add(1);
+    if bytes.get(cursor) == Some(&b'u') && bytes.get(cursor + 1) == Some(&b'{') {
+        cursor += 2;
+        while cursor < bytes.len() && bytes[cursor] != b'}' {
+            cursor += 1;
+        }
+        return cursor.saturating_add(usize::from(cursor < bytes.len()));
+    }
+    if bytes.get(cursor) == Some(&b'\r') && bytes.get(cursor + 1) == Some(&b'\n') {
+        cursor += 2;
+    } else if cursor < bytes.len() {
+        cursor += 1;
+    }
+    cursor
+}
+
 const fn offset_of_opener(comment_start: usize) -> usize {
     comment_start + 2
 }
@@ -1485,7 +1864,7 @@ const fn offset_of_opener(comment_start: usize) -> usize {
 fn line_end(bytes: &[u8], start: usize) -> usize {
     bytes[start..]
         .iter()
-        .position(|byte| *byte == b'\n')
+        .position(|byte| matches!(*byte, b'\r' | b'\n'))
         .map_or(bytes.len(), |relative| start + relative)
 }
 

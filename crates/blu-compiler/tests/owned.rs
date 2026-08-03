@@ -9,7 +9,7 @@ use blu_core::{
     CompilerId, CompilerIdentity, DiagnosticError, DiagnosticLimit, IdentityLimits, Phase,
     SemanticProfile, SourceFile, SourceId, SourceLimits,
 };
-use blu_runtime::{Dialect, HeapError, RuntimeError, Value, Vm};
+use blu_runtime::{Dialect, HeapError, MemoryConfig, RuntimeError, Value, Vm};
 use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
@@ -136,6 +136,182 @@ fn owned_vertical_slice_round_trips_and_executes_for_blu_and_luau() {
 }
 
 #[test]
+fn owned_compiler_persists_function_definition_lines_in_bluv2() {
+    let source =
+        make_source(b"local function answer(value)\n    return value\nend\nreturn answer(42)");
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Lua54, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        compiled.bytes()[4..6],
+        blu_bytecode::blu::BLU_V2_VERSION.to_le_bytes()
+    );
+    let function = compiled
+        .artifact()
+        .prototypes()
+        .iter()
+        .find(|prototype| prototype.parameter_count == 1)
+        .expect("function prototype");
+    assert_eq!(function.line_defined, 1);
+    assert_eq!(function.last_line_defined, 3);
+    assert_eq!(function.line_info.len(), function.code.len());
+    assert!(function.line_info.iter().all(|line| (1..=3).contains(line)));
+    assert_eq!(compiled.artifact().main().line_defined, 0);
+    assert_eq!(compiled.artifact().main().last_line_defined, 0);
+}
+
+#[test]
+fn owned_debug_getinfo_exposes_the_level_zero_c_function_for_lua_profiles() {
+    let source = make_source(
+        b"local info = debug.getinfo(0, 'Snulf')\nreturn info.what == 'C', info.source == '=[C]', info.short_src == '[C]', info.namewhat == 'field', info.name == 'getinfo', info.linedefined == -1, info.lastlinedefined == -1, info.nups == 0, info.nparams == nil, info.isvararg == nil, info.currentline == -1, type(info.func) == 'function'".to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result = Vm::default()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap();
+        assert_eq!(result.len(), 12, "{profile}");
+        for (index, value) in result.iter().enumerate() {
+            let expected = match index {
+                8 | 9 => profile == SemanticProfile::Lua51,
+                _ => true,
+            };
+            assert_eq!(*value, Value::Boolean(expected), "{profile}, field {index}");
+        }
+    }
+}
+
+#[test]
+fn owned_debug_getinfo_recovers_direct_global_and_method_call_names() {
+    let source = make_source(
+        b"function answer() local info = debug.getinfo(1, 'n') return info.namewhat, info.name end\nlocal object = { method = function(self) local info = debug.getinfo(1, 'n') return info.namewhat, info.name end }\nlocal first_what, first_name = answer()\nlocal second_what, second_name = object:method()\nreturn first_what, first_name, second_what, second_name"
+            .to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::String(Arc::from(&b"global"[..])),
+                Value::String(Arc::from(&b"answer"[..])),
+                Value::String(Arc::from(&b"method"[..])),
+                Value::String(Arc::from(&b"method"[..])),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_debug_getinfo_isolates_aliased_calls_and_reports_field_calls() {
+    let source = make_source(
+        b"function answer() local info = debug.getinfo(1, 'n') return info.namewhat, info.name end\nlocal alias = answer\nlocal object = { method = answer }\nlocal key = 'method'\nlocal local_what, local_name = alias()\nlocal field_what, field_name = object.method()\nlocal dynamic_what, dynamic_name = object[key]()\nlocal method_what, method_name = object:method()\nreturn local_what, local_name, field_what, field_name, dynamic_what, dynamic_name, method_what, method_name"
+            .to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result = Vm::default()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap();
+        assert_eq!(
+            result,
+            vec![
+                Value::String(Arc::from(&b"local"[..])),
+                Value::String(Arc::from(&b"alias"[..])),
+                Value::String(Arc::from(&b"field"[..])),
+                Value::String(Arc::from(&b"method"[..])),
+                Value::String(Arc::from(&b"field"[..])),
+                Value::String(Arc::from(&b"?"[..])),
+                Value::String(Arc::from(&b"method"[..])),
+                Value::String(Arc::from(&b"method"[..])),
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_debug_getinfo_reports_the_main_chunk_shape_and_function_object() {
+    let source = make_source(
+        b"local info = debug.getinfo(1, 'Snuf')\nreturn info.what == 'main', info.linedefined == 0, info.lastlinedefined == 0, info.nups, info.nparams, info.isvararg, type(info.func) == 'function'"
+            .to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        let result = result.unwrap();
+        assert_eq!(result.len(), 7, "{profile}");
+        assert!(
+            result[0..3]
+                .iter()
+                .all(|value| *value == Value::Boolean(true)),
+            "{profile}"
+        );
+        assert_eq!(
+            result[3],
+            Value::Number(if profile == SemanticProfile::Lua51 {
+                0.0
+            } else {
+                1.0
+            }),
+            "{profile}"
+        );
+        assert_eq!(
+            result[4],
+            if profile == SemanticProfile::Lua51 {
+                Value::Nil
+            } else {
+                Value::Number(0.0)
+            },
+            "{profile}"
+        );
+        assert_eq!(
+            result[5],
+            if profile == SemanticProfile::Lua51 {
+                Value::Nil
+            } else {
+                Value::Boolean(true)
+            },
+            "{profile}"
+        );
+        assert_eq!(result[6], Value::Boolean(true), "{profile}");
+    }
+}
+
+#[test]
 fn owned_labels_and_goto_execute_for_blu_and_lua52_plus() {
     let source = make_source(
         b"local value = 0 ::again:: value = value + 1 if value < 3 then goto again end return value"
@@ -172,14 +348,8 @@ fn owned_labels_and_goto_execute_for_blu_and_lua52_plus() {
 #[test]
 fn owned_goto_rejects_missing_duplicate_and_cross_scope_targets() {
     for (source, message) in [
-        (
-            b"goto missing return 1".as_slice(),
-            "goto target label is not defined",
-        ),
-        (
-            b"::x:: ::x:: return 1".as_slice(),
-            "duplicate label in one function",
-        ),
+        (b"goto missing return 1".as_slice(), "label 'missing'"),
+        (b"::x:: ::x:: return 1".as_slice(), "label 'x'"),
     ] {
         let result = OwnedCompiler::default().compile(
             &make_source(source.to_vec()),
@@ -188,8 +358,37 @@ fn owned_goto_rejects_missing_duplicate_and_cross_scope_targets() {
         );
         assert!(matches!(
             result,
-            Err(OwnedCompileError::ControlFlow { message: actual }) if actual == message
+            Err(OwnedCompileError::ControlFlow { message: actual }) if actual.contains(message)
         ));
+    }
+
+    let cross_scope =
+        make_source(b"goto inside; do local value = 1 ::inside:: end return 1".to_vec());
+    for profile in [
+        SemanticProfile::Blu,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        assert!(matches!(
+            OwnedCompiler::default().compile(&cross_scope, profile, compiler_identity()),
+            Err(OwnedCompileError::ControlFlow { message })
+                if message.contains("label 'inside'")
+        ));
+    }
+
+    for profile in [SemanticProfile::Blu, SemanticProfile::Lua55] {
+        let global_scope = make_source(b"goto done; global *; ::done:: return 1".to_vec());
+        let result = OwnedCompiler::default().compile(&global_scope, profile, compiler_identity());
+        assert!(
+            matches!(
+                &result,
+                Err(OwnedCompileError::ControlFlow { message })
+                    if message.contains("scope of '*'")
+            ),
+            "{profile}: {result:?}"
+        );
     }
 }
 
@@ -251,6 +450,136 @@ fn local_resolution_is_sequential_and_shadow_aware() {
             .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
             .is_err()
     );
+}
+
+#[test]
+fn global_declarations_are_scoped_and_execute_for_blu_and_lua55() {
+    for profile in [SemanticProfile::Blu, SemanticProfile::Lua55] {
+        let source = make_source(b"global first, second = 1, 2\nreturn first, second".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Number(1.0), Value::Number(2.0)]),
+            "{profile}"
+        );
+
+        let wildcard = make_source(b"global *\nvalue = 7\nreturn value".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&wildcard, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Number(7.0)]),
+            "{profile} wildcard"
+        );
+
+        let declaration = make_source(b"global print\nreturn print ~= nil".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&declaration, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile} declaration preserves builtin"
+        );
+    }
+}
+
+#[test]
+fn explicit_global_scopes_reject_undeclared_names_and_propagate_into_closures() {
+    for profile in [SemanticProfile::Blu, SemanticProfile::Lua55] {
+        let rejected = make_source(b"global declared\nreturn missing".to_vec());
+        let error = OwnedCompiler::default()
+            .compile(&rejected, profile, compiler_identity())
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OwnedCompileError::Diagnostic(ref diagnostic)
+                    if diagnostic.code().as_str() == "BLU-COMPILE-0012"
+            ),
+            "{profile}: {error}"
+        );
+
+        let closure = make_source(
+            b"global value\nvalue = 4\nlocal reader = function() return value end\nreturn reader()"
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&closure, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Number(4.0)]),
+            "{profile} closure"
+        );
+    }
+}
+
+#[test]
+fn global_function_declares_a_recursive_global_and_scopes_its_body() {
+    for profile in [SemanticProfile::Blu, SemanticProfile::Lua55] {
+        let source =
+            make_source(b"global function answer() return 42 end\nreturn answer()".to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Number(42.0)]),
+            "{profile}"
+        );
+
+        let rejected = make_source(b"global function answer() return missing end".to_vec());
+        let error = OwnedCompiler::default()
+            .compile(&rejected, profile, compiler_identity())
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OwnedCompileError::Diagnostic(ref diagnostic)
+                    if diagnostic.code().as_str() == "BLU-COMPILE-0012"
+            ),
+            "{profile}: {error}"
+        );
+    }
+}
+
+#[test]
+fn named_vararg_tables_materialize_values_and_n_for_blu_and_lua55() {
+    for profile in [SemanticProfile::Blu, SemanticProfile::Lua55] {
+        let source = make_source(
+            b"local function collect(... args) return args.n, args[1], args[2] end\nreturn collect(3, 4)"
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::Integer(2),
+                Value::Integer(3),
+                Value::Integer(4)
+            ]),
+            "{profile}"
+        );
+
+        let rejected = make_source(b"local function collect(... args) args = {} end".to_vec());
+        let error = OwnedCompiler::default()
+            .compile(&rejected, profile, compiler_identity())
+            .unwrap_err();
+        assert!(
+            matches!(
+                error,
+                OwnedCompileError::Diagnostic(ref diagnostic)
+                    if diagnostic.code().as_str() == "BLU-COMPILE-0011"
+            ),
+            "{profile}: {error}"
+        );
+    }
 }
 
 #[test]
@@ -338,7 +667,7 @@ fn local_lists_evaluate_before_binding_and_fill_missing_values_with_nil() {
     assert_eq!(
         Vm::new(Dialect::Blu)
             .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-        Ok(vec![Value::Number(2.0)])
+        Ok(vec![Value::Integer(1)])
     );
 }
 
@@ -527,7 +856,7 @@ fn floor_division_lowers_only_for_assigned_profiles_and_bootstrap_translation_re
             source.span(7, source.len()).unwrap()
         );
 
-        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+        if profile == SemanticProfile::Luau {
             assert_eq!(
                 translate_baseline_to_luau(
                     compiled.into_validated_artifact(),
@@ -621,7 +950,7 @@ fn syntax_failures_are_structured_and_implicit_returns_execute() {
         }
     }
 
-    let unresolved = make_source(b"local step = 1\nfor index = 1, 3, step do end".to_vec());
+    let unresolved = make_source(b"global answer\nother = 1".to_vec());
     let mut limits = OwnedCompileLimits::default();
     limits.parse.lexer.diagnostic_limits.max_label_message_bytes = 1;
     assert!(matches!(
@@ -716,7 +1045,16 @@ fn shared_baseline_artifacts_round_trip_for_all_seven_profiles() {
             );
             assert_eq!(
                 compiled.artifact().main().required_features,
-                FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS
+                FeatureBits::BASELINE
+                    | FeatureBits::INTEGER_CONSTANTS
+                    | if matches!(
+                        profile,
+                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) {
+                        FeatureBits::IMPLICIT_ENVIRONMENT
+                    } else {
+                        FeatureBits::empty()
+                    }
             );
         } else {
             assert_eq!(
@@ -726,6 +1064,11 @@ fn shared_baseline_artifacts_round_trip_for_all_seven_profiles() {
             assert_eq!(
                 compiled.artifact().main().required_features,
                 FeatureBits::BASELINE
+                    | if profile == SemanticProfile::Lua52 {
+                        FeatureBits::IMPLICIT_ENVIRONMENT
+                    } else {
+                        FeatureBits::empty()
+                    }
             );
         }
         let decoded = decode_validated(compiled.bytes(), BluLimits::default()).unwrap();
@@ -1030,6 +1373,35 @@ fn indexed_assignment_lists_snapshot_targets_and_rhs_before_committing() {
 }
 
 #[test]
+fn indexed_assignment_commits_snapshotted_targets_right_to_left() {
+    let source = make_source(
+        b"local values = {1} local alias = values values[1], alias[1] = 5, 6 return values[1]"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            Value::Integer(5)
+        } else {
+            Value::Number(5.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn logical_operators_short_circuit_and_return_operands_for_every_profile() {
     let source = make_source(
         br#"return "left" and "right", nil or "fallback", false and (1 + "2"), true or (1 + "2"), false or nil, nil and "unused""#
@@ -1142,10 +1514,12 @@ return value"#
     }
 
     let escaped = make_source(b"if true then local hidden = 1 end\nreturn hidden".to_vec());
-    assert!(
-        OwnedCompiler::default()
-            .compile(&escaped, SemanticProfile::Blu, compiler_identity())
-            .is_err()
+    let escaped = OwnedCompiler::default()
+        .compile(&escaped, SemanticProfile::Blu, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default().execute_blu_v1(escaped.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Nil])
     );
 }
 
@@ -1293,6 +1667,42 @@ fn repeat_until_executes_once_scopes_locals_and_tests_after_continue() {
         assert_eq!(
             Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
             Ok(vec![expected]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn repeat_until_keeps_body_locals_visible_to_its_condition() {
+    let source = make_source(
+        b"local count = 0\nrepeat\nlocal marker = count + 1\ncount = marker\nuntil marker == 3\nreturn count == 3"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .expect("repeat condition should see body locals");
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn lua54_repeat_until_closes_body_locals_after_testing_condition() {
+    let source = make_source(
+        b"local events = ''\nlocal metatable = {__close = function() events = events .. 'close' end}\nrepeat\nlocal value <close> = setmetatable({}, metatable)\nuntil events == 'close'\nreturn events == 'closeclose'"
+            .to_vec(),
+    );
+    for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .expect("repeat to-be-closed source should compile");
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
             "{profile}"
         );
     }
@@ -1479,17 +1889,47 @@ fn numeric_for_accepts_literal_steps_with_profile_specific_zero_direction() {
         SemanticProfile::Lua55,
     ] {
         let source = make_source(b"for index = 1, 3, 0 do end".to_vec());
-        let error = OwnedCompiler::default()
+        let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
-            .expect_err("rejected zero-step semantics should fail explicitly");
-        assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
+            .expect("zero-step semantics should be checked at runtime");
+        assert!(matches!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Err(RuntimeError::Raised(_))
+        ));
     }
 
-    let dynamic = make_source(b"local step = 1\nfor index = 1, 3, step do end".to_vec());
-    let error = OwnedCompiler::default()
+    let dynamic = make_source(
+        b"local step = 1 local total = 0\nfor index = 1, 3, step do total = total + index end return total"
+            .to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
         .compile(&dynamic, SemanticProfile::Blu, compiler_identity())
-        .expect_err("dynamic step direction should fail explicitly");
-    assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
+        .expect("dynamic Blu step should be checked at runtime");
+    assert_eq!(
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Integer(6)])
+    );
+}
+
+#[test]
+fn numeric_for_stops_when_integer_iteration_wraps() {
+    let source = make_source(
+        b"local up = 0 for index = math.mininteger, math.maxinteger, math.maxinteger do up = up + 1 end local down = 0 for index = math.maxinteger, math.mininteger, math.mininteger do down = down + 1 end return up, down".to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Integer(3), Value::Integer(2)]),
+            "{profile}"
+        );
+    }
 }
 
 #[test]
@@ -1499,19 +1939,14 @@ fn numeric_for_snapshots_dynamic_steps_for_profiles_with_assigned_zero_behavior(
             .to_vec(),
     );
     let zero = make_source(
-        b"local step = 0 local count = 0 for index = 1, 0, step do count = count + 1 if count == 1 then break end end return count"
+        b"local step = 0 local count = 0 for index = 1, 1, step do count = count + 1 if count == 1 then break end end return count"
             .to_vec(),
     );
-    for profile in [
-        SemanticProfile::Luau,
-        SemanticProfile::Lua51,
-        SemanticProfile::Lua52,
-        SemanticProfile::Lua53,
-    ] {
+    for profile in SemanticProfile::ALL {
         let compiled = OwnedCompiler::default()
             .compile(&dynamic, profile, compiler_identity())
             .expect("profile assigns dynamic step direction");
-        let expected = if profile == SemanticProfile::Lua53 {
+        let expected = if matches!(profile, SemanticProfile::Blu | SemanticProfile::Lua53) {
             vec![Value::Integer(9), Value::Integer(1)]
         } else {
             vec![Value::Number(9.0), Value::Number(1.0)]
@@ -1521,7 +1956,14 @@ fn numeric_for_snapshots_dynamic_steps_for_profiles_with_assigned_zero_behavior(
             Ok(expected),
             "{profile}"
         );
+    }
 
+    for profile in [
+        SemanticProfile::Luau,
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+    ] {
         let compiled = OwnedCompiler::default()
             .compile(&zero, profile, compiler_identity())
             .expect("profile assigns dynamic zero-step direction");
@@ -1542,10 +1984,17 @@ fn numeric_for_snapshots_dynamic_steps_for_profiles_with_assigned_zero_behavior(
         SemanticProfile::Lua54,
         SemanticProfile::Lua55,
     ] {
-        let error = OwnedCompiler::default()
-            .compile(&dynamic, profile, compiler_identity())
-            .expect_err("dynamic zero behavior is not executable for this profile");
-        assert!(matches!(error, OwnedCompileError::Diagnostic(_)));
+        let compiled = OwnedCompiler::default()
+            .compile(&zero, profile, compiler_identity())
+            .expect("dynamic zero behavior should be checked at runtime");
+        assert!(
+            matches!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Err(RuntimeError::Raised(_))
+            ),
+            "{profile}"
+        );
     }
 }
 
@@ -1618,6 +2067,57 @@ fn generic_for_executes_pairs_and_owned_iterators_across_profiles() {
 }
 
 #[test]
+fn direct_table_iteration_uses_profile_owned_iter_hook() {
+    let source = make_source(
+        b"local values=setmetatable({}, {__iter=function(value) local function iterator(_,index) if index<2 then return index+1,'hook'..tostring(index+1) end end return iterator,value,0 end}) local result='' for index,value in values do result=result..value end return result"
+            .to_vec(),
+    );
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::String(Arc::from(&b"hook1hook2"[..]))]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn luau_table_hash_fixture_order_is_observable() {
+    let source = make_source(
+        b"local t={['Mountains']=true,['Canyons']=true,['Dunes']=true,['Arctic']=true,['Lavaflow']=true,['Hills']=true,['Plains']=true,['Marsh']=true,['Water']=true} local result='' for key in pairs(t) do result=result..key end return result".to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Luau, compiler_identity())
+        .unwrap();
+    let result = Vm::default()
+        .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+        .unwrap();
+    assert_eq!(
+        result,
+        vec![Value::String(Arc::from(
+            &b"ArcticDunesCanyonsWaterMountainsHillsLavaflowPlainsMarsh"[..]
+        ))]
+    );
+}
+
+#[test]
+fn luau_userdata_namecall_uses_the_metatable_handler() {
+    let source = make_source(
+        b"local object = newproxy(true) getmetatable(object).__namecall = function(self, argument) return 42 + argument end return object:Foo(10)".to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Luau, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Number(52.0)])
+    );
+}
+
+#[test]
 fn pairs_honors_profile_available_pairs_metamethods_and_resumes_handlers() {
     let source = make_source(
         b"local wrapped=coroutine.wrap(function() local marker={} local mt={__pairs=function(value) local resume=coroutine.yield(value) return next,value,resume end} return pairs(setmetatable(marker,mt)) end) local yielded=wrapped() local iterator,state,control=wrapped('done') return yielded==state,type(iterator),control".to_vec(),
@@ -1640,6 +2140,100 @@ fn pairs_honors_profile_available_pairs_metamethods_and_resumes_handlers() {
                 Value::String(Arc::from(&b"function"[..])),
                 Value::String(Arc::from(&b"done"[..])),
             ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn ipairs_honors_profile_available_ipairs_metamethods_and_resumes_handlers() {
+    let source = make_source(
+        b"local wrapped=coroutine.wrap(function() local marker={} local mt={__ipairs=function(value) local resume=coroutine.yield(value) local function iterator(_,index) if index<1 then return index+1,resume end end return iterator,value,0 end} return ipairs(setmetatable(marker,mt)) end) local yielded=wrapped() local iterator,state,control=wrapped('done') local first,value=iterator(state,control) return yielded==state and first==1 and value=='done'".to_vec(),
+    );
+    for profile in [SemanticProfile::Lua52, SemanticProfile::Lua53] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn ipairs_reads_values_through_a_table_index_metamethod() {
+    let source = make_source(
+        b"local value = {n = 10} setmetatable(value, {__index = function(table, key) if key <= table.n then return key * 10 end end}) local count = 0 for key, item in ipairs(value) do count = count + 1 assert(key == count and item == count * 10) end return count == value.n".to_vec(),
+    );
+    for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn table_library_operations_honor_index_and_newindex_metamethods() {
+    let source = make_source(
+        b"local function test(proxy, target) for index = 1, 10 do table.insert(proxy, 1, index) end table.sort(proxy) assert(table.concat(proxy, ',') == '1,2,3,4,5,6,7,8,9,10') for index = 1, 8 do assert(table.remove(proxy, 1) == index) end local first, second, third = table.unpack(proxy) return #proxy == 2 and #target == 2 and first == 9 and second == 10 and third == nil end local target = {} local proxy = setmetatable({}, {__len = function() return #target end, __index = target, __newindex = target}) return test(proxy, target)".to_vec(),
+    );
+    for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn ipairs_wraps_integer_index_overflow_like_lua() {
+    let source = make_source(
+        b"local iterator = ipairs({}) local key, value = iterator({[math.mininteger] = 10}, math.maxinteger) local next_key, next_value = iterator({[math.mininteger] = 10}, key) return key, value, next_key, next_value".to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![
+                Value::Integer(i64::MIN),
+                Value::Integer(10),
+                Value::Nil,
+                Value::Nil,
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn table_insert_wraps_a_metamethod_length_overflow_like_lua() {
+    let source = make_source(
+        b"local value = setmetatable({}, {__len = function() return math.maxinteger end}) table.insert(value, 20) local key, item = next(value) return key == math.mininteger, item".to_vec(),
+    );
+    for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true), Value::Integer(20)]),
             "{profile}"
         );
     }
@@ -1935,7 +2529,7 @@ fn lua54_const_locals_reject_assignment_and_close_values_require_handlers() {
             .compile(&const_source, profile, compiler_identity())
             .expect_err("const assignment must be rejected");
         assert!(
-            error.to_string().contains("const local"),
+            error.to_string().contains("const variable 'value'"),
             "{profile}: {error}"
         );
     }
@@ -1957,6 +2551,40 @@ fn lua54_const_locals_reject_assignment_and_close_values_require_handlers() {
             ),
             "{profile}"
         );
+    }
+}
+
+#[test]
+fn lua55_global_const_visibility_survives_nested_function_boundaries() {
+    let source = make_source(
+        b"global a, var1<const>, z; local function foo() a=20; z=function() var1=12 end end"
+            .to_vec(),
+    );
+    let error = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Lua55, compiler_identity())
+        .expect_err("nested assignment to a global const must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("const variable 'var1'"),
+        "{error}"
+    );
+}
+
+#[test]
+fn lua54_and_lua55_reject_multiple_to_be_closed_locals_in_one_list() {
+    for source in [b"local <close> a, b".as_slice(), b"local a<close>, b<close>".as_slice()] {
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            let error = OwnedCompiler::default()
+                .compile(&make_source(source.to_vec()), profile, compiler_identity())
+                .expect_err("a Lua local list may have at most one <close> binding");
+            assert!(
+                error
+                    .to_string()
+                    .contains("multiple to-be-closed variables"),
+                "{profile}: {error}"
+            );
+        }
     }
 }
 
@@ -2066,7 +2694,7 @@ fn lua54_top_level_error_unwinding_closes_owned_values() {
         let mut vm = Vm::default();
         assert!(matches!(
             vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-            Err(RuntimeError::Raised(Value::String(message))) if &*message == b"body"
+            Err(RuntimeError::Raised(Value::String(message))) if message.ends_with(b": body")
         ));
         assert_eq!(vm.global(b"closed"), Some(&Value::Integer(1)), "{profile}");
     }
@@ -2159,7 +2787,7 @@ fn owned_fixed_calls_propagate_native_errors() {
             BluLimits::default()
         ),
         Err(blu_runtime::RuntimeError::Raised(Value::String(message)))
-            if message.as_ref() == b"owned failure"
+            if message.ends_with(b": owned failure")
     ));
 }
 
@@ -2542,6 +3170,77 @@ fn owned_table_length_is_raw_or_invokes_a_resumable_metamethod() {
             assert_eq!(result, Ok(vec![Value::Number(9.0)]));
         }
     }
+
+    let argument_count = make_source(
+        b"local value = setmetatable({}, {__len = function(...) return select('#', ...) end}) return #value"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&argument_count, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        assert_eq!(
+            result,
+            Ok(vec![if profile == SemanticProfile::Lua51 {
+                Value::Number(0.0)
+            } else if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(2)
+            } else if profile == SemanticProfile::Luau {
+                Value::Number(1.0)
+            } else {
+                Value::Number(2.0)
+            }]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn owned_protected_memory_errors_use_the_guest_diagnostic_for_blu_and_luau() {
+    let source = make_source(
+        b"local ok, error = pcall(function() table.create(1000000) end) return ok, error".to_vec(),
+    );
+    let memory = MemoryConfig {
+        hard_limit_bytes: Some(8 * 1024 * 1024),
+        gc_start_bytes: 8 * 1024 * 1024,
+        max_single_allocation_bytes: 1 << 20,
+        ..MemoryConfig::default()
+    };
+    for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result = Vm::try_new_with_memory(dialect(profile), memory)
+            .unwrap()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        assert_eq!(
+            result,
+            Ok(vec![
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"not enough memory"[..])),
+            ]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn luau_traceback_retains_the_protected_caller_after_a_yield() {
+    let source = make_source(
+        b"local function target() coroutine.yield() error('boom') end\nlocal co = coroutine.create(function() return xpcall(target, debug.traceback) end)\nlocal started = coroutine.resume(co)\nlocal resumed, ok, message = coroutine.resume(co)\nlocal first = type(message) == 'string' and string.find(message, 'owned-slice.blu:', 1, true)\nlocal second = first and string.find(message, 'owned-slice.blu:', first + 1, true)\nlocal third = second and string.find(message, 'owned-slice.blu:', second + 1, true)\nlocal fourth = third and string.find(message, 'owned-slice.blu:', third + 1, true)\nreturn started and resumed and not ok and first ~= nil and second ~= nil and third ~= nil and fourth == nil".to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Luau, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![Value::Boolean(true)])
+    );
 }
 
 #[test]
@@ -2565,6 +3264,11 @@ fn decimal_constants_follow_each_profile_numeric_policy() {
         assert_eq!(
             compiled.artifact().main().required_features,
             FeatureBits::BASELINE
+                | if profile == SemanticProfile::Lua52 {
+                    FeatureBits::IMPLICIT_ENVIRONMENT
+                } else {
+                    FeatureBits::empty()
+                }
         );
     }
 
@@ -2588,7 +3292,16 @@ fn decimal_constants_follow_each_profile_numeric_policy() {
         );
         assert_eq!(
             compiled.artifact().main().required_features,
-            FeatureBits::BASELINE | FeatureBits::INTEGER_CONSTANTS
+            FeatureBits::BASELINE
+                | FeatureBits::INTEGER_CONSTANTS
+                | if matches!(
+                    profile,
+                    SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) {
+                    FeatureBits::IMPLICIT_ENVIRONMENT
+                } else {
+                    FeatureBits::empty()
+                }
         );
     }
 
@@ -2608,7 +3321,7 @@ fn decimal_constants_follow_each_profile_numeric_policy() {
     );
     assert_eq!(
         compiled.artifact().main().required_features,
-        FeatureBits::BASELINE
+        FeatureBits::BASELINE | FeatureBits::IMPLICIT_ENVIRONMENT
     );
 
     let compiler = OwnedCompiler::new(OwnedCompileLimits {
@@ -3058,6 +3771,18 @@ fn long_strings_follow_explicit_lua_and_luau_newline_semantics() {
 }
 
 #[test]
+fn lua_long_strings_collapse_lfcr_newline_pairs() {
+    let source = make_source(b"return [[\ralo\n\ralo\r\n]]".to_vec());
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Lua54, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        compiled.artifact().main().constants,
+        [Constant::String(b"alo\nalo\n".to_vec())]
+    );
+}
+
+#[test]
 fn common_string_escapes_decode_to_bytes_for_every_profile() {
     let source = make_source(br#"return "\\\'\"\a\b\f\n\r\t\v""#.to_vec());
     let expected = b"\\'\"\x07\x08\x0c\n\r\t\x0b".to_vec();
@@ -3353,7 +4078,7 @@ fn string_find_rejects_malformed_sets_structurally() {
 #[test]
 fn string_find_preflights_pattern_work() {
     let source = make_source(
-        b"return string.find(string.rep('a', 4000), string.rep('a', 3000) .. 'b')".to_vec(),
+        b"return string.find(string.rep('a', 4000), string.rep('a', 3000) .. '[b]')".to_vec(),
     );
     for profile in SemanticProfile::ALL {
         let compiled = OwnedCompiler::default()
@@ -3970,7 +4695,11 @@ fn collectgarbage_rejects_unassigned_commands_and_wrong_types() {
         for (source, expected) in [
             (
                 b"return collectgarbage('restart')".as_slice(),
-                "unsupported",
+                if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                    "unsupported"
+                } else {
+                    "supported"
+                },
             ),
             (b"return collectgarbage({})".as_slice(), "type"),
         ] {
@@ -3988,10 +4717,543 @@ fn collectgarbage_rejects_unassigned_commands_and_wrong_types() {
                         ..
                     })
                 )),
+                "supported" => assert_eq!(
+                    result,
+                    Ok(vec![if matches!(
+                        profile,
+                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) {
+                        Value::Integer(0)
+                    } else {
+                        Value::Number(0.0)
+                    }])
+                ),
                 "type" => assert!(matches!(result, Err(RuntimeError::Type { .. }))),
                 _ => unreachable!(),
             }
         }
+    }
+}
+
+#[test]
+fn collectgarbage_controls_follow_lua_profile_surface() {
+    for profile in SemanticProfile::ALL {
+        let source = match profile {
+            SemanticProfile::Lua51 => {
+                b"local stopped,stop_value=pcall(collectgarbage,'stop') local running=pcall(collectgarbage,'isrunning') local collected,collect_value=pcall(collectgarbage,'collect') local restarted,restart_value=pcall(collectgarbage,'restart') return stopped and type(stop_value)=='number' and stop_value==0 and not running and collected and type(collect_value)=='number' and restarted and type(restart_value)=='number' and restart_value==0".as_slice()
+            }
+            SemanticProfile::Lua52
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55 => {
+                br#"local stopped,stop_value=pcall(collectgarbage,'stop')
+if not stopped or stop_value~=0 then return false end
+local was_stopped,state=pcall(collectgarbage,'isrunning')
+if not was_stopped or state~=false then return false end
+local collected,collect_value=pcall(collectgarbage,'collect')
+if not collected or collect_value~=0 then return false end
+local restarted,restart_value=pcall(collectgarbage,'restart')
+if not restarted or restart_value~=0 then return false end
+local running,after=pcall(collectgarbage,'isrunning')
+return running and after==true"#
+            }
+            SemanticProfile::Blu | SemanticProfile::Luau => {
+                b"return not pcall(collectgarbage,'stop') and pcall(collectgarbage,'collect') and not pcall(collectgarbage,'restart') and not pcall(collectgarbage,'isrunning')".as_slice()
+            }
+            _ => unreachable!("SemanticProfile::ALL contains only known profiles"),
+        };
+        let source = make_source(source.to_vec());
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn collectgarbage_step_reports_reclaimed_memory() {
+    let source = make_source(
+        br#"collectgarbage('collect')
+local values = {}
+for index = 1, 100 do values[index] = {{}}; local garbage = {} end
+local before = collectgarbage('count')
+collectgarbage('stop')
+local completed = collectgarbage('step', 20000)
+local after = collectgarbage('count')
+return before, after, completed"#
+            .to_vec(),
+    );
+    for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let mut vm = Vm::default();
+        let result = vm
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap_or_else(|error| panic!("{profile}: {error}"));
+        assert!(
+            matches!(result.get(2), Some(Value::Boolean(true))),
+            "{profile}"
+        );
+        assert!(
+            matches!((&result[0], &result[1]),
+                (Value::Number(before), Value::Number(after)) if before > after),
+            "{profile}: expected collection to reduce the public memory count, got {result:?}"
+        );
+    }
+}
+
+#[test]
+fn collectgarbage_step_size_controls_completion_budget() {
+    let source = make_source(
+        br#"collectgarbage('stop')
+local function steps(size)
+    collectgarbage('collect')
+    local values = {}
+    for index = 1, 100 do values[index] = {{}} end
+    local count = 0
+    repeat count = count + 1 until collectgarbage('step', size)
+    return count
+end
+return steps(10) < steps(2)"#
+            .to_vec(),
+    );
+    for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default()
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+                .unwrap_or_else(|error| panic!("{profile}: {error}")),
+            vec![Value::Boolean(true)],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn modern_collectgarbage_modes_and_parameters_round_trip() {
+    let mode_source = make_source(
+        b"local first=collectgarbage('incremental') local second=collectgarbage('generational') local third=collectgarbage('incremental') return first=='incremental' and second=='incremental' and third=='generational'".to_vec(),
+    );
+    for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+        let compiled = OwnedCompiler::default()
+            .compile(&mode_source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default()
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+                .unwrap_or_else(|error| panic!("{profile}: {error}")),
+            vec![Value::Boolean(true)],
+            "{profile}"
+        );
+    }
+
+    let parameter_source = make_source(
+        b"local old=collectgarbage('param','pause',100) local pause=collectgarbage('param','pause') local oldmul=collectgarbage('param','stepmul',100) local stepmul=collectgarbage('param','stepmul') return old==200 and pause==100 and oldmul==200 and stepmul==100".to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(
+            &parameter_source,
+            SemanticProfile::Lua55,
+            compiler_identity(),
+        )
+        .unwrap();
+    assert_eq!(
+        Vm::default()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap(),
+        vec![Value::Boolean(true)]
+    );
+}
+
+#[test]
+fn lua52_collectgarbage_modes_and_major_increment_round_trip() {
+    let source = make_source(
+        b"local gen=collectgarbage('generational') local inc=collectgarbage('incremental') local old=collectgarbage('setmajorinc',250) local prior=collectgarbage('setmajorinc',300) return gen==0 and inc==0 and old==200 and prior==250".to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Lua52, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default()
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap(),
+        vec![Value::Boolean(true)]
+    );
+}
+
+#[test]
+fn stopped_collectgarbage_disables_automatic_collection_until_restart() {
+    for profile in [
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let source = make_source(
+            br#"collectgarbage('stop')
+local allocated = pcall(function()
+    local value
+    for _=1,1000 do value={} end
+end)
+local running_ok,running = pcall(collectgarbage,'isrunning')
+local stopped = (not running_ok) or running == false
+collectgarbage('restart')
+local restarted_ok,restarted = pcall(collectgarbage,'isrunning')
+return allocated, stopped, (not restarted_ok) or restarted"#
+                .to_vec(),
+        );
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let baseline = Vm::default().heap().live_objects();
+        let result = Vm::default()
+            .with_heap_object_limit(baseline + 32)
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap_or_else(|error| panic!("{profile}: {error}"));
+        assert_eq!(
+            result,
+            vec![
+                Value::Boolean(false),
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ],
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn collectgarbage_stop_and_restart_return_profile_numeric_subtypes() {
+    let source = make_source(b"return collectgarbage('stop'), collectgarbage('restart')".to_vec());
+    for profile in [
+        SemanticProfile::Lua51,
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let zero = if matches!(
+            profile,
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
+            Value::Integer(0)
+        } else {
+            Value::Number(0.0)
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![zero.clone(), zero]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn table_gc_finalizers_follow_lua_profile_availability() {
+    let source = make_source(
+        b"local finalized=0 local function make() local value=setmetatable({}, {__gc=function() finalized=finalized+1 end}) end make() collectgarbage('collect') return finalized".to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = match profile {
+            SemanticProfile::Blu => Value::Integer(0),
+            SemanticProfile::Lua52 => Value::Number(1.0),
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
+                Value::Integer(1)
+            }
+            SemanticProfile::Lua51 | SemanticProfile::Luau => Value::Number(0.0),
+            _ => unreachable!("SemanticProfile::ALL contains only known profiles"),
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn automatic_table_finalizers_preserve_captured_open_locals() {
+    let source = make_source(
+        b"local finished=false local value=setmetatable({}, {__gc=function() finished=true end}) repeat value={} until finished return finished".to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let mut vm = Vm::try_new_with_memory(
+            Dialect::Blu,
+            MemoryConfig {
+                gc_start_bytes: 1,
+                gc_growth_percent: 0,
+                ..MemoryConfig::default()
+            },
+        )
+        .unwrap()
+        .with_instruction_limit(100_000);
+        assert_eq!(
+            vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn table_finalizers_arm_from_late_non_nil_gc_markers() {
+    let source = make_source(
+        b"local finalized=0 local value=setmetatable({}, {__gc=true}) local metatable=getmetatable(value) metatable.__gc=function() finalized=10 end value=nil collectgarbage() return finalized==10".to_vec(),
+    );
+    for profile in [
+        SemanticProfile::Lua52,
+        SemanticProfile::Lua53,
+        SemanticProfile::Lua54,
+        SemanticProfile::Lua55,
+    ] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn table_gc_finalizers_can_resurrect_once_and_do_not_repeat() {
+    let source = make_source(
+        b"local finalized=0 local resurrected local function make() local value=setmetatable({}, {__gc=function(value) finalized=finalized+1 resurrected=value end}) end make() collectgarbage('collect') local first=finalized==1 and resurrected~=nil collectgarbage('collect') return first and finalized==1 and resurrected~=nil".to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(matches!(
+                profile,
+                SemanticProfile::Lua52
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ))]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn table_gc_finalizers_can_be_explicitly_rearmed_after_resurrection() {
+    let source = make_source(
+        b"local finalized=0 local resurrected local metatable local function finalize(value) finalized=finalized+1 resurrected=value setmetatable(value, metatable) end metatable={__gc=finalize} local function make() local value=setmetatable({}, metatable) end make() collectgarbage('collect') local first=finalized==1 and resurrected~=nil resurrected=nil collectgarbage('collect') return first and finalized==2".to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        assert_eq!(
+            result,
+            Ok(vec![Value::Boolean(matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ))]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn table_gc_finalizers_follow_reverse_order_and_error_policy() {
+    let order_source = make_source(
+        b"local order={} local metatable={__gc=function(value) order[#order+1]=value.id end} local function make(id) local value=setmetatable({id=id}, metatable) end make(1) make(2) make(3) collectgarbage('collect') return table.concat(order, ',')".to_vec(),
+    );
+    let error_source = make_source(
+        b"local finalized=0 local function make() local value=setmetatable({}, {__gc=function() finalized=finalized+1 error('boom') end}) end make() local ok, err=pcall(collectgarbage, 'collect') return ok, type(err), finalized".to_vec(),
+    );
+    let yield_source = make_source(
+        b"local finalized=0 local function make() local value=setmetatable({}, {__gc=function() finalized=finalized+1 coroutine.yield('yielded') finalized=finalized+1 end}) end make() local ok, err=pcall(collectgarbage, 'collect') return ok, type(err), finalized".to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let order = OwnedCompiler::default()
+            .compile(&order_source, profile, compiler_identity())
+            .unwrap();
+        let order_expected = if matches!(
+            profile,
+            SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            "3,2,1"
+        } else {
+            ""
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(order.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::String(Arc::from(order_expected.as_bytes()))]),
+            "order {profile}"
+        );
+
+        let error = OwnedCompiler::default()
+            .compile(&error_source, profile, compiler_identity())
+            .unwrap();
+        let expected = match profile {
+            SemanticProfile::Lua52 | SemanticProfile::Lua53 => vec![
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"string"[..])),
+                Value::Number(1.0),
+            ],
+            SemanticProfile::Lua54 | SemanticProfile::Lua55 => vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"number"[..])),
+                Value::Integer(1),
+            ],
+            SemanticProfile::Blu | SemanticProfile::Luau | SemanticProfile::Lua51 => vec![
+                Value::Boolean(true),
+                if profile == SemanticProfile::Luau {
+                    Value::String(Arc::from(&b"nil"[..]))
+                } else {
+                    Value::String(Arc::from(&b"number"[..]))
+                },
+                if matches!(profile, SemanticProfile::Blu) {
+                    Value::Integer(0)
+                } else {
+                    Value::Number(0.0)
+                },
+            ],
+            _ => unreachable!("SemanticProfile::ALL contains only known profiles"),
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(error.into_validated_artifact(), BluLimits::default()),
+            Ok(expected),
+            "error {profile}"
+        );
+
+        let yielded = OwnedCompiler::default()
+            .compile(&yield_source, profile, compiler_identity())
+            .unwrap();
+        let expected = match profile {
+            SemanticProfile::Lua52 | SemanticProfile::Lua53 => vec![
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"string"[..])),
+                Value::Number(1.0),
+            ],
+            SemanticProfile::Lua54 | SemanticProfile::Lua55 => vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"number"[..])),
+                Value::Integer(1),
+            ],
+            SemanticProfile::Blu => vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"number"[..])),
+                Value::Integer(0),
+            ],
+            SemanticProfile::Luau => vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"nil"[..])),
+                Value::Number(0.0),
+            ],
+            SemanticProfile::Lua51 => vec![
+                Value::Boolean(true),
+                Value::String(Arc::from(&b"number"[..])),
+                Value::Number(0.0),
+            ],
+            _ => unreachable!("SemanticProfile::ALL contains only known profiles"),
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(yielded.into_validated_artifact(), BluLimits::default()),
+            Ok(expected),
+            "yield {profile}"
+        );
+    }
+}
+
+#[test]
+fn table_gc_finalizers_keep_the_profile_for_host_triggered_collection() {
+    let source = make_source(
+        b"finalized=0 return setmetatable({}, {__gc=function() finalized=finalized+1 end})"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let mut vm = Vm::default();
+        let values = vm
+            .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default())
+            .unwrap();
+        assert_eq!(values.len(), 1, "{profile}");
+        assert!(vm.release_value(&values[0]), "{profile}");
+        vm.collect(core::iter::empty()).unwrap();
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Lua52
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            if matches!(
+                profile,
+                SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+            ) {
+                Value::Integer(1)
+            } else {
+                Value::Number(1.0)
+            }
+        } else if profile == SemanticProfile::Blu {
+            Value::Integer(0)
+        } else {
+            Value::Number(0.0)
+        };
+        assert_eq!(vm.global(b"finalized"), Some(&expected), "{profile}");
+    }
+}
+
+#[test]
+fn table_gc_finalizer_register_liveness_boundary_is_explicit() {
+    let source = make_source(
+        b"local finalized=0 local resurrected local metatable local function finalize(value) finalized=finalized+1 resurrected=value end metatable={__gc=finalize} local function make() local value=setmetatable({}, metatable) end make() collectgarbage('collect') local function rearm(value) setmetatable(value, metatable) end if resurrected~=nil then rearm(resurrected) resurrected=nil collectgarbage('collect') end return finalized".to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = match profile {
+            SemanticProfile::Lua52 => Value::Number(1.0),
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
+                Value::Integer(2)
+            }
+            SemanticProfile::Blu => Value::Integer(0),
+            SemanticProfile::Luau | SemanticProfile::Lua51 => Value::Number(0.0),
+            _ => unreachable!("SemanticProfile::ALL contains only known profiles"),
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![expected]),
+            "{profile}"
+        );
     }
 }
 
@@ -4220,9 +5482,10 @@ fn table_move_handles_overlap_destinations_and_profile_availability() {
         if matches!(profile, SemanticProfile::Lua51 | SemanticProfile::Lua52) {
             assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "table.move",
-                    ..
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function",
+                    actual: "nil",
                 })
             ));
             continue;
@@ -4312,6 +5575,21 @@ fn whitespace_escape_consumes_all_following_ascii_space() {
                 "{profile}"
             );
         }
+    }
+}
+
+#[test]
+fn whitespace_escape_can_end_after_a_final_line_break() {
+    let source = make_source(b"return '\\z  \n\t\x0c\x0b\n'".to_vec());
+    for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap_or_else(|error| panic!("{profile}: {error}"));
+        assert_eq!(
+            compiled.artifact().main().constants,
+            [Constant::String(Vec::new())],
+            "{profile}"
+        );
     }
 }
 
@@ -4779,6 +6057,45 @@ fn mixed_return_prefixes_preserve_all_final_call_results() {
 }
 
 #[test]
+fn math_integer_bounds_are_profile_gated_and_exact() {
+    let source = make_source(
+        b"return math.mininteger,math.maxinteger,math.mininteger==nil,math.maxinteger==nil"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let expected = if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            vec![
+                Value::Integer(i64::MIN),
+                Value::Integer(i64::MAX),
+                Value::Boolean(false),
+                Value::Boolean(false),
+            ]
+        } else {
+            vec![
+                Value::Nil,
+                Value::Nil,
+                Value::Boolean(true),
+                Value::Boolean(true),
+            ]
+        };
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(expected),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
 fn math_atan_uses_the_explicit_profile_specific_second_argument_contract() {
     for profile in SemanticProfile::ALL {
         let source = make_source(b"return math.atan(1, 0)".to_vec());
@@ -4814,13 +6131,16 @@ fn math_atan_uses_the_explicit_profile_specific_second_argument_contract() {
                 Ok(vec![Value::Number(core::f64::consts::FRAC_PI_4)])
             );
         } else {
-            assert!(matches!(
-                result,
-                Err(blu_runtime::RuntimeError::Type {
-                    operation: "math.atan",
-                    ..
-                })
-            ));
+            assert!(
+                matches!(
+                    result,
+                    Err(blu_runtime::RuntimeError::Type {
+                        operation: "math.atan",
+                        ..
+                    }) | Err(blu_runtime::RuntimeError::LuauMessage(_))
+                ),
+                "{profile}"
+            );
         }
     }
 }
@@ -4843,13 +6163,17 @@ fn math_asin_and_acos_follow_the_shared_profile_contract() {
         let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
             .unwrap();
-        assert!(matches!(
-            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-            Err(blu_runtime::RuntimeError::Type {
-                operation: "math.acos",
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Err(blu_runtime::RuntimeError::Type {
+                    operation: "math.acos",
+                    ..
+                }) | Err(blu_runtime::RuntimeError::LuauMessage(_))
+            ),
+            "{profile}"
+        );
     }
 }
 
@@ -4932,13 +6256,20 @@ fn math_modf_rejects_non_numeric_arguments_structurally() {
         let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
             .unwrap();
-        assert!(matches!(
-            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-            Err(RuntimeError::Type {
-                operation: "math.modf",
-                ..
-            })
-        ));
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if profile == SemanticProfile::Luau {
+            assert!(matches!(result, Err(RuntimeError::LuauMessage(message)) if
+                String::from_utf8_lossy(&message).contains("invalid argument #1 to 'modf'")));
+        } else {
+            assert!(matches!(
+                result,
+                Err(RuntimeError::Type {
+                    operation: "math.modf",
+                    ..
+                })
+            ));
+        }
     }
 }
 
@@ -4991,13 +6322,17 @@ fn math_pow_follows_the_shared_numeric_contract() {
         let compiled = OwnedCompiler::default()
             .compile(&invalid, profile, compiler_identity())
             .unwrap();
-        assert!(matches!(
-            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-            Err(RuntimeError::Type {
-                operation: "math.pow",
-                ..
-            })
-        ));
+        assert!(
+            matches!(
+                Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+                Err(RuntimeError::Type {
+                    operation: "math.pow",
+                    ..
+                }) | Err(RuntimeError::LuauMessage(_))
+            ),
+            "{profile}"
+        );
     }
 }
 
@@ -5112,9 +6447,9 @@ fn legacy_elementary_math_is_explicitly_removed_only_in_lua55() {
         if profile == SemanticProfile::Lua55 {
             assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedLibraryFeature {
-                    function: "math.sinh",
-                    feature: "function removed in Lua 5.5",
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
                 })
             ));
         } else {
@@ -5246,7 +6581,7 @@ fn math_random_and_randomseed_follow_profile_contracts() {
                 assert_eq!(result, Ok(vec![Value::Number(2.0)]));
             }
             SemanticProfile::Lua52 => {
-                assert_eq!(result, Ok(vec![Value::Number(3.0)]));
+                assert_eq!(result, Ok(vec![Value::Number(2.5)]));
             }
             _ => assert!(matches!(
                 result,
@@ -5290,14 +6625,25 @@ fn math_random_and_randomseed_follow_profile_contracts() {
         let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
             .unwrap();
-        assert!(matches!(
-            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-            Err(blu_runtime::RuntimeError::ArgumentCount {
-                function: "math.random",
-                actual: 3,
-                ..
-            })
-        ));
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        if profile == SemanticProfile::Luau {
+            assert_eq!(
+                result,
+                Err(blu_runtime::RuntimeError::Raised(Value::String(Arc::from(
+                    &b"wrong number of arguments"[..],
+                ))))
+            );
+        } else {
+            assert!(matches!(
+                result,
+                Err(blu_runtime::RuntimeError::ArgumentCount {
+                    function: "math.random",
+                    actual: 3,
+                    ..
+                })
+            ));
+        }
     }
 }
 
@@ -5421,25 +6767,30 @@ fn math_type_and_tointeger_follow_modern_profile_contracts() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
-                result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "math.type",
-                    profile,
-                }),
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Type {
+                        operation: "call",
+                        ..
+                    })
+                ),
                 "{profile}"
             );
             let source = make_source(b"return math.tointeger(3)".to_vec());
             let compiled = OwnedCompiler::default()
                 .compile(&source, profile, compiler_identity())
                 .unwrap();
-            assert_eq!(
-                Vm::default()
-                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "math.tointeger",
-                    profile,
-                }),
+            let result = Vm::default()
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Type {
+                        operation: "call",
+                        ..
+                    })
+                ),
                 "{profile}"
             );
         }
@@ -5467,12 +6818,14 @@ fn math_type_and_tointeger_follow_modern_profile_contracts() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
-                result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "math.ult",
-                    profile,
-                }),
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Type {
+                        operation: "call",
+                        ..
+                    })
+                ),
                 "{profile}"
             );
         }
@@ -5529,12 +6882,14 @@ fn bit32_core_follows_profile_specific_conversion_and_result_rules() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
-                result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "bit32.band",
-                    profile,
-                }),
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Type {
+                        operation: "table index",
+                        ..
+                    })
+                ),
                 "{profile}"
             );
         }
@@ -5558,13 +6913,13 @@ fn bit32_core_follows_profile_specific_conversion_and_result_rules() {
                 })
             ),
             SemanticProfile::Lua51 | SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
-                assert_eq!(
+                assert!(matches!(
                     result,
-                    Err(RuntimeError::UnsupportedSemanticProfile {
-                        operation: "bit32.band",
-                        profile,
+                    Err(RuntimeError::Type {
+                        operation: "table index",
+                        ..
                     })
-                );
+                ));
             }
             _ => panic!("unhandled semantic profile {profile}"),
         }
@@ -5592,14 +6947,14 @@ fn bit32_core_follows_profile_specific_conversion_and_result_rules() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "bit32.bnot",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "table index",
+                    expected: "table",
+                    actual: "nil",
+                })
+            ));
         }
 
         let invalid_range = make_source(b"return bit32.extract(1,31,2)".to_vec());
@@ -5623,14 +6978,13 @@ fn bit32_core_follows_profile_specific_conversion_and_result_rules() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "bit32.extract",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "table index",
+                    ..
+                })
+            ));
         }
     }
 }
@@ -5800,14 +7154,13 @@ fn luau_math_extensions_are_profile_gated_and_edge_compatible() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "math.clamp",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
+                })
+            ));
         }
 
         let source = make_source(b"return math.clamp(2,3,1)".to_vec());
@@ -5825,14 +7178,13 @@ fn luau_math_extensions_are_profile_gated_and_edge_compatible() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "math.clamp",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
+                })
+            ));
         }
     }
 }
@@ -5864,14 +7216,13 @@ fn luau_math_classification_and_interpolation_extensions_are_profile_gated() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "math.isnan",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
+                })
+            ));
         }
     }
 }
@@ -5905,14 +7256,13 @@ fn luau_math_noise_matches_the_pinned_f32_perlin_contract() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "math.noise",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
+                })
+            ));
         }
     }
 }
@@ -5960,14 +7310,13 @@ fn string_split_matches_luau_byte_and_empty_field_semantics() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "string.split",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
+                })
+            ));
         }
     }
 }
@@ -5978,8 +7327,16 @@ fn string_format_executes_the_profile_common_conversion_core() {
         b"return string.format('%s:%d:%i:%u:%x:%X:%o:%c:%f:%e:%E:%.3s:%.2f:%.1e:%.3E:%5s:%4d:%8.2f:%-5s:%-4d:%-8.2f:%%','ok',12,-2,-1,255,255,9,65,1.25,1.25,0.00125,'abcdef',1.25,1.25,0.00125,'xy',7,1.25,'xy',7,1.25)"
             .to_vec(),
     );
+    let flags = make_source(
+        b"return string.format('%+d|% d|%#x|%#X|%#o|%05d|%08.2f|%-05d|%#.5g',15,15,255,255,9,15,1.25,15,1.25)"
+            .to_vec(),
+    );
+    let integer_precision = make_source(
+        b"return string.format('%.3d|%+.3d|%.5u|%.5x|%#.5o|%.0d|%#.0o|%08.5d|%08.5x',12,-12,12,255,9,0,0,12,255)"
+            .to_vec(),
+    );
     let fractional = make_source(b"return string.format('%d',12.9)".to_vec());
-    let unsupported = make_source(b"return string.format('%02d',7)".to_vec());
+    let unsupported = make_source(b"return string.format('%*d',7)".to_vec());
     let wide = make_source(b"return string.format('%100s','x')".to_vec());
     let dangling_width = make_source(b"return string.format('%12','x')".to_vec());
     for profile in SemanticProfile::ALL {
@@ -5995,6 +7352,26 @@ fn string_format_executes_the_profile_common_conversion_core() {
             ),
             Ok(vec![Value::String(Arc::from(
                 &b"ok:12:-2:18446744073709551615:ff:FF:11:A:1.250000:1.250000e+00:1.250000E-03:abc:1.25:1.2e+00:1.250E-03:   xy:   7:    1.25:xy   :7   :1.25    :%"[..]
+            ))]),
+            "{profile}"
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(
+                compile(&flags).into_validated_artifact(),
+                BluLimits::default(),
+            ),
+            Ok(vec![Value::String(Arc::from(
+                &b"+15| 15|0xff|0XFF|011|00015|00001.25|15   |1.2500"[..],
+            ))]),
+            "{profile}"
+        );
+        assert_eq!(
+            Vm::default().execute_blu_v1(
+                compile(&integer_precision).into_validated_artifact(),
+                BluLimits::default(),
+            ),
+            Ok(vec![Value::String(Arc::from(
+                &b"012|-012|00012|000ff|00011||0|   00012|   000ff"[..],
             ))]),
             "{profile}"
         );
@@ -6031,7 +7408,11 @@ fn string_format_executes_the_profile_common_conversion_core() {
             ),
             Err(RuntimeError::UnsupportedLibraryFeature {
                 function: "string.format",
-                feature: "this format flag or flag combination",
+                feature: if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+                    "dynamic width or precision"
+                } else {
+                    "this conversion specifier"
+                },
             }),
             "{profile}"
         );
@@ -6042,7 +7423,7 @@ fn string_format_executes_the_profile_common_conversion_core() {
             ),
             Err(RuntimeError::UnsupportedLibraryFeature {
                 function: "string.format",
-                feature: "field widths wider than two digits",
+                feature: "invalid conversion",
             }),
             "{profile}"
         );
@@ -6061,6 +7442,118 @@ fn string_format_executes_the_profile_common_conversion_core() {
 }
 
 #[test]
+fn string_format_modifier_rejections_follow_lua54_profiles() {
+    let source = make_source(
+        b"local function accepts(format, value) local ok = pcall(string.format, format, value) return ok end
+return accepts('%#d', 15), accepts('%+u', 15), accepts('%#s', 15), accepts('%0s', 15), accepts('%+q', 15), accepts('%5q', 15), accepts('%05c', 65), accepts('%+x', 15)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compiled = OwnedCompiler::default()
+            .compile(&source, profile, compiler_identity())
+            .unwrap();
+        let accepted = !matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55);
+        assert_eq!(
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(accepted); 8]),
+            "{profile}"
+        );
+    }
+}
+
+#[test]
+fn main_closure_preserves_modern_default_environment_and_format_profile() {
+    let source = make_source(
+        b"local function accepts(format, value) local ok, error = pcall(string.format, format, value) return ok, error end
+local ok, error = accepts('%#d', 15)
+return _VERSION, ok, error"
+            .to_vec(),
+    );
+    let compiled = OwnedCompiler::default()
+        .compile(&source, SemanticProfile::Lua52, compiler_identity())
+        .unwrap();
+    assert_eq!(
+        Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+        Ok(vec![
+            Value::String(Arc::from(&b"Lua 5.2"[..])),
+            Value::Boolean(true),
+            Value::String(Arc::from(&b"15"[..])),
+        ])
+    );
+}
+
+#[test]
+fn string_format_supports_quoted_values_and_profile_hex_floats() {
+    let quoted = make_source(b"return string.format('%q|%q|%q','a\\\"b\\\\c',12,12.5)".to_vec());
+    let hexadecimal = make_source(
+        b"return string.format('%.0a|%.1a|%.2a|%.3a|%.13a|%.3E',12.5,12.5,12.5,12.5,12.5,0.00125)"
+            .to_vec(),
+    );
+    for profile in SemanticProfile::ALL {
+        let compile = |source: &SourceFile| {
+            OwnedCompiler::default()
+                .compile(source, profile, compiler_identity())
+                .unwrap()
+        };
+        let quoted_result = Vm::default().execute_blu_v1(
+            compile(&quoted).into_validated_artifact(),
+            BluLimits::default(),
+        );
+        let modern = matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        );
+        let mut expected = if modern {
+            b"\"a\\\"b\\\\c\"|12|".to_vec()
+        } else {
+            b"\"a\\\"b\\\\c\"|\"12\"|\"".to_vec()
+        };
+        let tail: &[u8] = if modern { b"0x1.9p+3" } else { b"12.5" };
+        expected.extend_from_slice(tail);
+        if !modern {
+            expected.push(b'"');
+        }
+        assert_eq!(
+            quoted_result,
+            Ok(vec![Value::String(Arc::from(expected))]),
+            "{profile}"
+        );
+
+        let hexadecimal_result = Vm::default().execute_blu_v1(
+            compile(&hexadecimal).into_validated_artifact(),
+            BluLimits::default(),
+        );
+        if matches!(
+            profile,
+            SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55
+        ) {
+            assert_eq!(
+                hexadecimal_result,
+                Ok(vec![Value::String(Arc::from(
+                    &b"0x2p+3|0x1.9p+3|0x1.90p+3|0x1.900p+3|0x1.9000000000000p+3|1.250E-03"[..],
+                ))]),
+                "{profile}"
+            );
+        } else {
+            assert_eq!(
+                hexadecimal_result,
+                Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: "string.format",
+                    feature: "this conversion specifier",
+                }),
+                "{profile}"
+            );
+        }
+    }
+}
+
+#[test]
 fn luau_table_create_and_find_are_bounded_and_profile_gated() {
     let source = make_source(
         b"local filled=table.create(3,'x') local empty=table.create(3) local fractional=table.create(1.5,'y') return #filled,filled[1],filled[3],filled[4],#empty,empty[1],#fractional,table.find({1,2,1},1),table.find({1,2,1},1,2),table.find({[3]='x'},'x')"
@@ -6072,7 +7565,21 @@ fn luau_table_create_and_find_are_bounded_and_profile_gated() {
             .unwrap();
         let result =
             Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
-        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
+        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Lua55) {
+            assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Type {
+                        operation: "table.create",
+                        expected: "integer",
+                        ..
+                    })
+                ),
+                "{profile}"
+            );
+            continue;
+        }
+        if profile == SemanticProfile::Luau {
             let integral = |value| {
                 if profile == SemanticProfile::Blu {
                     Value::Integer(value)
@@ -6111,14 +7618,13 @@ fn luau_table_create_and_find_are_bounded_and_profile_gated() {
                 );
             }
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "table.create",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
+                })
+            ));
         }
     }
 }
@@ -6175,14 +7681,13 @@ fn luau_table_clear_and_clone_preserve_shallow_structure() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "table.clone",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
+                })
+            ));
         }
     }
 }
@@ -6212,14 +7717,13 @@ fn legacy_table_size_helpers_follow_profile_availability() {
                 "{profile}"
             );
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "table.getn",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
+                })
+            ));
         }
 
         let compiled = OwnedCompiler::default()
@@ -6236,20 +7740,19 @@ fn legacy_table_size_helpers_follow_profile_availability() {
         ) {
             assert_eq!(result, Ok(vec![Value::Number(3.0)]), "{profile}");
         } else {
-            assert_eq!(
+            assert!(matches!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "table.maxn",
-                    profile,
-                }),
-                "{profile}"
-            );
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    ..
+                })
+            ));
         }
     }
 }
 
 #[test]
-fn lua51_table_foreach_callbacks_follow_profile_availability() {
+fn legacy_table_foreach_callbacks_follow_profile_availability() {
     let source = make_source(
         b"local stop=table.foreach({a=1},function(key,value) return key..value end) local first,second,third=0,0,0.0 local result=table.foreachi({2,4,6},function(index,value) if index==1 then first=index+value elseif index==2 then second=index+value else third=index+value end if index==2 then return 'stop' end end) return stop,first,second,third,result".to_vec(),
     );
@@ -6259,7 +7762,10 @@ fn lua51_table_foreach_callbacks_follow_profile_availability() {
             .unwrap();
         let result =
             Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
-        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Lua51) {
+        if matches!(
+            profile,
+            SemanticProfile::Blu | SemanticProfile::Luau | SemanticProfile::Lua51
+        ) {
             assert_eq!(
                 result,
                 Ok(vec![
@@ -6273,9 +7779,10 @@ fn lua51_table_foreach_callbacks_follow_profile_availability() {
         } else {
             assert_eq!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "table.foreach",
-                    profile,
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function",
+                    actual: "nil",
                 }),
                 "{profile}"
             );
@@ -6288,7 +7795,11 @@ fn lua51_table_foreach_callbacks_resume_owned_coroutines() {
     let source = make_source(
         b"local foreach=coroutine.wrap(function() local result=table.foreach({10,20},function(key,value) local replacement=coroutine.yield(value) collectgarbage('collect') return replacement end) return result end) local a=foreach() local b=foreach() local c=foreach('done') local foreachi=coroutine.wrap(function() local result=table.foreachi({30,40},function(index,value) local replacement=coroutine.yield(value) collectgarbage('collect') return replacement end) return result end) local d=foreachi() local e=foreachi() local f=foreachi('done') return a,b,c,d,e,f".to_vec(),
     );
-    for profile in [SemanticProfile::Blu, SemanticProfile::Lua51] {
+    for profile in [
+        SemanticProfile::Blu,
+        SemanticProfile::Luau,
+        SemanticProfile::Lua51,
+    ] {
         let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
             .unwrap();
@@ -6400,9 +7911,10 @@ fn table_pack_and_unpack_names_follow_profile_availability() {
         if profile == SemanticProfile::Lua51 {
             assert_eq!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "table.pack",
-                    profile,
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function",
+                    actual: "nil",
                 })
             );
         } else {
@@ -6417,9 +7929,10 @@ fn table_pack_and_unpack_names_follow_profile_availability() {
         if profile == SemanticProfile::Lua51 {
             assert_eq!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "table.unpack",
-                    profile,
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function",
+                    actual: "nil",
                 })
             );
         } else {
@@ -6433,15 +7946,19 @@ fn table_pack_and_unpack_names_follow_profile_availability() {
             Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
         if matches!(
             profile,
-            SemanticProfile::Blu | SemanticProfile::Luau | SemanticProfile::Lua51
+            SemanticProfile::Blu
+                | SemanticProfile::Luau
+                | SemanticProfile::Lua51
+                | SemanticProfile::Lua52
         ) {
             assert_eq!(result, Ok(vec![value(20), value(30)]), "{profile}");
         } else {
             assert_eq!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "unpack",
-                    profile,
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function",
+                    actual: "nil",
                 })
             );
         }
@@ -6515,9 +8032,10 @@ fn luau_frozen_tables_enforce_heap_wide_immutability() {
         } else {
             assert_eq!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "table.freeze",
-                    profile,
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function",
+                    actual: "nil",
                 }),
                 "{profile}"
             );
@@ -6546,8 +8064,7 @@ fn coroutine_introspection_uses_the_active_semantic_profile() {
             main,
             match profile {
                 SemanticProfile::Lua51 => vec![Value::String(Arc::from(&b"nil"[..])), Value::Nil,],
-                SemanticProfile::Luau =>
-                    vec![Value::String(Arc::from(&b"thread"[..])), Value::Nil,],
+                SemanticProfile::Luau => vec![Value::String(Arc::from(&b"nil"[..])), Value::Nil,],
                 _ => vec![
                     Value::String(Arc::from(&b"thread"[..])),
                     Value::Boolean(true),
@@ -6563,9 +8080,10 @@ fn coroutine_introspection_uses_the_active_semantic_profile() {
         match profile {
             SemanticProfile::Lua51 | SemanticProfile::Lua52 => assert_eq!(
                 yieldable,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "coroutine.isyieldable",
-                    profile,
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function",
+                    actual: "nil",
                 }),
                 "{profile}"
             ),
@@ -6772,12 +8290,14 @@ fn legacy_gcinfo_is_profile_gated_and_reports_integer_kibibytes() {
                     matches!(result, Ok(values) if matches!(values.as_slice(), [Value::Number(value)] if *value >= 0.0 && value.fract() == 0.0))
                 );
             }
-            _ => assert_eq!(
-                result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "gcinfo",
-                    profile,
-                }),
+            _ => assert!(
+                matches!(
+                    result,
+                    Err(RuntimeError::Type {
+                        operation: "call",
+                        ..
+                    })
+                ),
                 "{profile}"
             ),
         }
@@ -6819,9 +8339,10 @@ fn typeof_and_rawlen_follow_profile_availability() {
         if profile == SemanticProfile::Lua51 {
             assert_eq!(
                 result,
-                Err(RuntimeError::UnsupportedSemanticProfile {
-                    operation: "rawlen",
-                    profile,
+                Err(RuntimeError::Type {
+                    operation: "call",
+                    expected: "function",
+                    actual: "nil",
                 })
             );
         } else {
@@ -6841,6 +8362,28 @@ fn typeof_and_rawlen_follow_profile_availability() {
             };
             assert_eq!(result, Ok(vec![value(3), value(2)]), "{profile}");
         }
+    }
+}
+
+#[test]
+fn rawlen_environment_surface_tracks_profile_switches_on_one_vm() {
+    let cases = [
+        (SemanticProfile::Lua55, b"return rawlen ~= nil".as_slice()),
+        (SemanticProfile::Lua51, b"return rawlen == nil".as_slice()),
+        (SemanticProfile::Lua52, b"return rawlen ~= nil".as_slice()),
+        (SemanticProfile::Lua51, b"return rawlen == nil".as_slice()),
+        (SemanticProfile::Blu, b"return rawlen ~= nil".as_slice()),
+    ];
+    let mut vm = Vm::default();
+    for (profile, source) in cases {
+        let compiled = OwnedCompiler::default()
+            .compile(&make_source(source.to_vec()), profile, compiler_identity())
+            .unwrap();
+        assert_eq!(
+            vm.execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
+            Ok(vec![Value::Boolean(true)]),
+            "{profile}"
+        );
     }
 }
 
@@ -7418,17 +8961,19 @@ fn owned_binary_arithmetic_invokes_resumable_metamethods() {
 #[test]
 fn owned_callable_table_metamethods_resume_across_operator_families() {
     let source = make_source(
-        b"local left local right local handler handler = setmetatable({}, {__call = function(self, a, b) return self == handler and a == left and (b == right or b == left or b == nil) end}) local mt = {__add = handler, __unm = handler, __concat = handler, __eq = handler, __lt = handler, __le = handler, __len = handler} left = setmetatable({}, mt) right = setmetatable({}, mt) return left + right, -left, left .. right, left == right, left < right, left <= right, #left"
+        b"local left local right local handler handler = setmetatable({}, {__call = function(self, a, b) return rawequal(self, handler) and rawequal(a, left) and (rawequal(b, right) or rawequal(b, left) or b == nil) end}) local mt = {__add = handler, __unm = handler, __concat = handler, __eq = handler, __lt = handler, __le = handler, __len = function() return 7 end} left = setmetatable({}, mt) right = setmetatable({}, mt) return left + right, -left, left .. right, left == right, left < right, left <= right, #left"
             .to_vec(),
     );
     for profile in SemanticProfile::ALL {
         let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
             .unwrap();
-        let length = if profile == SemanticProfile::Lua51 {
-            Value::Number(0.0)
-        } else {
-            Value::Boolean(true)
+        let length = match profile {
+            SemanticProfile::Lua51 => Value::Number(0.0),
+            SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55 => {
+                Value::Integer(7)
+            }
+            _ => Value::Number(7.0),
         };
         assert_eq!(
             Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),

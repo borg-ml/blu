@@ -18,6 +18,7 @@ pub use crate::blu_translate::{TranslatedChunk, TranslationError, translate_base
 /// Bytes which cannot be confused with a serialized Luau chunk.
 pub const MAGIC: [u8; 4] = *b"BLU\0";
 pub const BLU_V1_VERSION: u16 = 1;
+pub const BLU_V2_VERSION: u16 = 2;
 
 // BluV1 logical decoded-storage charges. These deliberately do not use Rust
 // layout or allocator capacity: every target charges the same conservative
@@ -36,6 +37,7 @@ const DECODED_UPVALUE_DEBUG_CHARGE: usize = 40;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BytecodeFormat {
     BluV1,
+    BluV2,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, Hash, PartialEq)]
@@ -79,6 +81,11 @@ impl FeatureBits {
     pub const DYNAMIC_CALL_RESULTS: Self = Self(1 << 14);
     /// Profile-gated 64-bit integer bitwise operators.
     pub const BITWISE_OPERATORS: Self = Self(1 << 15);
+    /// A serialized function projection whose main prototype owns fresh load-time upvalues.
+    pub const DUMPED_FUNCTION: Self = Self(1 << 16);
+    /// The prototype reserves register zero for the Lua 5.2+ lexical
+    /// environment and stores user parameters after that slot.
+    pub const IMPLICIT_ENVIRONMENT: Self = Self(1 << 17);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -95,7 +102,9 @@ impl FeatureBits {
             | Self::RETURN_CALLS.0
             | Self::VARARGS.0
             | Self::DYNAMIC_CALL_RESULTS.0
-            | Self::BITWISE_OPERATORS.0,
+            | Self::BITWISE_OPERATORS.0
+            | Self::DUMPED_FUNCTION.0
+            | Self::IMPLICIT_ENVIRONMENT.0,
     );
 
     #[must_use]
@@ -214,6 +223,12 @@ pub struct Prototype {
     pub register_count: u16,
     pub parameter_count: u16,
     pub is_vararg: bool,
+    /// One-based source line where this function is defined. The main chunk
+    /// uses zero, matching Lua's debug metadata convention.
+    pub line_defined: u32,
+    /// One-based source line containing the end of this function definition.
+    /// The main chunk uses zero.
+    pub last_line_defined: u32,
     pub required_features: FeatureBits,
     pub constants: Vec<Constant>,
     pub upvalues: Vec<Upvalue>,
@@ -221,6 +236,9 @@ pub struct Prototype {
     pub code: Vec<Instruction>,
     /// Exactly one source span per instruction (PC is the vector index).
     pub source_map: Vec<ByteSpan>,
+    /// BluV2's one-based source line for each instruction PC. BluV1 decodes
+    /// with an empty vector because the legacy wire format did not retain it.
+    pub line_info: Vec<u32>,
     pub locals: Vec<LocalDebug>,
     pub upvalue_debug: Vec<UpvalueDebug>,
 }
@@ -300,6 +318,13 @@ pub enum Instruction {
         argument_count: u16,
     },
     SetListCallVarargs {
+        table: u16,
+        start: u32,
+        function: u16,
+        arguments: u16,
+        argument_count: u16,
+    },
+    SetListCallDynamic {
         table: u16,
         start: u32,
         function: u16,
@@ -395,6 +420,9 @@ pub enum Instruction {
     SetUpvalue {
         upvalue: u16,
         source: u16,
+    },
+    CloseUpvalues {
+        from: u16,
     },
     Varargs {
         destination: u16,
@@ -566,6 +594,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::SetListVarargs { .. }
             | Instruction::SetListCall { .. }
             | Instruction::SetListCallVarargs { .. }
+            | Instruction::SetListCallDynamic { .. }
             | Instruction::Call { .. }
             | Instruction::CallResults { .. }
             | Instruction::CallVarargsResults { .. }
@@ -582,6 +611,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
             | Instruction::NewClosure { .. }
             | Instruction::GetUpvalue { .. }
             | Instruction::SetUpvalue { .. }
+            | Instruction::CloseUpvalues { .. }
             | Instruction::Varargs { .. }
             | Instruction::ReturnVarargs { .. }
             | Instruction::Move { .. }
@@ -621,6 +651,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::SetListVarargs { .. }
                 | Instruction::SetListCall { .. }
                 | Instruction::SetListCallVarargs { .. }
+                | Instruction::SetListCallDynamic { .. }
                 | Instruction::Call { .. }
                 | Instruction::CallResults { .. }
                 | Instruction::CallVarargsResults { .. }
@@ -637,6 +668,7 @@ pub const fn instruction_is_legal(profile: SemanticProfile, instruction: Instruc
                 | Instruction::NewClosure { .. }
                 | Instruction::GetUpvalue { .. }
                 | Instruction::SetUpvalue { .. }
+                | Instruction::CloseUpvalues { .. }
                 | Instruction::Varargs { .. }
                 | Instruction::ReturnVarargs { .. }
                 | Instruction::Move { .. }
@@ -904,7 +936,10 @@ impl fmt::Display for ValidationError {
 impl std::error::Error for ValidationError {}
 
 pub fn validate(artifact: &Artifact, limits: BluLimits) -> Result<(), ValidationError> {
-    if artifact.format != BytecodeFormat::BluV1 {
+    if !matches!(
+        artifact.format,
+        BytecodeFormat::BluV1 | BytecodeFormat::BluV2
+    ) {
         return Err(ValidationError::UnsupportedFormat);
     }
     check_limit("source count", artifact.sources.len(), limits.max_sources)?;
@@ -981,6 +1016,14 @@ pub fn validate(artifact: &Artifact, limits: BluLimits) -> Result<(), Validation
     )?;
     parents.resize(artifact.prototypes.len(), None);
     for (index, prototype) in artifact.prototypes.iter().enumerate() {
+        if artifact.format == BytecodeFormat::BluV2
+            && prototype.line_info.len() != prototype.code.len()
+        {
+            return Err(ValidationError::InvalidMetadata {
+                prototype: index,
+                what: "line info length does not equal instruction count",
+            });
+        }
         validate_prototype(index, prototype, &artifact.prototypes, &sources, limits)?;
         check_limit(
             "child count",
@@ -1042,7 +1085,11 @@ pub fn validate(artifact: &Artifact, limits: BluLimits) -> Result<(), Validation
                     });
                 }
             }
-        } else if !prototype.upvalues.is_empty() {
+        } else if !prototype.upvalues.is_empty()
+            && !prototype
+                .required_features
+                .contains(FeatureBits::DUMPED_FUNCTION)
+        {
             return Err(ValidationError::InvalidMetadata {
                 prototype: index,
                 what: "main prototype upvalues",
@@ -1318,6 +1365,385 @@ fn validate_prototype_graph(prototypes: &[Prototype], main: usize) -> Result<(),
     Ok(())
 }
 
+fn mark_required_register(register: u16, initialized: &mut [bool], required: &mut [bool]) {
+    let register = register as usize;
+    if register < initialized.len() && !initialized[register] {
+        required[register] = true;
+    }
+}
+
+fn mark_written_register(register: u16, initialized: &mut [bool]) {
+    if let Some(initialized) = initialized.get_mut(register as usize) {
+        *initialized = true;
+    }
+}
+
+fn mark_required_range(first: u16, count: u16, initialized: &mut [bool], required: &mut [bool]) {
+    for offset in 0..usize::from(count) {
+        let Some(register) = usize::from(first).checked_add(offset) else {
+            break;
+        };
+        if register >= initialized.len() {
+            break;
+        }
+        if !initialized[register] {
+            required[register] = true;
+        }
+    }
+}
+
+fn mark_written_range(first: u16, count: u16, initialized: &mut [bool]) {
+    for offset in 0..usize::from(count) {
+        let Some(register) = usize::from(first).checked_add(offset) else {
+            break;
+        };
+        if register >= initialized.len() {
+            break;
+        }
+        initialized[register] = true;
+    }
+}
+
+fn backward_branch_requirements(
+    code: &[Instruction],
+    target: usize,
+    registers: usize,
+) -> Vec<bool> {
+    let mut required = vec![false; registers];
+    let mut incoming = HashMap::<usize, Vec<bool>>::new();
+    incoming.insert(target, vec![false; registers]);
+    let mut work = vec![target];
+    while let Some(pc) = work.pop() {
+        let Some(mut initialized) = incoming.get(&pc).cloned() else {
+            continue;
+        };
+        let Some(instruction) = code.get(pc).copied() else {
+            continue;
+        };
+        let mut successors = [usize::MAX; 2];
+        let mut successor_count = 0;
+        let mut add_successor = |successor: usize| {
+            if successor < code.len() && successor_count < successors.len() {
+                successors[successor_count] = successor;
+                successor_count += 1;
+            }
+        };
+        let mut terminates = false;
+        match instruction {
+            Instruction::LoadConstant { destination, .. }
+            | Instruction::LoadGlobal { destination, .. }
+            | Instruction::NewTable { destination }
+            | Instruction::NewClosure { destination, .. }
+            | Instruction::GetUpvalue { destination, .. } => {
+                mark_written_register(destination, &mut initialized);
+            }
+            Instruction::StoreGlobal { source, .. } | Instruction::SetUpvalue { source, .. } => {
+                mark_required_register(source, &mut initialized, &mut required);
+            }
+            Instruction::GetTable {
+                destination,
+                table,
+                key,
+            } => {
+                mark_required_register(table, &mut initialized, &mut required);
+                mark_required_register(key, &mut initialized, &mut required);
+                mark_written_register(destination, &mut initialized);
+            }
+            Instruction::SetTable { table, key, value } => {
+                mark_required_register(table, &mut initialized, &mut required);
+                mark_required_register(key, &mut initialized, &mut required);
+                mark_required_register(value, &mut initialized, &mut required);
+            }
+            Instruction::SetListVarargs { table, .. } => {
+                mark_required_register(table, &mut initialized, &mut required);
+            }
+            Instruction::SetListCall {
+                table,
+                function,
+                arguments,
+                argument_count,
+                ..
+            }
+            | Instruction::SetListCallVarargs {
+                table,
+                function,
+                arguments,
+                argument_count,
+                ..
+            }
+            | Instruction::SetListCallDynamic {
+                table,
+                function,
+                arguments,
+                argument_count,
+                ..
+            } => {
+                mark_required_register(table, &mut initialized, &mut required);
+                mark_required_register(function, &mut initialized, &mut required);
+                mark_required_range(arguments, argument_count, &mut initialized, &mut required);
+            }
+            Instruction::Call {
+                destination,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                mark_required_register(function, &mut initialized, &mut required);
+                mark_required_range(arguments, argument_count, &mut initialized, &mut required);
+                mark_written_register(destination, &mut initialized);
+            }
+            Instruction::CallResults {
+                destination,
+                function,
+                arguments,
+                argument_count,
+                result_count,
+            }
+            | Instruction::CallVarargsResults {
+                destination,
+                function,
+                arguments,
+                argument_count,
+                result_count,
+            }
+            | Instruction::CallDynamicResults {
+                destination,
+                function,
+                arguments,
+                argument_count,
+                result_count,
+            } => {
+                mark_required_register(function, &mut initialized, &mut required);
+                mark_required_range(arguments, argument_count, &mut initialized, &mut required);
+                mark_written_range(destination, result_count, &mut initialized);
+            }
+            Instruction::CallAllResults {
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::CallVarargsAllResults {
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::CallDynamicAllResults {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                mark_required_register(function, &mut initialized, &mut required);
+                mark_required_range(arguments, argument_count, &mut initialized, &mut required);
+            }
+            Instruction::ReturnCall {
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::ReturnCallVarargs {
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::ReturnCallDynamic {
+                function,
+                arguments,
+                argument_count,
+            } => {
+                mark_required_register(function, &mut initialized, &mut required);
+                mark_required_range(arguments, argument_count, &mut initialized, &mut required);
+                terminates = true;
+            }
+            Instruction::ReturnCallPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::ReturnCallVarargsPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::ReturnCallDynamicPrefix {
+                first,
+                count,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                mark_required_range(first, count, &mut initialized, &mut required);
+                mark_required_register(function, &mut initialized, &mut required);
+                mark_required_range(arguments, argument_count, &mut initialized, &mut required);
+                terminates = true;
+            }
+            Instruction::Varargs { destination, count } => {
+                mark_written_range(destination, count, &mut initialized);
+            }
+            Instruction::ReturnVarargs { first, count } => {
+                mark_required_range(first, count, &mut initialized, &mut required);
+                terminates = true;
+            }
+            Instruction::Move {
+                destination,
+                source,
+            }
+            | Instruction::Not {
+                destination,
+                source,
+            }
+            | Instruction::Negate {
+                destination,
+                source,
+            }
+            | Instruction::Length {
+                destination,
+                source,
+            }
+            | Instruction::BitwiseNot {
+                destination,
+                source,
+            } => {
+                mark_required_register(source, &mut initialized, &mut required);
+                mark_written_register(destination, &mut initialized);
+            }
+            Instruction::Add {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::Subtract {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::Multiply {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::Divide {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::Modulo {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::Power {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::FloorDivide {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::BitwiseAnd {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::BitwiseOr {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::BitwiseExclusiveOr {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::ShiftLeft {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::ShiftRight {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::Concatenate {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::Equal {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::LessThan {
+                destination,
+                left,
+                right,
+            }
+            | Instruction::LessEqual {
+                destination,
+                left,
+                right,
+            } => {
+                mark_required_register(left, &mut initialized, &mut required);
+                mark_required_register(right, &mut initialized, &mut required);
+                mark_written_register(destination, &mut initialized);
+            }
+            Instruction::JumpIfTruthy { condition, target }
+            | Instruction::JumpIfFalsy { condition, target } => {
+                mark_required_register(condition, &mut initialized, &mut required);
+                add_successor(target as usize);
+                add_successor(pc.saturating_add(1));
+            }
+            Instruction::Jump { target } => {
+                add_successor(target as usize);
+            }
+            Instruction::CloseUpvalues { .. } => {
+                add_successor(pc.saturating_add(1));
+            }
+            Instruction::Return { first, count } => {
+                mark_required_range(first, count, &mut initialized, &mut required);
+                terminates = true;
+            }
+        }
+        if !terminates
+            && !matches!(
+                instruction,
+                Instruction::Jump { .. }
+                    | Instruction::JumpIfTruthy { .. }
+                    | Instruction::JumpIfFalsy { .. }
+                    | Instruction::CloseUpvalues { .. }
+            )
+        {
+            add_successor(pc.saturating_add(1));
+        }
+        for successor in successors.into_iter().take(successor_count) {
+            let Some(existing) = incoming.get_mut(&successor) else {
+                incoming.insert(successor, initialized.clone());
+                work.push(successor);
+                continue;
+            };
+            let mut changed = false;
+            for (current, incoming) in existing.iter_mut().zip(&initialized) {
+                let merged = *current && *incoming;
+                if merged != *current {
+                    *current = merged;
+                    changed = true;
+                }
+            }
+            if changed {
+                work.push(successor);
+            }
+        }
+    }
+    required
+}
+
 fn validate_prototype(
     index: usize,
     prototype: &Prototype,
@@ -1468,6 +1894,7 @@ fn validate_prototype(
             instruction,
             Instruction::SetListCall { .. }
                 | Instruction::SetListCallVarargs { .. }
+                | Instruction::SetListCallDynamic { .. }
                 | Instruction::CallAllResults { .. }
                 | Instruction::CallVarargsAllResults { .. }
                 | Instruction::CallDynamicResults { .. }
@@ -1528,6 +1955,7 @@ fn validate_prototype(
             Instruction::NewClosure { .. }
                 | Instruction::GetUpvalue { .. }
                 | Instruction::SetUpvalue { .. }
+                | Instruction::CloseUpvalues { .. }
         )
     }) && !prototype.required_features.contains(FeatureBits::CLOSURES)
     {
@@ -1544,6 +1972,7 @@ fn validate_prototype(
                 | Instruction::SetListVarargs { .. }
                 | Instruction::SetListCall { .. }
                 | Instruction::SetListCallVarargs { .. }
+                | Instruction::SetListCallDynamic { .. }
         ) || (matches!(instruction, Instruction::NewTable { .. })
             && !(pc == 0
                 && matches!(
@@ -1692,7 +2121,19 @@ fn validate_prototype(
     let mut initialized = Vec::new();
     try_reserve_validation(&mut initialized, "register initialization", registers)?;
     initialized.resize(registers, false);
-    initialized[..prototype.parameter_count as usize].fill(true);
+    let parameter_offset = usize::from(
+        prototype
+            .required_features
+            .contains(FeatureBits::IMPLICIT_ENVIRONMENT),
+    );
+    let parameter_end = parameter_offset.saturating_add(prototype.parameter_count as usize);
+    if parameter_end > registers {
+        return Err(ValidationError::InvalidMetadata {
+            prototype: index,
+            what: "parameter register range",
+        });
+    }
+    initialized[parameter_offset..parameter_end].fill(true);
     let mut incoming = HashMap::<usize, Vec<bool>>::new();
     let mut backward_target_flags = Vec::new();
     try_reserve_validation(
@@ -1718,6 +2159,7 @@ fn validate_prototype(
                 | Instruction::CallDynamicAllResults { .. }
                 | Instruction::ReturnCallDynamic { .. }
                 | Instruction::ReturnCallDynamicPrefix { .. }
+                | Instruction::SetListCallDynamic { .. }
         );
         if dynamic_consumer
             && (incoming.contains_key(&pc)
@@ -1748,7 +2190,23 @@ fn validate_prototype(
                 reachable = true;
             }
         }
+        let backward_only_entry = !reachable && backward_target_flags[pc];
+        if backward_only_entry {
+            // A forward jump can skip over a block that is entered only by a
+            // later backward goto.  Treat that backward target as a second
+            // entry point so the linear validator can check its instructions
+            // and record the initialization state used by the back-edge.
+            initialized = backward_branch_requirements(&prototype.code, pc, registers);
+            reachable = true;
+        }
         if !reachable {
+            if matches!(instruction, Instruction::CloseUpvalues { .. }) {
+                // Scope cleanup emitted for a fallthrough path can sit after
+                // an unconditional jump that leaves the block. It has no
+                // reads or control-flow effect, so it is safe to retain as
+                // unreachable debug-preserving epilogue code.
+                continue;
+            }
             return Err(ValidationError::InvalidInstruction {
                 prototype: index,
                 pc,
@@ -1858,7 +2316,12 @@ fn validate_prototype(
             }
             Instruction::SetListVarargs { table, start } => {
                 check_read(index, pc, table, &initialized)?;
-                if start == 0 {
+                if start == 0
+                    && !matches!(
+                        prototype.profile,
+                        SemanticProfile::Blu | SemanticProfile::Lua55
+                    )
+                {
                     return Err(ValidationError::InvalidInstruction {
                         prototype: index,
                         pc,
@@ -1874,6 +2337,13 @@ fn validate_prototype(
                 argument_count,
             }
             | Instruction::SetListCallVarargs {
+                table,
+                start,
+                function,
+                arguments,
+                argument_count,
+            }
+            | Instruction::SetListCallDynamic {
                 table,
                 start,
                 function,
@@ -2029,6 +2499,7 @@ fn validate_prototype(
                             | Instruction::CallDynamicAllResults { .. }
                             | Instruction::ReturnCallDynamic { .. }
                             | Instruction::ReturnCallDynamicPrefix { .. }
+                            | Instruction::SetListCallDynamic { .. }
                     )
                 ) {
                     return Err(ValidationError::InvalidInstruction {
@@ -2192,6 +2663,15 @@ fn validate_prototype(
                         what: "upvalue",
                         index: upvalue as usize,
                         count: prototype.upvalues.len(),
+                    });
+                }
+            }
+            Instruction::CloseUpvalues { from } => {
+                if from as usize > registers {
+                    return Err(ValidationError::InvalidInstruction {
+                        prototype: index,
+                        pc,
+                        what: "upvalue close register is out of range",
                     });
                 }
             }
@@ -2433,11 +2913,12 @@ fn validate_prototype(
                             what: "backward branch target state is unavailable",
                         });
                     };
-                    if target_state
-                        .iter()
-                        .zip(&initialized)
-                        .any(|(required, current)| *required && !*current)
-                    {
+                    let required = backward_branch_requirements(&prototype.code, target, registers);
+                    if target_state.iter().zip(&initialized).zip(&required).any(
+                        |((target_initialized, current), required)| {
+                            *required && *target_initialized && !*current
+                        },
+                    ) {
                         return Err(ValidationError::InvalidInstruction {
                             prototype: index,
                             pc,
@@ -2697,7 +3178,11 @@ pub fn encode(artifact: &ValidatedArtifact, limits: BluLimits) -> Result<Vec<u8>
             requested: encoded_size,
         })?;
     out.extend_from_slice(&MAGIC);
-    put_u16(&mut out, BLU_V1_VERSION);
+    let version = match artifact.format {
+        BytecodeFormat::BluV1 => BLU_V1_VERSION,
+        BytecodeFormat::BluV2 => BLU_V2_VERSION,
+    };
+    put_u16(&mut out, version);
     put_u16(&mut out, 0);
     put_compiler(&mut out, &artifact.compiler)?;
     put_len(&mut out, "source count", artifact.sources.len())?;
@@ -2710,7 +3195,7 @@ pub fn encode(artifact: &ValidatedArtifact, limits: BluLimits) -> Result<Vec<u8>
     put_len(&mut out, "prototype count", artifact.prototypes.len())?;
     put_u32(&mut out, artifact.main);
     for prototype in &artifact.prototypes {
-        put_prototype(&mut out, prototype)?;
+        put_prototype(&mut out, prototype, artifact.format)?;
     }
     debug_assert_eq!(out.len(), encoded_size);
     Ok(out)
@@ -2730,7 +3215,15 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
     add_size(&mut size, 4 + 4)?;
     for prototype in &artifact.prototypes {
         profile_tag(prototype.profile)?;
-        add_size(&mut size, 20 + 4)?;
+        add_size(
+            &mut size,
+            20 + 4
+                + if artifact.format == BytecodeFormat::BluV2 {
+                    8
+                } else {
+                    0
+                },
+        )?;
         for constant in &prototype.constants {
             add_size(
                 &mut size,
@@ -2785,13 +3278,16 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
                     Instruction::ReturnCallPrefix { .. }
                     | Instruction::ReturnCallVarargsPrefix { .. } => 11,
                     Instruction::ReturnCallDynamicPrefix { .. } => 11,
-                    Instruction::SetListCall { .. } | Instruction::SetListCallVarargs { .. } => 13,
+                    Instruction::SetListCall { .. }
+                    | Instruction::SetListCallVarargs { .. }
+                    | Instruction::SetListCallDynamic { .. } => 13,
                     Instruction::NewTable { .. } => 3,
                     Instruction::NewClosure { .. }
                     | Instruction::GetUpvalue { .. }
                     | Instruction::SetUpvalue { .. }
                     | Instruction::Varargs { .. }
                     | Instruction::ReturnVarargs { .. } => 5,
+                    Instruction::CloseUpvalues { .. } => 3,
                     Instruction::JumpIfTruthy { .. } | Instruction::JumpIfFalsy { .. } => 7,
                     Instruction::Jump { .. } => 5,
                     Instruction::Move { .. }
@@ -2805,6 +3301,10 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
         }
         add_size(&mut size, 4)?;
         add_scaled(&mut size, prototype.source_map.len(), 12)?;
+        if artifact.format == BytecodeFormat::BluV2 {
+            add_size(&mut size, 4)?;
+            add_scaled(&mut size, prototype.line_info.len(), 4)?;
+        }
         add_size(&mut size, 4)?;
         for local in &prototype.locals {
             add_size(&mut size, 4 + local.name.len() + 2 + 4 + 4)?;
@@ -2841,13 +3341,21 @@ fn put_compiler(out: &mut Vec<u8>, compiler: &CompilerIdentity) -> Result<(), En
     Ok(())
 }
 
-fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeError> {
+fn put_prototype(
+    out: &mut Vec<u8>,
+    prototype: &Prototype,
+    format: BytecodeFormat,
+) -> Result<(), EncodeError> {
     out.push(profile_tag(prototype.profile)?);
     out.push(u8::from(prototype.is_vararg));
     put_u16(out, 0);
     put_u32(out, prototype.source.get());
     put_u16(out, prototype.register_count);
     put_u16(out, prototype.parameter_count);
+    if format == BytecodeFormat::BluV2 {
+        put_u32(out, prototype.line_defined);
+        put_u32(out, prototype.last_line_defined);
+    }
     put_u64(out, prototype.required_features.bits());
     put_len(out, "constant count", prototype.constants.len())?;
     for constant in &prototype.constants {
@@ -2954,6 +3462,20 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 argument_count,
             } => {
                 out.push(39);
+                put_u16(out, *table);
+                put_u32(out, *start);
+                put_u16(out, *function);
+                put_u16(out, *arguments);
+                put_u16(out, *argument_count);
+            }
+            Instruction::SetListCallDynamic {
+                table,
+                start,
+                function,
+                arguments,
+                argument_count,
+            } => {
+                out.push(52);
                 put_u16(out, *table);
                 put_u32(out, *start);
                 put_u16(out, *function);
@@ -3133,6 +3655,10 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
                 out.push(28);
                 put_u16(out, *upvalue);
                 put_u16(out, *source);
+            }
+            Instruction::CloseUpvalues { from } => {
+                out.push(53);
+                put_u16(out, *from);
             }
             Instruction::Varargs { destination, count } => {
                 out.push(32);
@@ -3371,6 +3897,12 @@ fn put_prototype(out: &mut Vec<u8>, prototype: &Prototype) -> Result<(), EncodeE
         put_u32(out, span.start().get());
         put_u32(out, span.end().get());
     }
+    if format == BytecodeFormat::BluV2 {
+        put_len(out, "line info count", prototype.line_info.len())?;
+        for line in &prototype.line_info {
+            put_u32(out, *line);
+        }
+    }
     put_len(out, "local debug count", prototype.locals.len())?;
     for local in &prototype.locals {
         put_bytes(out, "local name", &local.name)?;
@@ -3471,6 +4003,7 @@ pub enum DecodeError {
         start: u32,
         end: u32,
     },
+    InvalidMetadata(&'static str),
     TrailingBytes {
         count: usize,
     },
@@ -3540,6 +4073,7 @@ impl fmt::Display for DecodeError {
             Self::InvalidSpan { offset, start, end } => {
                 write!(f, "invalid span {start}..{end} at offset {offset}")
             }
+            Self::InvalidMetadata(what) => write!(f, "invalid Blu metadata: {what}"),
             Self::TrailingBytes { count } => write!(f, "{count} trailing BluV1 bytes"),
             Self::Validation(error) => error.fmt(f),
         }
@@ -3570,9 +4104,13 @@ pub fn decode(bytes: &[u8], limits: BluLimits) -> Result<Artifact, DecodeError> 
         return Err(DecodeError::InvalidMagic(magic));
     }
     let version = reader.u16()?;
-    if version != BLU_V1_VERSION {
-        return Err(DecodeError::UnsupportedVersion(version));
-    }
+    let format = match version {
+        BLU_V1_VERSION => BytecodeFormat::BluV1,
+        BLU_V2_VERSION => BytecodeFormat::BluV2,
+        _ => {
+            return Err(DecodeError::UnsupportedVersion(version));
+        }
+    };
     let reserved_offset = reader.offset;
     let reserved = reader.u16()?;
     if reserved != 0 {
@@ -3617,7 +4155,7 @@ pub fn decode(bytes: &[u8], limits: BluLimits) -> Result<Artifact, DecodeError> 
     let mut prototypes = Vec::new();
     try_reserve_decode(&mut prototypes, "prototypes", prototype_count)?;
     for _ in 0..prototype_count {
-        prototypes.push(read_prototype(&mut reader, limits, &mut budget)?);
+        prototypes.push(read_prototype(&mut reader, limits, &mut budget, format)?);
     }
     if reader.offset != bytes.len() {
         return Err(DecodeError::TrailingBytes {
@@ -3625,7 +4163,7 @@ pub fn decode(bytes: &[u8], limits: BluLimits) -> Result<Artifact, DecodeError> 
         });
     }
     Ok(Artifact {
-        format: BytecodeFormat::BluV1,
+        format,
         compiler,
         sources,
         prototypes,
@@ -3781,6 +4319,7 @@ fn read_prototype(
     reader: &mut Reader<'_>,
     limits: BluLimits,
     budget: &mut DecodeBudget,
+    format: BytecodeFormat,
 ) -> Result<Prototype, DecodeError> {
     let profile_offset = reader.offset;
     let profile = tag_profile(reader.u8()?).ok_or(DecodeError::InvalidTag {
@@ -3825,6 +4364,11 @@ fn read_prototype(
         limits.max_total_registers,
     )?;
     let parameter_count = reader.u16()?;
+    let (line_defined, last_line_defined) = if format == BytecodeFormat::BluV2 {
+        (reader.u32()?, reader.u32()?)
+    } else {
+        (0, 0)
+    };
     let required_features = FeatureBits::from_bits(reader.u64()?);
 
     let constant_count = reader.count("constant count", limits.max_constants_per_prototype, 1)?;
@@ -4049,6 +4593,9 @@ fn read_prototype(
                 upvalue: reader.u16()?,
                 source: reader.u16()?,
             },
+            53 => Instruction::CloseUpvalues {
+                from: reader.u16()?,
+            },
             29 => Instruction::CallResults {
                 destination: reader.u16()?,
                 function: reader.u16()?,
@@ -4176,6 +4723,13 @@ fn read_prototype(
                 arguments: reader.u16()?,
                 argument_count: reader.u16()?,
             },
+            52 => Instruction::SetListCallDynamic {
+                table: reader.u16()?,
+                start: reader.u32()?,
+                function: reader.u16()?,
+                arguments: reader.u16()?,
+                argument_count: reader.u16()?,
+            },
             tag => {
                 return Err(DecodeError::InvalidTag {
                     offset,
@@ -4205,6 +4759,21 @@ fn read_prototype(
             ByteSpan::new(span_source, ByteOffset::new(start), ByteOffset::new(end))
                 .map_err(|_| DecodeError::InvalidSpan { offset, start, end })?,
         );
+    }
+
+    let mut line_info = Vec::new();
+    if format == BytecodeFormat::BluV2 {
+        let line_count = reader.count("line info count", limits.max_code_per_prototype, 4)?;
+        if line_count != code.len() {
+            return Err(DecodeError::InvalidMetadata(
+                "line info count does not equal instruction count",
+            ));
+        }
+        budget.charge_fixed(line_count, DECODED_SOURCE_MAP_CHARGE / 3, limits)?;
+        try_reserve_decode(&mut line_info, "line info", line_count)?;
+        for _ in 0..line_count {
+            line_info.push(reader.u32()?);
+        }
     }
 
     let local_count = reader.count(
@@ -4262,12 +4831,15 @@ fn read_prototype(
         register_count,
         parameter_count,
         is_vararg,
+        line_defined,
+        last_line_defined,
         required_features,
         constants,
         upvalues,
         children,
         code,
         source_map,
+        line_info,
         locals,
         upvalue_debug,
     })

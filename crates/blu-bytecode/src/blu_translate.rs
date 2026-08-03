@@ -123,6 +123,10 @@ pub fn translate_baseline_to_luau(
                 )
             }) {
                 "comparisons"
+            } else if prototype.code.iter().enumerate().any(|(pc, instruction)| {
+                matches!(instruction, BluInstruction::Jump { target } if (*target as usize) <= pc)
+            }) {
+                "backward branches"
             } else {
                 "forward branches"
             };
@@ -197,7 +201,7 @@ pub fn translate_baseline_to_luau(
             instructions,
             constants,
             children: Vec::new(),
-            line_defined: 0,
+            line_defined: prototype.line_defined,
             debug_name: None,
             line_info: None,
             debug_info: None,
@@ -396,7 +400,8 @@ fn translate_instruction(
         }
         BluInstruction::NewClosure { .. }
         | BluInstruction::GetUpvalue { .. }
-        | BluInstruction::SetUpvalue { .. } => Err(TranslationError::UnsupportedInstruction {
+        | BluInstruction::SetUpvalue { .. }
+        | BluInstruction::CloseUpvalues { .. } => Err(TranslationError::UnsupportedInstruction {
             prototype,
             instruction: "closures",
         }),
@@ -414,6 +419,7 @@ fn translate_instruction(
             })
         }
         BluInstruction::SetListCall { .. }
+        | BluInstruction::SetListCallDynamic { .. }
         | BluInstruction::CallAllResults { .. }
         | BluInstruction::CallDynamicAllResults { .. }
         | BluInstruction::CallDynamicResults { .. } => {

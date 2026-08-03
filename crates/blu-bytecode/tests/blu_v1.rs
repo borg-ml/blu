@@ -1,7 +1,7 @@
 use blu_bytecode::blu::{
-    Artifact, BLU_V1_VERSION, BluLimits, BytecodeFormat, Constant, DecodeError, FeatureBits,
-    Instruction, LocalDebug, MAGIC, Prototype, SourceRecord, TranslationError, Upvalue,
-    UpvalueDebug, ValidatedArtifact, ValidationError, decode, decode_validated, encode,
+    Artifact, BLU_V1_VERSION, BLU_V2_VERSION, BluLimits, BytecodeFormat, Constant, DecodeError,
+    FeatureBits, Instruction, LocalDebug, MAGIC, Prototype, SourceRecord, TranslationError,
+    Upvalue, UpvalueDebug, ValidatedArtifact, ValidationError, decode, decode_validated, encode,
     instruction_is_legal, translate_baseline_to_luau,
 };
 use blu_bytecode::{ChunkError, Constant as LuauConstant, LoadLimits, Opcode, load};
@@ -105,6 +105,8 @@ fn fixture() -> Artifact {
                 register_count: 3,
                 parameter_count: 0,
                 is_vararg: false,
+                line_defined: 0,
+                last_line_defined: 0,
                 required_features: FeatureBits::BASELINE,
                 constants: vec![Constant::Number(40.0), Constant::Number(2.0)],
                 upvalues: vec![],
@@ -126,6 +128,7 @@ fn fixture() -> Artifact {
                     Instruction::Return { first: 2, count: 1 },
                 ],
                 source_map: vec![span(34, 36), span(71, 72), span(34, 72), span(64, 72)],
+                line_info: Vec::new(),
                 locals: vec![LocalDebug {
                     name: b"answer".to_vec(),
                     register: 0,
@@ -140,6 +143,8 @@ fn fixture() -> Artifact {
                 register_count: 1,
                 parameter_count: 1,
                 is_vararg: true,
+                line_defined: 0,
+                last_line_defined: 0,
                 required_features: FeatureBits::BASELINE,
                 constants: vec![
                     Constant::Nil,
@@ -150,6 +155,7 @@ fn fixture() -> Artifact {
                 children: vec![],
                 code: vec![Instruction::Return { first: 0, count: 1 }],
                 source_map: vec![span(0, 0)],
+                line_info: Vec::new(),
                 locals: vec![],
                 upvalue_debug: vec![UpvalueDebug {
                     name: b"captured".to_vec(),
@@ -722,6 +728,32 @@ fn pre_integer_baseline_encoding_remains_byte_for_byte_stable() {
     let limits = BluLimits::default();
     let validated = ValidatedArtifact::new(baseline_fixture(SemanticProfile::Blu), limits).unwrap();
     assert_eq!(encode(&validated, limits).unwrap(), EXPECTED);
+}
+
+#[test]
+fn blu_v2_round_trip_preserves_function_line_metadata() {
+    let mut artifact = baseline_fixture(SemanticProfile::Lua54);
+    artifact.format = BytecodeFormat::BluV2;
+    artifact.prototypes[0].line_defined = 3;
+    artifact.prototypes[0].last_line_defined = 7;
+    artifact.prototypes[0].line_info = vec![3; artifact.prototypes[0].code.len()];
+    let validated = ValidatedArtifact::new(artifact, BluLimits::default()).unwrap();
+    let bytes = encode(&validated, BluLimits::default()).unwrap();
+    assert_eq!(u16::from_le_bytes([bytes[4], bytes[5]]), BLU_V2_VERSION);
+    let decoded = decode_validated(&bytes, BluLimits::default()).unwrap();
+    assert_eq!(decoded.main().line_defined, 3);
+    assert_eq!(decoded.main().last_line_defined, 7);
+    assert_eq!(decoded.main().line_info, vec![3; decoded.main().code.len()]);
+}
+
+#[test]
+fn blu_v1_decode_defaults_line_metadata_without_changing_legacy_bytes() {
+    let artifact = baseline_fixture(SemanticProfile::Lua54);
+    let validated = ValidatedArtifact::new(artifact, BluLimits::default()).unwrap();
+    let bytes = encode(&validated, BluLimits::default()).unwrap();
+    let decoded = decode_validated(&bytes, BluLimits::default()).unwrap();
+    assert_eq!(decoded.main().line_defined, 0);
+    assert_eq!(decoded.main().last_line_defined, 0);
 }
 
 #[test]
@@ -1419,6 +1451,63 @@ fn forward_branches_are_feature_gated_and_merge_register_initialization() {
             feature: "backward branches",
         })
     );
+
+    let mut unsafe_back_edge = baseline_fixture(SemanticProfile::Blu);
+    unsafe_back_edge.prototypes[0].parameter_count = 1;
+    unsafe_back_edge.prototypes[0].required_features =
+        FeatureBits::BASELINE | FeatureBits::FORWARD_BRANCHES | FeatureBits::BACKWARD_BRANCHES;
+    let span = unsafe_back_edge.prototypes[0].source_map[0];
+    unsafe_back_edge.prototypes[0].code = vec![
+        // The branch can enter pc 3 without initializing register 1.
+        Instruction::JumpIfFalsy {
+            condition: 0,
+            target: 3,
+        },
+        Instruction::LoadConstant {
+            destination: 1,
+            constant: 1,
+        },
+        Instruction::Move {
+            destination: 2,
+            source: 1,
+        },
+        // The first entry to pc 2 has register 1 initialized, but the
+        // merged path through pc 3 does not; pc 2 reads it before writing the
+        // loop result, so the back-edge must be rejected.
+        Instruction::Jump { target: 2 },
+        Instruction::Return { first: 0, count: 1 },
+    ];
+    unsafe_back_edge.prototypes[0].source_map = vec![span; 5];
+    assert_eq!(
+        ValidatedArtifact::new(unsafe_back_edge, limits),
+        Err(ValidationError::InvalidInstruction {
+            prototype: 0,
+            pc: 3,
+            what: "backward branch loses initialized registers",
+        })
+    );
+}
+
+#[test]
+fn luau_bootstrap_translation_labels_backward_branches_precisely() {
+    let limits = BluLimits::default();
+    let mut artifact = baseline_fixture(SemanticProfile::Blu);
+    artifact.prototypes[0].required_features =
+        FeatureBits::BASELINE | FeatureBits::FORWARD_BRANCHES | FeatureBits::BACKWARD_BRANCHES;
+    artifact.prototypes[0].code[1] = Instruction::JumpIfFalsy {
+        condition: 0,
+        target: 3,
+    };
+    artifact.prototypes[0].code[2] = Instruction::Jump { target: 1 };
+    artifact.prototypes[0].code[3] = Instruction::Return { first: 0, count: 1 };
+    let artifact = ValidatedArtifact::new(artifact, limits).unwrap();
+    assert_eq!(
+        translate_baseline_to_luau(artifact, SemanticProfile::Blu, limits),
+        Err(TranslationError::UnsupportedInstruction {
+            prototype: 0,
+            instruction: "backward branches",
+        })
+    );
 }
 
 #[test]
@@ -2005,7 +2094,7 @@ fn serialized_discriminants_reserved_fields_and_trailing_data_are_rejected() {
     ));
 
     let mut bad_version = bytes.clone();
-    bad_version[4..6].copy_from_slice(&(BLU_V1_VERSION + 1).to_le_bytes());
+    bad_version[4..6].copy_from_slice(&(BLU_V2_VERSION + 1).to_le_bytes());
     assert!(matches!(
         decode(&bad_version, limits),
         Err(DecodeError::UnsupportedVersion(_))

@@ -43,8 +43,9 @@ pub struct LinePosition {
     pub byte_column: u32,
 }
 
-/// Index of zero-based physical lines. Both LF and CRLF start a new line after
-/// the LF byte; columns are byte offsets and therefore do not require UTF-8.
+/// Index of zero-based physical lines. LF, CRLF, and lone CR line endings
+/// start a new line after the terminator; columns are byte offsets and
+/// therefore do not require UTF-8.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LineIndex {
     starts: Vec<ByteOffset>,
@@ -67,7 +68,15 @@ impl LineIndex {
 
         let capacity = bytes
             .iter()
-            .filter(|byte| **byte == b'\n')
+            .enumerate()
+            .filter(|(index, byte)| match **byte {
+                b'\r' => {
+                    bytes.get(index + 1) != Some(&b'\n')
+                        && (*index == 0 || bytes.get(index - 1) != Some(&b'\n'))
+                }
+                b'\n' => true,
+                _ => false,
+            })
             .count()
             .checked_add(1)
             .ok_or(LineIndexError::LineCountOverflow)?;
@@ -81,8 +90,21 @@ impl LineIndex {
         let mut starts = allocate_line_starts(capacity)?;
         starts.push(ByteOffset::new(0));
         for (index, byte) in bytes.iter().enumerate() {
-            if *byte == b'\n' {
-                let start = index.checked_add(1).ok_or(LineIndexError::OffsetOverflow {
+            let line_break = match *byte {
+                b'\r' => {
+                    bytes.get(index + 1) != Some(&b'\n')
+                        && (index == 0 || bytes.get(index - 1) != Some(&b'\n'))
+                }
+                b'\n' => true,
+                _ => false,
+            };
+            if line_break {
+                let start = if *byte == b'\n' && bytes.get(index + 1) == Some(&b'\r') {
+                    index.checked_add(2)
+                } else {
+                    index.checked_add(1)
+                }
+                .ok_or(LineIndexError::OffsetOverflow {
                     actual: usize::MAX,
                     maximum: u32::MAX as usize,
                 })?;
@@ -257,6 +279,8 @@ impl SourceFile {
             if end > full.start().as_usize() && self.bytes[end - 1] == b'\r' {
                 end -= 1;
             }
+        } else if end > full.start().as_usize() && self.bytes[end - 1] == b'\r' {
+            end -= 1;
         }
         ByteSpan::from_usize(self.identity.id(), full.start().as_usize(), end)
             .map_err(SourceError::Span)

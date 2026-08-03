@@ -71,7 +71,9 @@ impl SourceIdentity {
         limits: IdentityLimits,
     ) -> Result<Self, IdentityError> {
         let name = name.into();
-        validate_text("source name", &name, limits.max_source_name_bytes, false)?;
+        // Lua permits an explicitly empty chunk name (`load(source, "")`),
+        // and the name remains observable through debug.getinfo.
+        validate_text("source name", &name, limits.max_source_name_bytes, true)?;
         Ok(Self { id, name })
     }
 

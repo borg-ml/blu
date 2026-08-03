@@ -3,12 +3,14 @@ use crate::{
     BinaryOperator, Block, BreakStatement, CallExpression, CallStatement,
     CompoundAssignmentOperator, CompoundAssignmentStatement, ContinueStatement, DialectDirective,
     DoStatement, Expression, ExpressionId, ExpressionKind, FieldExpression, FunctionBody,
-    FunctionExpression, FunctionId, FunctionStatement, GenericForStatement, GotoStatement,
-    Identifier, IfClause, IfExpression, IfStatement, IndexExpression, LabelStatement, LexError,
-    Lexed, LexerLimits, LocalAttribute, LocalFunctionStatement, LocalListStatement, LocalStatement,
+    FunctionExpression, FunctionId, FunctionStatement, GenericForStatement, GlobalStatement,
+    GotoStatement, Identifier, IfClause, IfExpression, IfStatement, IndexExpression,
+    InterpolatedString, InterpolatedStringPart, LabelStatement, LexError, Lexed, LexerLimits,
+    LocalAttribute, LocalFunctionStatement, LocalListStatement, LocalStatement,
     MethodCallExpression, NumericForStatement, RepeatStatement, ReturnStatement, Statement,
     TableConstructor, TableField, Token, TokenKind, UnaryExpression, UnaryOperator, WhileStatement,
-    lex, supports_local_attributes,
+    lex, supports_global_declarations, supports_local_attributes, supports_named_vararg,
+    supports_type_annotations,
 };
 use blu_core::{
     ByteSpan, Diagnostic, DiagnosticError, DiagnosticLimits, Phase, SemanticProfile, Severity,
@@ -293,6 +295,7 @@ struct Parser<'a> {
     loop_depth: usize,
     expressions: Vec<Expression>,
     table_fields: Vec<TableField>,
+    interpolated_parts: Vec<InterpolatedStringPart>,
     table_field_count: usize,
     call_arguments: Vec<ExpressionId>,
     call_argument_count: usize,
@@ -320,6 +323,7 @@ impl<'a> Parser<'a> {
             loop_depth: 0,
             expressions: allocate_vec(ast_capacity, "AST expressions")?,
             table_fields: allocate_vec(ast_capacity, "AST table fields")?,
+            interpolated_parts: allocate_vec(ast_capacity, "AST interpolated string parts")?,
             table_field_count: 0,
             call_arguments: allocate_vec(ast_capacity, "AST call arguments")?,
             call_argument_count: 0,
@@ -345,6 +349,7 @@ impl<'a> Parser<'a> {
             self.statements,
             self.expressions,
             self.table_fields,
+            self.interpolated_parts,
             self.call_arguments,
             self.functions,
         );
@@ -358,8 +363,34 @@ impl<'a> Parser<'a> {
             }
             match token.kind() {
                 TokenKind::Semicolon => {
+                    if self.lexed.profile() == SemanticProfile::Luau
+                        && self
+                            .previous_significant_kind()
+                            .is_none_or(|kind| kind == TokenKind::Semicolon)
+                    {
+                        self.report_current(
+                            "BLU-PARSE-0056",
+                            "empty statements are unavailable in the Luau profile",
+                            &["statement"],
+                        )?;
+                    }
                     self.bump();
                 }
+                TokenKind::Global
+                    if self.lexed.profile() == SemanticProfile::Lua55
+                        && !matches!(
+                            self.significant_kind_after_cursor(1),
+                            Some(
+                                TokenKind::Function
+                                    | TokenKind::LessThan
+                                    | TokenKind::Star
+                                    | TokenKind::Identifier
+                            )
+                        ) =>
+                {
+                    self.parse_expression_statement()?
+                }
+                TokenKind::Global => self.parse_global()?,
                 TokenKind::Local => self.parse_local()?,
                 TokenKind::Function => self.parse_function_statement()?,
                 TokenKind::Identifier => self.parse_assignment()?,
@@ -377,6 +408,7 @@ impl<'a> Parser<'a> {
                 | TokenKind::BitwiseExclusiveOr
                 | TokenKind::Hash
                 | TokenKind::LeftParenthesis
+                | TokenKind::InterpolatedStringStart
                 | TokenKind::LeftBrace => self.parse_expression_statement()?,
                 TokenKind::If => self.parse_if()?,
                 TokenKind::While => self.parse_while()?,
@@ -409,13 +441,12 @@ impl<'a> Parser<'a> {
                             keyword.span(),
                         )))?;
                     }
-                    while self.at(TokenKind::Semicolon) {
+                    if self.at(TokenKind::Semicolon) {
                         self.bump();
                     }
-                    if self
-                        .current()
-                        .is_some_and(|token| !terminators.contains(&token.kind()))
-                    {
+                    if self.current().is_some_and(|token| {
+                        !terminators.contains(&token.kind()) && token.kind() != TokenKind::Semicolon
+                    }) {
                         self.report_current(
                             "BLU-PARSE-0023",
                             "unexpected token after loop-control statement",
@@ -431,13 +462,28 @@ impl<'a> Parser<'a> {
                 }
                 TokenKind::Return => {
                     self.parse_return()?;
-                    while self.at(TokenKind::Semicolon) {
+                    if self.at(TokenKind::Semicolon) {
                         self.bump();
                     }
-                    if self
-                        .current()
-                        .is_some_and(|token| !terminators.contains(&token.kind()))
+                    if self.at(TokenKind::Semicolon)
+                        && matches!(
+                            self.lexed.profile(),
+                            SemanticProfile::Lua51
+                                | SemanticProfile::Lua52
+                                | SemanticProfile::Lua53
+                                | SemanticProfile::Lua54
+                                | SemanticProfile::Lua55
+                        )
                     {
+                        self.report_current(
+                            "BLU-PARSE-0005",
+                            "unexpected token after return statement",
+                            &["end of source"],
+                        )?;
+                    }
+                    if self.current().is_some_and(|token| {
+                        !terminators.contains(&token.kind()) && token.kind() != TokenKind::Semicolon
+                    }) {
                         self.report_current(
                             "BLU-PARSE-0005",
                             "unexpected token after return statement",
@@ -484,6 +530,21 @@ impl<'a> Parser<'a> {
                 message: "label parser entered without a current token",
             });
         };
+        if self.lexed.profile() == SemanticProfile::Luau {
+            self.report_current(
+                "BLU-PARSE-0055",
+                "labels are unavailable in the Luau profile; `::` is reserved for type assertions",
+                &["type assertion"],
+            )?;
+            while self
+                .current()
+                .is_some_and(|token| token.kind() != TokenKind::ColonColon)
+            {
+                self.bump();
+            }
+            self.bump();
+            return Ok(());
+        }
         if !self.at(TokenKind::Identifier) {
             self.report_current_or_eof(
                 "BLU-PARSE-0046",
@@ -923,11 +984,25 @@ impl<'a> Parser<'a> {
         self.bump();
         let mut parameters = allocate_vec(2, "function parameters")?;
         let mut is_vararg = false;
+        let mut vararg_name = None;
         if !self.at(TokenKind::RightParenthesis) {
             loop {
                 if self.at(TokenKind::Ellipsis) {
                     self.bump();
                     is_vararg = true;
+                    if supports_named_vararg(self.lexed.profile()) && self.at(TokenKind::Identifier)
+                    {
+                        let Some(name) = self.bump() else {
+                            return Err(ParseError::InternalInvariant {
+                                message: "identifier check succeeded without a current token",
+                            });
+                        };
+                        vararg_name = Some(Identifier::new(name.span()));
+                    }
+                    if supports_type_annotations(self.lexed.profile()) && self.at(TokenKind::Colon)
+                    {
+                        self.skip_type_annotation()?;
+                    }
                     break;
                 }
                 if !self.at(TokenKind::Identifier) {
@@ -943,6 +1018,9 @@ impl<'a> Parser<'a> {
                         message: "identifier check succeeded without a current token",
                     });
                 };
+                if supports_type_annotations(self.lexed.profile()) && self.at(TokenKind::Colon) {
+                    self.skip_type_annotation()?;
+                }
                 self.function_node_count = self.function_node_count.saturating_add(1);
                 self.check_ast_limit()?;
                 push_fallible(
@@ -965,6 +1043,9 @@ impl<'a> Parser<'a> {
             return Ok(None);
         }
         self.bump();
+        if supports_type_annotations(self.lexed.profile()) && self.at(TokenKind::Colon) {
+            self.skip_type_annotation()?;
+        }
         let outer_loop_depth = core::mem::replace(&mut self.loop_depth, 0);
         let parsed_body = self.parse_nested_block(&[TokenKind::End]);
         self.loop_depth = outer_loop_depth;
@@ -990,6 +1071,7 @@ impl<'a> Parser<'a> {
             FunctionBody::new(
                 parameters,
                 is_vararg,
+                vararg_name,
                 body,
                 keyword.span().merge(end.span())?,
             ),
@@ -998,7 +1080,148 @@ impl<'a> Parser<'a> {
         Ok(Some(id))
     }
 
+    fn skip_type_annotation(&mut self) -> Result<(), ParseError> {
+        if !self.at(TokenKind::Colon) {
+            return Err(ParseError::InternalInvariant {
+                message: "type annotation parser entered without a colon",
+            });
+        }
+        self.bump();
+        self.skip_type_expression()
+    }
+
+    fn skip_type_assertion(&mut self) -> Result<(), ParseError> {
+        if !self.at(TokenKind::ColonColon) {
+            return Err(ParseError::InternalInvariant {
+                message: "type assertion parser entered without `::`",
+            });
+        }
+        self.bump();
+        self.skip_type_expression()
+    }
+
+    fn skip_type_expression(&mut self) -> Result<(), ParseError> {
+        self.skip_type_primary()?;
+
+        if self.at(TokenKind::Question) {
+            self.bump();
+        }
+
+        // The owned AST intentionally has no type information. Preserve the
+        // useful Luau/Blu compatibility slice by consuming qualified and
+        // union/intersection names while leaving all type-checking to a future
+        // typed frontend.
+        loop {
+            if self.at(TokenKind::BitwiseOr) || self.at(TokenKind::BitwiseAnd) {
+                self.bump();
+                self.skip_type_primary()?;
+                if self.at(TokenKind::Question) {
+                    self.bump();
+                }
+                continue;
+            }
+            break;
+        }
+        Ok(())
+    }
+
+    fn skip_type_primary(&mut self) -> Result<(), ParseError> {
+        if self.at_type_atom() {
+            self.bump();
+            while self.at(TokenKind::Dot) {
+                self.bump();
+                if !self.at_type_atom() {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0041",
+                        "expected a type name after `.`",
+                        &["identifier", "nil"],
+                    )?;
+                    return Ok(());
+                }
+                self.bump();
+            }
+            if self.at(TokenKind::LessThan) {
+                self.skip_type_container(
+                    TokenKind::LessThan,
+                    TokenKind::GreaterThan,
+                    "BLU-PARSE-0043",
+                    ">",
+                )?;
+            }
+            return Ok(());
+        }
+        if self.at(TokenKind::LeftBrace) {
+            return self.skip_type_container(
+                TokenKind::LeftBrace,
+                TokenKind::RightBrace,
+                "BLU-PARSE-0043",
+                "}",
+            );
+        }
+        if self.at(TokenKind::LeftParenthesis) {
+            self.skip_type_container(
+                TokenKind::LeftParenthesis,
+                TokenKind::RightParenthesis,
+                "BLU-PARSE-0043",
+                ")",
+            )?;
+            if self.at(TokenKind::Minus) {
+                self.bump();
+                if self.at(TokenKind::GreaterThan) {
+                    self.bump();
+                    self.skip_type_expression()?;
+                }
+            }
+            return Ok(());
+        }
+        self.report_current_or_eof(
+            "BLU-PARSE-0040",
+            "expected a type name after `:`",
+            &["identifier", "nil", "{", "("],
+        )?;
+        Ok(())
+    }
+
+    fn skip_type_container(
+        &mut self,
+        open: TokenKind,
+        close: TokenKind,
+        code: &'static str,
+        expected: &'static str,
+    ) -> Result<(), ParseError> {
+        if !self.at(open) {
+            return Err(ParseError::InternalInvariant {
+                message: "type container parser entered without its opener",
+            });
+        }
+        self.bump();
+        let mut depth = 1usize;
+        while let Some(token) = self.current() {
+            if token.kind() == open {
+                depth = depth.saturating_add(1);
+            } else if token.kind() == close {
+                depth -= 1;
+                self.bump();
+                if depth == 0 {
+                    return Ok(());
+                }
+                continue;
+            }
+            self.bump();
+        }
+        self.report_current_or_eof(code, "unterminated type annotation", &[expected])?;
+        Ok(())
+    }
+
+    fn at_type_atom(&self) -> bool {
+        self.at(TokenKind::Identifier) || self.at(TokenKind::Nil)
+    }
+
     fn parse_function_statement(&mut self) -> Result<(), ParseError> {
+        self.parse_function_statement_with_global(false)
+    }
+
+    fn parse_function_statement_with_global(&mut self, is_global: bool) -> Result<(), ParseError> {
         let Some(keyword) = self.bump() else {
             return Err(ParseError::InternalInvariant {
                 message: "function parser entered without a current token",
@@ -1080,12 +1303,20 @@ impl<'a> Parser<'a> {
                 message: "new function body is out of bounds",
             });
         };
-        self.push_statement(Statement::Function(FunctionStatement::new(
-            names,
-            function,
-            is_method,
-            keyword.span().merge(body.span())?,
-        )))
+        let span = keyword.span().merge(body.span())?;
+        let statement = if is_global {
+            if is_method || names.len() != 1 {
+                self.report_current(
+                    "BLU-PARSE-0054",
+                    "global function declarations require one plain name",
+                    &["plain function name"],
+                )?;
+            }
+            FunctionStatement::new_global(names, function, span)
+        } else {
+            FunctionStatement::new(names, function, is_method, span)
+        };
+        self.push_statement(Statement::Function(statement))
     }
 
     fn parse_local(&mut self) -> Result<(), ParseError> {
@@ -1144,6 +1375,9 @@ impl<'a> Parser<'a> {
         let mut attributes = allocate_vec(1, "local attribute list")?;
         if let Some(name) = name {
             names.push(name);
+            if supports_type_annotations(self.lexed.profile()) && self.at(TokenKind::Colon) {
+                self.skip_type_annotation()?;
+            }
             attributes.push(self.parse_local_attribute(default_attribute)?);
         }
         while self.at(TokenKind::Comma) {
@@ -1161,6 +1395,9 @@ impl<'a> Parser<'a> {
                     message: "identifier check succeeded without a current token",
                 });
             };
+            if supports_type_annotations(self.lexed.profile()) && self.at(TokenKind::Colon) {
+                self.skip_type_annotation()?;
+            }
             push_fallible(
                 &mut names,
                 Identifier::new(identifier.span()),
@@ -1222,6 +1459,106 @@ impl<'a> Parser<'a> {
             )))?;
         }
         Ok(())
+    }
+
+    fn parse_global(&mut self) -> Result<(), ParseError> {
+        let Some(keyword) = self.bump() else {
+            return Err(ParseError::InternalInvariant {
+                message: "global parser entered without a current token",
+            });
+        };
+        if !supports_global_declarations(self.lexed.profile()) {
+            self.report_current(
+                "BLU-PARSE-0051",
+                "global declarations are unavailable in this profile",
+                &["identifier"],
+            )?;
+            return Ok(());
+        }
+        if self.at(TokenKind::Function) {
+            return self.parse_function_statement_with_global(true);
+        }
+
+        let leading_attribute = self.parse_local_attribute(LocalAttribute::Regular)?;
+
+        let mut names = allocate_vec(1, "global name list")?;
+        let mut attributes = allocate_vec(1, "global name attributes")?;
+        let wildcard = if self.at(TokenKind::Star) {
+            self.bump();
+            push_fallible(&mut attributes, leading_attribute, "global name attributes")?;
+            true
+        } else {
+            loop {
+                if !self.at(TokenKind::Identifier) {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0052",
+                        "expected a global name or `*`",
+                        &["identifier", "*"],
+                    )?;
+                    break;
+                }
+                let Some(identifier) = self.bump() else {
+                    return Err(ParseError::InternalInvariant {
+                        message: "identifier check succeeded without a current token",
+                    });
+                };
+                let inline_attribute = self.parse_local_attribute(LocalAttribute::Regular)?;
+                push_fallible(
+                    &mut names,
+                    Identifier::new(identifier.span()),
+                    "global name list",
+                )?;
+                push_fallible(
+                    &mut attributes,
+                    if inline_attribute == LocalAttribute::Regular {
+                        leading_attribute
+                    } else {
+                        inline_attribute
+                    },
+                    "global name attributes",
+                )?;
+                if !self.at(TokenKind::Comma) {
+                    break;
+                }
+                self.bump();
+            }
+            false
+        };
+
+        let mut values = allocate_vec(1, "global value list")?;
+        if self.at(TokenKind::Equal) {
+            self.bump();
+            if wildcard {
+                self.report_current(
+                    "BLU-PARSE-0053",
+                    "`global *` cannot have initial values",
+                    &["end of declaration"],
+                )?;
+            } else if let Some(value) = self.parse_expression(0)? {
+                values.push(value.id);
+                while self.at(TokenKind::Comma) {
+                    self.bump();
+                    let Some(value) = self.parse_expression(0)? else {
+                        break;
+                    };
+                    push_fallible(&mut values, value.id, "global value list")?;
+                }
+            }
+        }
+        let end = if let Some(value) = values.last() {
+            self.expression(*value)?.span()
+        } else if let Some(name) = names.last() {
+            name.span()
+        } else {
+            keyword.span()
+        };
+        self.push_statement(Statement::Global(GlobalStatement::new(
+            names,
+            values,
+            wildcard,
+            attributes,
+            keyword.span().merge(end)?,
+        )))
     }
 
     fn parse_local_attribute(
@@ -1305,7 +1642,15 @@ impl<'a> Parser<'a> {
             });
         };
         let mut values = allocate_vec(1, "return expression list")?;
-        if self.current().is_none() || self.at(TokenKind::Semicolon) {
+        if self.current().is_none()
+            || self.at(TokenKind::Semicolon)
+            || self.current().is_some_and(|token| {
+                matches!(
+                    token.kind(),
+                    TokenKind::End | TokenKind::Else | TokenKind::ElseIf | TokenKind::Until
+                )
+            })
+        {
             return self.push_statement(Statement::Return(ReturnStatement::new(
                 values,
                 keyword.span(),
@@ -1462,6 +1807,106 @@ impl<'a> Parser<'a> {
             return Ok(());
         };
         let kind = self.expression(expression.id)?.kind();
+        if self.at(TokenKind::Equal)
+            || self.at(TokenKind::Comma)
+            || compound_assignment_operator(self.current().map(Token::kind)).is_some()
+        {
+            let first_target = match kind {
+                ExpressionKind::Identifier(identifier) => AssignmentTarget::Identifier(identifier),
+                ExpressionKind::Index(index) => AssignmentTarget::Index(index),
+                ExpressionKind::Field(field) => AssignmentTarget::Field(field),
+                _ => {
+                    self.report_current_or_eof(
+                        "BLU-PARSE-0007",
+                        "expected an assignable identifier, index, or field",
+                        &["identifier", "index", "field"],
+                    )?;
+                    return Ok(());
+                }
+            };
+            if let Some(operator) = compound_assignment_operator(self.current().map(Token::kind)) {
+                self.bump();
+                let Some(value) = self.parse_expression(0)? else {
+                    return Ok(());
+                };
+                let span = self
+                    .expression(expression.id)?
+                    .span()
+                    .merge(self.expression(value.id)?.span())?;
+                return self.push_statement(Statement::CompoundAssignment(
+                    CompoundAssignmentStatement::new(first_target, operator, value.id, span),
+                ));
+            }
+            let mut targets = allocate_vec(1, "assignment target list")?;
+            targets.push(first_target);
+            while self.at(TokenKind::Comma) {
+                self.bump();
+                let Some(target_expression) = self.parse_expression(0)? else {
+                    return Ok(());
+                };
+                let target = match self.expression(target_expression.id)?.kind() {
+                    ExpressionKind::Identifier(identifier) => {
+                        AssignmentTarget::Identifier(identifier)
+                    }
+                    ExpressionKind::Index(index) => AssignmentTarget::Index(index),
+                    ExpressionKind::Field(field) => AssignmentTarget::Field(field),
+                    _ => {
+                        self.report_current_or_eof(
+                            "BLU-PARSE-0046",
+                            "expected an assignable identifier, index, or field",
+                            &["identifier", "index", "field"],
+                        )?;
+                        return Ok(());
+                    }
+                };
+                push_fallible(&mut targets, target, "assignment target list")?;
+            }
+            if !self.at(TokenKind::Equal) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0006",
+                    "expected `=` after assignment target",
+                    &["="],
+                )?;
+                return Ok(());
+            }
+            self.bump();
+            let Some(first_value) = self.parse_expression(0)? else {
+                return Ok(());
+            };
+            let mut values = allocate_vec(1, "assignment value list")?;
+            values.push(first_value.id);
+            while self.at(TokenKind::Comma) {
+                self.bump();
+                let Some(value) = self.parse_expression(0)? else {
+                    return Ok(());
+                };
+                push_fallible(&mut values, value.id, "assignment value list")?;
+            }
+            let Some(last_value) = values.last().copied() else {
+                return Err(ParseError::InternalInvariant {
+                    message: "assignment value list became empty",
+                });
+            };
+            let span = self
+                .expression(expression.id)?
+                .span()
+                .merge(self.expression(last_value)?.span())?;
+            if targets.len() == 1 && values.len() == 1 {
+                let Some(target) = targets.first().copied() else {
+                    return Err(ParseError::InternalInvariant {
+                        message: "single assignment target list became empty",
+                    });
+                };
+                return self.push_statement(Statement::Assignment(AssignmentStatement::new(
+                    target,
+                    first_value.id,
+                    span,
+                )));
+            }
+            return self.push_statement(Statement::AssignmentList(AssignmentListStatement::new(
+                targets, values, span,
+            )));
+        }
         if matches!(
             kind,
             ExpressionKind::Call(_) | ExpressionKind::MethodCall(_)
@@ -1565,6 +2010,89 @@ impl<'a> Parser<'a> {
         .map(Some)
     }
 
+    fn parse_interpolated_string(
+        &mut self,
+        start: Token,
+    ) -> Result<Option<BuiltExpression>, ParseError> {
+        self.bump();
+        let mut parts = allocate_vec(2, "interpolated string parts")?;
+        let mut depth = 1;
+        loop {
+            let Some(text) = self
+                .current()
+                .filter(|token| token.kind() == TokenKind::InterpolatedStringText)
+            else {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0057",
+                    "expected interpolated string text",
+                    &["interpolated string text"],
+                )?;
+                return Ok(None);
+            };
+            self.bump();
+            push_fallible(
+                &mut parts,
+                InterpolatedStringPart::Text(text.span()),
+                "interpolated string parts",
+            )?;
+            if self.at(TokenKind::InterpolatedStringEnd) {
+                let Some(end) = self.bump() else {
+                    return Err(ParseError::InternalInvariant {
+                        message: "interpolated string end check succeeded without a token",
+                    });
+                };
+                let first_part = self.interpolated_parts.len();
+                let part_count = parts.len();
+                for part in parts {
+                    push_fallible(
+                        &mut self.interpolated_parts,
+                        part,
+                        "AST interpolated string parts",
+                    )?;
+                }
+                let span = start.span().merge(end.span())?;
+                return self
+                    .push_expression(
+                        Expression::new(
+                            ExpressionKind::InterpolatedString(InterpolatedString::new(
+                                first_part, part_count, span,
+                            )),
+                            span,
+                        ),
+                        depth,
+                    )
+                    .map(Some);
+            }
+            if !self.at(TokenKind::InterpolationOpen) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0058",
+                    "expected `{` in interpolated string",
+                    &["{"],
+                )?;
+                return Ok(None);
+            }
+            self.bump();
+            let Some(expression) = self.parse_expression(0)? else {
+                return Ok(None);
+            };
+            depth = depth.max(expression.depth.saturating_add(1));
+            if !self.at(TokenKind::InterpolationClose) {
+                self.report_current_or_eof(
+                    "BLU-PARSE-0059",
+                    "expected `}` after interpolated expression",
+                    &["}"],
+                )?;
+                return Ok(None);
+            }
+            self.bump();
+            push_fallible(
+                &mut parts,
+                InterpolatedStringPart::Expression(expression.id),
+                "interpolated string parts",
+            )?;
+        }
+    }
+
     fn parse_primary(&mut self) -> Result<Option<BuiltExpression>, ParseError> {
         let Some(token) = self.current() else {
             self.report_current_or_eof(
@@ -1598,7 +2126,13 @@ impl<'a> Parser<'a> {
             TokenKind::HexNumber => ExpressionKind::HexNumber,
             TokenKind::BinaryInteger => ExpressionKind::BinaryInteger,
             TokenKind::StringLiteral => ExpressionKind::StringLiteral,
+            TokenKind::InterpolatedStringStart => {
+                return self.parse_interpolated_string(token);
+            }
             TokenKind::Identifier => ExpressionKind::Identifier(Identifier::new(token.span())),
+            TokenKind::Global if self.lexed.profile() == SemanticProfile::Lua55 => {
+                ExpressionKind::Identifier(Identifier::new(token.span()))
+            }
             TokenKind::If => {
                 if !matches!(
                     self.lexed.profile(),
@@ -1758,7 +2292,21 @@ impl<'a> Parser<'a> {
         mut expression: BuiltExpression,
     ) -> Result<BuiltExpression, ParseError> {
         loop {
+            let kind = self.expression(expression.id)?.kind();
+            if supports_type_annotations(self.lexed.profile())
+                && self.at(TokenKind::ColonColon)
+                && !self.at_label_token_sequence()
+            {
+                // Luau's runtime type assertions are erased by the owned
+                // frontend. Consume the assertion while retaining the value
+                // expression and continue parsing any following postfix.
+                self.skip_type_assertion()?;
+                continue;
+            }
             if self.at(TokenKind::LeftBracket) {
+                if !is_postfix_expression(kind) {
+                    break;
+                }
                 self.bump();
                 let Some(key) = self.parse_expression(0)? else {
                     return Ok(expression);
@@ -1785,6 +2333,9 @@ impl<'a> Parser<'a> {
                     depth,
                 )?;
             } else if self.at(TokenKind::Dot) {
+                if !is_postfix_expression(kind) {
+                    break;
+                }
                 self.bump();
                 let Some(name) = self
                     .current()
@@ -1811,6 +2362,9 @@ impl<'a> Parser<'a> {
                     expression.depth.saturating_add(1),
                 )?;
             } else if self.at(TokenKind::Colon) {
+                if !is_postfix_expression(kind) {
+                    break;
+                }
                 self.bump();
                 let Some(name) = self
                     .current()
@@ -1824,50 +2378,76 @@ impl<'a> Parser<'a> {
                     return Ok(expression);
                 };
                 self.bump();
-                if !self.at(TokenKind::LeftParenthesis) {
-                    self.report_current_or_eof(
-                        "BLU-PARSE-0033",
-                        "expected `(` after method name",
-                        &["("],
-                    )?;
-                    return Ok(expression);
-                }
-                self.bump();
                 let mut arguments = allocate_vec(2, "method call arguments")?;
                 let mut depth = expression.depth;
-                if !self.at(TokenKind::RightParenthesis) {
-                    loop {
-                        let Some(argument) = self.parse_expression(0)? else {
-                            return Ok(expression);
-                        };
-                        self.check_ast_limit()?;
-                        self.call_argument_count = self.call_argument_count.saturating_add(1);
-                        push_fallible(&mut arguments, argument.id, "method call arguments")?;
-                        depth = depth.max(argument.depth);
-                        if !self.at(TokenKind::Comma) {
-                            break;
+                let end_span = if self.at(TokenKind::LeftParenthesis) {
+                    self.bump();
+                    if !self.at(TokenKind::RightParenthesis) {
+                        loop {
+                            let Some(argument) = self.parse_expression(0)? else {
+                                return Ok(expression);
+                            };
+                            self.check_ast_limit()?;
+                            self.call_argument_count = self.call_argument_count.saturating_add(1);
+                            push_fallible(&mut arguments, argument.id, "method call arguments")?;
+                            depth = depth.max(argument.depth);
+                            if !self.at(TokenKind::Comma) {
+                                break;
+                            }
+                            self.bump();
                         }
-                        self.bump();
                     }
-                }
-                let Some(close) = self
-                    .current()
-                    .filter(|token| token.kind() == TokenKind::RightParenthesis)
-                else {
+                    let Some(close) = self
+                        .current()
+                        .filter(|token| token.kind() == TokenKind::RightParenthesis)
+                    else {
+                        self.report_current_or_eof(
+                            "BLU-PARSE-0031",
+                            "expected `)` after call arguments",
+                            &[")"],
+                        )?;
+                        return Ok(expression);
+                    };
+                    self.bump();
+                    close.span()
+                } else if self.at(TokenKind::LeftBrace) {
+                    let Some(open) = self.current() else {
+                        return Ok(expression);
+                    };
+                    let argument = self.parse_table_constructor(open)?;
+                    self.check_ast_limit()?;
+                    self.call_argument_count = self.call_argument_count.saturating_add(1);
+                    push_fallible(&mut arguments, argument.id, "method call arguments")?;
+                    depth = depth.max(argument.depth);
+                    self.expression(argument.id)?.span()
+                } else if self.at(TokenKind::StringLiteral) {
+                    let Some(token) = self.current() else {
+                        return Ok(expression);
+                    };
+                    self.bump();
+                    let argument = self.push_expression(
+                        Expression::new(ExpressionKind::StringLiteral, token.span()),
+                        1,
+                    )?;
+                    self.check_ast_limit()?;
+                    self.call_argument_count = self.call_argument_count.saturating_add(1);
+                    push_fallible(&mut arguments, argument.id, "method call arguments")?;
+                    depth = depth.max(argument.depth);
+                    self.expression(argument.id)?.span()
+                } else {
                     self.report_current_or_eof(
-                        "BLU-PARSE-0031",
-                        "expected `)` after call arguments",
-                        &[")"],
+                        "BLU-PARSE-0033",
+                        "expected `(`, table, or string argument after method name",
+                        &["(", "table", "string literal"],
                     )?;
                     return Ok(expression);
                 };
-                self.bump();
                 let first_argument = self.call_arguments.len();
                 let argument_count = arguments.len();
                 for argument in arguments {
                     push_fallible(&mut self.call_arguments, argument, "AST call arguments")?;
                 }
-                let span = self.expression(expression.id)?.span().merge(close.span())?;
+                let span = self.expression(expression.id)?.span().merge(end_span)?;
                 expression = self.push_expression(
                     Expression::new(
                         ExpressionKind::MethodCall(MethodCallExpression::new(
@@ -1882,6 +2462,26 @@ impl<'a> Parser<'a> {
                     depth.saturating_add(1),
                 )?;
             } else if self.at(TokenKind::LeftParenthesis) {
+                if !is_postfix_expression(kind) {
+                    break;
+                }
+                if self.lexed.profile() == SemanticProfile::Luau && self.current_has_line_break() {
+                    self.report_current(
+                        "BLU-PARSE-0057",
+                        "a line break before call arguments is unavailable in the Luau profile",
+                        &["call on the same line"],
+                    )?;
+                    return Ok(expression);
+                }
+                if matches!(kind, ExpressionKind::Table(_))
+                    && self.parenthesized_prefix_starts_assignment()
+                {
+                    // A newline after a table constructor starts a new
+                    // Luau prefix-assignment statement in constructs such as
+                    // `local t = {}\n(t)[key] = value`, rather than a call on
+                    // the constructor itself.
+                    break;
+                }
                 self.bump();
                 let mut arguments = allocate_vec(2, "call arguments")?;
                 let mut depth = expression.depth;
@@ -1930,11 +2530,168 @@ impl<'a> Parser<'a> {
                     ),
                     depth.saturating_add(1),
                 )?;
+            } else if self.at(TokenKind::LeftBrace) {
+                if !is_postfix_expression(kind) {
+                    break;
+                }
+                let Some(open) = self.current() else {
+                    return Ok(expression);
+                };
+                let argument = self.parse_table_constructor(open)?;
+                self.check_ast_limit()?;
+                self.call_argument_count = self.call_argument_count.saturating_add(1);
+                let first_argument = self.call_arguments.len();
+                push_fallible(&mut self.call_arguments, argument.id, "call arguments")?;
+                let span = self
+                    .expression(expression.id)?
+                    .span()
+                    .merge(self.expression(argument.id)?.span())?;
+                expression = self.push_expression(
+                    Expression::new(
+                        ExpressionKind::Call(CallExpression::new(
+                            expression.id,
+                            first_argument,
+                            1,
+                            span,
+                        )),
+                        span,
+                    ),
+                    expression.depth.max(argument.depth).saturating_add(1),
+                )?;
+            } else if self.at(TokenKind::StringLiteral) {
+                if !is_postfix_expression(kind) {
+                    break;
+                }
+                let Some(token) = self.current() else {
+                    return Ok(expression);
+                };
+                self.bump();
+                let argument = self.push_expression(
+                    Expression::new(ExpressionKind::StringLiteral, token.span()),
+                    1,
+                )?;
+                self.check_ast_limit()?;
+                self.call_argument_count = self.call_argument_count.saturating_add(1);
+                let first_argument = self.call_arguments.len();
+                push_fallible(&mut self.call_arguments, argument.id, "call arguments")?;
+                let span = self
+                    .expression(expression.id)?
+                    .span()
+                    .merge(self.expression(argument.id)?.span())?;
+                expression = self.push_expression(
+                    Expression::new(
+                        ExpressionKind::Call(CallExpression::new(
+                            expression.id,
+                            first_argument,
+                            1,
+                            span,
+                        )),
+                        span,
+                    ),
+                    expression.depth.max(argument.depth).saturating_add(1),
+                )?;
             } else {
                 break;
             }
         }
         Ok(expression)
+    }
+
+    fn at_label_token_sequence(&self) -> bool {
+        self.significant_kind_after_cursor(0) == Some(TokenKind::ColonColon)
+            && self.significant_kind_after_cursor(1) == Some(TokenKind::Identifier)
+            && self.significant_kind_after_cursor(2) == Some(TokenKind::ColonColon)
+    }
+
+    fn significant_kind_after_cursor(&self, wanted: usize) -> Option<TokenKind> {
+        let mut seen = 0;
+        for token in self.lexed.tokens().get(self.cursor..)?.iter().copied() {
+            if is_trivia(token.kind()) {
+                continue;
+            }
+            if seen == wanted {
+                return Some(token.kind());
+            }
+            seen += 1;
+        }
+        None
+    }
+
+    fn parenthesized_prefix_starts_assignment(&self) -> bool {
+        let tokens = self.lexed.tokens();
+        let mut index = self.cursor;
+        let mut line_break = false;
+        while tokens
+            .get(index)
+            .is_some_and(|token| is_trivia(token.kind()))
+        {
+            if let Some(token) = tokens.get(index) {
+                line_break |= self
+                    .source
+                    .slice(token.span())
+                    .ok()
+                    .is_some_and(|bytes| bytes.contains(&b'\n') || bytes.contains(&b'\r'));
+            }
+            index += 1;
+        }
+        if !line_break {
+            return false;
+        }
+        if tokens.get(index).map(|token| token.kind()) != Some(TokenKind::LeftParenthesis) {
+            return false;
+        }
+        let mut depth = 0usize;
+        while let Some(token) = tokens.get(index) {
+            match token.kind() {
+                TokenKind::LeftParenthesis => depth = depth.saturating_add(1),
+                TokenKind::RightParenthesis => {
+                    depth = depth.saturating_sub(1);
+                    if depth == 0 {
+                        index += 1;
+                        while tokens.get(index).is_some_and(|next| is_trivia(next.kind())) {
+                            index += 1;
+                        }
+                        if tokens
+                            .get(index)
+                            .is_some_and(|next| next.kind() == TokenKind::LeftBracket)
+                        {
+                            let mut bracket_depth = 0usize;
+                            while let Some(next) = tokens.get(index) {
+                                match next.kind() {
+                                    TokenKind::LeftBracket => {
+                                        bracket_depth = bracket_depth.saturating_add(1)
+                                    }
+                                    TokenKind::RightBracket => {
+                                        bracket_depth = bracket_depth.saturating_sub(1);
+                                        if bracket_depth == 0 {
+                                            index += 1;
+                                            break;
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                index += 1;
+                            }
+                        } else if tokens
+                            .get(index)
+                            .is_some_and(|next| next.kind() == TokenKind::Dot)
+                        {
+                            index = index.saturating_add(2);
+                        }
+                        while tokens.get(index).is_some_and(|next| is_trivia(next.kind())) {
+                            index += 1;
+                        }
+                        return tokens.get(index).is_some_and(|next| {
+                            next.kind() == TokenKind::Equal
+                                || compound_assignment_operator(Some(next.kind())).is_some()
+                        });
+                    }
+                }
+                _ => {}
+            }
+            index += 1;
+        }
+        false
     }
 
     fn parse_table_constructor(&mut self, open: Token) -> Result<BuiltExpression, ParseError> {
@@ -2086,6 +2843,7 @@ impl<'a> Parser<'a> {
             .statement_count
             .saturating_add(self.expressions.len())
             .saturating_add(self.table_field_count)
+            .saturating_add(self.interpolated_parts.len())
             .saturating_add(self.call_argument_count)
             .saturating_add(self.function_node_count)
             .saturating_add(1);
@@ -2116,6 +2874,28 @@ impl<'a> Parser<'a> {
             .iter()
             .copied()
             .find(|token| !is_trivia(token.kind()))
+    }
+
+    fn previous_significant_kind(&self) -> Option<TokenKind> {
+        self.lexed
+            .tokens()
+            .get(..self.cursor)?
+            .iter()
+            .rev()
+            .copied()
+            .find(|token| !is_trivia(token.kind()))
+            .map(Token::kind)
+    }
+
+    fn current_has_line_break(&self) -> bool {
+        self.lexed
+            .tokens()
+            .get(self.cursor..)
+            .unwrap_or_default()
+            .iter()
+            .take_while(|token| is_trivia(token.kind()))
+            .filter_map(|token| self.source.slice(token.span()).ok())
+            .any(|bytes| bytes.contains(&b'\n') || bytes.contains(&b'\r'))
     }
 
     fn at(&self, kind: TokenKind) -> bool {
@@ -2237,6 +3017,18 @@ fn is_trivia(kind: TokenKind) -> bool {
     matches!(
         kind,
         TokenKind::Whitespace | TokenKind::Comment | TokenKind::DialectDirective
+    )
+}
+
+fn is_postfix_expression(kind: ExpressionKind) -> bool {
+    matches!(
+        kind,
+        ExpressionKind::Identifier(_)
+            | ExpressionKind::Group(_)
+            | ExpressionKind::Index(_)
+            | ExpressionKind::Field(_)
+            | ExpressionKind::Call(_)
+            | ExpressionKind::MethodCall(_)
     )
 }
 
