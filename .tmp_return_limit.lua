@@ -1,0 +1,5 @@
+local code = "return 10" .. string.rep(",10", 253)
+local first, first_message = load(code)
+print("FIRST", first ~= nil, first_message)
+local second, second_message = load(code .. ",10")
+print("SECOND", second ~= nil, second_message)

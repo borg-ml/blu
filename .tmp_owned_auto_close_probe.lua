@@ -1,0 +1,16 @@
+local file = os.tmpname()
+io.output(file); io.write("a\nb\n"):close()
+local ok, err = pcall(function()
+  for l in io.lines(file) do print("line", l) end
+  print("after-loop")
+end)
+print("result", tostring(ok), type(err), tostring(err))
+os.remove(file)
+local file2 = os.tmpname()
+io.output(file2); io.write("0123456789\n"):close()
+local ok2, err2 = pcall(function()
+  for a,b in io.lines(file2, 1, 1) do print("pair", a, b) end
+  print("after-pair")
+end)
+print("pair-result", tostring(ok2), type(err2), tostring(err2))
+os.remove(file2)

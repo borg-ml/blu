@@ -1439,8 +1439,9 @@ The current owned surface deliberately keeps the following gaps explicit:
   canonical Blu binary artifact whose selected function prototype becomes the
   dumped chunk's main and whose descendants are remapped safely; the existing
   binary `load` path round-trips the result. The second boolean argument emits
-  a stripped BluV1 artifact with debug locals, upvalue names, line ranges, and
-  per-PC lines removed. Captured upvalue values are never serialized: Lua 5.1
+  a compact stripped BluV1 artifact with debug locals and upvalue names removed,
+  function definition line ranges retained, and per-PC line tables/active-line
+  data removed. Captured upvalue values are never serialized: Lua 5.1
   reloads them as nil, while Lua 5.2–5.5 seed the first reloaded upvalue from
   the supplied chunk environment and leave later slots nil. The bytes are
   Blu's validated artifact format, not a claim of PUC Lua byte-for-byte
@@ -1511,22 +1512,22 @@ Lua 5.1 portable matrix currently passes 9/9 cases in Blu, including its deep
 `sieve.lua` coroutine chain. At the pinned Luau revision, the runner also
 instruments `assert` and reports the failing assertion ordinal. The current
 Blu-owned ledger is therefore concrete rather than a blanket suite waiver:
-the selected portable Lua 5.4.8 and 5.5.0 matrices each execute 16 cases,
-with 9 reference passes and 7 explicitly isolated cases. The original
-portable smoke subset remains 8/8 for each version, including the 5.5
-named-vararg fixture; the added cases are retained to make the remaining
-frontend, continuation, diagnostic, and library boundaries executable.
+the selected portable Lua 5.4.8 and 5.5.0 matrices each execute 17 cases,
+with all 17 reference passes after the formerly isolated `locals.lua`
+to-be-closed/debug-caller case was fixed. The original portable smoke subset
+remains 8/8 for each version, including the 5.5 named-vararg fixture;
+the added cases are retained to make the remaining frontend, continuation,
+diagnostic, and library boundaries executable.
 The modern runner executes each fixture with a
 fixture-rooted file capability and an explicit portable child option, so these
 results exercise the source-backed `require` and path-search behavior rather
 than relying on ambient host files. The pinned Luau corpus currently contains
 34 selected fixtures and has 25 reference passes in each owned profile. Blu
-has 12 profile-isolated probes: the modern `coroutine.running` pair and
+has 11 profile-isolated probes: the modern `coroutine.running` pair and
 main-thread yieldability, the bounded-versus-full `debug` surface, Blu's
 semicolon-only syntax acceptance, Luau's double-number comparison at `math`
 assertion 33, its signed 32-bit `table.move` destination wrap, the `pcall`
-traceback assertions that require `debug`, Blu's hidden `os` library at
-`sort`/`os.clock`, Luau's typed iterator diagnostic in `iter_fenv`, Blu's
+traceback assertions that require `debug`, Luau's typed iterator diagnostic in `iter_fenv`, Blu's
 structured nil-call diagnostic in `tmerror`, Luau's canonical `__tostring`
 return diagnostic in `events`, Luau's surrogate-codepoint
 rejection at `utf8` assertion 327, and the documented negative-zero and

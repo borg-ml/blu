@@ -6,6 +6,10 @@ dialect pragmatically unifies and extends Luau and modern Lua; explicit
 compatibility dialects preserve the exact semantics of each upstream language
 version where those semantics conflict.
 
+Borg Agent embedding, package authority, and customization boundaries are
+documented in [`docs/borg-embedding.md`](docs/borg-embedding.md). Blu owns the
+language runtime; the Borg host owns extension admission and capabilities.
+
 Blu starts from [Luau](https://github.com/luau-lang/luau)'s optimized language
 and VM design, but it is not confined to Roblox's sandboxed Luau surface. Blu
 supports explicit Luau and Lua compatibility modes alongside a first-class

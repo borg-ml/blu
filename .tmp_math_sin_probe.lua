@@ -1,0 +1,6 @@
+local value = math.sin(0)
+print("SIN", value, type(value), value == 0, math.cos(0), math.cos(0) == 1)
+local ok, error_value = pcall(function()
+  assert(math.sin(0) == 0)
+end)
+print("ASSERT", ok, error_value)

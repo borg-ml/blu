@@ -2569,6 +2569,30 @@ fn lua54_const_locals_reject_assignment_and_close_values_require_handlers() {
 }
 
 #[test]
+fn lua55_numeric_and_first_generic_for_bindings_are_const() {
+    for source in [
+        b"for i = 1, 2 do i = 2 end".as_slice(),
+        b"for value in pairs({}) do value = 2 end".as_slice(),
+    ] {
+        let error = OwnedCompiler::default()
+            .compile(
+                &make_source(source.to_vec()),
+                SemanticProfile::Lua55,
+                compiler_identity(),
+            )
+            .expect_err("Lua 5.5 loop variables must be const");
+        assert!(error.to_string().contains("const variable"), "{error}");
+    }
+    OwnedCompiler::default()
+        .compile(
+            &make_source(b"for _, value in pairs({}) do value = 2 end".to_vec()),
+            SemanticProfile::Lua55,
+            compiler_identity(),
+        )
+        .expect("Lua 5.5 secondary generic-for variables remain mutable");
+}
+
+#[test]
 fn lua55_global_const_visibility_survives_nested_function_boundaries() {
     let source = make_source(
         b"global a, var1<const>, z; local function foo() a=20; z=function() var1=12 end end"
@@ -4148,7 +4172,7 @@ fn string_match_shares_structured_pattern_and_argument_errors() {
             match expected {
                 "pattern" => assert!(matches!(
                     result,
-                    Err(RuntimeError::UnsupportedLibraryFeature { .. })
+                    Err(RuntimeError::LuaMessage(_)) | Err(RuntimeError::Raised(Value::String(_)))
                 )),
                 "type" => assert!(matches!(result, Err(RuntimeError::Type { .. }))),
                 _ => unreachable!(),
@@ -4248,14 +4272,16 @@ fn string_patterns_reject_invalid_backreferences_structurally() {
             let compiled = OwnedCompiler::default()
                 .compile(&source, profile, compiler_identity())
                 .unwrap();
-            assert!(matches!(
-                Vm::default()
-                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-                Err(RuntimeError::UnsupportedLibraryFeature {
-                    feature: "invalid Lua pattern capture reference",
-                    ..
-                })
-            ));
+            let result = Vm::default()
+                .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+            let valid = match result {
+                Err(RuntimeError::LuaMessage(message))
+                | Err(RuntimeError::Raised(Value::String(message))) => {
+                    message.as_ref().starts_with(b"invalid capture index %")
+                }
+                _ => false,
+            };
+            assert!(valid);
         }
     }
 }
@@ -4467,13 +4493,14 @@ fn string_gsub_replacement_escapes_follow_the_lua51_split() {
                 ])
             );
         } else {
-            assert!(matches!(
-                result,
-                Err(RuntimeError::UnsupportedLibraryFeature {
-                    function: "string.gsub",
-                    feature: "nonportable replacement escapes",
-                })
-            ));
+            let invalid_escape = match result {
+                Err(RuntimeError::LuaMessage(message))
+                | Err(RuntimeError::Raised(Value::String(message))) => {
+                    message.as_ref() == b"invalid use of '%'"
+                }
+                _ => false,
+            };
+            assert!(invalid_escape);
         }
     }
 }
@@ -4651,16 +4678,16 @@ fn string_gsub_rejects_unimplemented_capture_replacements_structurally() {
         let compiled = OwnedCompiler::default()
             .compile(&source, profile, compiler_identity())
             .unwrap();
-        assert!(matches!(
-            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-            Err(RuntimeError::UnsupportedLibraryFeature {
-                function: "string.gsub",
-                ..
-            }) | Err(RuntimeError::UnsupportedLibraryFeature {
-                function: "string.find",
-                ..
-            })
-        ));
+        let result =
+            Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+        let valid = match result {
+            Err(RuntimeError::LuaMessage(message))
+            | Err(RuntimeError::Raised(Value::String(message))) => {
+                message.as_ref().starts_with(b"invalid capture index %")
+            }
+            _ => false,
+        };
+        assert!(valid);
     }
 }
 
@@ -7580,18 +7607,33 @@ fn luau_table_create_and_find_are_bounded_and_profile_gated() {
             .unwrap();
         let result =
             Vm::default().execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
-        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Lua55) {
-            assert!(
-                matches!(
-                    result,
-                    Err(RuntimeError::Type {
-                        operation: "table.create",
-                        expected: "integer",
-                        ..
-                    })
-                ),
-                "{profile}"
-            );
+        if profile == SemanticProfile::Blu {
+            let invalid_fractional_count = match result {
+                Err(RuntimeError::Type {
+                    operation: "table.create",
+                    expected: "integer",
+                    ..
+                }) => true,
+                Err(RuntimeError::LuaMessage(message)) => {
+                    message.as_ref() == b"table.create expected integer, received number"
+                }
+                Err(RuntimeError::Raised(Value::String(message))) => {
+                    message.as_ref() == b"table.create expected integer, received number"
+                }
+                _ => false,
+            };
+            assert!(invalid_fractional_count, "{profile}");
+            continue;
+        }
+        if profile == SemanticProfile::Lua55 {
+            assert!(matches!(
+                result,
+                Err(RuntimeError::Type {
+                    operation: "table.create",
+                    expected: "number",
+                    actual: "string",
+                })
+            ));
             continue;
         }
         if profile == SemanticProfile::Luau {
@@ -7625,12 +7667,21 @@ fn luau_table_create_and_find_are_bounded_and_profile_gated() {
                 let compiled = OwnedCompiler::default()
                     .compile(&make_source(source.to_vec()), profile, compiler_identity())
                     .unwrap();
-                assert_eq!(
-                    Vm::default()
-                        .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default()),
-                    Err(RuntimeError::InvalidRange { operation }),
-                    "{profile}"
-                );
+                let result = Vm::default()
+                    .execute_blu_v1(compiled.into_validated_artifact(), BluLimits::default());
+                if operation == "table.create" {
+                    assert_eq!(
+                        result,
+                        Err(RuntimeError::TableCreateOutOfRange { kind: "array" }),
+                        "{profile}"
+                    );
+                } else {
+                    assert_eq!(
+                        result,
+                        Err(RuntimeError::InvalidRange { operation }),
+                        "{profile}"
+                    );
+                }
             }
         } else {
             assert!(matches!(

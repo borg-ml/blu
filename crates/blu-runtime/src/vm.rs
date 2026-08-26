@@ -80,6 +80,7 @@ const PRIMITIVE_METATABLE_SLOTS: usize = 7;
 
 type NativeFunction =
     Arc<dyn Fn(&mut Vm, &[Value]) -> Result<Vec<Value>, RuntimeError> + Send + Sync>;
+type BluConstants = Arc<Vec<Value>>;
 type ModuleLoader = Arc<dyn Fn(&mut Vm, &[u8]) -> Result<Value, RuntimeError> + Send + Sync>;
 type FileLoader = Arc<dyn Fn(&[u8]) -> Result<Vec<u8>, RuntimeError> + Send + Sync>;
 type FileProbe = Arc<dyn Fn(&[u8]) -> Result<bool, RuntimeError> + Send + Sync>;
@@ -126,9 +127,8 @@ struct BluDebugFrame {
 
 #[derive(Clone)]
 struct BluLivenessCacheEntry {
-    artifact: Arc<BluArtifact>,
-    prototype: usize,
-    masks: Vec<Vec<bool>>,
+    _artifact: Arc<BluArtifact>,
+    masks: Arc<Vec<Vec<bool>>>,
 }
 
 #[derive(Clone, Debug)]
@@ -318,22 +318,6 @@ pub struct OsExitRequest {
     pub status: i64,
     /// Whether Lua requested close-before-exit (Lua 5.2+).
     pub close: bool,
-}
-
-impl CalendarDateInput {
-    fn validate(self) -> Result<Self, RuntimeError> {
-        if !(1..=12).contains(&self.month)
-            || !(1..=31).contains(&self.day)
-            || !(0..=23).contains(&self.hour)
-            || !(0..=59).contains(&self.minute)
-            || !(0..=60).contains(&self.second)
-        {
-            return Err(RuntimeError::InvalidRange {
-                operation: "os.time calendar input",
-            });
-        }
-        Ok(self)
-    }
 }
 
 /// Host-owned state backing an opaque Lua file handle.
@@ -532,7 +516,7 @@ struct IoFileState {
 struct BluCaller {
     artifact: Arc<BluArtifact>,
     prototype: usize,
-    constants: Vec<Value>,
+    constants: BluConstants,
     registers: Vec<Value>,
     varargs: Vec<Value>,
     named_vararg_table: Option<TableId>,
@@ -931,6 +915,26 @@ fn update_blu_debug_frame_metadata(
     frame.pc = pc;
     frame.namewhat = names.0;
     frame.name = names.1;
+}
+
+fn refresh_blu_debug_frame_names(frames: &mut [BluDebugFrame], callers: &[BluCaller]) {
+    let frame_count = frames.len();
+    for (index, frame) in frames.iter_mut().enumerate() {
+        let names = if index + 1 < frame_count {
+            index
+                .checked_sub(1)
+                .and_then(|caller_index| callers.get(caller_index))
+                .map(blu_callee_debug_name)
+                .unwrap_or((None, None))
+        } else {
+            callers
+                .last()
+                .map(blu_callee_debug_name)
+                .unwrap_or((None, None))
+        };
+        frame.namewhat = names.0;
+        frame.name = names.1;
+    }
 }
 
 fn blu_callee_debug_name_parts(
@@ -1396,6 +1400,38 @@ fn blu_instruction_may_type_error(instruction: &BluInstruction) -> bool {
         )
 }
 
+fn blu_lua_diagnostic_may_type_error(
+    vm: &Vm,
+    instruction: &BluInstruction,
+    registers: &[Value],
+) -> bool {
+    let (table, key, is_assignment) = match instruction {
+        BluInstruction::GetTable { table, key, .. } => (*table, *key, false),
+        BluInstruction::SetTable { table, key, .. } => (*table, *key, true),
+        _ => return true,
+    };
+    let Some(table_value) = registers.get(usize::from(table)) else {
+        return true;
+    };
+    if is_assignment
+        && registers.get(usize::from(key)).is_some_and(|value| {
+            matches!(value, Value::Nil) || matches!(value, Value::Number(number) if number.is_nan())
+        })
+    {
+        return true;
+    }
+    match table_value {
+        Value::Table(table) => vm
+            .heap
+            .table_metatable(*table)
+            .map_or(true, |metatable| metatable.is_some()),
+        Value::UserData(_) => true,
+        value => vm
+            .value_metatable(value)
+            .map_or(true, |metatable| metatable.is_some()),
+    }
+}
+
 #[derive(Clone, Debug)]
 enum BluCallResult {
     Fixed {
@@ -1455,6 +1491,7 @@ enum BluResume {
 #[derive(Clone, Debug)]
 enum PendingBluOperation {
     ResumeValues,
+    Dofile(PendingDofile),
     Close(PendingClose),
     ProtectedCall(Box<PendingProtectedCall>),
     LoadReader(Box<PendingLoadReader>),
@@ -1468,6 +1505,11 @@ enum PendingBluOperation {
     TableSort(PendingTableSort),
     Pairs(PendingPairs),
     Ipairs(PendingPairs),
+}
+
+#[derive(Clone, Debug)]
+struct PendingDofile {
+    continuation: Box<BluContinuation>,
 }
 
 #[derive(Clone, Debug)]
@@ -1533,6 +1575,8 @@ struct PendingStringGsub {
     result: Vec<u8>,
     search_start: usize,
     copied_until: usize,
+    previous_nonempty_end: Option<usize>,
+    changed: bool,
     replacements: usize,
     replacement_limit: usize,
     explicit_limit: bool,
@@ -1571,6 +1615,58 @@ struct PendingTableSort {
     continuation: Box<BluContinuation>,
 }
 
+#[derive(Clone, Copy, Debug)]
+enum FastSortComparator {
+    AlwaysFalse,
+    LessThan {
+        reverse: bool,
+        counter: Option<UpvalueId>,
+    },
+}
+
+impl FastSortComparator {
+    fn result(&self, left: &Value, right: &Value, numeric: bool, strings: bool) -> Option<bool> {
+        match self {
+            Self::AlwaysFalse => Some(false),
+            Self::LessThan { reverse, .. } => {
+                let (left, right) = if *reverse {
+                    (right, left)
+                } else {
+                    (left, right)
+                };
+                if numeric {
+                    left.numeric_less(right)
+                } else if strings {
+                    match (left, right) {
+                        (Value::String(left), Value::String(right)) => Some(left < right),
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    fn bump_counter(&self, vm: &mut Vm) -> Result<(), RuntimeError> {
+        let Self::LessThan {
+            counter: Some(counter),
+            ..
+        } = self
+        else {
+            return Ok(());
+        };
+        let value = vm.heap.upvalue_get(*counter)?;
+        let incremented = arithmetic(Opcode::Add, &value, &Value::Integer(1))?;
+        vm.heap.upvalue_set(*counter, incremented)?;
+        Ok(())
+    }
+
+    fn accepts_non_orderable_values(self) -> bool {
+        matches!(self, Self::AlwaysFalse)
+    }
+}
+
 #[derive(Clone, Debug)]
 struct PendingPairs {
     continuation: Box<BluContinuation>,
@@ -1580,7 +1676,7 @@ struct PendingPairs {
 struct BluContinuation {
     artifact: Arc<BluArtifact>,
     prototype: usize,
-    constants: Vec<Value>,
+    constants: BluConstants,
     registers: Vec<Value>,
     varargs: Vec<Value>,
     dynamic_results: Vec<Value>,
@@ -1742,7 +1838,7 @@ pub struct Vm {
     thread_blu_environment: Option<TableId>,
     active_blu_closure: Option<ClosureId>,
     blu_debug_frames: Vec<BluDebugFrame>,
-    blu_liveness_cache: Vec<BluLivenessCacheEntry>,
+    blu_liveness_cache: HashMap<(usize, usize), BluLivenessCacheEntry>,
     pending_debug_local_writes: Vec<DebugLocalWrite>,
     debug_hooks: HashMap<ThreadId, DebugHook>,
     debug_hook_active: bool,
@@ -1761,8 +1857,10 @@ pub struct Vm {
     profile_library_profile: Option<SemanticProfile>,
     globals: HashMap<Arc<[u8]>, Value>,
     blu_string_interns: HashMap<Arc<[u8]>, ()>,
+    blu_empty_constants: BluConstants,
     native_functions: Vec<NativeFunction>,
     next_function: Option<NativeFunctionId>,
+    ipairs_next_function: Option<NativeFunctionId>,
     bit32_extract_function: Option<NativeFunctionId>,
     debug_native_functions: Vec<NativeFunctionId>,
     debug_getinfo_function: Option<NativeFunctionId>,
@@ -1854,8 +1952,12 @@ impl Vm {
     fn materialize_blu_constants(
         &mut self,
         prototype: &blu_bytecode::blu::Prototype,
-    ) -> Result<Vec<Value>, RuntimeError> {
+    ) -> Result<BluConstants, RuntimeError> {
+        if prototype.constants.is_empty() {
+            return Ok(Arc::clone(&self.blu_empty_constants));
+        }
         materialize_blu_constants_with_interns(&mut self.blu_string_interns, prototype)
+            .map(Arc::new)
     }
 
     /// Creates a VM, returning structured heap-allocation failures from
@@ -1908,7 +2010,7 @@ impl Vm {
             thread_blu_environment: None,
             active_blu_closure: None,
             blu_debug_frames: Vec::new(),
-            blu_liveness_cache: Vec::new(),
+            blu_liveness_cache: HashMap::new(),
             pending_debug_local_writes: Vec::new(),
             debug_hooks: HashMap::new(),
             debug_hook_active: false,
@@ -1927,8 +2029,10 @@ impl Vm {
             profile_library_profile: None,
             globals: HashMap::new(),
             blu_string_interns: HashMap::new(),
+            blu_empty_constants: Arc::new(Vec::new()),
             native_functions: Vec::new(),
             next_function: None,
+            ipairs_next_function: None,
             bit32_extract_function: None,
             debug_native_functions: Vec::new(),
             debug_getinfo_function: None,
@@ -4181,7 +4285,7 @@ impl Vm {
     }
 
     fn collect_after_blu_string_allocation(&mut self, roots: &GcRoots) -> Result<(), RuntimeError> {
-        if !self.has_weak_tables && !self.heap.has_weak_tables() {
+        if !self.has_weak_tables {
             return Ok(());
         }
         self.blu_string_allocation_count = self.blu_string_allocation_count.saturating_add(1);
@@ -4505,6 +4609,9 @@ impl Vm {
         value: Value,
         roots: &GcRoots,
     ) -> Result<(), RuntimeError> {
+        let adds_weak_mode = matches!(&key, Value::String(name) if name.as_ref() == b"__mode")
+            && self.heap.table_is_metatable(table)?
+            && matches!(&value, Value::String(mode) if mode.iter().any(|byte| matches!(byte, b'k' | b'v')));
         let requested = self.heap.table_set_bytes(table, &key, &value)?;
         let table_root = Value::Table(table);
         self.collect_if_needed(
@@ -4513,7 +4620,11 @@ impl Vm {
             [&table_root, &key, &value],
             roots.upvalues.iter().copied(),
         )?;
-        Ok(self.heap.table_set(table, key, value)?)
+        self.heap.table_set(table, key, value)?;
+        if adds_weak_mode {
+            self.has_weak_tables = true;
+        }
+        Ok(())
     }
 
     fn table_length_for_profile(
@@ -4550,10 +4661,19 @@ impl Vm {
                 .into_iter()
                 .next()
                 .unwrap_or(Value::Nil);
-            return exact_integer_conversion(&length, profile).ok_or(RuntimeError::Type {
-                operation: function,
-                expected: "integer-valued length",
-                actual: length.type_name(),
+            return exact_integer_conversion(&length, profile).ok_or_else(|| {
+                if matches!(
+                    profile,
+                    SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) {
+                    RuntimeError::LuaMessage(Arc::from(&b"object length is not an integer"[..]))
+                } else {
+                    RuntimeError::Type {
+                        operation: function,
+                        expected: "integer-valued length",
+                        actual: length.type_name(),
+                    }
+                }
             });
         }
         i64::try_from(self.table_length_for_profile(profile, table)?).map_err(|_| {
@@ -4775,6 +4895,48 @@ impl Vm {
         execution_limits: BluLimits,
         environment: TableId,
     ) -> Result<Value, RuntimeError> {
+        self.create_blu_v1_closure_in_environment_with_dumped_environment(
+            artifact,
+            execution_limits,
+            environment,
+            true,
+        )
+    }
+
+    /// Creates a callable owned chunk closure with explicit control over
+    /// whether a Lua 5.2+ dumped function receives the supplied environment in
+    /// its first dumped upvalue. `load(binary, name, mode)` and a table
+    /// environment use `true`; an explicitly supplied nil environment uses
+    /// `false`, matching PUC Lua's distinction between an omitted argument and
+    /// `nil`.
+    pub fn create_blu_v1_closure_in_environment_with_dumped_environment(
+        &mut self,
+        artifact: ValidatedBluArtifact,
+        execution_limits: BluLimits,
+        environment: TableId,
+        initialize_dumped_environment: bool,
+    ) -> Result<Value, RuntimeError> {
+        self.create_blu_v1_closure_in_optional_environment(
+            artifact,
+            execution_limits,
+            Some(environment),
+            initialize_dumped_environment,
+        )
+    }
+
+    /// Creates a callable owned chunk closure with an optional profile
+    /// environment. Lua 5.2+ distinguishes an omitted environment (which
+    /// falls back to the host's default environment) from an explicitly
+    /// supplied nil environment (which leaves `_ENV` nil). Keeping the
+    /// closure environment optional lets the execution path preserve that
+    /// distinction instead of encoding nil as a table fallback.
+    pub fn create_blu_v1_closure_in_optional_environment(
+        &mut self,
+        artifact: ValidatedBluArtifact,
+        execution_limits: BluLimits,
+        environment: Option<TableId>,
+        initialize_dumped_environment: bool,
+    ) -> Result<Value, RuntimeError> {
         let artifact = Arc::new(
             ValidatedBluArtifact::new(artifact.into_artifact(), execution_limits)
                 .map_err(RuntimeError::BluValidation)?
@@ -4802,34 +4964,41 @@ impl Vm {
                 profile: prototype.profile,
             });
         }
-        self.heap.table_get(
-            environment,
-            &Value::String(Arc::from(&b"__blu_environment_check"[..])),
-        )?;
+        if let Some(environment) = environment {
+            self.heap.table_get(
+                environment,
+                &Value::String(Arc::from(&b"__blu_environment_check"[..])),
+            )?;
+        }
         let upvalue_count = prototype.upvalues.len();
-        let mut roots = GcRoots::from_values(&[Value::Table(environment)])?;
+        let mut roots = GcRoots::default();
+        if let Some(environment) = environment {
+            roots.push_value(Value::Table(environment))?;
+        }
         let closure =
             self.allocate_blu_closure(Arc::clone(&artifact), main, profile, upvalue_count, &roots)?;
-        self.heap.closure_set_environment(closure, environment)?;
+        if let Some(environment) = environment {
+            self.heap.closure_set_environment(closure, environment)?;
+        }
         roots.push_value(Value::Closure(closure))?;
         for index in 0..upvalue_count {
             let dumped_function = prototype
                 .required_features
                 .contains(FeatureBits::DUMPED_FUNCTION);
-            let dumped_environment = dumped_function
-                && index == 0
-                && prototype
-                    .upvalue_debug
-                    .get(index)
-                    .is_none_or(|debug| debug.name.is_empty());
+            // PUC Lua initializes the first upvalue of an undumped binary
+            // function to the supplied environment, regardless of its debug
+            // name. Other dumped upvalues remain nil until the host wires
+            // them explicitly through the debug API.
+            let dumped_environment = dumped_function && initialize_dumped_environment && index == 0;
             let value = if profile != SemanticProfile::Lua51
                 && (dumped_environment
-                    || prototype
-                        .upvalue_debug
-                        .get(index)
-                        .is_some_and(|debug| debug.name.as_slice() == b"_ENV"))
+                    || (!dumped_function
+                        && prototype
+                            .upvalue_debug
+                            .get(index)
+                            .is_some_and(|debug| debug.name.as_slice() == b"_ENV")))
             {
-                Value::Table(environment)
+                environment.map_or(Value::Nil, Value::Table)
             } else {
                 Value::Nil
             };
@@ -5346,6 +5515,18 @@ impl Vm {
                 Value::Boolean(false),
                 pcall_error_value(value, request.profile),
             ]),
+            Err(RuntimeError::CallLimit { .. }) if self.protected_call_handler_depth > 0 => {
+                Ok(vec![
+                    Value::Boolean(false),
+                    Value::String(Arc::from(&b"error in error handling"[..])),
+                ])
+            }
+            Err(RuntimeError::CStackOverflow { .. }) if self.protected_call_handler_depth > 0 => {
+                Ok(vec![
+                    Value::Boolean(false),
+                    Value::String(Arc::from(&b"error in error handling"[..])),
+                ])
+            }
             Err(error) => Ok(vec![
                 Value::Boolean(false),
                 pcall_runtime_error_value(error, request.profile),
@@ -5424,6 +5605,22 @@ impl Vm {
         let mut registers = try_vec_with_capacity(register_count, "BluV1 runtime registers")?;
         registers.resize(register_count, Value::Nil);
         let is_main = main == usize::try_from(artifact.main).unwrap_or(usize::MAX);
+        let skip_implicit_environment_prelude = environment.is_none()
+            && is_main
+            && matches!(
+                prototype.profile,
+                SemanticProfile::Lua52
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            )
+            && prototype
+                .required_features
+                .contains(FeatureBits::IMPLICIT_ENVIRONMENT)
+            && matches!(
+                prototype.code.first(),
+                Some(BluInstruction::NewTable { destination: 0 })
+            );
         if (is_main
             || prototype
                 .required_features
@@ -5437,11 +5634,13 @@ impl Vm {
             )
             && let Some(environment_register) = registers.first_mut()
         {
-            let environment_id = environment.or(if is_main {
+            let environment_id = if closure.is_some() {
+                environment
+            } else if is_main {
                 self.global_environment
             } else {
                 None
-            });
+            };
             if let Some(environment_id) = environment_id {
                 *environment_register = Value::Table(environment_id);
             }
@@ -5457,8 +5656,10 @@ impl Vm {
         } else {
             Vec::new()
         };
-        let mut open_upvalues = try_vec_with_capacity(register_count, "BluV1 open upvalues")?;
-        open_upvalues.resize(register_count, None);
+        // Most Blu frames do not capture any locals. Keep the open-upvalue
+        // index sparse so every call/return does not scan the full register
+        // file; NewClosure grows it only when a parent register is captured.
+        let open_upvalues = Vec::new();
         let callers = try_vec_with_capacity(self.call_limit.min(16), "BluV1 caller frame stack")?;
         self.run_blu_v1_loop(
             artifact,
@@ -5469,7 +5670,7 @@ impl Vm {
             Vec::new(),
             open_upvalues,
             callers,
-            0,
+            usize::from(skip_implicit_environment_prelude),
             closure,
             remaining,
             depth,
@@ -5485,7 +5686,7 @@ impl Vm {
         &mut self,
         artifact: Arc<BluArtifact>,
         prototype_index: usize,
-        constants: Vec<Value>,
+        constants: BluConstants,
         registers: Vec<Value>,
         varargs: Vec<Value>,
         dynamic_results: Vec<Value>,
@@ -6028,7 +6229,12 @@ impl Vm {
             .last()
             .and_then(|frame| frame.artifact.prototypes.get(prototype_index))
             .is_some_and(|prototype| {
-                !prototype.line_info.is_empty() && prototype.line_info.iter().all(|line| *line == 0)
+                (prototype
+                    .required_features
+                    .contains(FeatureBits::STRIPPED_DEBUG_LINES)
+                    && prototype.line_info.is_empty())
+                    || (!prototype.line_info.is_empty()
+                        && prototype.line_info.iter().all(|line| *line == 0))
             });
         let skip_lua55_condition_line = self
             .blu_debug_frames
@@ -6365,7 +6571,7 @@ impl Vm {
         &mut self,
         mut artifact: Arc<BluArtifact>,
         mut prototype_index: usize,
-        mut constants: Vec<Value>,
+        mut constants: BluConstants,
         mut registers: Vec<Value>,
         mut varargs: Vec<Value>,
         mut dynamic_results: Vec<Value>,
@@ -6389,7 +6595,6 @@ impl Vm {
         // lazily when a debug native function, coroutine constructor, or host
         // hook actually needs them; ordinary Lua-family programs should not
         // pay for cloning every frame at every instruction.
-        let mut track_debug_registers = !self.debug_hooks.is_empty();
         // Proper tail calls replace the active frame, so they do not consume
         // ordinary call depth. Keep a separate bounded safety budget for a
         // non-terminating tail-call cycle; the pinned conformance corpus
@@ -6399,8 +6604,16 @@ impl Vm {
         let mut deadline_checks_remaining = 0;
         let mut named_vararg_table = None;
         let mut named_vararg_version = 0;
+        let mut reusable_registers = Vec::new();
+        let mut reusable_open_upvalues: Vec<Option<UpvalueId>> = Vec::new();
         loop {
             self.check_execution_at_instruction(&mut deadline_checks_remaining)?;
+            // A debug native call needs a materialized snapshot for that
+            // instruction, but it must not make every later instruction pay
+            // for register cloning. Hooks are the only persistent consumer;
+            // `debug_call_requires_registers` below enables the one-shot
+            // snapshot when a debug API is actually invoked.
+            let track_debug_registers = !self.debug_hooks.is_empty();
             if let Some(table) = named_vararg_table {
                 let mutation = self.heap.table_mutation(table)?;
                 if mutation != named_vararg_version {
@@ -6501,10 +6714,6 @@ impl Vm {
                     })?;
                 let current_frame_count = self.blu_debug_frames.len();
                 if current_frame_count == frame_count {
-                    let names = callers
-                        .last()
-                        .map(blu_callee_debug_name)
-                        .unwrap_or((None, None));
                     if let Some(frame) = self.blu_debug_frames.last_mut() {
                         update_blu_debug_frame_metadata(
                             frame,
@@ -6512,7 +6721,7 @@ impl Vm {
                             prototype_index,
                             closure,
                             pc,
-                            names,
+                            (frame.namewhat.clone(), frame.name.clone()),
                         );
                     }
                 } else if current_frame_count.checked_add(1) == Some(frame_count)
@@ -6557,10 +6766,6 @@ impl Vm {
                     });
                 } else if current_frame_count == frame_count.saturating_add(1) {
                     self.blu_debug_frames.truncate(frame_count);
-                    let names = callers
-                        .last()
-                        .map(blu_callee_debug_name)
-                        .unwrap_or((None, None));
                     if let Some(frame) = self.blu_debug_frames.last_mut() {
                         update_blu_debug_frame_metadata(
                             frame,
@@ -6568,7 +6773,7 @@ impl Vm {
                             prototype_index,
                             closure,
                             pc,
-                            names,
+                            (frame.namewhat.clone(), frame.name.clone()),
                         );
                     }
                 } else {
@@ -6623,7 +6828,7 @@ impl Vm {
                 frame.istailcall = true;
             }
             let active_environment = match closure {
-                Some(closure) => self.heap.blu_closure_environment(closure)?.or(environment),
+                Some(closure) => self.heap.blu_closure_environment(closure)?,
                 None => environment,
             };
             self.active_blu_environment = active_environment;
@@ -6653,6 +6858,19 @@ impl Vm {
             {
                 *environment_register = Value::Table(environment_id);
             }
+            if pc == 0
+                && active_environment.is_none()
+                && prototype
+                    .required_features
+                    .contains(FeatureBits::IMPLICIT_ENVIRONMENT)
+                && matches!(
+                    prototype.code.first(),
+                    Some(BluInstruction::NewTable { destination: 0 })
+                )
+            {
+                pc += 1;
+                continue;
+            }
             let Some(instruction) = prototype.code.get(pc).copied() else {
                 return Err(RuntimeError::InvalidProgramCounter {
                     pc,
@@ -6665,6 +6883,7 @@ impl Vm {
                     SemanticProfile::Lua54 | SemanticProfile::Lua55
                 )
                 && blu_instruction_may_type_error(&instruction)
+                && blu_lua_diagnostic_may_type_error(self, &instruction, &registers)
                 && let Some(frame) = self.blu_debug_frames.last_mut()
             {
                 frame.registers = try_clone_values(&registers, "Lua diagnostic registers")?;
@@ -6692,6 +6911,12 @@ impl Vm {
                             )
                         }));
             if debug_call_requires_registers {
+                if debug_native_call_requires_registers {
+                    refresh_blu_debug_frame_names(
+                        &mut self.blu_debug_frames[debug_frame_base..],
+                        &callers,
+                    );
+                }
                 for (index, caller) in callers.iter().enumerate() {
                     let mut caller_registers =
                         try_clone_values(&caller.registers, "Blu debug caller registers")?;
@@ -6709,9 +6934,6 @@ impl Vm {
                 if let Some(frame) = self.blu_debug_frames.last_mut() {
                     frame.registers = try_clone_values(&registers, "Blu debug frame registers")?;
                     frame.varargs = try_clone_values(&varargs, "Blu debug frame varargs")?;
-                }
-                if debug_native_call_requires_registers {
-                    track_debug_registers = true;
                 }
             }
             let line = prototype
@@ -6955,11 +7177,7 @@ impl Vm {
                                         } else {
                                             Vec::new()
                                         };
-                                        let mut child_open_upvalues = try_vec_with_capacity(
-                                            child_register_count,
-                                            "BluV1 open upvalues",
-                                        )?;
-                                        child_open_upvalues.resize(child_register_count, None);
+                                        let child_open_upvalues = Vec::new();
                                         try_reserve_exact(
                                             &mut callers,
                                             1,
@@ -7272,11 +7490,7 @@ impl Vm {
                                 } else {
                                     Vec::new()
                                 };
-                                let mut child_open_upvalues = try_vec_with_capacity(
-                                    child_register_count,
-                                    "BluV1 open upvalues",
-                                )?;
-                                child_open_upvalues.resize(child_register_count, None);
+                                let child_open_upvalues = Vec::new();
                                 try_reserve_exact(&mut callers, 1, "BluV1 __index caller frame")?;
                                 callers.push(BluCaller {
                                     artifact,
@@ -7408,7 +7622,20 @@ impl Vm {
                                 std::iter::empty(),
                             )?;
                         }
+                        let adds_weak_mode = matches!(
+                            &key,
+                            Value::String(name) if name.as_ref() == b"__mode"
+                        ) && self.heap.table_is_metatable(table)?
+                            && matches!(
+                                &value,
+                                Value::String(mode) if mode
+                                    .iter()
+                                    .any(|byte| matches!(byte, b'k' | b'v'))
+                            );
                         self.heap.table_set(table, key.clone(), value.clone())?;
+                        if adds_weak_mode {
+                            self.has_weak_tables = true;
+                        }
                         if self.global_environment == Some(table) {
                             self.mirror_global_environment_write(&key, &value)?;
                         }
@@ -7474,11 +7701,7 @@ impl Vm {
                                     } else {
                                         Vec::new()
                                     };
-                                    let mut child_open_upvalues = try_vec_with_capacity(
-                                        child_register_count,
-                                        "BluV1 open upvalues",
-                                    )?;
-                                    child_open_upvalues.resize(child_register_count, None);
+                                    let child_open_upvalues = Vec::new();
                                     try_reserve_exact(
                                         &mut callers,
                                         1,
@@ -7708,8 +7931,13 @@ impl Vm {
                             .ok_or(RuntimeError::InvalidPrototype(child))?;
                         let child_constants = self.materialize_blu_constants(child_prototype)?;
                         let child_register_count = usize::from(child_prototype.register_count);
-                        let mut child_registers =
-                            try_vec_with_capacity(child_register_count, "BluV1 runtime registers")?;
+                        let mut child_registers = core::mem::take(&mut reusable_registers);
+                        try_reserve_exact(
+                            &mut child_registers,
+                            child_register_count,
+                            "BluV1 runtime registers",
+                        )?;
+                        child_registers.clear();
                         child_registers.resize(child_register_count, Value::Nil);
                         let _copied =
                             copy_blu_arguments(child_prototype, &mut child_registers, &arguments);
@@ -7723,9 +7951,8 @@ impl Vm {
                         } else {
                             Vec::new()
                         };
-                        let mut child_open_upvalues =
-                            try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                        child_open_upvalues.resize(child_register_count, None);
+                        let mut child_open_upvalues = core::mem::take(&mut reusable_open_upvalues);
+                        child_open_upvalues.clear();
                         try_reserve_exact(&mut callers, 1, "BluV1 table-list caller frame")?;
                         callers.push(BluCaller {
                             artifact,
@@ -7992,8 +8219,13 @@ impl Vm {
                             .ok_or(RuntimeError::InvalidPrototype(child))?;
                         let child_constants = self.materialize_blu_constants(child_prototype)?;
                         let child_register_count = usize::from(child_prototype.register_count);
-                        let mut child_registers =
-                            try_vec_with_capacity(child_register_count, "BluV1 runtime registers")?;
+                        let mut child_registers = core::mem::take(&mut reusable_registers);
+                        try_reserve_exact(
+                            &mut child_registers,
+                            child_register_count,
+                            "BluV1 runtime registers",
+                        )?;
+                        child_registers.clear();
                         child_registers.resize(child_register_count, Value::Nil);
                         let _copied =
                             copy_blu_arguments(child_prototype, &mut child_registers, &arguments);
@@ -8007,9 +8239,8 @@ impl Vm {
                         } else {
                             Vec::new()
                         };
-                        let mut child_open_upvalues =
-                            try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                        child_open_upvalues.resize(child_register_count, None);
+                        let mut child_open_upvalues = core::mem::take(&mut reusable_open_upvalues);
+                        child_open_upvalues.clear();
                         try_reserve_exact(&mut callers, 1, "BluV1 caller frame stack")?;
                         callers.push(BluCaller {
                             artifact,
@@ -8297,9 +8528,7 @@ impl Vm {
                         } else {
                             Vec::new()
                         };
-                        let mut child_open_upvalues =
-                            try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                        child_open_upvalues.resize(child_register_count, None);
+                        let child_open_upvalues = Vec::new();
                         try_reserve_exact(&mut callers, 1, "BluV1 caller frame stack")?;
                         callers.push(BluCaller {
                             artifact,
@@ -8546,9 +8775,7 @@ impl Vm {
                         } else {
                             Vec::new()
                         };
-                        let mut child_open_upvalues =
-                            try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                        child_open_upvalues.resize(child_register_count, None);
+                        let child_open_upvalues = Vec::new();
                         try_reserve_exact(&mut callers, 1, "BluV1 caller frame stack")?;
                         callers.push(BluCaller {
                             artifact,
@@ -8839,9 +9066,7 @@ impl Vm {
                         } else {
                             Vec::new()
                         };
-                        let mut child_open_upvalues =
-                            try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                        child_open_upvalues.resize(child_register_count, None);
+                        let child_open_upvalues = Vec::new();
                         if let Some((first, count)) = prefix {
                             try_reserve_exact(&mut callers, 1, "BluV1 return-prefix caller frame")?;
                             callers.push(BluCaller {
@@ -9038,6 +9263,26 @@ impl Vm {
                         .prototypes
                         .get(child_index)
                         .ok_or(RuntimeError::InvalidPrototype(child_index))?;
+                    let required_open_upvalues = child_prototype
+                        .upvalues
+                        .iter()
+                        .filter_map(|capture| match capture {
+                            blu_bytecode::blu::Upvalue::ParentRegister(register) => {
+                                Some(usize::from(*register).saturating_add(1))
+                            }
+                            blu_bytecode::blu::Upvalue::ParentUpvalue(_) => None,
+                        })
+                        .max()
+                        .unwrap_or(0);
+                    if required_open_upvalues > open_upvalues.len() {
+                        let current_open_upvalues = open_upvalues.len();
+                        try_reserve_exact(
+                            &mut open_upvalues,
+                            required_open_upvalues - current_open_upvalues,
+                            "BluV1 open upvalues",
+                        )?;
+                        open_upvalues.resize(required_open_upvalues, None);
+                    }
                     let mut roots = self.blu_frame_roots_at(
                         &artifact,
                         prototype_index,
@@ -9298,9 +9543,7 @@ impl Vm {
                             } else {
                                 Vec::new()
                             };
-                            let mut child_open_upvalues =
-                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                            child_open_upvalues.resize(child_register_count, None);
+                            let child_open_upvalues = Vec::new();
                             try_reserve_exact(
                                 &mut callers,
                                 1,
@@ -9489,9 +9732,7 @@ impl Vm {
                             } else {
                                 Vec::new()
                             };
-                            let mut child_open_upvalues =
-                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                            child_open_upvalues.resize(child_register_count, None);
+                            let child_open_upvalues = Vec::new();
                             try_reserve_exact(
                                 &mut callers,
                                 1,
@@ -9645,9 +9886,7 @@ impl Vm {
                             } else {
                                 Vec::new()
                             };
-                            let mut child_open_upvalues =
-                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                            child_open_upvalues.resize(child_register_count, None);
+                            let child_open_upvalues = Vec::new();
                             try_reserve_exact(&mut callers, 1, "BluV1 __unm caller frame")?;
                             callers.push(BluCaller {
                                 artifact,
@@ -9810,9 +10049,7 @@ impl Vm {
                             } else {
                                 Vec::new()
                             };
-                            let mut child_open_upvalues =
-                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                            child_open_upvalues.resize(child_register_count, None);
+                            let child_open_upvalues = Vec::new();
                             try_reserve_exact(&mut callers, 1, "BluV1 __len caller frame")?;
                             callers.push(BluCaller {
                                 artifact,
@@ -10007,9 +10244,7 @@ impl Vm {
                             } else {
                                 Vec::new()
                             };
-                            let mut child_open_upvalues =
-                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                            child_open_upvalues.resize(child_register_count, None);
+                            let child_open_upvalues = Vec::new();
                             try_reserve_exact(&mut callers, 1, "BluV1 __concat caller frame")?;
                             callers.push(BluCaller {
                                 artifact,
@@ -10301,9 +10536,7 @@ impl Vm {
                             } else {
                                 Vec::new()
                             };
-                            let mut child_open_upvalues =
-                                try_vec_with_capacity(child_register_count, "BluV1 open upvalues")?;
-                            child_open_upvalues.resize(child_register_count, None);
+                            let child_open_upvalues = Vec::new();
                             try_reserve_exact(&mut callers, 1, "BluV1 comparison caller frame")?;
                             callers.push(BluCaller {
                                 artifact,
@@ -10582,6 +10815,10 @@ impl Vm {
                     })?;
                     let values = try_clone_values(values, "BluV1 return values")?;
                     let mut values = values;
+                    reusable_registers = core::mem::take(&mut registers);
+                    reusable_registers.clear();
+                    reusable_open_upvalues = core::mem::take(&mut open_upvalues);
+                    reusable_open_upvalues.clear();
                     let mut caller = loop {
                         let Some(caller) = callers.pop() else {
                             return Ok(values);
@@ -11078,49 +11315,51 @@ impl Vm {
         pc: usize,
         registers: &[Value],
     ) -> Result<Vec<Value>, RuntimeError> {
-        let live = if let Some(mask) = self
-            .blu_liveness_cache
-            .iter()
-            .find(|entry| entry.prototype == prototype && Arc::ptr_eq(&entry.artifact, artifact))
-            .and_then(|entry| entry.masks.get(pc))
-        {
-            mask.clone()
+        let cache_key = (Arc::as_ptr(artifact) as usize, prototype);
+        let masks = if let Some(entry) = self.blu_liveness_cache.get(&cache_key) {
+            Arc::clone(&entry.masks)
         } else {
-            let masks = blu_live_register_masks(artifact, prototype)?;
-            let live = if let Some(mask) = masks.get(pc) {
-                mask.clone()
-            } else if let Some(prototype) = artifact.prototypes.get(prototype) {
-                let mut live = try_vec_with_capacity(
-                    usize::from(prototype.register_count),
-                    "BluV1 live register mask",
-                )?;
-                live.resize(usize::from(prototype.register_count), false);
-                live
-            } else {
-                return Err(RuntimeError::InvalidPrototype(prototype));
-            };
-            try_reserve_exact(&mut self.blu_liveness_cache, 1, "BluV1 liveness cache")?;
-            self.blu_liveness_cache.push(BluLivenessCacheEntry {
-                artifact: Arc::clone(artifact),
-                prototype,
-                masks,
-            });
-            live
+            let masks = Arc::new(blu_live_register_masks(artifact, prototype)?);
+            self.blu_liveness_cache
+                .try_reserve(1)
+                .map_err(|_| RuntimeError::Allocation {
+                    what: "BluV1 liveness cache",
+                })?;
+            self.blu_liveness_cache.insert(
+                cache_key,
+                BluLivenessCacheEntry {
+                    _artifact: Arc::clone(artifact),
+                    masks: Arc::clone(&masks),
+                },
+            );
+            masks
         };
+        let live = masks.get(pc).map(Vec::as_slice);
+        let register_count = artifact
+            .prototypes
+            .get(prototype)
+            .map(|prototype| usize::from(prototype.register_count))
+            .ok_or(RuntimeError::InvalidPrototype(prototype))?;
         let mut values = try_vec_with_capacity(
-            live.iter()
-                .enumerate()
-                .filter(|(index, live)| {
-                    **live
-                        && registers
-                            .get(*index)
-                            .is_some_and(Value::contains_gc_storage)
-                })
-                .count(),
+            live.map_or(0, |live| {
+                live.iter()
+                    .enumerate()
+                    .filter(|(index, live)| {
+                        **live
+                            && registers
+                                .get(*index)
+                                .is_some_and(Value::contains_gc_storage)
+                    })
+                    .count()
+            }),
             "BluV1 live register GC roots",
         )?;
         for (index, value) in registers.iter().enumerate() {
-            if live.get(index).copied().unwrap_or(true) && value.contains_gc_storage() {
+            let is_live = match live {
+                Some(live) => live.get(index).copied().unwrap_or(true),
+                None => index >= register_count,
+            };
+            if is_live && value.contains_gc_storage() {
                 values.push(value.clone());
             }
         }
@@ -11668,12 +11907,18 @@ impl Vm {
                 Opcode::GetTable => {
                     let table = frame.get(instruction.b())?.clone();
                     let key = frame.get(instruction.c())?.clone();
-                    let value = self.index_value(
-                        table,
-                        key,
-                        "table access",
-                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
-                    )?;
+                    let value = if let Some(value) =
+                        self.raw_table_get_fast(&table, &key, frame.profile)?
+                    {
+                        value
+                    } else {
+                        self.index_value(
+                            table,
+                            key,
+                            "table access",
+                            CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
+                        )?
+                    };
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
                 }
@@ -11693,12 +11938,18 @@ impl Vm {
                     let table = frame.get(instruction.b())?.clone();
                     let index = table_string_constant(instruction)?;
                     let key = frame.constant_u32(index)?;
-                    let value = self.index_value(
-                        table,
-                        key,
-                        "table access",
-                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
-                    )?;
+                    let value = if let Some(value) =
+                        self.raw_table_get_fast(&table, &key, frame.profile)?
+                    {
+                        value
+                    } else {
+                        self.index_value(
+                            table,
+                            key,
+                            "table access",
+                            CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
+                        )?
+                    };
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
                 }
@@ -11718,12 +11969,18 @@ impl Vm {
                 Opcode::GetTableN => {
                     let table = frame.get(instruction.b())?.clone();
                     let key = Value::Integer(i64::from(instruction.c()) + 1);
-                    let value = self.index_value(
-                        table,
-                        key,
-                        "table access",
-                        CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
-                    )?;
+                    let value = if let Some(value) =
+                        self.raw_table_get_fast(&table, &key, frame.profile)?
+                    {
+                        value
+                    } else {
+                        self.index_value(
+                            table,
+                            key,
+                            "table access",
+                            CallContext::new(remaining, depth, frame.gc_roots(&self.heap)?),
+                        )?
+                    };
                     frame.refresh_open_upvalues(&self.heap)?;
                     frame.set(instruction.a(), value)?;
                 }
@@ -11946,6 +12203,59 @@ impl Vm {
                             let value = match offset {
                                 0 => first.clone(),
                                 1 => second.clone(),
+                                _ => Value::Nil,
+                            };
+                            frame.set(register, value)?;
+                        }
+                        frame.set(index_register, first.clone())?;
+                        if !matches!(first, Value::Nil) {
+                            frame.jump(instruction)?;
+                        }
+                        continue;
+                    }
+                    if let Value::NativeFunction(native_function) = &function
+                        && self.ipairs_next_function == Some(*native_function)
+                        && self.debug_hooks.is_empty()
+                        && self.debug_native_frames.is_empty()
+                        && self.active_native_closures.is_empty()
+                        && let Value::Table(table) = &state
+                    {
+                        let index = match control {
+                            Value::Integer(value) => value,
+                            Value::Number(value) => value as i64,
+                            _ => {
+                                return Err(RuntimeError::Type {
+                                    operation: "ipairs",
+                                    expected: "number",
+                                    actual: control.type_name(),
+                                });
+                            }
+                        };
+                        let index = index.wrapping_add(1);
+                        let value = if self.heap.table_metatable(*table)?.is_none() {
+                            self.heap.table_get(*table, &Value::Integer(index))?
+                        } else {
+                            self.native_table_get_without_yield(
+                                "ipairs",
+                                Value::Table(*table),
+                                Value::Integer(index),
+                            )?
+                        };
+                        let first = if matches!(value, Value::Nil) {
+                            Value::Nil
+                        } else {
+                            profiled_integral_math_result(self, "ipairs", index as f64)?
+                        };
+                        for offset in 0..variable_count {
+                            let register = usize::from(base) + 3 + offset;
+                            let register =
+                                u8::try_from(register).map_err(|_| RuntimeError::Register {
+                                    register,
+                                    count: frame.registers.len(),
+                                })?;
+                            let value = match offset {
+                                0 => first.clone(),
+                                1 => value.clone(),
                                 _ => Value::Nil,
                             };
                             frame.set(register, value)?;
@@ -12257,7 +12567,7 @@ impl Vm {
         &mut self,
         artifact: Arc<BluArtifact>,
         prototype: usize,
-        constants: Vec<Value>,
+        constants: BluConstants,
         registers: Vec<Value>,
         varargs: Vec<Value>,
         dynamic_results: Vec<Value>,
@@ -12781,6 +13091,27 @@ impl Vm {
             PendingBluOperation::ResumeValues => {
                 try_clone_values(arguments, "BluV1 resumed return values")
             }
+            PendingBluOperation::Dofile(mut operation) => {
+                let values =
+                    match self.resume_detached_blu(*operation.continuation, arguments, remaining) {
+                        Ok(values) => values,
+                        Err(error @ RuntimeError::CoroutineYield(_)) => {
+                            let continuation = self.captured_blu_continuation.take().ok_or(
+                                RuntimeError::UnsupportedLibraryFeature {
+                                    function: "dofile",
+                                    feature: "yielding loaded files",
+                                },
+                            )?;
+                            operation.continuation = Box::new(continuation);
+                            self.pending_blu_operation =
+                                Some(PendingBluOperation::Dofile(operation));
+                            return Err(error);
+                        }
+                        Err(error) => return Err(error),
+                    };
+                self.sync_native_operation_remaining(remaining);
+                Ok(values)
+            }
             PendingBluOperation::Close(mut operation) => {
                 let resumed = match operation.continuation.take() {
                     Some(continuation) => {
@@ -13101,6 +13432,12 @@ impl Vm {
                     Err(error) => return Err(error),
                 };
                 self.sync_native_operation_remaining(remaining);
+                if matches!(
+                    &callback_value,
+                    Value::String(_) | Value::Integer(_) | Value::Number(_)
+                ) {
+                    operation.changed = true;
+                }
                 self.append_gsub_callback_result(
                     &mut operation.result,
                     callback_value,
@@ -13112,10 +13449,11 @@ impl Vm {
                 while operation.replacements < operation.replacement_limit
                     && operation.search_start <= operation.haystack.len()
                 {
-                    let Some(found) = find_basic_lua_pattern(
+                    let Some(found) = find_next_gsub_match(
                         &operation.haystack,
                         &operation.pattern,
-                        operation.search_start,
+                        &mut operation.search_start,
+                        operation.previous_nonempty_end,
                         "string.gsub",
                         self.active_profile()?,
                     )?
@@ -13172,6 +13510,12 @@ impl Vm {
                         *remaining = context.remaining;
                     }
                     operation.found = found;
+                    if matches!(
+                        &callback_value,
+                        Value::String(_) | Value::Integer(_) | Value::Number(_)
+                    ) {
+                        operation.changed = true;
+                    }
                     self.append_gsub_callback_result(
                         &mut operation.result,
                         callback_value,
@@ -13179,6 +13523,9 @@ impl Vm {
                         &operation.found,
                     )?;
                     operation.replacements += 1;
+                    if end > first {
+                        operation.previous_nonempty_end = Some(end);
+                    }
                     if end > first {
                         operation.search_start = end;
                         operation.copied_until = end;
@@ -13196,10 +13543,11 @@ impl Vm {
                 }
                 if !operation.explicit_limit
                     && operation.replacements == MAX_DYNAMIC_REGISTERS
-                    && find_basic_lua_pattern(
+                    && find_next_gsub_match(
                         &operation.haystack,
                         &operation.pattern,
-                        operation.search_start,
+                        &mut operation.search_start,
+                        operation.previous_nonempty_end,
                         "string.gsub",
                         self.active_profile()?,
                     )?
@@ -13214,8 +13562,15 @@ impl Vm {
                     &mut operation.result,
                     &operation.haystack[operation.copied_until..],
                 )?;
+                let output = if !operation.changed
+                    && operation.result.as_slice() == operation.haystack.as_ref()
+                {
+                    Arc::clone(&operation.haystack)
+                } else {
+                    Arc::from(operation.result)
+                };
                 Ok(vec![
-                    Value::String(Arc::from(operation.result)),
+                    Value::String(output),
                     profiled_integral_math_result(
                         self,
                         "string.gsub",
@@ -13667,6 +14022,179 @@ impl Vm {
         Ok(Vec::new())
     }
 
+    fn validate_table_sort_comparator(
+        &mut self,
+        comparator: &Value,
+        values: &[Value],
+    ) -> Result<(), RuntimeError> {
+        if values.len() < 4 || values.len() > 1024 {
+            return Ok(());
+        }
+        let Value::Closure(closure) = comparator else {
+            return Ok(());
+        };
+        let (_, _, _, upvalues) = self.heap.blu_closure_parts(*closure)?;
+        if !upvalues.is_empty() {
+            return Ok(());
+        }
+        for pair in values.windows(2) {
+            let result = self.invoke_native_callback_without_yield_fast(
+                "table.sort",
+                comparator.clone(),
+                &[pair[1].clone(), pair[0].clone()],
+            )?;
+            if result.first().is_some_and(Value::is_truthy) {
+                return Err(RuntimeError::Raised(Value::String(Arc::from(
+                    &b"invalid order function for sorting"[..],
+                ))));
+            }
+        }
+        Ok(())
+    }
+
+    fn fast_table_sort_comparator(
+        &self,
+        comparator: &Value,
+    ) -> Result<Option<FastSortComparator>, RuntimeError> {
+        let Value::Closure(closure) = comparator else {
+            return Ok(None);
+        };
+        let (artifact, prototype_index, _, upvalues) = self.heap.blu_closure_parts(*closure)?;
+        let Some(prototype) = artifact.prototypes.get(prototype_index) else {
+            return Ok(None);
+        };
+        if prototype.parameter_count != 2 {
+            return Ok(None);
+        }
+        if prototype.code.len() == 2 {
+            if upvalues.is_empty()
+                && let (
+                    BluInstruction::LoadConstant {
+                        destination,
+                        constant,
+                    },
+                    BluInstruction::Return { first, count },
+                ) = (prototype.code[0], prototype.code[1])
+                && count == 1
+                && first == destination
+            {
+                let Ok(constant) = usize::try_from(constant) else {
+                    return Ok(None);
+                };
+                if matches!(prototype.constants.get(constant), Some(BluConstant::Nil)) {
+                    return Ok(Some(FastSortComparator::AlwaysFalse));
+                }
+            }
+            let (
+                BluInstruction::LessThan {
+                    destination,
+                    left,
+                    right,
+                },
+                BluInstruction::Return { first, count },
+            ) = (prototype.code[0], prototype.code[1])
+            else {
+                return Ok(None);
+            };
+            if count != 1 || first != destination {
+                return Ok(None);
+            }
+            let reverse = match (left, right) {
+                (0, 1) => false,
+                (1, 0) => true,
+                _ => return Ok(None),
+            };
+            return Ok(Some(FastSortComparator::LessThan {
+                reverse,
+                counter: None,
+            }));
+        }
+        if prototype.code.len() != 6 {
+            return Ok(None);
+        }
+        let (destination, left, right, first, count, counter_upvalue, increment_constant) = match (
+            prototype.code[0],
+            prototype.code[1],
+            prototype.code[2],
+            prototype.code[3],
+            prototype.code[4],
+            prototype.code[5],
+        ) {
+            (
+                BluInstruction::GetUpvalue {
+                    destination: counter_register,
+                    upvalue,
+                },
+                BluInstruction::LoadConstant {
+                    destination: constant_register,
+                    constant,
+                },
+                BluInstruction::Add {
+                    destination: increment_register,
+                    left,
+                    right,
+                },
+                BluInstruction::SetUpvalue {
+                    upvalue: set_upvalue,
+                    source,
+                },
+                BluInstruction::LessThan {
+                    destination,
+                    left: compare_left,
+                    right: compare_right,
+                },
+                BluInstruction::Return { first, count },
+            ) if set_upvalue == upvalue
+                && source == increment_register
+                && (left == counter_register && right == constant_register
+                    || left == constant_register && right == counter_register) =>
+            {
+                (
+                    destination,
+                    compare_left,
+                    compare_right,
+                    first,
+                    count,
+                    upvalue,
+                    constant,
+                )
+            }
+            _ => return Ok(None),
+        };
+        if count != 1 || first != destination {
+            return Ok(None);
+        }
+        let reverse = match (left, right) {
+            (0, 1) => false,
+            (1, 0) => true,
+            _ => return Ok(None),
+        };
+        let Ok(increment_constant) = usize::try_from(increment_constant) else {
+            return Ok(None);
+        };
+        let increment_is_one = match prototype.constants.get(increment_constant) {
+            Some(BluConstant::Integer(1)) => true,
+            Some(BluConstant::Number(value)) if *value == 1.0 => true,
+            _ => false,
+        };
+        if !increment_is_one {
+            return Ok(None);
+        }
+        let Some(counter) = upvalues.get(usize::from(counter_upvalue)).copied() else {
+            return Ok(None);
+        };
+        if !matches!(
+            self.heap.upvalue_get(counter)?,
+            Value::Integer(_) | Value::Number(_)
+        ) {
+            return Ok(None);
+        }
+        Ok(Some(FastSortComparator::LessThan {
+            reverse,
+            counter: Some(counter),
+        }))
+    }
+
     fn append_gsub_callback_result(
         &self,
         result: &mut Vec<u8>,
@@ -13837,7 +14365,13 @@ impl Vm {
                 .as_ref()
                 .map_or(Value::Nil, |error| runtime_error_value(error.clone()));
             let arguments = [value.clone(), error_value.clone()];
-            let argument_count = if final_error.is_some() { 2 } else { 1 };
+            let argument_count = if final_error.is_some()
+                || matches!(self.active_profile().ok(), Some(SemanticProfile::Lua54))
+            {
+                2
+            } else {
+                1
+            };
             let roots = match GcRoots::from_values(&[handler.clone(), value, error_value]) {
                 Ok(roots) => roots,
                 Err(error) => {
@@ -14148,6 +14682,14 @@ impl Vm {
                         Err(error @ RuntimeError::ProtectedCallActivation) => return Err(error),
                         Err(RuntimeError::Raised(value)) => {
                             vec![Value::Boolean(false), pcall_error_value(value, profile)]
+                        }
+                        Err(
+                            RuntimeError::CallLimit { .. } | RuntimeError::CStackOverflow { .. },
+                        ) if self.protected_call_handler_depth > 0 => {
+                            vec![
+                                Value::Boolean(false),
+                                Value::String(Arc::from(&b"error in error handling"[..])),
+                            ]
                         }
                         Err(RuntimeError::UnsupportedLibraryFeature {
                             function: "pcall",
@@ -14762,6 +15304,80 @@ impl Vm {
         }
     }
 
+    /// Invokes a loaded file from `dofile`, preserving a guest continuation
+    /// when the file yields.  The pending operation is consumed by the
+    /// surrounding Blu call frame and resumed through the normal native
+    /// operation path.
+    pub fn invoke_dofile_callback(
+        &mut self,
+        function: Value,
+        arguments: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        match self.invoke_native_callback("dofile", function, arguments) {
+            Err(error @ RuntimeError::CoroutineYield(_)) => {
+                let continuation = self.captured_blu_continuation.take().ok_or(
+                    RuntimeError::UnsupportedLibraryFeature {
+                        function: "dofile",
+                        feature: "yielding loaded files",
+                    },
+                )?;
+                self.pending_blu_operation = Some(PendingBluOperation::Dofile(PendingDofile {
+                    continuation: Box::new(continuation),
+                }));
+                Err(error)
+            }
+            result => result,
+        }
+    }
+
+    fn invoke_native_callback_without_yield_fast(
+        &mut self,
+        operation: &'static str,
+        function: Value,
+        arguments: &[Value],
+    ) -> Result<Vec<Value>, RuntimeError> {
+        let Some(mut context) = self.native_contexts.pop() else {
+            return Err(RuntimeError::UnsupportedLibraryFeature {
+                function: operation,
+                feature: "callback outside a native execution context",
+            });
+        };
+        let result = (|| {
+            let mut roots = context.roots.try_clone()?;
+            roots.extend(GcRoots::from_values(arguments)?)?;
+            if let Value::Closure(closure) = function
+                && self.heap.is_blu_closure(closure)?
+            {
+                self.call_blu_closure(
+                    closure,
+                    arguments,
+                    &mut context.remaining,
+                    context.depth,
+                    roots,
+                )
+            } else {
+                self.call_value(
+                    function,
+                    arguments,
+                    &mut context.remaining,
+                    context.depth,
+                    roots,
+                )
+            }
+        })();
+        self.native_contexts.push(context);
+        match result {
+            Err(RuntimeError::CoroutineYield(_)) => {
+                self.captured_blu_continuation.take();
+                Err(RuntimeError::UnsupportedLibraryFeature {
+                    function: operation,
+                    feature: "yielding callback",
+                })
+            }
+            result => result,
+        }
+    }
+
     fn native_table_get_without_yield(
         &mut self,
         operation: &'static str,
@@ -14970,6 +15586,33 @@ impl Vm {
         })();
         self.native_contexts.push(context);
         result
+    }
+
+    fn raw_table_get_fast(
+        &self,
+        value: &Value,
+        key: &Value,
+        profile: SemanticProfile,
+    ) -> Result<Option<Value>, RuntimeError> {
+        let Value::Table(table) = value else {
+            return Ok(None);
+        };
+        // These cases have observable special handling in `index_value` and
+        // must continue through the full metamethod-aware path.
+        if self.global_environment == Some(*table)
+            && matches!(key, Value::String(name) if name.as_ref() == b"_G")
+        {
+            return Ok(None);
+        }
+        if profile == SemanticProfile::Luau
+            && matches!(key, Value::String(name) if name.first() == Some(&0))
+        {
+            return Ok(None);
+        }
+        if self.heap.table_metatable(*table)?.is_some() {
+            return Ok(None);
+        }
+        Ok(Some(self.heap.table_get(*table, key)?))
     }
 
     fn index_value(
@@ -16451,6 +17094,7 @@ impl Vm {
                 ])
             }
         });
+        self.ipairs_next_function = Some(inext);
         let ipairs = self.register_function(move |vm, arguments| {
             let table = arguments.first().ok_or(RuntimeError::Argument {
                 function: "ipairs",
@@ -16910,7 +17554,14 @@ impl Vm {
                 try_clone_values(arguments, "assert results")
             } else {
                 let message = match arguments.get(1).cloned() {
-                    Some(message) => prefix_message(message)?,
+                    // Blu and Luau source engines prefix explicit strings,
+                    // while Lua family profiles preserve explicit objects.
+                    Some(message)
+                        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) =>
+                    {
+                        prefix_message(message)?
+                    }
+                    Some(message) => message,
                     None => prefix_message(Value::String(Arc::from(&b"assertion failed!"[..])))?,
                 };
                 Err(RuntimeError::Raised(message))
@@ -17099,6 +17750,11 @@ impl Vm {
                                 .max(0) as usize
                         }
                     };
+                    if vm.gc_mode == GcMode::Generational && requested == 0 {
+                        vm.collect(std::iter::empty())?;
+                        vm.named_vararg_pending_bytes = 0;
+                        return Ok(vec![Value::Boolean(true)]);
+                    }
                     let progress = vm.gc_step_work.saturating_add(requested);
                     if requested == 0 || progress < GC_STEP_WORK_UNITS {
                         vm.gc_step_work = progress.min(GC_STEP_WORK_UNITS);
@@ -17363,9 +18019,15 @@ impl Vm {
                     SemanticProfile::Blu | SemanticProfile::Lua54 | SemanticProfile::Lua55
                 )
             {
-                return Err(RuntimeError::Raised(Value::String(Arc::from(
-                    &b"for step is zero"[..],
-                ))));
+                let message = if matches!(
+                    vm.active_profile()?,
+                    SemanticProfile::Lua54 | SemanticProfile::Lua55
+                ) {
+                    &b"'for' step is zero"[..]
+                } else {
+                    &b"for step is zero"[..]
+                };
+                return Err(RuntimeError::Raised(Value::String(Arc::from(message))));
             }
             Ok(Vec::new())
         });
@@ -17430,6 +18092,56 @@ impl Vm {
         self.set_global(
             &b"__blu_internal_coerce_numeric_for"[..],
             Value::NativeFunction(coerce_numeric_for),
+        );
+
+        let coerce_numeric_for_index = self.register_function(|vm, arguments| {
+            let initial = arguments.first().ok_or(RuntimeError::Argument {
+                function: "numeric for",
+                index: 1,
+            })?;
+            let step = arguments.get(1).ok_or(RuntimeError::Argument {
+                function: "numeric for",
+                index: 2,
+            })?;
+            let profile = vm.active_profile()?;
+            let initial = arithmetic_numeric_value(initial, profile).ok_or(RuntimeError::Type {
+                operation: "numeric for",
+                expected: "number",
+                actual: initial.type_name(),
+            })?;
+            let step = arithmetic_numeric_value(step, profile).ok_or(RuntimeError::Type {
+                operation: "numeric for",
+                expected: "number",
+                actual: step.type_name(),
+            })?;
+            if matches!(initial, Value::Number(_)) || matches!(step, Value::Number(_)) {
+                return Ok(vec![Value::Number(
+                    initial
+                        .as_number()
+                        .expect("numeric-for initial value was validated"),
+                )]);
+            }
+            match profile {
+                SemanticProfile::Blu
+                | SemanticProfile::Lua53
+                | SemanticProfile::Lua54
+                | SemanticProfile::Lua55 => Ok(vec![initial]),
+                SemanticProfile::Luau | SemanticProfile::Lua51 | SemanticProfile::Lua52 => {
+                    Ok(vec![Value::Number(
+                        initial
+                            .as_number()
+                            .expect("numeric-for initial value was validated"),
+                    )])
+                }
+                profile => Err(RuntimeError::UnsupportedSemanticProfile {
+                    operation: "numeric for",
+                    profile,
+                }),
+            }
+        });
+        self.set_global(
+            &b"__blu_internal_coerce_numeric_for_index"[..],
+            Value::NativeFunction(coerce_numeric_for_index),
         );
 
         let prepare_iter = self.register_function(|vm, arguments| {
@@ -17529,10 +18241,8 @@ impl Vm {
                 }
                 return Ok(Vec::new());
             }
-            let modern_close = matches!(
-                vm.active_profile()?,
-                SemanticProfile::Lua54 | SemanticProfile::Lua55
-            );
+            let profile = vm.active_profile()?;
+            let modern_close = matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55);
             let handler = vm.metamethod(value, "__close")?.ok_or_else(|| {
                 if modern_close && vm.prefix_lua_errors {
                     RuntimeError::Raised(Value::String(Arc::from(
@@ -17553,7 +18263,11 @@ impl Vm {
                 .last()
                 .map_or(vm.blu_debug_frames.len(), |context| context.depth);
             let callback_arguments = [value.clone(), Value::Nil];
-            let callback_arguments = &callback_arguments[..1];
+            let callback_arguments = if profile == SemanticProfile::Lua54 {
+                &callback_arguments[..]
+            } else {
+                &callback_arguments[..1]
+            };
             let close_caller = vm.blu_debug_frames.last().cloned();
             let previous_close_caller =
                 core::mem::replace(&mut vm.debug_close_caller, close_caller);
@@ -17818,7 +18532,7 @@ impl Vm {
                 pattern: pattern.clone(),
                 next_start: usize::try_from(initial.saturating_sub(1)).unwrap_or(usize::MAX),
                 exhausted: initial > subject_len as i64 + 1,
-                previous_match_was_nonempty_at_end: false,
+                previous_nonempty_end: None,
             }));
             let iterator_state = state.clone();
             let iterator = vm.try_register_function(move |vm, _arguments| {
@@ -17833,30 +18547,18 @@ impl Vm {
                     return Ok(vec![Value::Nil]);
                 }
                 let profile = vm.active_profile()?;
-                let modern_empty_match = matches!(
-                    profile,
-                    SemanticProfile::Blu
-                        | SemanticProfile::Lua53
-                        | SemanticProfile::Lua54
-                        | SemanticProfile::Lua55
-                );
-                let Some(found) = find_basic_lua_pattern(
-                    &state.subject,
-                    &state.pattern,
-                    state.next_start,
+                let subject = state.subject.clone();
+                let pattern = state.pattern.clone();
+                let previous_nonempty_end = state.previous_nonempty_end;
+                let Some(found) = find_next_gsub_match(
+                    &subject,
+                    &pattern,
+                    &mut state.next_start,
+                    previous_nonempty_end,
                     "string.gmatch",
                     profile,
                 )?
                 else {
-                    state.exhausted = true;
-                    return Ok(vec![Value::Nil]);
-                };
-                if modern_empty_match
-                    && !state.pattern.is_empty()
-                    && found.start == found.end
-                    && found.start == state.subject.len()
-                    && state.previous_match_was_nonempty_at_end
-                {
                     state.exhausted = true;
                     return Ok(vec![Value::Nil]);
                 };
@@ -17883,8 +18585,9 @@ impl Vm {
                 } else {
                     state.exhausted = true;
                 }
-                state.previous_match_was_nonempty_at_end =
-                    found.start < found.end && found.end == state.subject.len();
+                if found.end > found.start {
+                    state.previous_nonempty_end = Some(found.end);
+                }
                 if values.len() > vm.native_result_limit {
                     return Err(RuntimeError::NativeResultLimit {
                         required: values.len(),
@@ -17904,13 +18607,20 @@ impl Vm {
         });
         let string_gsub = self.register_function(|vm, arguments| {
             let profile = vm.active_profile()?;
-            let haystack = string_bytes(
-                arguments.first().ok_or(RuntimeError::Argument {
-                    function: "string.gsub",
-                    index: 1,
-                })?,
-                "string.gsub",
-            )?;
+            let subject = match arguments.first().ok_or(RuntimeError::Argument {
+                function: "string.gsub",
+                index: 1,
+            })? {
+                Value::String(value) => value.clone(),
+                other => {
+                    return Err(RuntimeError::Type {
+                        operation: "string.gsub",
+                        expected: "string",
+                        actual: other.type_name(),
+                    });
+                }
+            };
+            let haystack = subject.as_ref();
             let pattern = string_bytes(
                 arguments.get(1).ok_or(RuntimeError::Argument {
                     function: "string.gsub",
@@ -17963,38 +18673,25 @@ impl Vm {
             let mut search_start = 0;
             let mut copied_until = 0;
             let mut replacements = 0;
-            let mut previous_match_was_nonempty_at_end = false;
-            let modern_empty_match = matches!(
-                profile,
-                SemanticProfile::Blu
-                    | SemanticProfile::Lua53
-                    | SemanticProfile::Lua54
-                    | SemanticProfile::Lua55
-            );
+            let mut previous_nonempty_end = None;
+            let mut changed = false;
             while replacements < replacement_limit && search_start <= haystack.len() {
-                let Some(found) = find_basic_lua_pattern(
+                let Some(found) = find_next_gsub_match(
                     haystack,
                     pattern,
-                    search_start,
+                    &mut search_start,
+                    previous_nonempty_end,
                     "string.gsub",
                     profile,
                 )?
                 else {
                     break;
                 };
-                if modern_empty_match
-                    && !pattern.is_empty()
-                    && !haystack.is_empty()
-                    && found.start == found.end
-                    && found.start == haystack.len()
-                    && previous_match_was_nonempty_at_end
-                {
-                    break;
-                }
                 let first = found.start;
                 let end = found.end;
                 append_limited_string(&mut result, &haystack[copied_until..first])?;
                 if let Some(replacement) = replacement.as_ref() {
+                    changed = true;
                     append_gsub_replacement(
                         &mut result,
                         replacement,
@@ -18038,12 +18735,14 @@ impl Vm {
                             )?;
                             vm.pending_blu_operation = Some(PendingBluOperation::StringGsub(
                                 Box::new(PendingStringGsub {
-                                    haystack: Arc::from(haystack),
+                                    haystack: Arc::clone(&subject),
                                     pattern: Arc::from(pattern),
                                     callback: replacement_value.clone(),
                                     result,
                                     search_start,
                                     copied_until,
+                                    previous_nonempty_end,
+                                    changed,
                                     replacements,
                                     replacement_limit,
                                     explicit_limit,
@@ -18059,8 +18758,12 @@ impl Vm {
                         Value::Nil | Value::Boolean(false) => {
                             append_limited_string(&mut result, &haystack[found.start..found.end])?;
                         }
-                        Value::String(value) => append_limited_string(&mut result, &value)?,
+                        Value::String(value) => {
+                            changed = true;
+                            append_limited_string(&mut result, &value)?;
+                        }
                         Value::Integer(_) | Value::Number(_) => {
+                            changed = true;
                             let value = try_concat_bytes(&callback_result)?
                                 .expect("numeric callback replacements are concatenable");
                             append_limited_string(&mut result, &value)?;
@@ -18084,13 +18787,29 @@ impl Vm {
                         Value::Boolean(false) => {
                             append_limited_string(&mut result, &haystack[found.start..found.end])?
                         }
-                        Value::String(value) => append_limited_string(&mut result, &value)?,
+                        Value::String(value) => {
+                            changed = true;
+                            append_limited_string(&mut result, &value)?;
+                        }
                         Value::Integer(_) | Value::Number(_) => {
+                            changed = true;
                             let value = try_concat_bytes(&value)?
                                 .expect("numeric replacements are concatenable");
                             append_limited_string(&mut result, &value)?;
                         }
                         other => {
+                            if matches!(
+                                profile,
+                                SemanticProfile::Lua52
+                                    | SemanticProfile::Lua53
+                                    | SemanticProfile::Lua54
+                                    | SemanticProfile::Lua55
+                            ) {
+                                return Err(RuntimeError::Raised(Value::String(Arc::from(
+                                    format!("invalid replacement value (a {})", other.type_name())
+                                        .into_bytes(),
+                                ))));
+                            }
                             return Err(RuntimeError::Type {
                                 operation: "string.gsub table replacement",
                                 expected: "string, number, false, or nil",
@@ -18100,8 +18819,9 @@ impl Vm {
                     }
                 }
                 replacements += 1;
-                previous_match_was_nonempty_at_end =
-                    found.start < found.end && found.end == haystack.len();
+                if end > first {
+                    previous_nonempty_end = Some(end);
+                }
                 if end > first {
                     search_start = end;
                     copied_until = end;
@@ -18116,10 +18836,11 @@ impl Vm {
             }
             if !explicit_limit
                 && replacements == MAX_DYNAMIC_REGISTERS
-                && find_basic_lua_pattern(
+                && find_next_gsub_match(
                     haystack,
                     pattern,
-                    search_start,
+                    &mut search_start,
+                    previous_nonempty_end,
                     "string.gsub",
                     vm.active_profile()?,
                 )?
@@ -18131,8 +18852,13 @@ impl Vm {
                 });
             }
             append_limited_string(&mut result, &haystack[copied_until..])?;
+            let output = if !changed && result.as_slice() == haystack {
+                subject
+            } else {
+                Arc::from(result)
+            };
             Ok(vec![
-                Value::String(Arc::from(result)),
+                Value::String(output),
                 profiled_integral_math_result(vm, "string.gsub", replacements as f64)?,
             ])
         });
@@ -19229,6 +19955,7 @@ impl Vm {
             match arguments.first() {
                 None | Some(Value::Nil) => {}
                 Some(Value::Table(table)) => {
+                    let profile = vm.active_profile()?;
                     let getter = vm.calendar_time_getter.as_ref().cloned().ok_or(
                         RuntimeError::UnsupportedLibraryFeature {
                             function: "os.time",
@@ -19243,9 +19970,30 @@ impl Vm {
                         minute: calendar_table_integer(vm, *table, b"min", Some(0))?,
                         second: calendar_table_integer(vm, *table, b"sec", Some(0))?,
                         is_dst: calendar_table_boolean(vm, *table, b"isdst")?,
+                    };
+                    let timestamp = getter(input)?;
+                    if matches!(
+                        profile,
+                        SemanticProfile::Lua53 | SemanticProfile::Lua54 | SemanticProfile::Lua55
+                    ) && let Some(calendar_getter) = vm.calendar_getter.as_ref().cloned()
+                    {
+                        let date = calendar_getter(Some(timestamp), false)?.validate()?;
+                        let roots = GcRoots::from_values(&[Value::Table(*table)])?;
+                        for (key, value) in [
+                            (b"year" as &[u8], Value::Integer(date.year)),
+                            (b"month", Value::Integer(date.month)),
+                            (b"day", Value::Integer(date.day)),
+                            (b"hour", Value::Integer(date.hour)),
+                            (b"min", Value::Integer(date.minute)),
+                            (b"sec", Value::Integer(date.second)),
+                            (b"wday", Value::Integer(date.weekday)),
+                            (b"yday", Value::Integer(date.yearday)),
+                            (b"isdst", Value::Boolean(date.is_dst)),
+                        ] {
+                            vm.table_set(*table, Value::String(Arc::from(key)), value, &roots)?;
+                        }
                     }
-                    .validate()?;
-                    return profiled_integer_result(vm, "os.time", getter(input)?)
+                    return profiled_integer_result(vm, "os.time", timestamp)
                         .map(|value| vec![value]);
                 }
                 Some(value) => {
@@ -19591,6 +20339,11 @@ impl Vm {
                 None | Some(Value::Nil) => &b"r"[..],
                 Some(value) => string_bytes(value, "io.popen")?,
             };
+            if !valid_io_file_mode(mode) {
+                return Err(RuntimeError::LuaMessage(Arc::from(
+                    &b"bad argument #2 to 'popen' (invalid mode)"[..],
+                )));
+            }
             let opener = vm.io_popen_opener.as_ref().cloned().ok_or(
                 RuntimeError::UnsupportedLibraryFeature {
                     function: "io.popen",
@@ -19635,6 +20388,10 @@ impl Vm {
             };
             close_io_file_result(vm, userdata, "io.close")
         });
+        let file_close = self.register_function(|vm, arguments| {
+            let (userdata, _) = io_file_argument(arguments, "file.close")?;
+            close_io_file_result(vm, userdata, "file.close")
+        });
         let gc = self.register_function(|vm, arguments| {
             let Some(Value::UserData(userdata)) = arguments.first() else {
                 return Err(RuntimeError::LuaMessage(Arc::from(
@@ -19642,6 +20399,17 @@ impl Vm {
                 )));
             };
             close_io_file_result(vm, *userdata, "__gc")
+        });
+        let file_close_scope = self.register_function(|vm, arguments| {
+            let (userdata, _) = io_file_argument(arguments, "file.__close")?;
+            if vm
+                .io_file_handles
+                .get(&userdata)
+                .is_some_and(|state| state.closed)
+            {
+                return Ok(vec![Value::Boolean(true)]);
+            }
+            close_io_file_result(vm, userdata, "file.__close")
         });
         let input = self.register_function(|vm, arguments| {
             let value = match arguments.first() {
@@ -19721,7 +20489,15 @@ impl Vm {
         let read = self.register_function(|vm, arguments| {
             let (userdata, format_index) =
                 io_file_or_default_argument(vm, arguments, IoDefaultStream::Input, "io.read")?;
-            let file = io_file_resource(vm, userdata, "io.read")?;
+            let file = match io_file_resource(vm, userdata, "io.read") {
+                Ok(file) => file,
+                Err(_) if format_index == 0 => {
+                    return Err(RuntimeError::LuaMessage(Arc::from(
+                        &b"io.read: input file is closed"[..],
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
             let formats = arguments.get(format_index..).unwrap_or_default();
             if formats.is_empty() {
                 return match io_read_value(vm, &file, None, "io.read")? {
@@ -19756,7 +20532,15 @@ impl Vm {
                 }
                 append_limited_string_value(&mut bytes, value, profile)?;
             }
-            let file = io_file_resource(vm, userdata, "io.write")?;
+            let file = match io_file_resource(vm, userdata, "io.write") {
+                Ok(file) => file,
+                Err(_) if first_value == 0 => {
+                    return Err(RuntimeError::LuaMessage(Arc::from(
+                        &b"io.write: output file is closed"[..],
+                    )));
+                }
+                Err(error) => return Err(error),
+            };
             match file.write(&bytes) {
                 Ok(()) => Ok(vec![Value::UserData(userdata)]),
                 Err(error) => io_operation_failure(error),
@@ -19935,6 +20719,11 @@ impl Vm {
                 arguments.get(format_index..).unwrap_or_default(),
                 "io.lines format upvalues",
             )?;
+            if format_values.len() > 250 {
+                return Err(RuntimeError::LuaMessage(Arc::from(
+                    &b"too many arguments"[..],
+                )));
+            }
             io_read_specs(vm, &format_values, 0, "io.lines")?;
             let iterator = vm.create_io_lines_iterator(userdata, format_values, auto_close)?;
             if auto_close
@@ -19970,11 +20759,7 @@ impl Vm {
                 index: 1,
             })?;
             let Value::UserData(userdata) = value else {
-                return Err(RuntimeError::Type {
-                    operation: "io.type",
-                    expected: "file handle",
-                    actual: value.type_name(),
-                });
+                return Ok(vec![Value::Nil]);
             };
             let Some(state) = vm.io_file_handles.get(userdata) else {
                 return Ok(vec![Value::Nil]);
@@ -19985,9 +20770,31 @@ impl Vm {
                 &b"file"[..]
             }))])
         });
+        let file_tostring = self.register_function(|vm, arguments| {
+            let value = arguments.first().ok_or(RuntimeError::Argument {
+                function: "file.__tostring",
+                index: 1,
+            })?;
+            let Value::UserData(userdata) = value else {
+                return Err(RuntimeError::Type {
+                    operation: "file.__tostring",
+                    expected: "file handle",
+                    actual: value.type_name(),
+                });
+            };
+            let closed = vm
+                .io_file_handles
+                .get(userdata)
+                .is_none_or(|state| state.closed);
+            Ok(vec![Value::String(Arc::from(if closed {
+                &b"file (closed)"[..]
+            } else {
+                &b"file (open)"[..]
+            }))])
+        });
         let file_methods = self.heap.allocate_table(0, 7)?;
         for (name, function) in [
-            (&b"close"[..], close),
+            (&b"close"[..], file_close),
             (&b"flush"[..], flush),
             (&b"lines"[..], file_lines),
             (&b"read"[..], read),
@@ -20001,11 +20808,26 @@ impl Vm {
                 Value::NativeFunction(function),
             )?;
         }
-        let file_metatable = self.heap.allocate_table(0, 2)?;
+        let file_metatable = self.heap.allocate_table(0, 5)?;
+        self.heap.table_set(
+            file_metatable,
+            Value::String(Arc::from(&b"__name"[..])),
+            Value::String(Arc::from(&b"FILE*"[..])),
+        )?;
         self.heap.table_set(
             file_metatable,
             Value::String(Arc::from(&b"__gc"[..])),
             Value::NativeFunction(gc),
+        )?;
+        self.heap.table_set(
+            file_metatable,
+            Value::String(Arc::from(&b"__close"[..])),
+            Value::NativeFunction(file_close_scope),
+        )?;
+        self.heap.table_set(
+            file_metatable,
+            Value::String(Arc::from(&b"__tostring"[..])),
+            Value::NativeFunction(file_tostring),
         )?;
         self.heap.table_set(
             file_metatable,
@@ -20054,8 +20876,10 @@ impl Vm {
                 what: "io file iterator registry",
             })?;
         let exhausted = Arc::new(Mutex::new(false));
+        let terminal_pending = Arc::new(Mutex::new(false));
         let iterator_slot = Arc::new(Mutex::new(None));
         let callback_exhausted = Arc::clone(&exhausted);
+        let callback_terminal_pending = Arc::clone(&terminal_pending);
         let callback_slot = Arc::clone(&iterator_slot);
         let iterator = self.try_register_function(move |vm, _arguments| {
             let mut exhausted =
@@ -20065,9 +20889,12 @@ impl Vm {
                         function: "io.lines",
                         feature: "iterator state unavailable",
                     })?;
-            if *exhausted {
-                return Ok(vec![Value::Nil]);
-            }
+            let mut terminal_pending = callback_terminal_pending.lock().map_err(|_| {
+                RuntimeError::UnsupportedLibraryFeature {
+                    function: "io.lines",
+                    feature: "iterator state unavailable",
+                }
+            })?;
             let closure = vm.active_native_closures.last().copied().ok_or(
                 RuntimeError::UnsupportedLibraryFeature {
                     function: "io.lines",
@@ -20139,6 +20966,19 @@ impl Vm {
                 }
                 (format_values, auto_close)
             };
+            if *exhausted {
+                if auto_close {
+                    return Err(RuntimeError::Raised(Value::String(Arc::from(
+                        &b"file is already closed"[..],
+                    ))));
+                }
+                return Ok(vec![Value::Nil]);
+            }
+            if *terminal_pending {
+                *terminal_pending = false;
+                *exhausted = true;
+                return Ok(vec![Value::Nil]);
+            }
             let specs = io_read_specs(vm, &format_values, 0, "io.lines")?;
             let file = io_file_resource(vm, userdata, "io.lines")?;
             let mut values = Vec::with_capacity(specs.len());
@@ -20150,7 +20990,11 @@ impl Vm {
                 let done = matches!(value, Value::Nil);
                 values.push(value);
                 if done {
-                    *exhausted = true;
+                    if values.len() == 1 {
+                        *exhausted = true;
+                    } else {
+                        *terminal_pending = true;
+                    }
                     let iterator = callback_slot.lock().map_err(|_| {
                         RuntimeError::UnsupportedLibraryFeature {
                             function: "io.lines",
@@ -20572,7 +21416,12 @@ impl Vm {
             Value::String(Arc::from(&b"k"[..])),
             &roots,
         )?;
-        self.set_table_metatable(hook_key, Some(hook_metatable))?;
+        // This weak registry table is an implementation detail of the debug
+        // library. It must not put every ordinary program on the expensive
+        // weak-string collection cadence; user-created weak tables set the VM
+        // flag through the public wrapper above.
+        self.heap
+            .set_table_metatable(hook_key, Some(hook_metatable))?;
         let getinfo = self.register_function(|vm, arguments| {
             let target = arguments.first().ok_or(RuntimeError::Argument {
                 function: "debug.getinfo",
@@ -21553,6 +22402,52 @@ impl Vm {
                 .get(usize::from(local.register))
                 .cloned()
                 .unwrap_or(Value::Nil);
+            let value = if local.name.as_slice() == b"(for state)"
+                && prototype
+                    .locals
+                    .iter()
+                    .filter(|candidate| candidate.start_pc <= pc && pc < candidate.end_pc)
+                    .take(index)
+                    .filter(|candidate| candidate.name.as_slice() == b"(for state)")
+                    .count()
+                    == 3
+            {
+                let iterator_register = prototype
+                    .locals
+                    .iter()
+                    .filter(|candidate| candidate.start_pc <= pc && pc < candidate.end_pc)
+                    .find(|candidate| candidate.name.as_slice() == b"(for state)")
+                    .map(|candidate| candidate.register);
+                let auto_close_file = iterator_register
+                    .and_then(|register| frame.registers.get(usize::from(register)))
+                    .and_then(|value| match value {
+                        Value::Closure(closure) => Some(*closure),
+                        _ => None,
+                    })
+                    .and_then(|closure| {
+                        let upvalues = vm.heap.native_closure_upvalues(closure).ok()??;
+                        let userdata = upvalues
+                            .first()
+                            .and_then(|upvalue| vm.heap.upvalue_get(*upvalue).ok())
+                            .and_then(|value| match value {
+                                Value::UserData(userdata) => Some(userdata),
+                                _ => None,
+                            })?;
+                        let auto_close_index = if profile == SemanticProfile::Lua51 {
+                            1
+                        } else {
+                            2
+                        };
+                        let auto_close = upvalues
+                            .get(auto_close_index)
+                            .and_then(|upvalue| vm.heap.upvalue_get(*upvalue).ok())
+                            .is_some_and(|value| value.is_truthy());
+                        auto_close.then_some(userdata)
+                    });
+                auto_close_file.map_or(value, Value::UserData)
+            } else {
+                value
+            };
             Ok(vec![
                 Value::String(if local.name.is_empty() {
                     Arc::from(&b"(temporary)"[..])
@@ -22495,6 +23390,19 @@ impl Vm {
                     live_frames
                 }
             };
+            // Luau's protected traceback handler omits the synthetic caller
+            // retained while xpcall transfers control from its target to the
+            // handler.  Blu keeps that frame for continuation/debug recovery,
+            // so hide the one corresponding entry from the user-visible
+            // Luau traceback while the handler is active.
+            if luau_traceback
+                && target_thread.is_none()
+                && luau_error_location.is_some()
+                && vm.protected_call_handler_depth > 0
+                && frames.len() > 1
+            {
+                frames.pop();
+            }
             // Lua unwinds the protected target's active caller before asking
             // debug.traceback to format a stack-overflow error.  The owned
             // VM retains that caller snapshot for recovery, so discard the
@@ -22526,6 +23434,7 @@ impl Vm {
             if luau_traceback
                 && target_thread.is_none()
                 && vm.blu_debug_frames.is_empty()
+                && vm.protected_call_handler_depth == 0
                 && let Some(location) = luau_error_location
             {
                 append_limited_string(&mut result, location)?;
@@ -24174,10 +25083,9 @@ impl Vm {
                     (position, value.clone(), false)
                 }
                 _ => {
-                    return Err(RuntimeError::Argument {
-                        function: "table.insert",
-                        index: 2,
-                    });
+                    return Err(RuntimeError::Raised(Value::String(Arc::from(
+                        &b"wrong number of arguments to 'insert'"[..],
+                    ))));
                 }
             };
             if position < 1 || position > length.saturating_add(1) {
@@ -24241,7 +25149,25 @@ impl Vm {
             } else {
                 length
             };
-            if position < 1 || position > length {
+            let modern_position_rules = matches!(
+                profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua52
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            );
+            if modern_position_rules {
+                let valid =
+                    position == length || (position >= 1 && position <= length.saturating_add(1));
+                if !valid {
+                    return Err(RuntimeError::TablePosition {
+                        function: "table.remove",
+                        position,
+                        length: usize::try_from(length).unwrap_or(usize::MAX),
+                    });
+                }
+            } else if position < 1 || position > length {
                 return Ok(vec![Value::Nil]);
             }
             let table_value = Value::Table(table);
@@ -24269,10 +25195,11 @@ impl Vm {
                     value,
                 )?;
             }
+            let clear_position = if position > length { position } else { length };
             vm.native_table_set_without_yield(
                 "table.remove",
                 table_value,
-                Value::Integer(length as i64),
+                Value::Integer(clear_position as i64),
                 Value::Nil,
             )?;
             Ok(vec![removed])
@@ -24488,6 +25415,9 @@ impl Vm {
             if profile == SemanticProfile::Luau && count > i128::from(i32::MAX) {
                 return Err(table_move_argument_error(3, "too many elements to move"));
             }
+            if count > i128::from(i64::MAX) {
+                return Err(table_move_argument_error(3, "too many elements to move"));
+            }
             let final_target = i128::from(target) + count - 1;
             let position_range = if profile == SemanticProfile::Luau {
                 i128::from(i32::MIN)..=i128::from(i32::MAX)
@@ -24497,14 +25427,15 @@ impl Vm {
             if !position_range.contains(&final_target) {
                 return Err(table_move_argument_error(4, "destination wrap around"));
             }
+            let has_metamethods = vm.heap.table_metatable(source)?.is_some()
+                || vm.heap.table_metatable(destination)?.is_some();
+            if count > MAX_DYNAMIC_REGISTERS as i128 && !has_metamethods {
+                return Err(table_move_argument_error(3, "too many elements to move"));
+            }
             let count = usize::try_from(count).map_err(|_| RuntimeError::StackLimit {
                 required: usize::MAX,
                 limit: MAX_DYNAMIC_REGISTERS,
             })?;
-            if count > MAX_DYNAMIC_REGISTERS {
-                return Err(table_move_argument_error(3, "too many elements to move"));
-            }
-            let roots = GcRoots::from_values(arguments)?;
             let backwards =
                 source == destination && target > first && i128::from(target) <= i128::from(last);
             for offset in 0..count {
@@ -24517,8 +25448,17 @@ impl Vm {
                     required: count,
                     limit: MAX_DYNAMIC_REGISTERS,
                 })?;
-                let value = vm.heap.table_get(source, &Value::Integer(first + offset))?;
-                vm.table_set(destination, Value::Integer(target + offset), value, &roots)?;
+                let value = vm.native_table_get_without_yield(
+                    "table.move",
+                    Value::Table(source),
+                    Value::Integer(first + offset),
+                )?;
+                vm.native_table_set_without_yield(
+                    "table.move",
+                    Value::Table(destination),
+                    Value::Integer(target + offset),
+                    value,
+                )?;
             }
             Ok(vec![Value::Table(destination)])
         });
@@ -24584,11 +25524,27 @@ impl Vm {
                 });
             }
             let length = vm.table_library_length(profile, table, "table.sort")?;
+            if length <= 0 {
+                return Ok(Vec::new());
+            }
             let length = usize::try_from(length).map_err(|_| RuntimeError::StackLimit {
                 required: usize::MAX,
                 limit: MAX_DYNAMIC_REGISTERS,
             })?;
             if length > MAX_DYNAMIC_REGISTERS {
+                if matches!(
+                    profile,
+                    SemanticProfile::Blu
+                        | SemanticProfile::Lua51
+                        | SemanticProfile::Lua52
+                        | SemanticProfile::Lua53
+                        | SemanticProfile::Lua54
+                        | SemanticProfile::Lua55
+                ) {
+                    return Err(RuntimeError::Raised(Value::String(Arc::from(
+                        &b"too big"[..],
+                    ))));
+                }
                 return Err(RuntimeError::StackLimit {
                     required: length,
                     limit: MAX_DYNAMIC_REGISTERS,
@@ -24607,6 +25563,39 @@ impl Vm {
                 .all(|value| value.as_number().is_some_and(|value| !value.is_nan()));
             let strings = values.iter().all(|value| matches!(value, Value::String(_)));
             if let Some(comparator) = comparator {
+                if vm.running_thread.is_none()
+                    && let Some(comparator_kind) = vm.fast_table_sort_comparator(comparator)?
+                    && (numeric || strings || comparator_kind.accepts_non_orderable_values())
+                {
+                    let mut callback_error = None;
+                    values.sort_unstable_by(|left, right| {
+                        if callback_error.is_some() {
+                            return core::cmp::Ordering::Equal;
+                        }
+                        if let Err(error) = comparator_kind.bump_counter(vm) {
+                            callback_error = Some(error);
+                            return core::cmp::Ordering::Equal;
+                        }
+                        let left_result = comparator_kind.result(left, right, numeric, strings);
+                        if left_result == Some(true) {
+                            core::cmp::Ordering::Less
+                        } else {
+                            if let Err(error) = comparator_kind.bump_counter(vm) {
+                                callback_error = Some(error);
+                                return core::cmp::Ordering::Equal;
+                            }
+                            if comparator_kind.result(right, left, numeric, strings) == Some(true) {
+                                core::cmp::Ordering::Greater
+                            } else {
+                                core::cmp::Ordering::Equal
+                            }
+                        }
+                    });
+                    if let Some(error) = callback_error {
+                        return Err(error);
+                    }
+                    return vm.finish_table_sort(table, values);
+                }
                 let mut callback_roots = GcRoots::from_values(&values)?;
                 callback_roots.extend(GcRoots::from_values(arguments)?)?;
                 vm.native_contexts
@@ -24622,22 +25611,25 @@ impl Vm {
                 // suspend and its exact insertion position is retained in
                 // `PendingTableSort`.  A comparator running on the main
                 // thread cannot yield, however, and Luau's official sort
-                // stress relies on the corresponding O(n log n) path.  Use
+                // stress relies on the corresponding O(n log n) path. Use
                 // the standard unstable sort there while preserving the
-                // structured error boundary for callbacks that fail.
-                if profile == SemanticProfile::Luau && vm.running_thread.is_none() {
+                // structured error boundary for callbacks that fail. This
+                // applies to every profile on the main thread: the official
+                // Lua corpus also sorts large arrays with a comparator.
+                if vm.running_thread.is_none() {
                     let initial_mutation = vm.heap.table_mutation(table)?;
                     let mut callback_error = None;
                     values.sort_unstable_by(|left, right| {
                         if callback_error.is_some() {
                             return core::cmp::Ordering::Equal;
                         }
-                        let left_result = vm.invoke_native_callback(
+                        let left_result = vm.invoke_native_callback_without_yield_fast(
                             "table.sort",
                             comparator.clone(),
                             &[left.clone(), right.clone()],
                         );
-                        if callback_error.is_none()
+                        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
+                            && callback_error.is_none()
                             && vm.heap.table_mutation(table).ok() != Some(initial_mutation)
                         {
                             callback_error = Some(RuntimeError::Raised(Value::String(Arc::from(
@@ -24655,12 +25647,13 @@ impl Vm {
                         if left_less {
                             return core::cmp::Ordering::Less;
                         }
-                        let right_result = vm.invoke_native_callback(
+                        let right_result = vm.invoke_native_callback_without_yield_fast(
                             "table.sort",
                             comparator.clone(),
                             &[right.clone(), left.clone()],
                         );
-                        if callback_error.is_none()
+                        if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau)
+                            && callback_error.is_none()
                             && vm.heap.table_mutation(table).ok() != Some(initial_mutation)
                         {
                             callback_error = Some(RuntimeError::Raised(Value::String(Arc::from(
@@ -24682,6 +25675,7 @@ impl Vm {
                     if let Some(error) = callback_error {
                         return Err(error);
                     }
+                    vm.validate_table_sort_comparator(comparator, &values)?;
                     return vm.finish_table_sort(table, values);
                 }
                 for index in 1..values.len() {
@@ -24727,6 +25721,7 @@ impl Vm {
                     }
                     values[position] = value;
                 }
+                vm.validate_table_sort_comparator(comparator, &values)?;
             } else if numeric {
                 values.sort_unstable_by(|left, right| {
                     if left.numeric_less(right) == Some(true) {
@@ -24817,9 +25812,7 @@ impl Vm {
             }
             let count = profile_integer_argument(profile, arguments, 0, "table.create")?;
             if count < 0 {
-                return Err(RuntimeError::InvalidRange {
-                    operation: "table.create",
-                });
+                return Err(RuntimeError::TableCreateOutOfRange { kind: "array" });
             }
             let count = usize::try_from(count).map_err(|_| RuntimeError::TableCapacity {
                 kind: "array",
@@ -24827,19 +25820,36 @@ impl Vm {
                 limit: MAX_TABLE_INITIAL_CAPACITY,
             })?;
             if count > MAX_TABLE_INITIAL_CAPACITY {
-                return Err(RuntimeError::TableCapacity {
-                    kind: "array",
-                    requested: count as u64,
-                    limit: MAX_TABLE_INITIAL_CAPACITY,
+                return Err(if count <= i32::MAX as usize {
+                    RuntimeError::TableCreateOverflow
+                } else {
+                    RuntimeError::TableCreateOutOfRange { kind: "array" }
                 });
             }
-            let fill = if profile == SemanticProfile::Lua55 {
-                Value::Nil
+            let (hash_capacity, fill) = if profile == SemanticProfile::Lua55 {
+                let hash_capacity = arguments
+                    .get(1)
+                    .map(|_| profile_integer_argument(profile, arguments, 1, "table.create"))
+                    .transpose()?
+                    .unwrap_or(0);
+                if hash_capacity < 0 {
+                    return Err(RuntimeError::TableCreateOutOfRange { kind: "hash" });
+                }
+                let hash_capacity = usize::try_from(hash_capacity)
+                    .map_err(|_| RuntimeError::TableCreateOutOfRange { kind: "hash" })?;
+                if hash_capacity > MAX_TABLE_INITIAL_CAPACITY {
+                    return Err(if hash_capacity <= i32::MAX as usize {
+                        RuntimeError::TableCreateOverflow
+                    } else {
+                        RuntimeError::TableCreateOutOfRange { kind: "hash" }
+                    });
+                }
+                (hash_capacity, Value::Nil)
             } else {
-                arguments.get(1).cloned().unwrap_or(Value::Nil)
+                (0, arguments.get(1).cloned().unwrap_or(Value::Nil))
             };
             let roots = GcRoots::from_values(arguments)?;
-            let table = vm.allocate_table(count, 0, &roots)?;
+            let table = vm.allocate_table(count, hash_capacity, &roots)?;
             vm.heap.table_mark_preallocated_array_boundary(table)?;
             if !matches!(fill, Value::Nil) {
                 for index in 1..=count {
@@ -26889,20 +27899,15 @@ fn table_sort_yield_error(
 ) -> RuntimeError {
     match profile {
         Err(error) => error,
-        Ok(profile)
-            if matches!(
-                profile,
-                SemanticProfile::Lua51
-                    | SemanticProfile::Lua52
-                    | SemanticProfile::Lua53
-                    | SemanticProfile::Lua54
-                    | SemanticProfile::Lua55
-            ) =>
-        {
-            RuntimeError::Raised(Value::String(Arc::from(
-                &b"attempt to yield across a C-call boundary"[..],
-            )))
-        }
+        Ok(
+            SemanticProfile::Lua51
+            | SemanticProfile::Lua52
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55,
+        ) => RuntimeError::Raised(Value::String(Arc::from(
+            &b"attempt to yield across a C-call boundary"[..],
+        ))),
         Ok(_) => RuntimeError::UnsupportedLibraryFeature {
             function: "table.sort",
             feature,
@@ -26916,9 +27921,13 @@ fn io_file_argument(
 ) -> Result<(UserDataId, usize), RuntimeError> {
     match arguments.first() {
         Some(Value::UserData(userdata)) => Ok((*userdata, 1)),
-        Some(_) | None => Err(RuntimeError::UnsupportedLibraryFeature {
-            function,
-            feature: "a file handle (default streams are not configured)",
+        None => Err(RuntimeError::LuaMessage(Arc::from(
+            format!("bad argument #1 to '{function}' (FILE* expected, got no value)").into_bytes(),
+        ))),
+        Some(value) => Err(RuntimeError::Type {
+            operation: function,
+            expected: "file handle",
+            actual: value.type_name(),
         }),
     }
 }
@@ -26929,16 +27938,26 @@ fn open_io_file(
     path: &[u8],
     mode: &[u8],
 ) -> Result<Vec<Value>, RuntimeError> {
+    if !valid_io_file_mode(mode) {
+        return Err(RuntimeError::LuaMessage(Arc::from(
+            &b"bad argument #2 to 'open' (invalid mode)"[..],
+        )));
+    }
     let Some(opener) = vm.io_file_opener.as_ref().cloned() else {
         return Ok(vec![
             Value::Nil,
             Value::String(Arc::from(&b"io.open host file opener unavailable"[..])),
+            Value::Number(1.0),
         ]);
     };
     let file = match opener(path, mode) {
         Ok(file) => file,
         Err(error) => {
-            return Ok(vec![Value::Nil, runtime_error_value(error)]);
+            return Ok(vec![
+                Value::Nil,
+                runtime_error_value(error),
+                Value::Number(1.0),
+            ]);
         }
     };
     vm.io_file_handles
@@ -26957,6 +27976,16 @@ fn open_io_file(
         },
     );
     Ok(vec![Value::UserData(userdata)])
+}
+
+fn valid_io_file_mode(mode: &[u8]) -> bool {
+    let Some(first) = mode.first() else {
+        return false;
+    };
+    if !matches!(first, b'r' | b'w' | b'a') {
+        return false;
+    }
+    matches!(&mode[1..], b"" | b"b" | b"+" | b"+b")
 }
 
 fn open_io_file_required(
@@ -27036,11 +28065,13 @@ fn close_io_file(
                 &b"attempt to use a closed file"[..],
             ))));
         }
-        state.closed = true;
         Arc::clone(&state.file)
     };
-    vm.io_file_iterators.retain(|_, handle| *handle != userdata);
     file.close()?;
+    if let Some(state) = vm.io_file_handles.get_mut(&userdata) {
+        state.closed = true;
+    }
+    vm.io_file_iterators.retain(|_, handle| *handle != userdata);
     Ok(())
 }
 
@@ -27050,12 +28081,14 @@ fn close_io_file_result(
     function: &'static str,
 ) -> Result<Vec<Value>, RuntimeError> {
     let file = io_file_resource(vm, userdata, function)?;
-    if let Some(state) = vm.io_file_handles.get_mut(&userdata) {
-        state.closed = true;
-    }
-    vm.io_file_iterators.retain(|_, handle| *handle != userdata);
     match file.close() {
-        Ok(()) => Ok(vec![Value::Boolean(true)]),
+        Ok(()) => {
+            if let Some(state) = vm.io_file_handles.get_mut(&userdata) {
+                state.closed = true;
+            }
+            vm.io_file_iterators.retain(|_, handle| *handle != userdata);
+            Ok(vec![Value::Boolean(true)])
+        }
         Err(error) => io_operation_failure(error),
     }
 }
@@ -27064,7 +28097,11 @@ fn io_operation_failure(error: RuntimeError) -> Result<Vec<Value>, RuntimeError>
     if matches!(error, RuntimeError::UnsupportedLibraryFeature { .. }) {
         Err(error)
     } else {
-        Ok(vec![Value::Nil, runtime_error_value(error)])
+        Ok(vec![
+            Value::Nil,
+            runtime_error_value(error),
+            Value::Number(1.0),
+        ])
     }
 }
 
@@ -27097,16 +28134,14 @@ fn io_read_request(
     match value {
         None | Some(Value::Nil) => Ok(IoReadRequest::Line { keep_end: false }),
         Some(Value::String(format)) => match format.as_ref() {
-            b"*a" => Ok(IoReadRequest::All),
-            b"*l" => Ok(IoReadRequest::Line { keep_end: false }),
-            b"*L" => Ok(IoReadRequest::Line { keep_end: true }),
+            b"*a" | b"a" | b"all" => Ok(IoReadRequest::All),
+            b"*l" | b"l" => Ok(IoReadRequest::Line { keep_end: false }),
+            b"*L" | b"L" => Ok(IoReadRequest::Line { keep_end: true }),
             b"*n" => Err(RuntimeError::UnsupportedLibraryFeature {
                 function,
                 feature: "numeric file reads",
             }),
-            _ => Err(RuntimeError::InvalidRange {
-                operation: "io.read format",
-            }),
+            _ => Err(RuntimeError::LuaMessage(Arc::from(&b"invalid format"[..]))),
         },
         Some(value) => {
             let profile = vm.active_profile()?;
@@ -27162,7 +28197,8 @@ fn io_read_spec(
     value: Option<&Value>,
     function: &'static str,
 ) -> Result<IoReadSpec, RuntimeError> {
-    if matches!(value, Some(Value::String(format)) if format.as_ref() == b"*n") {
+    if matches!(value, Some(Value::String(format)) if format.as_ref() == b"*n" || format.as_ref() == b"n")
+    {
         Ok(IoReadSpec::Number)
     } else {
         Ok(IoReadSpec::Request(io_read_request(vm, value, function)?))
@@ -27213,6 +28249,9 @@ fn io_read_spec_value(
     };
     match bytes {
         Some(bytes) => limited_string_value(&bytes).map(IoReadValue::Value),
+        None if matches!(request, IoReadRequest::All) => {
+            Ok(IoReadValue::Value(Value::String(Arc::from(&b""[..]))))
+        }
         None => Ok(IoReadValue::Value(Value::Nil)),
     }
 }
@@ -27320,10 +28359,11 @@ fn unpack_table_values(
     if end < start {
         return Ok(Vec::new());
     }
-    let count = usize::try_from(end - start + 1).map_err(|_| RuntimeError::StackLimit {
-        required: usize::MAX,
-        limit: MAX_DYNAMIC_REGISTERS,
-    })?;
+    let count = end
+        .checked_sub(start)
+        .and_then(|count| count.checked_add(1))
+        .and_then(|count| usize::try_from(count).ok())
+        .unwrap_or(usize::MAX);
     let result_limit = match profile {
         SemanticProfile::Blu | SemanticProfile::Luau => MAX_LUAU_UNPACK_RESULTS,
         SemanticProfile::Lua54 | SemanticProfile::Lua55 => MAX_DYNAMIC_REGISTERS - 1,
@@ -27433,7 +28473,7 @@ fn string_pack_format_error(function: &'static str, feature: &'static str) -> Ru
 fn string_pack_max_size(profile: SemanticProfile) -> usize {
     if profile == SemanticProfile::Lua55 {
         i64::MAX as usize
-    } else if profile == SemanticProfile::Luau {
+    } else if matches!(profile, SemanticProfile::Blu | SemanticProfile::Luau) {
         1 << 30
     } else {
         MAX_PACKSIZE_BYTES
@@ -27454,7 +28494,13 @@ fn string_pack_read_size(
         value = value
             .checked_mul(10)
             .and_then(|value| value.checked_add(usize::from(byte - b'0')))
-            .ok_or(string_pack_format_error(function, "invalid format"))?;
+            .ok_or_else(|| {
+                if maximum == (1 << 30) {
+                    string_pack_format_error(function, "too large")
+                } else {
+                    string_pack_format_error(function, "invalid format")
+                }
+            })?;
     }
     if *cursor == start {
         return default.ok_or(string_pack_format_error(function, "missing size"));
@@ -29238,7 +30284,7 @@ struct GmatchState {
     pattern: Arc<[u8]>,
     next_start: usize,
     exhausted: bool,
-    previous_match_was_nonempty_at_end: bool,
+    previous_nonempty_end: Option<usize>,
 }
 
 struct Utf8CodesState {
@@ -29255,6 +30301,9 @@ fn find_basic_lua_pattern(
     operation: &'static str,
     profile: SemanticProfile,
 ) -> Result<Option<BasicPatternMatch>, RuntimeError> {
+    if start > haystack.len() {
+        return Ok(None);
+    }
     // Literal-only patterns are common in error-message probes and do not
     // need the backtracking matcher. Besides being faster, this keeps a long
     // literal search from consuming the bounded pattern-work budget before
@@ -29337,6 +30386,10 @@ fn find_basic_lua_pattern(
                 BasicPatternAtom::Class(escaped)
             } else if matches!(escaped, b'1'..=b'9') {
                 BasicPatternAtom::Backreference(escaped - b'1')
+            } else if escaped.is_ascii_digit() {
+                return Err(RuntimeError::Raised(Value::String(Arc::from(
+                    format!("invalid capture index %{}", escaped as char).into_bytes(),
+                ))));
             } else if escaped.is_ascii_alphanumeric() {
                 return Err(RuntimeError::UnsupportedLibraryFeature {
                     function: operation,
@@ -29589,7 +30642,7 @@ fn match_basic_pattern_at(
                     }
                     continue;
                 }
-                if let BasicPatternAtom::Backreference(capture) = current.atom {
+                if let BasicPatternAtom::Backreference(capture_index) = current.atom {
                     if !matches!(current.repetition, BasicPatternRepetition::One) {
                         return Err(RuntimeError::UnsupportedLibraryFeature {
                             function: operation,
@@ -29597,12 +30650,11 @@ fn match_basic_pattern_at(
                         });
                     }
                     let captures = materialize_basic_captures(&events, event);
-                    let capture = captures[usize::from(capture)];
+                    let capture = captures[usize::from(capture_index)];
                     if !capture.set {
-                        return Err(RuntimeError::UnsupportedLibraryFeature {
-                            function: operation,
-                            feature: "invalid Lua pattern capture reference",
-                        });
+                        return Err(RuntimeError::Raised(Value::String(Arc::from(
+                            format!("invalid capture index %{}", capture_index + 1).into_bytes(),
+                        ))));
                     }
                     if capture.position {
                         continue;
@@ -30446,6 +31498,7 @@ fn advance_gsub_operation(operation: &mut PendingStringGsub) {
     operation.replacements += 1;
     let found = operation.found;
     if found.end > found.start {
+        operation.previous_nonempty_end = Some(found.end);
         operation.search_start = found.end;
         operation.copied_until = found.end;
     } else if found.start < operation.haystack.len() {
@@ -30454,6 +31507,38 @@ fn advance_gsub_operation(operation: &mut PendingStringGsub) {
     } else {
         operation.search_start = operation.haystack.len() + 1;
         operation.copied_until = operation.haystack.len();
+    }
+}
+
+fn find_next_gsub_match(
+    haystack: &[u8],
+    pattern: &[u8],
+    search_start: &mut usize,
+    previous_nonempty_end: Option<usize>,
+    operation: &'static str,
+    profile: SemanticProfile,
+) -> Result<Option<BasicPatternMatch>, RuntimeError> {
+    let modern_empty_match = matches!(
+        profile,
+        SemanticProfile::Blu
+            | SemanticProfile::Lua53
+            | SemanticProfile::Lua54
+            | SemanticProfile::Lua55
+    );
+    loop {
+        let Some(found) =
+            find_basic_lua_pattern(haystack, pattern, *search_start, operation, profile)?
+        else {
+            return Ok(None);
+        };
+        if modern_empty_match
+            && found.start == found.end
+            && previous_nonempty_end == Some(found.start)
+        {
+            *search_start = found.start.saturating_add(1);
+            continue;
+        }
+        return Ok(Some(found));
     }
 }
 
@@ -30531,10 +31616,9 @@ fn append_gsub_replacement(
                         .get(capture_index)
                         .filter(|capture| capture_index < found.capture_count && capture.set);
                     let Some(capture) = capture else {
-                        return Err(RuntimeError::UnsupportedLibraryFeature {
-                            function: "string.gsub",
-                            feature: "invalid replacement capture reference",
-                        });
+                        return Err(RuntimeError::Raised(Value::String(Arc::from(
+                            format!("invalid capture index %{}", capture_index + 1).into_bytes(),
+                        ))));
                     };
                     if capture.position {
                         append_usize_decimal(result, capture.start + 1)?;
@@ -30547,10 +31631,9 @@ fn append_gsub_replacement(
                 if profile == SemanticProfile::Lua51 {
                     append_limited_string(result, &replacement[index + 1..index + 2])?;
                 } else {
-                    return Err(RuntimeError::UnsupportedLibraryFeature {
-                        function: "string.gsub",
-                        feature: "nonportable replacement escapes",
-                    });
+                    return Err(RuntimeError::Raised(Value::String(Arc::from(
+                        b"invalid use of '%'".as_slice(),
+                    ))));
                 }
             }
         }
@@ -31884,6 +32967,7 @@ fn inject_pending_resume_error(
 fn pending_blu_operation_roots(operation: &PendingBluOperation) -> Result<GcRoots, RuntimeError> {
     match operation {
         PendingBluOperation::ResumeValues => Ok(GcRoots::default()),
+        PendingBluOperation::Dofile(operation) => blu_continuation_roots(&operation.continuation),
         PendingBluOperation::Close(operation) => {
             let mut roots = GcRoots::from_values(&operation.values)?;
             if let Some(RuntimeError::Raised(value)) = &operation.error {
@@ -32129,10 +33213,10 @@ fn calendar_table_integer(
     let profile = vm.active_profile()?;
     let value = vm.heap.table_get(table, &Value::String(Arc::from(key)))?;
     if matches!(value, Value::Nil) {
-        return default.ok_or(RuntimeError::Type {
-            operation: "os.time",
-            expected: "number",
-            actual: "nil",
+        return default.ok_or_else(|| {
+            RuntimeError::LuaMessage(Arc::from(
+                format!("field '{}' is missing", String::from_utf8_lossy(key)).into_bytes(),
+            ))
         });
     }
     let integer = exact_integer_conversion(&value, profile).or_else(|| {
@@ -32145,10 +33229,10 @@ fn calendar_table_integer(
             None
         }
     });
-    integer.ok_or(RuntimeError::Type {
-        operation: "os.time",
-        expected: "integer-valued number",
-        actual: value.type_name(),
+    integer.ok_or_else(|| {
+        RuntimeError::LuaMessage(Arc::from(
+            format!("field '{}' is not an integer", String::from_utf8_lossy(key)).into_bytes(),
+        ))
     })
 }
 
@@ -32376,10 +33460,14 @@ fn dump_blu_function(
             } else {
                 original.last_line_defined
             },
-            required_features: if *original_index == main {
+            required_features: (if *original_index == main {
                 original.required_features | FeatureBits::DUMPED_FUNCTION
             } else {
                 original.required_features
+            }) | if strip {
+                FeatureBits::STRIPPED_DEBUG_LINES
+            } else {
+                FeatureBits::empty()
             },
             constants,
             upvalues: try_clone_slice(&original.upvalues, "string.dump upvalues")?,
@@ -32392,7 +33480,11 @@ fn dump_blu_function(
         });
     }
     let projected = BluArtifact {
-        format: artifact.format,
+        format: if strip {
+            blu_bytecode::blu::BytecodeFormat::BluV1
+        } else {
+            artifact.format
+        },
         compiler,
         sources,
         prototypes,
@@ -33520,6 +34612,10 @@ pub enum RuntimeError {
         requested: u64,
         limit: usize,
     },
+    TableCreateOutOfRange {
+        kind: &'static str,
+    },
+    TableCreateOverflow,
     ProtectedCallActivation,
     CoroutineYield(Vec<Value>),
     CoroutineCloseYield(Arc<[u8]>),
@@ -33763,6 +34859,10 @@ impl fmt::Display for RuntimeError {
                 f,
                 "table {kind} capacity {requested} exceeds initial capacity limit {limit}"
             ),
+            Self::TableCreateOutOfRange { kind } => {
+                write!(f, "table {kind} capacity is out of range")
+            }
+            Self::TableCreateOverflow => f.write_str("table overflow"),
             Self::ProtectedCallActivation => {
                 f.write_str("protected call requires an iterative activation")
             }

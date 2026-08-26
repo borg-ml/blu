@@ -410,7 +410,7 @@ enum BindingName {
     GlobalDefault,
     ImplicitSelf,
     ImplicitEnvironment,
-    ImplicitToClose,
+    ImplicitForState,
 }
 
 impl BindingName {
@@ -418,7 +418,9 @@ impl BindingName {
         let expected = match self {
             Self::Source(span) => source.slice(span)?,
             Self::Global(span) => source.slice(span)?,
-            Self::GlobalWildcard | Self::GlobalDefault | Self::ImplicitToClose => return Ok(false),
+            Self::GlobalWildcard | Self::GlobalDefault | Self::ImplicitForState => {
+                return Ok(false);
+            }
             Self::ImplicitSelf => b"self",
             Self::ImplicitEnvironment => b"_ENV",
         };
@@ -429,7 +431,8 @@ impl BindingName {
         match self {
             Self::Source(span) => Ok(source.slice(span)?),
             Self::Global(span) => Ok(source.slice(span)?),
-            Self::GlobalWildcard | Self::GlobalDefault | Self::ImplicitToClose => Ok(b""),
+            Self::GlobalWildcard | Self::GlobalDefault => Ok(b""),
+            Self::ImplicitForState => Ok(b"(for state)"),
             Self::ImplicitSelf => Ok(b"self"),
             Self::ImplicitEnvironment => Ok(b"_ENV"),
         }
@@ -442,7 +445,6 @@ impl BindingName {
                 | Self::GlobalWildcard
                 | Self::GlobalDefault
                 | Self::ImplicitEnvironment
-                | Self::ImplicitToClose
         )
     }
 
@@ -1415,7 +1417,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             self.lower_numeric_for_control(initial_source, statement.span(), "initial")?;
         let limit_source = self.lower_expression(statement.limit())?;
         let limit = self.lower_numeric_for_control(limit_source, statement.span(), "limit")?;
-        let index = self.allocate_register()?;
+        let mut index = self.allocate_register()?;
         self.emit(
             Instruction::Move {
                 destination: index,
@@ -1497,6 +1499,35 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 statement.span(),
             )?;
         }
+
+        let index_coercer =
+            self.lower_global_name(b"__blu_internal_coerce_numeric_for_index", statement.span())?;
+        let index_arguments = self.allocate_register()?;
+        self.emit(
+            Instruction::Move {
+                destination: index_arguments,
+                source: index,
+            },
+            statement.span(),
+        )?;
+        let step_argument = self.allocate_register()?;
+        self.emit(
+            Instruction::Move {
+                destination: step_argument,
+                source: step,
+            },
+            statement.span(),
+        )?;
+        index = self.allocate_register()?;
+        self.emit(
+            Instruction::Call {
+                destination: index,
+                function: index_coercer,
+                arguments: index_arguments,
+                argument_count: 2,
+            },
+            statement.span(),
+        )?;
 
         let loop_scope = self.bindings.len();
         let start = self.code.len();
@@ -1594,7 +1625,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             Binding {
                 name: BindingName::Source(statement.name().span()),
                 register: binding,
-                constant: false,
+                constant: self.profile == SemanticProfile::Lua55,
                 to_close: false,
                 start_pc,
                 end_pc: None,
@@ -1905,20 +1936,27 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         let to_close = controls.get(3).copied();
 
         let loop_scope = self.bindings.len();
-        if let Some(to_close) = to_close {
+        if matches!(
+            self.profile,
+            SemanticProfile::Lua54 | SemanticProfile::Lua55
+        ) {
             let loop_binding_start = u32::try_from(self.code.len()).map_err(|_| {
                 OwnedCompileError::InternalInvariant {
                     message: "instruction count passed limits but cannot fit a debug PC",
                 }
             })?;
-            self.push_binding_with_flags(
-                BindingName::ImplicitToClose,
-                to_close,
-                loop_binding_start,
-                false,
-                true,
-            )?;
-            self.emit_mark_close_value(to_close, None, statement.span())?;
+            for (index, register) in controls.iter().take(4).copied().enumerate() {
+                self.push_binding_with_flags(
+                    BindingName::ImplicitForState,
+                    register,
+                    loop_binding_start,
+                    false,
+                    index == 3,
+                )?;
+            }
+            if let Some(to_close) = to_close {
+                self.emit_mark_close_value(to_close, None, statement.span())?;
+            }
         }
         let start = self.code.len();
         let iterator_span = statement
@@ -1964,13 +2002,20 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             u32::try_from(self.code.len()).map_err(|_| OwnedCompileError::InternalInvariant {
                 message: "instruction count passed limits but cannot fit a debug PC",
             })?;
-        for (name, register) in statement
+        for (index, (name, register)) in statement
             .names()
             .iter()
             .copied()
             .zip(results.iter().copied())
+            .enumerate()
         {
-            self.push_binding(BindingName::Source(name.span()), register, start_pc)?;
+            self.push_binding_with_flags(
+                BindingName::Source(name.span()),
+                register,
+                start_pc,
+                self.profile == SemanticProfile::Lua55 && index == 0,
+                false,
+            )?;
         }
         push_fallible(
             &mut self.loop_breaks,
@@ -3850,7 +3895,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
         if constructor.field_count() > 1
             && (constructor.first_field()..end).all(|index| {
                 matches!(self.table_fields[index], TableField::Array(value)
-                    if self.table_literal_constant(value).ok().flatten().is_some())
+                    if self.table_literal_constant_available(value))
             })
         {
             let key_register = self.allocate_register()?;
@@ -3871,7 +3916,7 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                 };
                 let key_constant = self.push_constant(key)?;
                 let value_constant = self
-                    .table_literal_constant(value)?
+                    .lower_table_literal_constant(value)?
                     .expect("constant table fast path was checked above");
                 let value_constant = self.push_constant(value_constant)?;
                 self.emit(
@@ -3902,6 +3947,85 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
                         .ok_or(OwnedCompileError::InternalInvariant {
                             message: "table array field index overflows i64",
                         })?;
+            }
+            return Ok(());
+        }
+        // Large hash constructors generated by the PUC `verybig.lua` fixture
+        // have the same shape as the array case above: every key is a field
+        // name and every value is a literal. Reuse one key/value register
+        // pair instead of retaining a temporary for every field. This keeps
+        // source-size stress tests within Lua's physical register window
+        // while preserving source order for duplicate keys.
+        let all_named_literals = (constructor.first_field()..end).all(|index| {
+            matches!(self.table_fields[index], TableField::Named { value, .. }
+                if self.table_literal_constant_available(value))
+        });
+        if constructor.field_count() > 1 && all_named_literals {
+            let key_register = self.allocate_register()?;
+            let value_register = self.allocate_register()?;
+            let reverse_blu_fields = self.profile == SemanticProfile::Blu
+                && (constructor.first_field()..end).all(|index| {
+                    let TableField::Named { name, .. } = self.table_fields[index] else {
+                        return false;
+                    };
+                    !(constructor.first_field()..index).any(|previous| {
+                        let TableField::Named {
+                            name: previous_name,
+                            ..
+                        } = self.table_fields[previous]
+                        else {
+                            return false;
+                        };
+                        self.source
+                            .slice(previous_name.span())
+                            .is_ok_and(|previous_name| {
+                                self.source
+                                    .slice(name.span())
+                                    .is_ok_and(|name| previous_name == name)
+                            })
+                    })
+                });
+            let mut field_indices = allocate_vec(constructor.field_count(), "table fields")?;
+            if reverse_blu_fields {
+                field_indices.extend((constructor.first_field()..end).rev());
+            } else {
+                field_indices.extend(constructor.first_field()..end);
+            }
+            for index in field_indices {
+                let TableField::Named { name, value } = self.table_fields[index] else {
+                    unreachable!("constant table fast path only accepts named fields")
+                };
+                let span = self.expression(value)?.span();
+                let key_constant = self.push_constant(Constant::String(copy_bytes(
+                    self.source.slice(name.span())?,
+                    "table field name",
+                )?))?;
+                let value_constant = self
+                    .lower_table_literal_constant(value)?
+                    .expect("constant table fast path was checked above");
+                let value_constant = self.push_constant(value_constant)?;
+                self.emit(
+                    Instruction::LoadConstant {
+                        destination: key_register,
+                        constant: key_constant,
+                    },
+                    span,
+                )?;
+                self.emit(
+                    Instruction::LoadConstant {
+                        destination: value_register,
+                        constant: value_constant,
+                    },
+                    span,
+                )?;
+                self.emit(
+                    Instruction::SetTable {
+                        table,
+                        key: key_register,
+                        value: value_register,
+                    },
+                    span,
+                )?;
             }
             return Ok(());
         }
@@ -4192,6 +4316,64 @@ impl<'a, 'prototypes> Lowerer<'a, 'prototypes> {
             ExpressionKind::BinaryInteger => self.binary_integer_constant(expression.span())?,
             _ => return Ok(None),
         }))
+    }
+
+    fn table_literal_constant_available(&self, expression: ExpressionId) -> bool {
+        let Ok(expression_value) = self.expression(expression) else {
+            return false;
+        };
+        match expression_value.kind() {
+            ExpressionKind::StringLiteral => true,
+            ExpressionKind::Unary(unary) if unary.operator() == UnaryOperator::Negate => {
+                self.table_literal_constant_available(unary.operand())
+            }
+            _ => self
+                .table_literal_constant(expression)
+                .ok()
+                .flatten()
+                .is_some(),
+        }
+    }
+
+    fn lower_table_literal_constant(
+        &mut self,
+        expression: ExpressionId,
+    ) -> Result<Option<Constant>, OwnedCompileError> {
+        let expression_value = *self.expression(expression)?;
+        if matches!(expression_value.kind(), ExpressionKind::StringLiteral) {
+            return self.string_constant(expression_value.span()).map(Some);
+        }
+        if let ExpressionKind::Unary(unary) = expression_value.kind()
+            && unary.operator() == UnaryOperator::Negate
+        {
+            if matches!(
+                self.expression(unary.operand())?.kind(),
+                ExpressionKind::DecimalInteger
+            ) && matches!(
+                self.profile,
+                SemanticProfile::Blu
+                    | SemanticProfile::Lua53
+                    | SemanticProfile::Lua54
+                    | SemanticProfile::Lua55
+            ) && self
+                .decimal_integer_is_i64_min_magnitude(self.expression(unary.operand())?.span())?
+            {
+                return Ok(Some(Constant::Integer(i64::MIN)));
+            }
+            let Some(constant) = self.lower_table_literal_constant(unary.operand())? else {
+                return Ok(None);
+            };
+            return Ok(Some(match constant {
+                Constant::Integer(value) => Constant::Integer(value.checked_neg().ok_or(
+                    OwnedCompileError::InternalInvariant {
+                        message: "constant unary negation overflowed",
+                    },
+                )?),
+                Constant::Number(value) => Constant::Number(-value),
+                _ => return Ok(None),
+            }));
+        }
+        self.table_literal_constant(expression)
     }
 
     fn lower_call(&mut self, call: CallExpression) -> Result<u16, OwnedCompileError> {

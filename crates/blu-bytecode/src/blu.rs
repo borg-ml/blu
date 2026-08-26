@@ -86,6 +86,9 @@ impl FeatureBits {
     /// The prototype reserves register zero for the Lua 5.2+ lexical
     /// environment and stores user parameters after that slot.
     pub const IMPLICIT_ENVIRONMENT: Self = Self(1 << 17);
+    /// A stripped BluV1 projection retains function definition lines while
+    /// omitting the per-instruction line table.
+    pub const STRIPPED_DEBUG_LINES: Self = Self(1 << 18);
     pub const SUPPORTED: Self = Self(
         Self::BASELINE.0
             | Self::INTEGER_CONSTANTS.0
@@ -104,7 +107,8 @@ impl FeatureBits {
             | Self::DYNAMIC_CALL_RESULTS.0
             | Self::BITWISE_OPERATORS.0
             | Self::DUMPED_FUNCTION.0
-            | Self::IMPLICIT_ENVIRONMENT.0,
+            | Self::IMPLICIT_ENVIRONMENT.0
+            | Self::STRIPPED_DEBUG_LINES.0,
     );
 
     #[must_use]
@@ -3306,7 +3310,11 @@ fn encoded_size(artifact: &Artifact) -> Result<usize, EncodeError> {
         add_size(
             &mut size,
             20 + 4
-                + if artifact.format == BytecodeFormat::BluV2 {
+                + if artifact.format == BytecodeFormat::BluV2
+                    || prototype
+                        .required_features
+                        .contains(FeatureBits::STRIPPED_DEBUG_LINES)
+                {
                     8
                 } else {
                     0
@@ -3447,6 +3455,14 @@ fn put_prototype(
         put_u32(out, prototype.last_line_defined);
     }
     put_u64(out, prototype.required_features.bits());
+    if format == BytecodeFormat::BluV1
+        && prototype
+            .required_features
+            .contains(FeatureBits::STRIPPED_DEBUG_LINES)
+    {
+        put_u32(out, prototype.line_defined);
+        put_u32(out, prototype.last_line_defined);
+    }
     put_len(out, "constant count", prototype.constants.len())?;
     for constant in &prototype.constants {
         match constant {
@@ -4468,6 +4484,13 @@ fn read_prototype(
         (0, 0)
     };
     let required_features = FeatureBits::from_bits(reader.u64()?);
+    let (line_defined, last_line_defined) = if format == BytecodeFormat::BluV1
+        && required_features.contains(FeatureBits::STRIPPED_DEBUG_LINES)
+    {
+        (reader.u32()?, reader.u32()?)
+    } else {
+        (line_defined, last_line_defined)
+    };
 
     let constant_count = reader.count("constant count", limits.max_constants_per_prototype, 1)?;
     DecodeBudget::add(

@@ -293,6 +293,11 @@ impl Engine {
                     }
                 }
             };
+            if profile == SemanticProfile::Lua55 && mode.contains(&b'B') {
+                return Err(RuntimeError::LuaMessage(Arc::from(
+                    &b"bad argument #3 to 'load' (invalid mode)"[..],
+                )));
+            }
             let chunk_name = match arguments.get(1) {
                 None | Some(Value::Nil) if is_lua_profile(profile) => {
                     source.as_deref().map_or_else(
@@ -333,6 +338,9 @@ impl Engine {
                     });
                 }
             };
+            let explicit_nil_environment = is_lua_profile(profile)
+                && profile != SemanticProfile::Lua51
+                && matches!(arguments.get(3), Some(Value::Nil));
             let environment = match arguments.get(3) {
                 None | Some(Value::Nil)
                     if matches!(
@@ -366,10 +374,17 @@ impl Engine {
                     });
                 }
             };
+            let closure_environment = if explicit_nil_environment {
+                None
+            } else {
+                Some(environment)
+            };
+            let initialize_dumped_environment = !matches!(profile, SemanticProfile::Lua51)
+                && !matches!(arguments.get(3), Some(Value::Nil));
             let completion = LoadReaderCompletion::new(move |vm, source| {
                 let binary_source = if source.starts_with(&bytecode::blu::MAGIC) {
                     Some(source)
-                } else if source.first() == Some(&0x1b) {
+                } else if let Some(lua_binary) = lua_binary_source(source) {
                     if !mode.contains(&b'b') {
                         let mode = String::from_utf8_lossy(&mode);
                         return Ok(vec![
@@ -380,7 +395,7 @@ impl Engine {
                             )),
                         ]);
                     }
-                    match lua_dump_payload(profile, source) {
+                    match lua_dump_payload(profile, lua_binary) {
                         Ok(payload) => Some(payload),
                         Err(message) => {
                             return Ok(vec![
@@ -420,28 +435,16 @@ impl Engine {
                             ]);
                         }
                     };
-                    let closure = match profile {
-                        SemanticProfile::Blu | SemanticProfile::Luau => vm
-                            .create_blu_v1_closure_in_environment(
-                                artifact,
-                                execution_limits,
-                                environment,
-                            )?,
-                        SemanticProfile::Lua51
-                        | SemanticProfile::Lua52
-                        | SemanticProfile::Lua53
-                        | SemanticProfile::Lua54
-                        | SemanticProfile::Lua55 => vm.create_blu_v1_closure_in_environment(
-                            artifact,
-                            execution_limits,
-                            environment,
-                        )?,
-                        _ => vm.create_blu_v1_closure_in_environment(
-                            artifact,
-                            execution_limits,
-                            environment,
-                        )?,
-                    };
+                    let closure = vm.create_blu_v1_closure_in_optional_environment(
+                        artifact,
+                        execution_limits,
+                        closure_environment,
+                        if is_lua_profile(profile) {
+                            initialize_dumped_environment
+                        } else {
+                            true
+                        },
+                    )?;
                     return Ok(vec![closure]);
                 }
                 if !mode.contains(&b't') {
@@ -507,28 +510,16 @@ impl Engine {
                     .identity
                     .max_source_name_bytes
                     .max(compiler_chunk_name_len);
-                let closure = match profile {
-                    SemanticProfile::Blu | SemanticProfile::Luau => vm
-                        .create_blu_v1_closure_in_environment(
-                            compilation.into_validated_artifact(),
-                            chunk_execution_limits,
-                            environment,
-                        )?,
-                    SemanticProfile::Lua51
-                    | SemanticProfile::Lua52
-                    | SemanticProfile::Lua53
-                    | SemanticProfile::Lua54
-                    | SemanticProfile::Lua55 => vm.create_blu_v1_closure_in_environment(
-                        compilation.into_validated_artifact(),
-                        chunk_execution_limits,
-                        environment,
-                    )?,
-                    _ => vm.create_blu_v1_closure_in_environment(
-                        compilation.into_validated_artifact(),
-                        chunk_execution_limits,
-                        environment,
-                    )?,
-                };
+                let closure = vm.create_blu_v1_closure_in_optional_environment(
+                    compilation.into_validated_artifact(),
+                    chunk_execution_limits,
+                    closure_environment,
+                    if is_lua_profile(profile) {
+                        initialize_dumped_environment
+                    } else {
+                        true
+                    },
+                )?;
                 Ok(vec![closure])
             });
             if let Some(reader) = reader {
@@ -652,9 +643,17 @@ impl Engine {
                         });
                     }
                 };
+                if profile == SemanticProfile::Lua55
+                    && matches!(&mode, Value::String(mode) if mode.contains(&b'B'))
+                {
+                    return Err(RuntimeError::LuaMessage(Arc::from(
+                        &b"bad argument #2 to 'loadfile' (invalid mode)"[..],
+                    )));
+                }
                 let environment = match arguments.get(2) {
-                    None | Some(Value::Nil) => Value::Nil,
-                    Some(Value::Table(environment)) => Value::Table(*environment),
+                    None => None,
+                    Some(Value::Nil) => Some(Value::Nil),
+                    Some(Value::Table(environment)) => Some(Value::Table(*environment)),
                     Some(value) => {
                         return Err(RuntimeError::Type {
                             operation: "loadfile",
@@ -663,7 +662,10 @@ impl Engine {
                         });
                     }
                 };
-                forwarded.extend([mode, environment]);
+                forwarded.push(mode);
+                if let Some(environment) = environment {
+                    forwarded.push(environment);
+                }
             }
             vm.invoke_native_callback_without_yield(
                 "loadfile",
@@ -687,12 +689,7 @@ impl Engine {
                     || Value::String(Arc::from(&b"loadfile failed"[..])),
                 )));
             }
-            vm.invoke_native_callback_without_yield(
-                "dofile",
-                "yielding loaded files",
-                function,
-                &[],
-            )
+            vm.invoke_dofile_callback(function, &[])
         })?;
         self.vm
             .try_set_global(&b"dofile"[..], Value::NativeFunction(dofile))?;
@@ -846,13 +843,33 @@ fn is_lua_profile(profile: SemanticProfile) -> bool {
 }
 
 fn normalize_lua_file_source(source: Vec<u8>) -> Vec<u8> {
-    if source.first() != Some(&b'#') {
+    let source = if source.starts_with(b"\xEF\xBB\xBF") {
+        source[3..].to_vec()
+    } else {
+        source
+    };
+    if source.first() != Some(&b'#') || source.iter().position(|byte| *byte == 0).is_some() {
         return source;
     }
     let mut normalized = Vec::with_capacity(source.len().saturating_add(1));
     normalized.extend_from_slice(b"--");
     normalized.extend_from_slice(&source[1..]);
     normalized
+}
+
+fn lua_binary_source(source: &[u8]) -> Option<&[u8]> {
+    if source.first() == Some(&0x1b) {
+        return Some(source);
+    }
+    if source.first() != Some(&b'#') {
+        return None;
+    }
+    let nul = source.iter().position(|byte| *byte == 0)?;
+    let start = source
+        .get(nul + 1..)?
+        .windows(4)
+        .position(|window| window == b"\x1bLua")?;
+    source.get(nul + 1 + start..)
 }
 
 fn lua_load_compile_error(source: &[u8], chunk_name: &str, error: &OwnedExecuteError) -> String {
@@ -909,10 +926,26 @@ fn lua_load_compile_error(source: &[u8], chunk_name: &str, error: &OwnedExecuteE
                 "too many local variables (limit is 200) in function at line {}",
                 lua_last_function_line(source)
             )
+        } else if matches!(
+            error,
+            frontend::OwnedCompileError::Limit {
+                kind: frontend::OwnedCompileLimit::ReturnValues,
+                ..
+            }
+        ) {
+            "too many returns".to_owned()
         } else {
             error.to_string()
         };
-        let detail = if lua_is_deep_local_limit(source, &detail) {
+        let detail = if matches!(
+            error,
+            frontend::OwnedCompileError::Limit {
+                kind: frontend::OwnedCompileLimit::ReturnValues,
+                ..
+            }
+        ) {
+            detail
+        } else if lua_is_deep_local_limit(source, &detail) {
             format!(
                 "too many local variables (limit is 200) in function at line {}",
                 lua_last_function_line(source)
@@ -940,7 +973,15 @@ fn lua_load_compile_error(source: &[u8], chunk_name: &str, error: &OwnedExecuteE
     } else {
         detail
     };
-    let detail = if lua_is_deep_local_limit(source, &detail) {
+    let detail = if matches!(
+        error,
+        frontend::OwnedCompileError::Limit {
+            kind: frontend::OwnedCompileLimit::ReturnValues,
+            ..
+        }
+    ) {
+        "too many returns".to_owned()
+    } else if lua_is_deep_local_limit(source, &detail) {
         format!(
             "too many local variables (limit is 200) in function at line {}",
             lua_last_function_line(source)
@@ -1388,6 +1429,13 @@ fn lua_load_compile_limits(
         compile_limits.max_call_arguments = compile_limits.max_call_arguments.min(256);
         compile_limits.artifact.max_upvalues_per_prototype =
             compile_limits.artifact.max_upvalues_per_prototype.min(255);
+        if matches!(profile, SemanticProfile::Lua54 | SemanticProfile::Lua55) {
+            // Lua 5.4 and 5.5 encode the fixed return count in an 8-bit
+            // instruction operand and reserve one value for the terminator;
+            // 254 explicit results are accepted, while 255 is rejected as
+            // "too many returns".
+            compile_limits.max_return_values = compile_limits.max_return_values.min(254);
+        }
     }
     compile_limits
 }
@@ -1714,6 +1762,47 @@ mod tests {
                 )
                 .unwrap_or_else(|error| panic!("{profile:?}: {error}"));
             assert_eq!(result, expected, "{profile:?}");
+        }
+    }
+
+    #[test]
+    fn owned_numeric_for_preserves_mixed_integer_float_loop_types() {
+        for profile in [
+            SemanticProfile::Blu,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            let result = Engine::default()
+                .execute_owned_source(
+                    br#"
+                        local first_float
+                        for i = -1, -10, -1.0 do
+                            first_float = math.type(i)
+                            break
+                        end
+                        local first_integer
+                        for i = 1, 10.5 do
+                            first_integer = math.type(i)
+                            break
+                        end
+                        return first_float, first_integer
+                    "#,
+                    profile,
+                )
+                .unwrap_or_else(|error| panic!("{profile}: {error}"));
+            assert_eq!(
+                result,
+                [
+                    Value::String(Arc::from(&b"float"[..])),
+                    Value::String(Arc::from(if profile == SemanticProfile::Blu {
+                        &b"float"[..]
+                    } else {
+                        &b"integer"[..]
+                    })),
+                ],
+                "{profile}"
+            );
         }
     }
 
@@ -2470,12 +2559,16 @@ mod tests {
                     end
                     local repeated = string.rep("c268435456", 8)
                     local near_limit = string.rep("c268435456", 7) .. "c268435453"
+                    local overflow_ok, overflow_message = pcall(
+                        string.packsize,
+                        "c1" .. string.rep("0", 40)
+                    )
                     return rejects(string.packsize, repeated),
                         rejects(string.packsize, near_limit),
                         string.packsize("c1073741824") == 1073741824,
                         rejects(string.unpack, "i987654321", ""),
                         rejects(string.unpack, "c9876543210", ""),
-                        rejects(string.packsize, "c1" .. string.rep("0", 40))
+                        not overflow_ok and string.find(overflow_message, "too large") ~= nil
                 "#,
                 SemanticProfile::Luau,
             )
@@ -3492,6 +3585,84 @@ return value"#
     }
 
     #[test]
+    fn modern_table_move_honors_index_and_newindex_metamethods() {
+        let source = br#"
+            local reads = setmetatable({}, {
+                __index = function(_, key) return key * 10 end,
+            })
+            local writes = setmetatable({}, {
+                __newindex = function(table, key, value)
+                    rawset(table, key * 2, value)
+                end,
+            })
+            table.move(reads, 1, 3, 4, writes)
+            return writes[8], writes[10], writes[12], writes[4]
+        "#;
+        for profile in [
+            SemanticProfile::Blu,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile:?}: {error}")),
+                [
+                    Value::Integer(10),
+                    Value::Integer(20),
+                    Value::Integer(30),
+                    Value::Nil,
+                ],
+                "{profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn modern_table_move_preserves_nil_errors_from_newindex() {
+        let source = br#"
+            local pos1, pos2
+            local a = setmetatable({}, {
+                __index = function(_, key) pos1 = key end,
+                __newindex = function(_, key) pos2 = key; error() end,
+            })
+            local status, message = pcall(table.move, a, 1, 2147483647, 0)
+            return status, message, pos1, pos2, type(message)
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua54)
+                .unwrap(),
+            [
+                Value::Boolean(false),
+                Value::Nil,
+                Value::Integer(1),
+                Value::Integer(0),
+                Value::String(Arc::from(&b"nil"[..])),
+            ]
+        );
+    }
+
+    #[test]
+    fn lua54_table_insert_too_many_arguments_probe() {
+        let source = br#"
+            local status, message = pcall(table.insert, {}, 2, 3, 4)
+            return status, message, type(message)
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua54)
+                .unwrap(),
+            [
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"wrong number of arguments to 'insert'"[..])),
+                Value::String(Arc::from(&b"string"[..])),
+            ]
+        );
+    }
+
+    #[test]
     fn official_luau_table_move_extreme_keys_match() {
         let source = br#"
             local function eqT(a, b)
@@ -3725,6 +3896,131 @@ return value"#
     }
 
     #[test]
+    fn lua_table_sort_treats_nonpositive_lengths_as_empty() {
+        let source = br#"
+            local empty = setmetatable({}, {__len = function() return -1 end})
+            table.sort(empty, error)
+            local huge = setmetatable({}, {__len = function() return math.maxinteger end})
+            local ok, message = pcall(table.sort, huge)
+            local invalid, invalid_message = pcall(table.sort, {1, 2, 3, 4}, function() return true end)
+            return not ok and string.find(message, "too big") ~= nil
+                and not invalid and string.find(invalid_message, "invalid order function") ~= nil
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua54)
+                .unwrap(),
+            [Value::Boolean(true)]
+        );
+    }
+
+    #[test]
+    fn table_sort_fast_paths_simple_numeric_and_string_comparators() {
+        let source = br#"
+            local numbers = {}
+            for i = 1, 10000 do numbers[i] = i end
+            table.sort(numbers, function(left, right) return right < left end)
+            local words = {"c", "a", "b"}
+            table.sort(words, function(left, right) return left < right end)
+            return numbers[1] == 10000 and numbers[10000] == 1
+                and words[1] == "a" and words[3] == "c"
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua54)
+                .unwrap(),
+            [Value::Boolean(true)]
+        );
+    }
+
+    #[test]
+    fn lua53_gsub_empty_matches_insert_between_every_character() {
+        let source = br#"
+            return string.gsub("a b cd", " *", "-")
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua54)
+                .unwrap(),
+            [
+                Value::String(Arc::from(&b"-a-b-c-d-"[..])),
+                Value::Integer(5),
+            ]
+        );
+    }
+
+    #[test]
+    fn lua53_gmatch_empty_matches_skip_after_nonempty_match() {
+        let source = br#"
+            local subject = "a  \nbc\t\td"
+            local result = ""
+            local cursor = 1
+            for start, finish in string.gmatch(subject, "()%s*()") do
+                result = result .. string.sub(subject, cursor, start - 1) .. "-"
+                cursor = finish
+            end
+            return result
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua54)
+                .unwrap(),
+            [Value::String(Arc::from(&b"-a-b-c-d-"[..]))]
+        );
+    }
+
+    #[test]
+    fn lua54_gsub_invalid_replacement_errors_match() {
+        let source = br#"
+            local a, b = pcall(string.gsub, "alo", ".", {a = {}})
+            local c, d = pcall(string.gsub, "alo", ".", "%2")
+            local e, f = pcall(string.gsub, "alo", "(%0)", "a")
+            local g, h = pcall(string.gsub, "alo", "(%1)", "a")
+            local i, j = pcall(string.gsub, "alo", ".", "%x")
+            return a, b, c, d, e, f, g, h, i, j
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua54)
+                .unwrap(),
+            [
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"invalid replacement value (a table)"[..])),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"invalid capture index %2"[..])),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"invalid capture index %0"[..])),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"invalid capture index %1"[..])),
+                Value::Boolean(false),
+                Value::String(Arc::from(&b"invalid use of '%'"[..])),
+            ]
+        );
+    }
+
+    #[test]
+    fn lua54_string_dump_strip_size_contract() {
+        let source = br#"
+            local name = string.rep("x", 1000)
+            local function make(source_name)
+                local function outer(x)
+                    return function(y) return x + y end
+                end
+                return outer
+            end
+            local f = assert(load("return function (x) return function (y) return x + y end end", name))
+            local full, stripped = string.dump(f), string.dump(f, true)
+            return #full > 1000 and #full < 2000, #stripped < 500
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua54)
+                .unwrap(),
+            [Value::Boolean(true), Value::Boolean(true)]
+        );
+    }
+
+    #[test]
     fn lua_table_sort_rejects_native_yielding_comparators_across_the_c_call() {
         let source = br#"
             local f = coroutine.wrap(function()
@@ -3772,7 +4068,7 @@ return value"#
     }
 
     #[test]
-    fn luau_table_sort_rejects_callback_mutation() {
+    fn table_sort_rejects_callback_mutation_for_owned_profiles() {
         let source = br#"
             local values = { 3, 1, 2 }
             local ok = pcall(table.sort, values, function(left, right)
@@ -3781,12 +4077,15 @@ return value"#
             end)
             return ok == false
         "#;
-        assert_eq!(
-            Engine::default()
-                .execute_owned_source(source, SemanticProfile::Luau)
-                .unwrap(),
-            vec![Value::Boolean(true)]
-        );
+        for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap(),
+                vec![Value::Boolean(true)],
+                "{profile}"
+            );
+        }
     }
 
     #[test]
@@ -3953,6 +4252,48 @@ return value"#
                     Value::Number(9.0),
                     Value::Number(7.0),
                 ],
+                "{profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua55_table_create_reserves_array_and_hash_capacity_without_filling() {
+        let source = br#"
+            local values = table.create(5, 17)
+            local empty = #values
+            values[1] = 10
+            values.answer = 42
+            return empty, #values, values[1], values.answer
+        "#;
+        assert_eq!(
+            Engine::default()
+                .execute_owned_source(source, SemanticProfile::Lua55)
+                .expect("Lua 5.5 table.create should execute"),
+            vec![
+                Value::Integer(0),
+                Value::Integer(1),
+                Value::Integer(10),
+                Value::Integer(42),
+            ]
+        );
+    }
+
+    #[test]
+    fn modern_generational_zero_step_collects_weak_values() {
+        let source = br#"
+            collectgarbage("generational")
+            local values = setmetatable({}, {__mode = "kv"})
+            values[1] = {answer = 42}
+            collectgarbage("step", 0)
+            return values[1] == nil
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile:?}: {error}")),
+                vec![Value::Boolean(true)],
                 "{profile:?}"
             );
         }
@@ -5039,6 +5380,47 @@ return value"#
     }
 
     #[test]
+    fn modern_table_remove_can_remove_the_zero_key_from_an_empty_table() {
+        let source = br#"
+            local values = {[0] = "ban"}
+            local removed = table.remove(values)
+            return removed, values[0], #values
+        "#;
+        for profile in [
+            SemanticProfile::Blu,
+            SemanticProfile::Lua52,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile:?}: {error}")),
+                [
+                    Value::String(Arc::from(&b"ban"[..])),
+                    Value::Nil,
+                    Value::Integer(0)
+                ],
+                "{profile:?}"
+            );
+        }
+        for profile in [SemanticProfile::Lua51, SemanticProfile::Luau] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile:?}: {error}")),
+                [
+                    Value::Nil,
+                    Value::String(Arc::from(&b"ban"[..])),
+                    Value::Integer(0)
+                ],
+                "{profile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn blu_luau_local_type_annotations_are_runtime_transparent() {
         let source = br#"
             local answer: number = 40
@@ -5643,6 +6025,19 @@ return value"#
             result,
             vec![Value::String(Arc::from(&b"basic.luau:1: oops"[..]))]
         );
+    }
+
+    #[test]
+    fn luau_xpcall_traceback_omits_the_synthetic_handler_frame() {
+        let source = br#"local ok, message = xpcall(function()
+    error("foo")
+end, debug.traceback)
+local expected = "pcall.luau:2: foo\n" .. "pcall.luau:2\n" .. "pcall.luau:2\n"
+return not ok and message == expected"#;
+        let result = Engine::default()
+            .execute_owned_source_named(source, "pcall.luau", SemanticProfile::Luau)
+            .unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(result, vec![Value::Boolean(true)]);
     }
 
     #[test]
@@ -6261,6 +6656,28 @@ return value"#
                 vec![default.clone(), default, expected, second.clone(), second],
                 "{profile}"
             );
+        }
+    }
+
+    #[test]
+    fn owned_load_explicit_nil_environment_does_not_fall_back_to_global() {
+        let source = br#"
+            local nil_environment = assert(load("return _ENV", "=(nil)", "t", nil))
+            local global_environment = assert(load("return _ENV", "=(global)", "t", _G))
+            local nil_value = nil_environment()
+            local global_value = global_environment()
+            return nil_value == nil and global_value == _G
+        "#;
+        for profile in [
+            SemanticProfile::Lua52,
+            SemanticProfile::Lua53,
+            SemanticProfile::Lua54,
+            SemanticProfile::Lua55,
+        ] {
+            let values = Engine::default()
+                .execute_owned_source(source, profile)
+                .unwrap_or_else(|error| panic!("profile {profile:?}: {error:?}"));
+            assert_eq!(values, vec![Value::Boolean(true)], "profile {profile:?}");
         }
     }
 
@@ -11320,6 +11737,24 @@ return require"debug".getinfo(1).currentline
     }
 
     #[test]
+    fn blu_packsize_rejects_aggregate_formats_above_string_limit() {
+        let source = br#"
+            local format = string.rep("c268435456", 4) .. "c1"
+            local ok, message = pcall(string.packsize, format)
+            return not ok and string.find(message, "too large") ~= nil
+        "#;
+        for profile in [SemanticProfile::Blu, SemanticProfile::Luau] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("profile {profile:?}: {error:?}")),
+                vec![Value::Boolean(true)],
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
     fn string_unpack_wide_unsigned_values_preserve_profile_number_models() {
         let source = br#"
             local lnum = 0x060504030201
@@ -11607,7 +12042,8 @@ return require"debug".getinfo(1).currentline
             local name, value = debug.getupvalue(restored, 1)
             local ok, result = pcall(restored)
             return name == "captured"
-                and value == nil
+                and ((_VERSION == "Lua 5.1" and value == nil)
+                    or (_VERSION ~= "Lua 5.1" and type(value) == "table"))
                 and ok
                 and result == value
         "#;
@@ -12543,6 +12979,99 @@ return require"debug".getinfo(1).currentline
     }
 
     #[test]
+    fn lua_xpcall_stack_overflow_in_nested_protection_reports_error_in_handler() {
+        let source = br#"
+            local function loop (x, y, z)
+                return 1 + loop(x, y, z)
+            end
+            local result, message = xpcall(loop, function (error_value)
+                assert(string.find(error_value, "stack overflow"))
+                local nested_ok, nested_message = pcall(loop)
+                assert(not nested_ok and string.find(nested_message, "error handling"))
+                assert(math.sin(0) == 0)
+                return 15
+            end)
+            return not result and message == 15
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile:?}: {error}")),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua_assert_preserves_explicit_error_objects() {
+        let source = br#"
+            local object = {}
+            local string_ok, string_message = pcall(assert, false, "X", object)
+            local object_ok, object_message = pcall(assert, false, object)
+            local nil_ok, nil_message = pcall(assert, nil, nil)
+            return not string_ok and string_message == "X"
+                and not object_ok and object_message == object
+                and not nil_ok and (
+                    (_VERSION == "Lua 5.5" and nil_message == "<no error object>")
+                    or (_VERSION ~= "Lua 5.5" and nil_message == nil)
+                )
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile:?}: {error}")),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn luau_assert_prefixes_explicit_string_messages() {
+        let values = Engine::default()
+            .execute_owned_source_named(
+                br#"
+                    local ok, message = pcall(function() assert(false, "X") end)
+                    return not ok and message ~= "X" and string.find(message, ": X") ~= nil
+                "#,
+                "assert.luau",
+                SemanticProfile::Luau,
+            )
+            .unwrap();
+        assert_eq!(values, vec![Value::Boolean(true)]);
+    }
+
+    #[test]
+    fn lua54_and_lua55_reject_more_than_254_fixed_returns() {
+        let mut valid = String::from("return 10");
+        for _ in 0..253 {
+            valid.push_str(",10");
+        }
+        let too_many = format!("{valid},10");
+        let source = format!(
+            r#"
+                local valid, valid_message = load("{valid}")
+                local too_many, too_many_message = load("{too_many}")
+                return valid ~= nil and valid_message == nil
+                    and too_many == nil
+                    and string.find(too_many_message, "too many returns") ~= nil
+            "#
+        );
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source.as_bytes(), profile)
+                    .unwrap_or_else(|error| panic!("{profile:?}: {error}")),
+                vec![Value::Boolean(true)],
+                "profile {profile:?}"
+            );
+        }
+    }
+
+    #[test]
     fn resumed_coroutine_errors_unwind_to_suspended_protected_calls() {
         assert_eq!(
             Engine::default().execute(
@@ -13074,7 +13603,9 @@ return require"debug".getinfo(1).currentline
                 })
                 error("boom")
             end)
-            return scope_count == 0 and error_count == 1 and not ok
+            return scope_count == (_VERSION == "Lua 5.4" and 1 or 0)
+                and error_count == 1
+                and not ok
         "##;
         for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
             assert_eq!(
@@ -13131,6 +13662,33 @@ return require"debug".getinfo(1).currentline
             return first and signal == "close-yield"
                 and second and result == "body"
                 and coroutine.status(co) == "dead"
+        "#;
+        for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
+            assert_eq!(
+                Engine::default()
+                    .execute_owned_source(source, profile)
+                    .unwrap_or_else(|error| panic!("{profile}: {error:?}")),
+                vec![Value::Boolean(true)],
+                "{profile}"
+            );
+        }
+    }
+
+    #[test]
+    fn lua54_close_yield_preserves_the_profile_specific_close_error_argument() {
+        let source = br#"
+            local co = coroutine.wrap(function()
+                local value <close> = setmetatable({}, {__close = coroutine.yield})
+                return "body"
+            end)
+            local yielded = table.pack(co())
+            local resumed = table.pack(co())
+            local expected = _VERSION == "Lua 5.4" and 2 or 1
+            return yielded.n == expected
+                and type(yielded[1]) == "table"
+                and yielded[2] == nil
+                and resumed.n == 1
+                and resumed[1] == "body"
         "#;
         for profile in [SemanticProfile::Lua54, SemanticProfile::Lua55] {
             assert_eq!(

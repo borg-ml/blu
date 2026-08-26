@@ -1,0 +1,4 @@
+CLOSE_COUNT	Lua 5.4	0
+ERROR_COUNT	Lua 5.4	1
+RESULT	Lua 5.4	0	1	false
+DIRECT	Lua 5.4	1	1

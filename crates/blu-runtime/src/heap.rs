@@ -214,11 +214,6 @@ impl Heap {
         self.memory.should_collect(requested)
     }
 
-    #[must_use]
-    pub(crate) const fn has_weak_tables(&self) -> bool {
-        self.has_weak_tables
-    }
-
     pub(crate) fn charge_external(&mut self, bytes: usize) -> Result<(), HeapError> {
         self.memory.reserve(bytes)?.commit();
         Ok(())
@@ -359,6 +354,7 @@ impl Heap {
                 hash_order_enabled: false,
                 hash,
                 hash_capacity,
+                hash_tombstones: 0,
                 hash_order: Vec::new(),
                 hash_order_capacity: 0,
                 hash_order_positions: HashMap::new(),
@@ -810,6 +806,7 @@ impl Heap {
         let had_array = !table.array.is_empty();
         table.array.fill(Value::Nil);
         table.hash.clear();
+        table.hash_tombstones = 0;
         table.hash_order.clear();
         table.hash_order_positions.clear();
         table.hash_order_enabled = false;
@@ -889,7 +886,7 @@ impl Heap {
         Ok(())
     }
 
-    fn table_is_metatable(&self, candidate: TableId) -> Result<bool, HeapError> {
+    pub(crate) fn table_is_metatable(&self, candidate: TableId) -> Result<bool, HeapError> {
         self.table(candidate)?;
         Ok(self.live_indices.iter().any(|index| {
             matches!(
@@ -958,9 +955,6 @@ impl Heap {
                 index
             } else {
                 if table.hash_order_capacity != 0 {
-                    if !table.hash.contains_key(&key) {
-                        return Err(HeapError::InvalidIterationKey);
-                    }
                     let luau_order;
                     let order = if matches!(table.hash_iteration_order, HashIterationOrder::Luau) {
                         luau_order = table.luau_hash_order();
@@ -968,6 +962,11 @@ impl Heap {
                     } else {
                         &table.hash_order
                     };
+                    if !table.hash.contains_key(&key)
+                        && !order.iter().any(|candidate| candidate == &key)
+                    {
+                        return Err(HeapError::InvalidIterationKey);
+                    }
                     let Some(position) = order.iter().position(|candidate| candidate == &key)
                     else {
                         return Err(HeapError::InvalidIterationKey);
@@ -1678,6 +1677,7 @@ impl Heap {
                 cleanup.push((table_id, array, hash));
             }
         }
+        let mut released_hash_bytes = 0usize;
         for (table_id, array, hash) in cleanup {
             let table = table_mut_in_slots(&mut self.slots, table_id)?;
             for index in array {
@@ -1689,6 +1689,12 @@ impl Heap {
                 table.remove_hash_entry(&key);
             }
             table.trim_array();
+            released_hash_bytes = released_hash_bytes
+                .checked_add(table.trim_hash()?)
+                .ok_or(MemoryError::SizeOverflow)?;
+        }
+        if released_hash_bytes != 0 {
+            self.memory.release(released_hash_bytes)?;
         }
         Ok(())
     }
@@ -1988,6 +1994,7 @@ struct Table {
     hash_order_enabled: bool,
     hash: HashMap<Key, Value>,
     hash_capacity: usize,
+    hash_tombstones: usize,
     hash_order: Vec<Key>,
     hash_order_capacity: usize,
     hash_order_positions: HashMap<Key, usize>,
@@ -2027,6 +2034,7 @@ impl Table {
                         if self.hash_order_capacity != 0 {
                             self.push_hash_order_key(tombstone.clone());
                         }
+                        self.hash_tombstones = self.hash_tombstones.saturating_add(1);
                     }
                     self.hash.insert(tombstone, Value::Nil);
                 } else if !matches!(value, Value::Nil) {
@@ -2090,14 +2098,28 @@ impl Table {
                 // `next` permits clearing the key it just returned and then
                 // continuing with `next(table, key)`.
                 self.hash_contains_heap_key |= key.contains_heap_reference();
+                if !self
+                    .hash
+                    .get(&key)
+                    .is_some_and(|value| matches!(value, Value::Nil))
+                {
+                    self.hash_tombstones = self.hash_tombstones.saturating_add(1);
+                }
                 self.hash.insert(key, Value::Nil);
             }
         } else {
             self.hash_contains_heap_key |= key.contains_heap_reference();
             self.hash_contains_heap_value |= value_contains_heap_reference;
+            if matches!(self.hash_iteration_order, HashIterationOrder::Unordered)
+                && self.hash_tombstones >= 1024
+                && self.hash_tombstones >= self.hash.len().saturating_sub(self.hash_tombstones)
+            {
+                self.compact_hash();
+            }
             if !self.hash.contains_key(&key) {
-                self.hash_order_enabled |=
-                    self.preserve_hash_order && !matches!(key, Key::Integer(_) | Key::Number(_));
+                self.hash_order_enabled |= (self.preserve_hash_order
+                    && !matches!(key, Key::Integer(_) | Key::Number(_)))
+                    || key.contains_heap_reference();
                 let required = self
                     .hash
                     .len()
@@ -2107,6 +2129,12 @@ impl Table {
                 if self.hash_order_capacity != 0 {
                     self.push_hash_order_key(key.clone());
                 }
+            } else if self
+                .hash
+                .get(&key)
+                .is_some_and(|value| matches!(value, Value::Nil))
+            {
+                self.hash_tombstones = self.hash_tombstones.saturating_sub(1);
             }
             self.hash.insert(key, value);
         }
@@ -2161,8 +2189,9 @@ impl Table {
             .len()
             .checked_add(1)
             .ok_or(MemoryError::SizeOverflow)?;
-        let track_hash_order =
-            self.preserve_hash_order && !matches!(key, Key::Integer(_) | Key::Number(_));
+        let track_hash_order = (self.preserve_hash_order
+            && !matches!(key, Key::Integer(_) | Key::Number(_)))
+            || key.contains_heap_reference();
         self.hash_growth_bytes(required, track_hash_order)
     }
 
@@ -2417,7 +2446,57 @@ impl Table {
     }
 
     fn remove_hash_entry(&mut self, key: &Key) -> Option<Value> {
-        self.hash.remove(key)
+        let value = self.hash.remove(key);
+        if value
+            .as_ref()
+            .is_some_and(|value| matches!(value, Value::Nil))
+        {
+            self.hash_tombstones = self.hash_tombstones.saturating_sub(1);
+        }
+        value
+    }
+
+    fn trim_hash(&mut self) -> Result<usize, MemoryError> {
+        let old_bytes = checked_add(
+            checked_hash_bytes::<Key, Value>(self.hash_capacity)?,
+            checked_add(
+                checked_vector_bytes::<Key>(self.hash_order_capacity)?,
+                checked_hash_bytes::<Key, usize>(self.hash_order_capacity)?,
+            )?,
+        )?;
+        self.hash.retain(|_, value| !matches!(value, Value::Nil));
+        self.hash_tombstones = 0;
+        self.hash.shrink_to_fit();
+        self.hash_capacity = self.hash.len();
+        if self.hash_order_capacity != 0 {
+            self.hash_order.retain(|key| self.hash.contains_key(key));
+            self.hash_order.shrink_to_fit();
+            self.hash_order_capacity = self.hash_order.len();
+            self.rebuild_hash_order();
+            self.hash_order_positions.shrink_to_fit();
+        }
+        let new_bytes = checked_add(
+            checked_hash_bytes::<Key, Value>(self.hash_capacity)?,
+            checked_add(
+                checked_vector_bytes::<Key>(self.hash_order_capacity)?,
+                checked_hash_bytes::<Key, usize>(self.hash_order_capacity)?,
+            )?,
+        )?;
+        Ok(old_bytes.saturating_sub(new_bytes))
+    }
+
+    fn compact_hash(&mut self) {
+        if self.hash_tombstones == 0 {
+            return;
+        }
+        self.hash.retain(|_, value| !matches!(value, Value::Nil));
+        if matches!(self.hash_iteration_order, HashIterationOrder::Unordered)
+            && self.hash_order_capacity != 0
+        {
+            self.hash_order.retain(|key| self.hash.contains_key(key));
+            self.rebuild_hash_order();
+        }
+        self.hash_tombstones = 0;
     }
 
     fn push_hash_order_key(&mut self, key: Key) {
