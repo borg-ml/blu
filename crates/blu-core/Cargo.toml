@@ -6,6 +6,8 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
+keywords = ["lua", "luau", "diagnostics", "spans", "shared-types"]
+categories = ["development-tools", "api-bindings"]
 authors.workspace = true
 
 [dependencies]
